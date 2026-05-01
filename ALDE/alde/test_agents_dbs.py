@@ -10,7 +10,12 @@ PKG_ROOT = Path(__file__).resolve().parents[1]
 if str(PKG_ROOT) not in sys.path:
     sys.path.insert(0, str(PKG_ROOT))
 
-from alde.agents_db import KnowledgeObjectService, ObjectMappingService, RuntimeConfigObject
+from alde.agents_db import (
+    AgentMemoryAttachmentService,
+    KnowledgeObjectService,
+    ObjectMappingService,
+    RuntimeConfigObject,
+)
 
 
 class _RecordingKnowledgeRepository:
@@ -23,12 +28,31 @@ class _RecordingKnowledgeRepository:
         return bucket[str(object_id)]
 
 
+class _StubAgentMemoryService:
+    def append_session_context(self, **_: Any) -> bool:
+        return True
+
+    def load_object_record(self, **_: Any) -> dict[str, Any]:
+        return {}
+
+    def load_session_scope_key(
+        self,
+        *,
+        scope_key: str | None = None,
+        thread_id: int | None = None,
+    ) -> str:
+        _ = thread_id
+        if isinstance(scope_key, str) and scope_key.strip():
+            return scope_key.strip()
+        return "thread:test"
+
+
 class TestObjectMappingService(unittest.TestCase):
     def test_store_mapped_object_supports_explicit_raw_text_entity_and_relation_models(self) -> None:
         repository = _RecordingKnowledgeRepository()
         mapping_service = ObjectMappingService(
             KnowledgeObjectService(repository),
-            RuntimeConfigObject(mongo_uri="mongodb://unused"),
+            RuntimeConfigObject(agents_db_uri="mongodb://unused"),
         )
 
         result = mapping_service.store_mapped_object(
@@ -135,6 +159,99 @@ class TestObjectMappingService(unittest.TestCase):
             relation_types,
             {"offered_by", "requires_skill", "requires_database_knowledge"},
         )
+
+
+class TestAgentMemoryAttachmentService(unittest.TestCase):
+    def test_load_attachment_payload_uses_job_default_object_for_document_field(self) -> None:
+        service = AgentMemoryAttachmentService(_StubAgentMemoryService())
+
+        attachment_payload = service.load_attachment_payload(
+            handoff_payload={
+                "output": {
+                    "document": {
+                        "id": "cover-letter-doc-001",
+                    }
+                }
+            },
+            handoff_metadata={"job_name": "cover_letter_writer"},
+            runtime_metadata={"job_name": "cover_letter_writer"},
+        )
+
+        attachments = list(attachment_payload.get("attachments") or [])
+        self.assertEqual(len(attachments), 1)
+        self.assertEqual(attachments[0].get("obj_name"), "cover_letters")
+        self.assertEqual(attachments[0].get("correlation_id"), "cover-letter-doc-001")
+        self.assertEqual(attachments[0].get("source_field"), "document")
+        self.assertEqual(attachment_payload.get("job_name"), "cover_letter_writer")
+
+    def test_load_attachment_payload_uses_runtime_job_skill_profiles_when_job_name_missing(self) -> None:
+        service = AgentMemoryAttachmentService(_StubAgentMemoryService())
+
+        attachment_payload = service.load_attachment_payload(
+            handoff_payload={
+                "output": {
+                    "document": {
+                        "id": "cover-letter-doc-002",
+                    }
+                }
+            },
+            handoff_metadata={},
+            runtime_metadata={
+                "job_skill_profiles": {
+                    "cover_letter_writer": "xworker_cover_letter_writer",
+                }
+            },
+        )
+
+        attachments = list(attachment_payload.get("attachments") or [])
+        self.assertEqual(len(attachments), 1)
+        self.assertEqual(attachments[0].get("obj_name"), "cover_letters")
+        self.assertEqual(attachments[0].get("correlation_id"), "cover-letter-doc-002")
+        self.assertEqual(attachments[0].get("source_field"), "document")
+
+    def test_load_attachment_payload_uses_generic_root_keys_without_runtime_config(self) -> None:
+        service = AgentMemoryAttachmentService(_StubAgentMemoryService())
+
+        attachment_payload = service.load_attachment_payload(
+            handoff_payload={
+                "output": {
+                    "obj_name": "documents",
+                    "correlation_id": "generic-correlation-001",
+                    "result": {
+                        "title": "Generic Payload",
+                    },
+                }
+            },
+            handoff_metadata={},
+            runtime_metadata={"job_name": "unknown_job"},
+        )
+
+        attachments = list(attachment_payload.get("attachments") or [])
+        self.assertEqual(len(attachments), 1)
+        self.assertEqual(attachments[0].get("obj_name"), "documents")
+        self.assertEqual(attachments[0].get("correlation_id"), "generic-correlation-001")
+        self.assertEqual(attachments[0].get("source_field"), "output")
+
+    def test_load_attachment_payload_infers_profile_object_from_generic_id_key(self) -> None:
+        service = AgentMemoryAttachmentService(_StubAgentMemoryService())
+
+        attachment_payload = service.load_attachment_payload(
+            handoff_payload={
+                "output": {
+                    "parsed_profile": {
+                        "id": "profile-generic-001",
+                    }
+                }
+            },
+            handoff_metadata={},
+            runtime_metadata={},
+        )
+
+        attachments = list(attachment_payload.get("attachments") or [])
+        self.assertEqual(len(attachments), 1)
+        self.assertEqual(attachments[0].get("obj_name"), "profiles")
+        self.assertEqual(attachments[0].get("correlation_id"), "profile-generic-001")
+        self.assertEqual(attachments[0].get("source_field"), "parsed_profile")
 
 
 if __name__ == "__main__":

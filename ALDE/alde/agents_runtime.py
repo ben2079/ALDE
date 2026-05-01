@@ -457,7 +457,7 @@ JOB_PROMPTS: dict[str, dict[str, Any]] = {
     "router_planner_cover_letter_sequence": {
         "prompt": _text(
             """
-            === Job: router_planner_cover_letter_sequence ===
+            === Job: Xrouter_Xplanner for cover_letter_generation_sequence ===
             Description: Specialized router planner for dispatch -> parse -> cover-letter execution.
             Goal: Initialize the deterministic sequence for cover-letter generation from applicant profile and job-offer inputs.
 
@@ -469,20 +469,26 @@ JOB_PROMPTS: dict[str, dict[str, Any]] = {
             - Do not invent filesystem or DB state.
             """
         ),
+
         "task": {
-            "mode": "router_sequence_planner",
+            "mode": "sequence_router_planner",
             "defaults": {
                 "target_agent": "_xworker",
-                "route_job_name": "document_dispatch",
-                "parser_job_name": "job_posting_parser",
-                "writer_job_name": "cover_letter_writer",
-                "sequence_name": "dispatch_parse_generate_cover_letter",
+                "job_name": "document_dispatch",
             },
+            "sequence_name": "dispatch_parse_generate_cover_letter",
+            "available_jobs": [
+                "document_dispatch",
+                "job_posting_parser",
+                "cover_letter_writer",
+            ],
         },
+
         "output_schema": {
             "target_agent": "_xworker",
             "job_name": "document_dispatch",
             "user_question": "{...sequence payload json...}",
+
             "handoff_metadata": {
                 "sequence_name": "dispatch_parse_generate_cover_letter",
                 "parser_job_name": "job_posting_parser",
@@ -595,9 +601,9 @@ JOB_CONFIGS: dict[str, dict[str, Any]] = {
                 "sequence": {
                     "name": "dispatch_parse_generate_cover_letter",
                     "steps": [
-                        "dispatch_document(load_applicant_profile, load_job_offers)",
-                        "parse_document(parse_job_offer)",
-                        "generate_cover_letter(handoff_parser_result, handoff_applicant_profile)",
+                        "dispatch_document",
+                        "job_posting_parser",
+                        "cover_letter_writer",
                     ],
                     "parser_job_name": "job_posting_parser",
                     "writer_job_name": "cover_letter_writer",
@@ -1166,6 +1172,7 @@ AGENT_SKILLS: dict[str, dict[str, Any]] = {
     },
     "xworker_dispatch": {
         "role": "xworker",
+        
         "prompt_fragments": ["source_grounding", "deterministic_workflow"],
         "description": "Worker profile for deterministic dispatch and document bucketing.",
         "job_name": "document_dispatch",

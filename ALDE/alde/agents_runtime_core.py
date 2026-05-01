@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from queue import Empty, Queue
-from threading import Event, Thread
+from threading import Event, Lock, Thread
 from typing import Any, Callable, Generic, TypeVar
 
 
@@ -107,35 +107,71 @@ class InMemoryMessageRunnerService(Generic[MessageObject]):
         worker_name: str,
         process_object_message: Callable[[MessageObject], None],
         poll_interval_seconds: float = 0.5,
+        worker_count: int = 1,
     ) -> None:
         self.worker_name = worker_name
         self.process_object_message = process_object_message
         self.poll_interval_seconds = max(float(poll_interval_seconds), 0.05)
+        self.worker_count = max(int(worker_count or 1), 1)
         self._queue: Queue[MessageObject] = Queue()
         self._stop = Event()
-        self._thread = Thread(target=self._work_loop, daemon=True, name=self.worker_name)
+        self._thread_lock = Lock()
+        self._threads: list[Thread] = []
+
+    def _build_object_thread(self, thread_index: int) -> Thread:
+        normalized_worker_name = str(self.worker_name or "").strip() or "inmemory-runner"
+        thread_name = (
+            normalized_worker_name
+            if self.worker_count <= 1
+            else f"{normalized_worker_name}-{thread_index + 1}"
+        )
+        return Thread(target=self._work_loop, daemon=True, name=thread_name)
+
+    def _load_alive_object_threads(self) -> list[Thread]:
+        return [thread for thread in self._threads if thread.is_alive()]
 
     def start_object_runner(self) -> None:
-        if self._thread.is_alive():
-            return
-        self._thread = Thread(target=self._work_loop, daemon=True, name=self.worker_name)
-        self._stop.clear()
-        self._thread.start()
+        with self._thread_lock:
+            alive_threads = self._load_alive_object_threads()
+            if len(alive_threads) >= self.worker_count:
+                self._threads = alive_threads
+                return
+
+            self._stop.clear()
+            while len(alive_threads) < self.worker_count:
+                thread = self._build_object_thread(len(alive_threads))
+                alive_threads.append(thread)
+                thread.start()
+
+            self._threads = alive_threads
 
     def stop_object_runner(self) -> None:
         self._stop.set()
-        if self._thread.is_alive():
-            self._thread.join(timeout=5)
+        with self._thread_lock:
+            threads = list(self._threads)
+
+        for thread in threads:
+            if thread.is_alive():
+                thread.join(timeout=5)
+
+        with self._thread_lock:
+            self._threads = self._load_alive_object_threads()
 
     def submit_object_message(self, message: MessageObject) -> None:
         self.start_object_runner()
         self._queue.put(message)
 
     def load_object_health(self) -> dict[str, Any]:
+        with self._thread_lock:
+            alive_threads = self._load_alive_object_threads()
+            self._threads = alive_threads
+
         return {
             "backend": "inmemory",
             "healthy": True,
-            "runner_alive": self._thread.is_alive(),
+            "runner_alive": bool(alive_threads),
+            "runner_count": len(alive_threads),
+            "configured_runner_count": self.worker_count,
             "pending_count": self._queue.qsize(),
         }
 

@@ -15,6 +15,7 @@ import subprocess
 import shutil
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from urllib.parse import urlparse
 
 # Keep both repository roots on sys.path so local imports work in direct-script
 # mode and when the module is imported through the lowercase package alias.
@@ -177,7 +178,7 @@ def save_generated_image(image_bytes: bytes, *, mime: str | None = None) -> Path
 
 try:
     try:
-        from .file_viewer import (
+        from file_viewer import (
             classify as _fv_classify,
             ImageWidget as _FVImageWidget,
             ChatImageWidget as _FVChatImageWidget,
@@ -214,6 +215,7 @@ from PySide6.QtGui import (
     QDragEnterEvent,
     QDropEvent,
     QImage,
+    QIntValidator,
     QTextCursor,
     QTextOption,
     QFontMetrics,
@@ -2148,6 +2150,23 @@ class AIWidget(QWidget):
         self.footer_controls_layout = QHBoxLayout(self.footer_controls)
         self.footer_controls_layout.setContentsMargins(2, 0, 2, 2)
         self.footer_controls_layout.setSpacing(4)
+        self.btn_footer_actions = QToolButton(self.footer_controls)
+        self.btn_footer_actions.setObjectName("chatFooterActionsButton")
+        footer_action_icon = _icon("automation_25dp_B7B7B7_FILL0_wght500_GRAD0_opsz24.svg")
+        if not footer_action_icon.isNull():
+            self.btn_footer_actions.setIcon(footer_action_icon)
+        self.btn_footer_actions.setText("Action")
+        self.btn_footer_actions.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self.btn_footer_actions.setPopupMode(QToolButton.InstantPopup)
+        self.btn_footer_actions.setCursor(Qt.PointingHandCursor)
+        self.btn_footer_actions.setToolTip("Configured actions starten")
+        self.btn_footer_actions.setFixedHeight(24)
+
+        self._footer_action_menu = QMenu(self.btn_footer_actions)
+        self._footer_action_menu.aboutToShow.connect(self._rebuild_footer_action_menu)
+        self.btn_footer_actions.setMenu(self._footer_action_menu)
+
+        self.footer_controls_layout.addWidget(self.btn_footer_actions, 0, Qt.AlignLeft | Qt.AlignVCenter)
         self.footer_controls_layout.addStretch(1)
 
         # 3) Prompt in ChatWindow integrieren
@@ -2178,6 +2197,244 @@ class AIWidget(QWidget):
         except Exception:
             pass
         self._schedule_prompt_autofit()
+
+    def _load_action_schema_configs(self) -> dict[str, dict[str, Any]]:
+        try:
+            try:
+                from .agents_config import get_action_request_schema_configs  # type: ignore
+            except ImportError as e:
+                msg = str(e)
+                if "no known parent package" in msg or "attempted relative import" in msg:
+                    from alde.agents_config import get_action_request_schema_configs  # type: ignore
+                else:
+                    raise
+
+            raw_configs = get_action_request_schema_configs()
+            if not isinstance(raw_configs, dict):
+                return {}
+            return {
+                str(action_object_name).strip(): dict(action_config or {})
+                for action_object_name, action_config in raw_configs.items()
+                if str(action_object_name).strip() and isinstance(action_config, dict)
+            }
+        except Exception:
+            return {}
+
+    def _load_configured_action_objects(self) -> list[dict[str, Any]]:
+        action_objects: list[dict[str, Any]] = []
+        for action_object_name, action_config in self._load_action_schema_configs().items():
+            action_names = [
+                str(value).strip()
+                for value in (action_config.get("actions") or [])
+                if str(value).strip()
+            ]
+            action_name = action_names[0] if action_names else str(action_object_name).strip()
+            if not action_name:
+                continue
+
+            required_paths = [
+                str(path_name).strip()
+                for path_name in (action_config.get("required_paths") or [])
+                if str(path_name).strip()
+            ]
+            required_non_action_paths = [
+                path_name
+                for path_name in required_paths
+                if path_name.casefold() != "action"
+            ]
+
+            resolution_config = action_config.get("request_resolution")
+            resolution_objects = (
+                resolution_config.get("objects")
+                if isinstance(resolution_config, dict)
+                else []
+            )
+            request_fields = [
+                str(resolution_object.get("request_field") or "").strip()
+                for resolution_object in (resolution_objects or [])
+                if isinstance(resolution_object, dict)
+                and str(resolution_object.get("request_field") or "").strip()
+            ]
+
+            display_name = str(action_object_name or action_name).strip().replace("_", " ")
+            display_name = " ".join(display_name.split())
+            if display_name:
+                display_name = display_name[0].upper() + display_name[1:]
+
+            action_objects.append(
+                {
+                    "action_object_name": str(action_object_name).strip(),
+                    "action_name": action_name,
+                    "display_name": display_name or action_name,
+                    "description": str(action_config.get("description") or "").strip(),
+                    "required_non_action_paths": required_non_action_paths,
+                    "request_fields": request_fields,
+                }
+            )
+
+        action_objects.sort(
+            key=lambda action_object: str(
+                action_object.get("display_name")
+                or action_object.get("action_object_name")
+                or ""
+            ).casefold()
+        )
+        return action_objects
+
+    def _set_action_request_path_value(
+        self,
+        *,
+        action_request: dict[str, Any],
+        path_name: str,
+        path_value: Any,
+    ) -> None:
+        path_segments = [segment.strip() for segment in str(path_name or "").split(".") if segment.strip()]
+        if not path_segments:
+            return
+
+        cursor = action_request
+        for segment in path_segments[:-1]:
+            nested_value = cursor.get(segment)
+            if not isinstance(nested_value, dict):
+                nested_value = {}
+                cursor[segment] = nested_value
+            cursor = nested_value
+
+        leaf_name = path_segments[-1]
+        if leaf_name not in cursor:
+            cursor[leaf_name] = path_value
+
+    def _load_action_placeholder_value(self, path_name: str) -> str:
+        normalized_path_name = str(path_name or "").strip()
+        leaf_name = normalized_path_name.split(".")[-1] if normalized_path_name else ""
+        if leaf_name in {"scan_dir", "job_postings_dir"}:
+            return "<ABSOLUTE_DIRECTORY_PATH>"
+        if leaf_name.endswith("_db_path") or leaf_name.endswith("_path"):
+            return "<ABSOLUTE_PATH>"
+        if leaf_name in {"thread_id", "dispatcher_message_id"}:
+            return f"<{leaf_name.upper()}>"
+        return f"<{normalized_path_name or leaf_name or 'value'}>"
+
+    def _build_action_request_object(self, action_object: dict[str, Any]) -> dict[str, Any]:
+        action_name = str(action_object.get("action_name") or "").strip()
+        action_request: dict[str, Any] = {"action": action_name}
+
+        for path_name in action_object.get("required_non_action_paths") or []:
+            normalized_path_name = str(path_name or "").strip()
+            if not normalized_path_name:
+                continue
+            self._set_action_request_path_value(
+                action_request=action_request,
+                path_name=normalized_path_name,
+                path_value=self._load_action_placeholder_value(normalized_path_name),
+            )
+
+        for request_field in action_object.get("request_fields") or []:
+            normalized_request_field = str(request_field or "").strip()
+            if not normalized_request_field or normalized_request_field in action_request:
+                continue
+            self._set_action_request_path_value(
+                action_request=action_request,
+                path_name=normalized_request_field,
+                path_value={
+                    "source": "text",
+                    "value": f"<{normalized_request_field}>",
+                },
+            )
+
+        return action_request
+
+    def _action_request_has_placeholders(self, value: Any) -> bool:
+        if isinstance(value, str):
+            normalized_value = value.strip()
+            return normalized_value.startswith("<") and normalized_value.endswith(">")
+        if isinstance(value, dict):
+            return any(self._action_request_has_placeholders(item) for item in value.values())
+        if isinstance(value, (list, tuple)):
+            return any(self._action_request_has_placeholders(item) for item in value)
+        return False
+
+    def _show_footer_status(self, message: str, timeout_ms: int = 5000) -> None:
+        try:
+            window = self.window()
+            status_bar = window.statusBar() if window is not None and hasattr(window, "statusBar") else None
+            if status_bar is not None:
+                status_bar.showMessage(str(message), int(timeout_ms))
+        except Exception:
+            pass
+
+    def _dispatch_action_object(self, *, action_object_name: str, action_request: dict[str, Any]) -> None:
+        if getattr(self, "_api_key_missing", False):
+            self._append("System", "Chat is disabled because OPENAI_API_KEY is not set.")
+            return
+
+        action_request_text = json.dumps(action_request, ensure_ascii=False)
+        self._append("You", action_request_text)
+        self.prompt_edit.clear()
+
+        try:
+            action_reply = ChatCom(
+                _model=self._model,
+                _input_text=action_request_text,
+            ).get_response()
+        except Exception as exc:
+            action_reply = f"[ERROR] {exc}"
+
+        self._append("AI", str(action_reply))
+        self._dropped_files = []
+        self._runtime_context_entries = []
+        self._show_footer_status(f"Action gestartet: {action_object_name}")
+
+    def _start_action_object(self, action_object: dict[str, Any]) -> None:
+        action_object_name = str(action_object.get("display_name") or action_object.get("action_object_name") or "Action").strip()
+        action_request = self._build_action_request_object(action_object)
+        action_request_text = json.dumps(action_request, ensure_ascii=False, indent=2)
+
+        if self._action_request_has_placeholders(action_request):
+            self.prompt_edit.setPlainText(action_request_text)
+            prompt_cursor = self.prompt_edit.textCursor()
+            prompt_cursor.movePosition(QTextCursor.End)
+            self.prompt_edit.setTextCursor(prompt_cursor)
+            self._show_footer_status(f"Action-Vorlage geladen: {action_object_name}")
+            self._append(
+                "System",
+                f"Action-Vorlage geladen: {action_object_name}. Bitte Platzhalter ausfuellen und Send druecken.",
+            )
+            return
+
+        self._dispatch_action_object(
+            action_object_name=action_object_name,
+            action_request=action_request,
+        )
+
+    def _rebuild_footer_action_menu(self) -> None:
+        footer_menu = getattr(self, "_footer_action_menu", None)
+        if not isinstance(footer_menu, QMenu):
+            return
+
+        footer_menu.clear()
+        action_objects = self._load_configured_action_objects()
+        if not action_objects:
+            no_action = footer_menu.addAction("Keine konfigurierten Actions gefunden")
+            no_action.setEnabled(False)
+            return
+
+        for action_object in action_objects:
+            menu_label = str(
+                action_object.get("display_name")
+                or action_object.get("action_object_name")
+                or action_object.get("action_name")
+                or "Action"
+            ).strip()
+            menu_action = footer_menu.addAction(menu_label)
+            menu_action.setData(dict(action_object))
+            description = str(action_object.get("description") or "").strip()
+            if description:
+                menu_action.setToolTip(description)
+                menu_action.setStatusTip(description)
+            menu_action.triggered.connect(
+                lambda _checked=False, action_data=dict(action_object): self._start_action_object(action_data)
+            )
 
     def _prompt_shell_height(self, editor_height: int) -> int:
         composer = getattr(self, "prompt_composer", None)
@@ -7637,10 +7894,682 @@ class ControlPlaneWidget(QWidget):
             f"background:{chip_color};color:{self.scheme['col7']};font-weight:600;\">{chip_text}</span>"
         )
 
+
+@dataclass
+class EnvVariableObject:
+    object_name: str
+    value: str
+    enabled: bool
+
+
+@dataclass
+class EnvSectionObject:
+    object_name: str
+    comment_lines: list[str]
+    variable_objects: list[EnvVariableObject]
+
+
+@dataclass
+class EnvVariableControlObject:
+    variable_object: EnvVariableObject
+    enabled_toggle: QCheckBox
+    value_widget: QWidget
+    value_kind: str
+
+
+class EnvConfigDomainService:
+    _ENV_ASSIGNMENT_PATTERN = re.compile(r"^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$")
+
+    def load_object(self, object_name: str) -> list[str]:
+        env_path = Path(str(object_name or "")).expanduser()
+        if not env_path.exists() or not env_path.is_file():
+            return []
+        try:
+            return env_path.read_text(encoding="utf-8", errors="replace").splitlines()
+        except Exception:
+            return []
+
+    def parse_object(self, object_name: str, line_payload: list[str]) -> list[EnvSectionObject]:
+        _ = object_name
+        section_objects: list[EnvSectionObject] = []
+        current_section_object: EnvSectionObject | None = None
+        pending_comment_lines: list[str] = []
+        leading_comment_lines: list[str] = []
+
+        for line_object in line_payload:
+            raw_line = str(line_object or "")
+            stripped_line = raw_line.strip()
+            if not stripped_line:
+                if pending_comment_lines and not section_objects:
+                    leading_comment_lines.extend(pending_comment_lines)
+                pending_comment_lines.clear()
+                continue
+
+            if stripped_line.startswith("#"):
+                comment_payload = stripped_line[1:].strip()
+                disabled_variable_object = self._parse_variable_object(comment_payload, enabled=False)
+                if disabled_variable_object is not None:
+                    current_section_object = self._resolve_section_object(
+                        section_objects,
+                        pending_comment_lines,
+                        leading_comment_lines,
+                        current_section_object,
+                    )
+                    current_section_object.variable_objects.append(disabled_variable_object)
+                    pending_comment_lines.clear()
+                    leading_comment_lines.clear()
+                elif comment_payload:
+                    pending_comment_lines.append(comment_payload)
+                continue
+
+            enabled_variable_object = self._parse_variable_object(stripped_line, enabled=True)
+            if enabled_variable_object is None:
+                pending_comment_lines.clear()
+                continue
+
+            current_section_object = self._resolve_section_object(
+                section_objects,
+                pending_comment_lines,
+                leading_comment_lines,
+                current_section_object,
+            )
+            current_section_object.variable_objects.append(enabled_variable_object)
+            pending_comment_lines.clear()
+            leading_comment_lines.clear()
+
+        return section_objects
+
+    def serialize_object(self, object_name: str, section_objects: list[EnvSectionObject]) -> str:
+        _ = object_name
+        serialized_lines: list[str] = []
+        normalized_sections = [
+            section_object for section_object in section_objects
+            if isinstance(section_object, EnvSectionObject)
+            and list(section_object.variable_objects)
+        ]
+
+        for section_index, section_object in enumerate(normalized_sections):
+            section_title = str(section_object.object_name or "").strip()
+            include_section_header = bool(section_title) and section_title.lower() != "general"
+            section_comment_lines = [
+                str(comment_line or "").strip()
+                for comment_line in list(section_object.comment_lines)
+                if str(comment_line or "").strip()
+            ]
+
+            if include_section_header:
+                serialized_lines.append(f"# {section_title}")
+            for comment_line in section_comment_lines:
+                serialized_lines.append(f"# {comment_line}")
+
+            for variable_object in list(section_object.variable_objects):
+                variable_name = str(variable_object.object_name or "").strip()
+                if not variable_name:
+                    continue
+                variable_value = str(variable_object.value or "")
+                line_prefix = "" if bool(variable_object.enabled) else "# "
+                serialized_lines.append(f"{line_prefix}{variable_name}={variable_value}")
+
+            if section_index < len(normalized_sections) - 1:
+                serialized_lines.append("")
+
+        serialized_payload = "\n".join(serialized_lines).rstrip()
+        if serialized_payload:
+            serialized_payload += "\n"
+        return serialized_payload
+
+    def store_object(self, object_name: str, section_objects: list[EnvSectionObject]) -> None:
+        env_path = Path(str(object_name or "")).expanduser()
+        env_path.parent.mkdir(parents=True, exist_ok=True)
+        serialized_payload = self.serialize_object(object_name, section_objects)
+        env_path.write_text(serialized_payload, encoding="utf-8")
+
+    @classmethod
+    def _parse_variable_object(cls, line_payload: str, *, enabled: bool) -> EnvVariableObject | None:
+        payload = str(line_payload or "").strip()
+        if not payload:
+            return None
+
+        assignment_match = cls._ENV_ASSIGNMENT_PATTERN.match(payload)
+        if assignment_match is None:
+            return None
+
+        variable_name = str(assignment_match.group(1) or "").strip()
+        if not variable_name:
+            return None
+
+        variable_value = str(assignment_match.group(2) or "")
+        return EnvVariableObject(
+            object_name=variable_name,
+            value=variable_value,
+            enabled=bool(enabled),
+        )
+
+    @staticmethod
+    def _resolve_section_object(
+        section_objects: list[EnvSectionObject],
+        pending_comment_lines: list[str],
+        leading_comment_lines: list[str],
+        fallback_section_object: EnvSectionObject | None,
+    ) -> EnvSectionObject:
+        normalized_comment_lines = [
+            str(comment_line or "").strip()
+            for comment_line in pending_comment_lines
+            if str(comment_line or "").strip()
+        ]
+        normalized_leading_comment_lines = [
+            str(comment_line or "").strip()
+            for comment_line in leading_comment_lines
+            if str(comment_line or "").strip()
+        ]
+        if normalized_comment_lines:
+            next_section_object = EnvSectionObject(
+                object_name=normalized_comment_lines[0],
+                comment_lines=list(normalized_leading_comment_lines) + list(normalized_comment_lines[1:]),
+                variable_objects=[],
+            )
+            section_objects.append(next_section_object)
+            return next_section_object
+
+        if isinstance(fallback_section_object, EnvSectionObject):
+            return fallback_section_object
+
+        default_section_object = EnvSectionObject(
+            object_name="General",
+            comment_lines=list(normalized_leading_comment_lines),
+            variable_objects=[],
+        )
+        section_objects.append(default_section_object)
+        return default_section_object
+
+
+class EnvConfigWidget(QWidget):
+    def __init__(
+        self,
+        *,
+        object_name: str,
+        env_service: EnvConfigDomainService,
+        store_handler: Callable[[Path], None] | None = None,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self._object_name = str(object_name or "")
+        self._env_service = env_service
+        self._store_handler = store_handler
+        self._section_widget_map: list[tuple[EnvSectionObject, list[EnvVariableControlObject]]] = []
+        self._dirty = False
+        self._watch_events_paused = False
+
+        self._file_watcher = QtCore.QFileSystemWatcher(self)
+        self._file_watcher.fileChanged.connect(self._handle_object_file_changed)
+
+        self._build_object_ui()
+        self._register_object_file_watch()
+        self.reload_object()
+
+    def _build_object_ui(self) -> None:
+        root = QVBoxLayout(self)
+        root.setContentsMargins(12, 12, 12, 12)
+        root.setSpacing(10)
+
+        header_row = QHBoxLayout()
+        header_row.setContentsMargins(0, 0, 0, 0)
+        header_row.setSpacing(8)
+
+        self._path_label = QLabel(f"ENV source: {self._object_name}", self)
+        self._path_label.setObjectName("envWidgetPathLabel")
+        header_row.addWidget(self._path_label, 1)
+
+        self._add_button = QPushButton("Add variable", self)
+        self._add_button.clicked.connect(self._add_object_variable)
+        header_row.addWidget(self._add_button, 0)
+
+        self._reload_button = QPushButton("Reload", self)
+        self._reload_button.clicked.connect(self.reload_object)
+        header_row.addWidget(self._reload_button, 0)
+
+        self._save_button = QPushButton("Save .env", self)
+        self._save_button.clicked.connect(self.store_object)
+        header_row.addWidget(self._save_button, 0)
+
+        root.addLayout(header_row)
+
+        self._scroll_area = QScrollArea(self)
+        self._scroll_area.setWidgetResizable(True)
+        self._scroll_area.setFrameShape(QFrame.NoFrame)
+
+        self._section_container = QWidget(self._scroll_area)
+        self._section_layout = QVBoxLayout(self._section_container)
+        self._section_layout.setContentsMargins(0, 0, 0, 0)
+        self._section_layout.setSpacing(10)
+        self._scroll_area.setWidget(self._section_container)
+        root.addWidget(self._scroll_area, 1)
+
+        self._status_label = QLabel("", self)
+        self._status_label.setObjectName("envWidgetStatusLabel")
+        root.addWidget(self._status_label)
+
+        self.setStyleSheet(
+            "QFrame#envSectionCard {"
+            " border: 1px solid #2c2c2c;"
+            " border-radius: 10px;"
+            " padding: 4px;"
+            " }"
+            "QLabel#envSectionTitle {"
+            " font-weight: 700;"
+            " }"
+            "QLabel#envSectionDescription {"
+            " color: #9a9a9a;"
+            " font-size: 11px;"
+            " }"
+            "QLabel#envWidgetPathLabel {"
+            " color: #9a9a9a;"
+            " }"
+            "QLabel#envWidgetStatusLabel {"
+            " color: #9a9a9a;"
+            " }"
+            "QLabel#envVariableTypeChip {"
+            " color: #9a9a9a;"
+            " border: 1px solid #2c2c2c;"
+            " border-radius: 6px;"
+            " padding: 1px 6px;"
+            " font-size: 10px;"
+            " min-width: 34px;"
+            " }"
+            "QLineEdit#envVariableInput {"
+            " font-family: monospace;"
+            " }"
+            "QComboBox#envVariableBoolInput {"
+            " font-family: monospace;"
+            " min-width: 76px;"
+            " }"
+        )
+
+    def _register_object_file_watch(self) -> None:
+        env_path = Path(self._object_name)
+        env_path_text = str(env_path)
+        if not env_path.exists() or not env_path.is_file():
+            return
+        if env_path_text not in set(self._file_watcher.files()):
+            self._file_watcher.addPath(env_path_text)
+
+    @Slot(str)
+    def _handle_object_file_changed(self, _path: str) -> None:
+        self._register_object_file_watch()
+        if self._watch_events_paused:
+            return
+        if self._dirty:
+            self._status_label.setText("External .env update detected. Save or reload to synchronize.")
+            return
+        QtCore.QTimer.singleShot(80, self.reload_object)
+
+    @Slot()
+    def reload_object(self) -> None:
+        line_payload = self._env_service.load_object(self._object_name)
+        section_objects = self._env_service.parse_object(self._object_name, line_payload)
+        self._render_object_sections(section_objects)
+        self._set_dirty_state(False)
+        self._status_label.setText(f"Loaded {sum(len(section.variable_objects) for section in section_objects)} variables.")
+
+    @Slot()
+    def store_object(self) -> None:
+        section_objects = self._collect_object_sections()
+        try:
+            self._watch_events_paused = True
+            self._env_service.store_object(self._object_name, section_objects)
+        except Exception as exc:
+            self._status_label.setText(f"Save failed: {exc}")
+            return
+        finally:
+            QtCore.QTimer.singleShot(200, self._resume_object_watch)
+
+        self._set_dirty_state(False)
+        self._status_label.setText(f"Saved .env: {self._object_name}")
+        if callable(self._store_handler):
+            try:
+                self._store_handler(Path(self._object_name))
+            except Exception:
+                pass
+        self.reload_object()
+
+    @Slot()
+    def _resume_object_watch(self) -> None:
+        self._watch_events_paused = False
+        self._register_object_file_watch()
+
+    @Slot()
+    def _add_object_variable(self) -> None:
+        variable_name, accepted = QInputDialog.getText(
+            self,
+            "ENV",
+            "Variable name:",
+        )
+        if not accepted:
+            return
+
+        normalized_name = str(variable_name or "").strip()
+        if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", normalized_name):
+            QMessageBox.information(self, "ENV", "Variable names must match [A-Za-z_][A-Za-z0-9_]*")
+            return
+
+        variable_value, accepted_value = QInputDialog.getText(
+            self,
+            "ENV",
+            f"Value for {normalized_name}:",
+        )
+        if not accepted_value:
+            return
+
+        section_objects = self._collect_object_sections()
+        if not section_objects:
+            section_objects = [EnvSectionObject("General", [], [])]
+
+        existing_names = {
+            str(variable_object.object_name or "").strip()
+            for section_object in section_objects
+            for variable_object in section_object.variable_objects
+        }
+        if normalized_name in existing_names:
+            QMessageBox.information(self, "ENV", f"Variable already exists: {normalized_name}")
+            return
+
+        section_names = [str(section_object.object_name or "General") for section_object in section_objects]
+        target_section_name = section_names[0]
+        if len(section_names) > 1:
+            selected_section_name, section_accepted = QInputDialog.getItem(
+                self,
+                "ENV",
+                "Target section:",
+                section_names,
+                0,
+                False,
+            )
+            if not section_accepted:
+                return
+            target_section_name = str(selected_section_name or target_section_name)
+
+        target_section_object = next(
+            (
+                section_object
+                for section_object in section_objects
+                if str(section_object.object_name or "General") == target_section_name
+            ),
+            None,
+        )
+        if target_section_object is None:
+            target_section_object = EnvSectionObject(target_section_name, [], [])
+            section_objects.append(target_section_object)
+
+        target_section_object.variable_objects.append(
+            EnvVariableObject(
+                object_name=normalized_name,
+                value=str(variable_value or ""),
+                enabled=True,
+            )
+        )
+        self._render_object_sections(section_objects)
+        self._set_dirty_state(True)
+        self._status_label.setText(f"Variable added: {normalized_name}")
+
+    def _render_object_sections(self, section_objects: list[EnvSectionObject]) -> None:
+        while self._section_layout.count():
+            item = self._section_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+
+        self._section_widget_map = []
+
+        has_variables = any(section_object.variable_objects for section_object in section_objects)
+        if not has_variables:
+            empty_label = QLabel("No variables found. Add one to start configuring ALDE.", self._section_container)
+            empty_label.setObjectName("envSectionDescription")
+            self._section_layout.addWidget(empty_label)
+            self._section_layout.addStretch(1)
+            return
+
+        for section_object in section_objects:
+            if not section_object.variable_objects:
+                continue
+
+            card = QFrame(self._section_container)
+            card.setObjectName("envSectionCard")
+            card_layout = QVBoxLayout(card)
+            card_layout.setContentsMargins(8, 8, 8, 8)
+            card_layout.setSpacing(6)
+
+            section_title = QLabel(str(section_object.object_name or "General"), card)
+            section_title.setObjectName("envSectionTitle")
+            card_layout.addWidget(section_title)
+
+            if section_object.comment_lines:
+                section_description = QLabel(" | ".join(section_object.comment_lines), card)
+                section_description.setObjectName("envSectionDescription")
+                section_description.setWordWrap(True)
+                card_layout.addWidget(section_description)
+
+            form_layout = QFormLayout()
+            form_layout.setContentsMargins(0, 0, 0, 0)
+            form_layout.setSpacing(6)
+            form_layout.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
+
+            variable_rows: list[EnvVariableControlObject] = []
+            for variable_object in section_object.variable_objects:
+                variable_row_widget = QWidget(card)
+                variable_row_layout = QHBoxLayout(variable_row_widget)
+                variable_row_layout.setContentsMargins(0, 0, 0, 0)
+                variable_row_layout.setSpacing(6)
+
+                control_object = self._build_variable_control_object(variable_object, variable_row_widget)
+                variable_row_layout.addWidget(control_object.enabled_toggle, 0)
+
+                value_kind_chip = QLabel(control_object.value_kind.upper(), variable_row_widget)
+                value_kind_chip.setObjectName("envVariableTypeChip")
+                value_kind_chip.setAlignment(Qt.AlignCenter)
+                variable_row_layout.addWidget(value_kind_chip, 0)
+
+                variable_row_layout.addWidget(control_object.value_widget, 1)
+
+                form_layout.addRow(str(variable_object.object_name or ""), variable_row_widget)
+                variable_rows.append(control_object)
+
+            card_layout.addLayout(form_layout)
+            self._section_layout.addWidget(card)
+            self._section_widget_map.append((section_object, variable_rows))
+
+        self._section_layout.addStretch(1)
+
+    def _collect_object_sections(self) -> list[EnvSectionObject]:
+        collected_sections: list[EnvSectionObject] = []
+        for section_object, variable_rows in self._section_widget_map:
+            collected_variables: list[EnvVariableObject] = []
+            for control_object in variable_rows:
+                variable_object = control_object.variable_object
+                variable_name = str(variable_object.object_name or "").strip()
+                if not variable_name:
+                    continue
+
+                variable_value = ""
+                if control_object.value_kind == "bool" and isinstance(control_object.value_widget, QComboBox):
+                    variable_value = str(control_object.value_widget.currentData() or control_object.value_widget.currentText() or "")
+                elif isinstance(control_object.value_widget, QLineEdit):
+                    variable_value = str(control_object.value_widget.text() or "")
+
+                collected_variables.append(
+                    EnvVariableObject(
+                        object_name=variable_name,
+                        value=variable_value,
+                        enabled=bool(control_object.enabled_toggle.isChecked()),
+                    )
+                )
+
+            if collected_variables:
+                collected_sections.append(
+                    EnvSectionObject(
+                        object_name=str(section_object.object_name or "General"),
+                        comment_lines=list(section_object.comment_lines),
+                        variable_objects=collected_variables,
+                    )
+                )
+
+        return collected_sections
+
+    def _build_variable_control_object(self, variable_object: EnvVariableObject, parent: QWidget) -> EnvVariableControlObject:
+        variable_name = str(variable_object.object_name or "")
+        variable_value = str(variable_object.value or "")
+        value_kind = self._infer_variable_value_kind(variable_name, variable_value)
+
+        enabled_toggle = QCheckBox("on", parent)
+        enabled_toggle.setChecked(bool(variable_object.enabled))
+        enabled_toggle.setToolTip("Enable or disable this variable in .env")
+        enabled_toggle.stateChanged.connect(self._mark_object_dirty)
+
+        if value_kind == "bool":
+            true_token, false_token = self._bool_token_pair_for_value(variable_value)
+            value_widget = QComboBox(parent)
+            value_widget.setObjectName("envVariableBoolInput")
+            value_widget.addItem(true_token, true_token)
+            value_widget.addItem(false_token, false_token)
+            value_widget.setCurrentIndex(0 if self._is_true_bool_value(variable_value) else 1)
+            value_widget.currentIndexChanged.connect(self._mark_object_dirty)
+            return EnvVariableControlObject(
+                variable_object=variable_object,
+                enabled_toggle=enabled_toggle,
+                value_widget=value_widget,
+                value_kind=value_kind,
+            )
+
+        value_widget = QLineEdit(parent)
+        value_widget.setObjectName("envVariableInput")
+        value_widget.setText(variable_value)
+        if value_kind == "int":
+            value_widget.setValidator(QIntValidator(-2147483647, 2147483647, value_widget))
+            value_widget.setPlaceholderText("integer")
+        if self._is_secret_variable_object(variable_name):
+            value_widget.setEchoMode(QLineEdit.PasswordEchoOnEdit)
+        value_widget.textEdited.connect(self._mark_object_dirty)
+        return EnvVariableControlObject(
+            variable_object=variable_object,
+            enabled_toggle=enabled_toggle,
+            value_widget=value_widget,
+            value_kind=value_kind,
+        )
+
+    @staticmethod
+    def _infer_variable_value_kind(object_name: str, value: str) -> str:
+        normalized_name = str(object_name or "").upper()
+        normalized_value = str(value or "").strip()
+        normalized_value_lower = normalized_value.lower()
+        name_tokens = {
+            token
+            for token in normalized_name.split("_")
+            if token
+        }
+
+        bool_value_tokens = {"1", "0", "true", "false", "yes", "no", "on", "off"}
+        bool_name_tokens = {
+            "ENABLE",
+            "ENABLED",
+            "DISABLE",
+            "DISABLED",
+            "STRICT",
+            "DEBUG",
+            "VERBOSE",
+            "READ_ONLY",
+            "READONLY",
+            "GPU_ONLY",
+            "TLS",
+            "SSL",
+            "ALLOW",
+            "USE",
+            "HAS",
+            "AUTO",
+        }
+        numeric_name_tokens = {
+            "PORT",
+            "TIMEOUT",
+            "INTERVAL",
+            "RETRY",
+            "RETRIES",
+            "COUNT",
+            "LIMIT",
+            "SIZE",
+            "DIM",
+            "DIMENSION",
+            "LENGTH",
+            "TTL",
+            "SECONDS",
+            "MINUTES",
+            "HOURS",
+            "MS",
+            "MAX",
+            "MIN",
+            "AGE",
+        }
+
+        if normalized_value_lower in bool_value_tokens:
+            return "bool"
+        if name_tokens & bool_name_tokens:
+            if not normalized_value or normalized_value_lower in bool_value_tokens:
+                return "bool"
+
+        if re.fullmatch(r"[-+]?\\d+", normalized_value):
+            return "int"
+        if name_tokens & numeric_name_tokens:
+            if not normalized_value or re.fullmatch(r"[-+]?\\d+", normalized_value):
+                return "int"
+
+        return "text"
+
+    @staticmethod
+    def _bool_token_pair_for_value(value: str) -> tuple[str, str]:
+        normalized_value = str(value or "").strip()
+        normalized_lower = normalized_value.lower()
+        token_pairs = (
+            ("1", "0"),
+            ("true", "false"),
+            ("True", "False"),
+            ("TRUE", "FALSE"),
+            ("yes", "no"),
+            ("Yes", "No"),
+            ("YES", "NO"),
+            ("on", "off"),
+            ("On", "Off"),
+            ("ON", "OFF"),
+        )
+        for true_token, false_token in token_pairs:
+            if normalized_value == true_token or normalized_value == false_token:
+                return (true_token, false_token)
+        for true_token, false_token in token_pairs:
+            if normalized_lower == true_token.lower() or normalized_lower == false_token.lower():
+                return (true_token, false_token)
+        return ("1", "0")
+
+    @staticmethod
+    def _is_true_bool_value(value: str) -> bool:
+        return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+    def _mark_object_dirty(self, *_args: Any) -> None:
+        self._set_dirty_state(True)
+
+    def _set_dirty_state(self, dirty: bool) -> None:
+        self._dirty = bool(dirty)
+        self._save_button.setEnabled(True)
+        if self._dirty:
+            self._status_label.setText("Unsaved changes")
+
+    @staticmethod
+    def _is_secret_variable_object(object_name: str) -> bool:
+        upper_name = str(object_name or "").upper()
+        for token in ("KEY", "SECRET", "TOKEN", "PASSWORD"):
+            if token in upper_name:
+                return True
+        return False
+
 class MainAIEditor(QMainWindow):
     ORG_NAME: Final = "ai.bentu"
 
-    APP_NAME: Final = "[/\/]  AI IDE "
+    APP_NAME: Final = "[/\/]  AI IDE"
     _SCHEMA:  Final = 2
 
     # ---------------------------------------------------------------- init --
@@ -7650,6 +8579,8 @@ class MainAIEditor(QMainWindow):
         self._accent, self._base = SCHEME_BLUE, SCHEME_DARK
         self._tab_docks: List[QDockWidget] = []          # store all tab docks
         self._workspace_column_widths: list[int] = [280, 760, 460]
+        self._explorer_splitter_sizes: list[int] = [380, 130]
+        self._explorer_database_panel_visible: bool = False
 
         # Crash-isolation helper: progressively enable init steps.
         # Default is "full" (999). Smaller numbers build less UI.
@@ -7753,6 +8684,440 @@ class MainAIEditor(QMainWindow):
             self.act_toggle_tabdock.setChecked(False)
         if not terminal_enabled:
             self.act_toggle_console.setChecked(False)
+
+    def _open_symbol_database_connection(self) -> None:
+        return
+
+    def _set_explorer_toggle_action_checked(self, checked: bool) -> None:
+        toggle_action = getattr(self, "act_toggle_explorer", None)
+        if not isinstance(toggle_action, QAction):
+            return
+        previous_state = toggle_action.blockSignals(True)
+        toggle_action.setChecked(bool(checked))
+        toggle_action.blockSignals(previous_state)
+
+    def _normalize_splitter_sizes(self, sizes: list[int] | tuple[int, ...], *, total: int = 1000) -> list[int]:
+        weights = [max(int(value), 0) for value in list(sizes)]
+        if not weights:
+            return []
+
+        positive_total = sum(weights)
+        if positive_total <= 0:
+            return [1 for _ in weights]
+
+        remaining_total = max(int(total), len(weights))
+        remaining_weight = positive_total
+        normalized: list[int] = []
+        for weight in weights:
+            if weight <= 0:
+                normalized.append(0)
+                continue
+            if remaining_weight <= 0:
+                normalized.append(max(1, remaining_total))
+                remaining_total = 0
+                continue
+            mapped = max(1, int(round((weight / remaining_weight) * max(remaining_total, 1))))
+            mapped = min(mapped, max(remaining_total, 1))
+            normalized.append(mapped)
+            remaining_total -= mapped
+            remaining_weight -= weight
+
+        return normalized
+
+    def _explorer_splitter_heights(self) -> tuple[int, int]:
+        splitter = getattr(self, "explorer_splitter", None)
+        if not isinstance(splitter, QSplitter):
+            return (0, 0)
+        sizes = splitter.sizes()
+        if len(sizes) < 2:
+            return (0, 0)
+        return (max(int(sizes[0]), 0), max(int(sizes[1]), 0))
+
+    def _show_explorer_project_area_only(self) -> None:
+        files_dock = getattr(self, "files_dock", None)
+        splitter = getattr(self, "explorer_splitter", None)
+        if not isinstance(files_dock, QDockWidget) or not isinstance(splitter, QSplitter):
+            return
+
+        if not files_dock.isVisible():
+            files_dock.show()
+
+        top_height, bottom_height = self._explorer_splitter_heights()
+        if top_height > 0 and bottom_height > 0:
+            self._explorer_splitter_sizes = [top_height, bottom_height]
+        splitter.setSizes([1, 0])
+        self._explorer_database_panel_visible = False
+        self._set_explorer_toggle_action_checked(True)
+
+        rebalance_columns = getattr(self, "_rebalance_workspace_columns", None)
+        if callable(rebalance_columns):
+            rebalance_columns()
+
+    def _show_explorer_database_area_only(self) -> None:
+        files_dock = getattr(self, "files_dock", None)
+        splitter = getattr(self, "explorer_splitter", None)
+        if not isinstance(files_dock, QDockWidget) or not isinstance(splitter, QSplitter):
+            return
+
+        if not files_dock.isVisible():
+            files_dock.show()
+
+        top_height, bottom_height = self._explorer_splitter_heights()
+        if top_height > 0 and bottom_height > 0:
+            self._explorer_splitter_sizes = [top_height, bottom_height]
+        splitter.setSizes([0, 1])
+        self._explorer_database_panel_visible = True
+        self._set_explorer_toggle_action_checked(True)
+
+        focus_widget = getattr(self, "input_db_connection_name", None)
+        if isinstance(focus_widget, QLineEdit):
+            focus_widget.setFocus()
+
+        rebalance_columns = getattr(self, "_rebalance_workspace_columns", None)
+        if callable(rebalance_columns):
+            rebalance_columns()
+
+    def _show_explorer_project_and_database_split(self) -> None:
+        files_dock = getattr(self, "files_dock", None)
+        splitter = getattr(self, "explorer_splitter", None)
+        if not isinstance(files_dock, QDockWidget) or not isinstance(splitter, QSplitter):
+            return
+
+        if not files_dock.isVisible():
+            files_dock.show()
+
+        top_height, bottom_height = self._explorer_splitter_heights()
+
+        preferred_top, preferred_bottom = list(self._explorer_splitter_sizes)[:2]
+        if preferred_top <= 0 or preferred_bottom <= 0:
+            preferred_top = max(top_height, 1)
+            preferred_bottom = max(bottom_height, 1)
+        if preferred_top <= 0 or preferred_bottom <= 0:
+            preferred_top, preferred_bottom = (7, 3)
+
+        normalized = self._normalize_splitter_sizes([int(preferred_top), int(preferred_bottom)], total=1000)
+        if len(normalized) != 2:
+            normalized = [7, 3]
+
+        splitter.setSizes(normalized)
+        self._explorer_splitter_sizes = list(normalized)
+        self._explorer_database_panel_visible = True
+        self._set_explorer_toggle_action_checked(True)
+
+        rebalance_columns = getattr(self, "_rebalance_workspace_columns", None)
+        if callable(rebalance_columns):
+            rebalance_columns()
+
+    def _toggle_explorer_project_area(self, _checked: bool = False) -> None:
+        files_dock = getattr(self, "files_dock", None)
+        if not isinstance(files_dock, QDockWidget):
+            return
+
+        if not files_dock.isVisible():
+            files_dock.show()
+            self._set_explorer_toggle_action_checked(True)
+            rebalance_columns = getattr(self, "_rebalance_workspace_columns", None)
+            if callable(rebalance_columns):
+                rebalance_columns()
+            return
+
+        files_dock.hide()
+        self._set_explorer_toggle_action_checked(False)
+        self._explorer_database_panel_visible = False
+
+    def _toggle_explorer_database_area(self) -> None:
+        files_dock = getattr(self, "files_dock", None)
+        splitter = getattr(self, "explorer_splitter", None)
+        status_bar = self.statusBar() if hasattr(self, "statusBar") else None
+        if not isinstance(files_dock, QDockWidget) or not isinstance(splitter, QSplitter):
+            if status_bar is not None:
+                status_bar.showMessage("Database panel is not available.", 3200)
+            return
+
+        if not files_dock.isVisible():
+            self._show_explorer_database_area_only()
+            return
+
+        top_height, bottom_height = self._explorer_splitter_heights()
+
+        # If project area currently fills the dock, click on DB symbol should
+        # show both areas in a shared split.
+        if top_height > 0 and bottom_height <= 0:
+            self._show_explorer_project_and_database_split()
+            return
+
+        # If DB area currently fills the dock, clicking DB closes the dock.
+        if bottom_height > 0 and top_height <= 0:
+            files_dock.hide()
+            self._set_explorer_toggle_action_checked(False)
+            self._explorer_database_panel_visible = False
+            return
+
+        # If both areas are shown, clicking DB hides DB and keeps project area.
+        if top_height > 0 and bottom_height > 0:
+            self._show_explorer_project_area_only()
+            return
+
+        self._show_explorer_database_area_only()
+
+    def _handle_explorer_visibility_change(self, visible: bool) -> None:
+        self._set_explorer_toggle_action_checked(bool(visible))
+        if not bool(visible):
+            self._explorer_database_panel_visible = False
+
+    def _reveal_explorer_database_area(self) -> None:
+        files_dock = getattr(self, "files_dock", None)
+        if isinstance(files_dock, QDockWidget) and not files_dock.isVisible():
+            files_dock.show()
+
+        toggle_action = getattr(self, "act_toggle_explorer", None)
+        if isinstance(toggle_action, QAction) and not toggle_action.isChecked():
+            previous_state = toggle_action.blockSignals(True)
+            toggle_action.setChecked(True)
+            toggle_action.blockSignals(previous_state)
+
+        self._show_explorer_project_and_database_split()
+
+        focus_widget = getattr(self, "input_db_connection_name", None)
+        if isinstance(focus_widget, QLineEdit):
+            focus_widget.setFocus()
+
+    def _build_explorer_database_panel(self, parent: QWidget) -> QFrame:
+        panel = QFrame(parent)
+        panel.setObjectName("ExplorerDatabasePanel")
+        panel.setFrameShape(QFrame.NoFrame)
+        panel.setMinimumSize(0, 0)
+        panel.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.MinimumExpanding)
+
+        panel_layout = QVBoxLayout(panel)
+        panel_layout.setContentsMargins(10, 10, 10, 10)
+        panel_layout.setSpacing(8)
+
+        header_layout = QHBoxLayout()
+        header_layout.setContentsMargins(0, 0, 0, 0)
+        header_layout.setSpacing(8)
+
+        panel_title = QLabel("Database Connections", panel)
+        panel_title.setObjectName("controlMeta")
+        header_layout.addWidget(panel_title, 1)
+        panel_layout.addLayout(header_layout)
+
+        form_layout = QFormLayout()
+        form_layout.setContentsMargins(0, 0, 0, 0)
+        form_layout.setSpacing(8)
+        form_layout.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
+
+        self.input_db_connection_name = QLineEdit(panel)
+        self.input_db_connection_name.setPlaceholderText("Connection name")
+        form_layout.addRow("Name", self.input_db_connection_name)
+
+        self.input_db_connection_type = QComboBox(panel)
+        self.input_db_connection_type.addItems([
+            "PostgreSQL",
+            "MySQL",
+            "MSSQL",
+            "MongoDB",
+            "SQLite",
+            "Custom",
+        ])
+        form_layout.addRow("Type", self.input_db_connection_type)
+
+        self.input_db_connection_host = QLineEdit(panel)
+        self.input_db_connection_host.setPlaceholderText("localhost")
+        self.input_db_connection_host.setText("localhost")
+        form_layout.addRow("Host", self.input_db_connection_host)
+
+        self.input_db_connection_port = QLineEdit(panel)
+        self.input_db_connection_port.setPlaceholderText("5432")
+        self.input_db_connection_port.setText("5432")
+        form_layout.addRow("Port", self.input_db_connection_port)
+
+        self.input_db_connection_database = QLineEdit(panel)
+        self.input_db_connection_database.setPlaceholderText("database")
+        form_layout.addRow("Database", self.input_db_connection_database)
+
+        self.input_db_connection_username = QLineEdit(panel)
+        self.input_db_connection_username.setPlaceholderText("username")
+        form_layout.addRow("Username", self.input_db_connection_username)
+
+        panel_layout.addLayout(form_layout)
+
+        self.btn_explorer_database_submit = QPushButton("Add connection", panel)
+        self.btn_explorer_database_submit.setObjectName("controlAction")
+        self.btn_explorer_database_submit.setCursor(Qt.PointingHandCursor)
+        self.btn_explorer_database_submit.clicked.connect(self._submit_explorer_database_connection)
+        panel_layout.addWidget(self.btn_explorer_database_submit, 0, Qt.AlignLeft)
+        panel_layout.addStretch(1)
+
+        self._apply_explorer_database_panel_style(panel)
+
+        return panel
+
+    @staticmethod
+    def _truncate_projection_value(value: Any, *, max_length: int = 96) -> str:
+        text = str(value or "").strip()
+        if not text:
+            return "not set"
+        if len(text) <= max_length:
+            return text
+        return f"{text[:max_length - 3]}..."
+
+    @staticmethod
+    def _mask_projection_uri(value: str) -> str:
+        raw_value = str(value or "").strip()
+        if not raw_value:
+            return ""
+
+        try:
+            parsed = urlparse(raw_value)
+        except Exception:
+            return raw_value
+
+        username = str(parsed.username or "").strip()
+        password = parsed.password
+        hostname = str(parsed.hostname or "").strip()
+        if password is None or not hostname:
+            return raw_value
+
+        masked_netloc = f"{username}:***@{hostname}" if username else f"***@{hostname}"
+        if parsed.port is not None:
+            masked_netloc = f"{masked_netloc}:{parsed.port}"
+        return parsed._replace(netloc=masked_netloc).geturl()
+
+    @staticmethod
+    def _project_connection_type_from_uri(value: str) -> str:
+        try:
+            scheme = str(urlparse(str(value or "").strip()).scheme or "").strip().lower()
+        except Exception:
+            scheme = ""
+
+        scheme_to_type = {
+            "postgres": "PostgreSQL",
+            "postgresql": "PostgreSQL",
+            "mysql": "MySQL",
+            "mariadb": "MySQL",
+            "mssql": "MSSQL",
+            "sqlserver": "MSSQL",
+            "mongodb": "MongoDB",
+            "sqlite": "SQLite",
+        }
+        return scheme_to_type.get(scheme, "Custom")
+
+    @staticmethod
+    def _project_host_port_from_uri(value: str) -> tuple[str, str]:
+        try:
+            parsed = urlparse(str(value or "").strip())
+        except Exception:
+            return ("not set", "not set")
+
+        projected_host = str(parsed.hostname or "").strip() or "not set"
+        projected_port = str(parsed.port) if parsed.port is not None else "not set"
+        return projected_host, projected_port
+
+    def _submit_explorer_database_connection(self) -> None:
+        explorer_widget = getattr(self, "explorer", None)
+        tree_widget = getattr(explorer_widget, "tree", None)
+        add_to_section = getattr(tree_widget, "add_to_section", None)
+        remove_from_section = getattr(tree_widget, "remove_from_section", None)
+        status_bar = self.statusBar() if hasattr(self, "statusBar") else None
+
+        if not callable(add_to_section):
+            if status_bar is not None:
+                status_bar.showMessage("Explorer database store is not available.", 3200)
+            return
+
+        name_input = getattr(self, "input_db_connection_name", None)
+        type_input = getattr(self, "input_db_connection_type", None)
+        host_input = getattr(self, "input_db_connection_host", None)
+        port_input = getattr(self, "input_db_connection_port", None)
+        database_input = getattr(self, "input_db_connection_database", None)
+        username_input = getattr(self, "input_db_connection_username", None)
+
+        connection_name = str(name_input.text() if isinstance(name_input, QLineEdit) else "").strip()
+        if not connection_name:
+            QMessageBox.information(self, "Database Connection", "Please enter a connection name.")
+            if isinstance(name_input, QLineEdit):
+                name_input.setFocus()
+            return
+
+        connection_type = str(type_input.currentText() if isinstance(type_input, QComboBox) else "PostgreSQL").strip() or "PostgreSQL"
+        host_value = str(host_input.text() if isinstance(host_input, QLineEdit) else "localhost").strip() or "localhost"
+        database_name = str(database_input.text() if isinstance(database_input, QLineEdit) else "").strip()
+        username = str(username_input.text() if isinstance(username_input, QLineEdit) else "").strip()
+
+        port_value_raw = str(port_input.text() if isinstance(port_input, QLineEdit) else "5432").strip() or "5432"
+        try:
+            port_value = int(port_value_raw)
+        except Exception:
+            QMessageBox.information(self, "Database Connection", "Port must be a number.")
+            if isinstance(port_input, QLineEdit):
+                port_input.setFocus()
+            return
+
+        connection_data = {
+            "name": connection_name,
+            "type": connection_type,
+            "host": host_value,
+            "port": port_value,
+            "database": database_name,
+            "username": username,
+        }
+
+        if callable(remove_from_section):
+            while bool(remove_from_section("DATABASES", connection_name)):
+                pass
+        add_to_section("DATABASES", connection_name, connection_data)
+
+        if status_bar is not None:
+            status_bar.showMessage(f"Database connection added: {connection_name}", 3200)
+
+    def _apply_explorer_database_panel_style(self, panel: QFrame | None = None) -> None:
+        target_panel = panel if panel is not None else getattr(self, "explorer_database_panel", None)
+        if not isinstance(target_panel, QFrame):
+            return
+
+        scheme = _build_scheme(self._accent, self._base)
+        target_panel.setStyleSheet(
+            f"QFrame#ExplorerDatabasePanel {{"
+            f" background: {scheme.get('col9', '#101010')};"
+            f" border: 1px solid {scheme.get('col10', '#1f1f1f')};"
+            " border-top-left-radius: 14px;"
+            " border-top-right-radius: 14px;"
+            " border-bottom-left-radius: 14px;"
+            " border-bottom-right-radius: 14px;"
+            " }"
+            "QFrame#ExplorerDatabasePanel QLabel {"
+            " background: transparent;"
+            " border: none;"
+            " }"
+            f"QFrame#ExplorerDatabasePanel QLineEdit,"
+            f"QFrame#ExplorerDatabasePanel QComboBox {{"
+            f" background: {scheme.get('col9', '#101010')};"
+            f" color: {scheme.get('col6', '#E3E3DED6')};"
+            f" border: 1px solid {scheme.get('col10', '#1f1f1f')};"
+            " border-radius: 8px;"
+            " padding: 4px 8px;"
+            " }"
+            f"QFrame#ExplorerDatabasePanel QLineEdit:focus,"
+            f"QFrame#ExplorerDatabasePanel QComboBox:focus {{"
+            f" background: {scheme.get('col5', '#000000')};"
+            f" border-color: {scheme.get('col10', '#1f1f1f')};"
+            " }"
+        )
+
+    def _remember_explorer_splitter_sizes(self, *_args: Any) -> None:
+        splitter = getattr(self, "explorer_splitter", None)
+        if not isinstance(splitter, QSplitter):
+            return
+
+        sizes = splitter.sizes()
+        if len(sizes) < 2:
+            return
+
+        top_size = int(sizes[0]) if len(sizes) > 0 else 0
+        bottom_size = int(sizes[1]) if len(sizes) > 1 else 0
+        if top_size > 0 and bottom_size > 0:
+            self._explorer_splitter_sizes = [top_size, bottom_size]
     # ================================================= seitliche Widgets ===
 
     def _create_side_widgets(self):
@@ -7761,16 +9126,44 @@ class MainAIEditor(QMainWindow):
 
         self.files_dock = QDockWidget("Explorer", self)
         self.files_dock.setObjectName("FilesDock")
+        self.files_dock.setMinimumSize(0, 0)
+        self.files_dock.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Expanding)
 
         disable_explorer = _env_truthy("AI_IDE_DISABLE_EXPLORER", "0")
         if not disable_explorer:
             # Use new multi-root tree widget with toolbar
             self.explorer = JsonTreeWidgetWithToolbar()
+            self.explorer.setMinimumSize(0, 0)
+            self.explorer.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Expanding)
+            if hasattr(self.explorer, "tree") and isinstance(self.explorer.tree, QTreeWidget):
+                self.explorer.tree.setMinimumSize(0, 0)
+                self.explorer.tree.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Expanding)
             self.explorer.tree.setEditTriggers(
                 QTreeWidget.DoubleClicked | QTreeWidget.EditKeyPressed
             )
+            self.explorer_splitter = None
+            self.explorer_database_panel = None
+            self.btn_explorer_database_submit = None
+            self.input_db_connection_name = None
+            self.input_db_connection_type = None
+            self.input_db_connection_host = None
+            self.input_db_connection_port = None
+            self.input_db_connection_database = None
+            self.input_db_connection_username = None
+            self._explorer_database_panel_visible = False
             self.files_dock.setWidget(self.explorer)
+            self._apply_main_splitter_style()
         else:
+            self.explorer_splitter = None
+            self.explorer_database_panel = None
+            self.btn_explorer_database_submit = None
+            self.input_db_connection_name = None
+            self.input_db_connection_type = None
+            self.input_db_connection_host = None
+            self.input_db_connection_port = None
+            self.input_db_connection_database = None
+            self.input_db_connection_username = None
+            self._explorer_database_panel_visible = False
             self.explorer = None
             self.files_dock.setWidget(QWidget())
         self._strip_dock_decoration(self.files_dock)
@@ -7792,7 +9185,12 @@ class MainAIEditor(QMainWindow):
             self.chat_dock.setFeatures(QDockWidget.NoDockWidgetFeatures)
             self.chat_dock.setAllowedAreas(Qt.LeftDockWidgetArea | Qt.RightDockWidgetArea)
             self.chat_dock.setWidget(QWidget())
+        self.chat_dock.setMinimumSize(0, 0)
+        self.chat_dock.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Expanding)
         chat_widget = self.chat_dock.widget()
+        if isinstance(chat_widget, QWidget):
+            chat_widget.setMinimumSize(0, 0)
+            chat_widget.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Expanding)
         if isinstance(chat_widget, AIWidget):
             if self.explorer is not None:
                 scheme = _build_scheme(self._accent, self._base)
@@ -7807,8 +9205,12 @@ class MainAIEditor(QMainWindow):
         self.control_plane_dock.setTitleBarWidget(QWidget())
         self.control_plane_dock.setFeatures(QDockWidget.NoDockWidgetFeatures)
         self.control_plane_dock.setAllowedAreas(Qt.LeftDockWidgetArea | Qt.RightDockWidgetArea)
+        self.control_plane_dock.setMinimumSize(0, 0)
+        self.control_plane_dock.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Expanding)
         if not disable_control_plane:
             self.control_plane_widget = ControlPlaneWidget(self._accent, self._base, self)
+            self.control_plane_widget.setMinimumSize(0, 0)
+            self.control_plane_widget.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Expanding)
             self.control_plane_dock.setWidget(self.control_plane_widget)
         else:
             self.control_plane_widget = None
@@ -7915,21 +9317,32 @@ class MainAIEditor(QMainWindow):
         self._strip_dock_decoration(self.chat_dock)
         self._strip_dock_decoration(self.control_plane_dock)
 
+        self.setMinimumSize(0, 0)
+        for dock in (self.files_dock, self.chat_dock, self.control_plane_dock):
+            if isinstance(dock, QDockWidget):
+                dock.setMinimumSize(0, 0)
+                dock.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Expanding)
+
         self.main_split = QSplitter(Qt.Horizontal, self)
         self.main_split.setObjectName("mainHorizontalSplitter")
-        self.main_split.setChildrenCollapsible(False)
+        self.main_split.setChildrenCollapsible(True)
         self.main_split.setHandleWidth(7)
         self.main_split.setOpaqueResize(True)
         self.main_split.addWidget(self.files_dock)       # links
         self.main_split.addWidget(self.chat_dock)        # mitte
         self.main_split.addWidget(self.control_plane_dock)  # rechts
+        for index in range(3):
+            try:
+                self.main_split.setCollapsible(index, True)
+            except Exception:
+                pass
         self.main_split.setStretchFactor(0, 1)
         self.main_split.setStretchFactor(1, 3)
         self.main_split.setStretchFactor(2, 2)
         default_sizes = list(getattr(self, "_workspace_column_widths", [280, 760, 460]))
         if len(default_sizes) != 3:
             default_sizes = [280, 760, 460]
-        self.main_split.setSizes(default_sizes)
+        self.main_split.setSizes(self._normalize_splitter_sizes(default_sizes, total=1000))
         self.main_split.splitterMoved.connect(self._remember_workspace_column_widths)
         self._remember_workspace_column_widths()
         self._apply_main_splitter_style()
@@ -7961,40 +9374,66 @@ class MainAIEditor(QMainWindow):
         self._strip_dock_decoration(self.console_dock)
 
     def _apply_main_splitter_style(self) -> None:
-        splitter = getattr(self, "main_split", None)
-        if splitter is None:
-            return
-
         scheme = _build_scheme(self._accent, self._base)
         handle_idle, _, _ = _splitter_handle_palette(scheme)
         handle_hover = str(scheme.get("col2") or scheme.get("col1") or "#6280ff")
         handle_pressed = str(scheme.get("col2") or scheme.get("col1") or "#6280ff")
         splitter_bg = str(scheme.get("col5") or "#000000")
-        splitter.setStyleSheet(
-            f"""
-            QSplitter#mainHorizontalSplitter {{
-                background: {splitter_bg};
-            }}
-            QSplitter#mainHorizontalSplitter::handle:vertical {{
-                background: {handle_idle};
-                margin: 0px;
-                min-width: 7px;
-                border-radius: 999px;
-          }}
-            QSplitter#mainHorizontalSplitter::handle:horizontal {{
-                background: {handle_idle};
-                margin: 0px 12px;
-                min-height: 7px;
-                border-radius: 999px;
-          }}
-            QSplitter#mainHorizontalSplitter::handle:hover {{
-                background: {handle_hover};
-            }}
-            QSplitter#mainHorizontalSplitter::handle:pressed {{
-                background: {handle_pressed};
-            }}
-            """
-        )
+        main_splitter = getattr(self, "main_split", None)
+        if isinstance(main_splitter, QSplitter):
+            main_splitter.setStyleSheet(
+                f"""
+                QSplitter#mainHorizontalSplitter {{
+                    background: {splitter_bg};
+                }}
+                QSplitter#mainHorizontalSplitter::handle:vertical {{
+                    background: {handle_idle};
+                    margin: 0px;
+                    min-width: 7px;
+                    border-radius: 999px;
+              }}
+                QSplitter#mainHorizontalSplitter::handle:horizontal {{
+                    background: {handle_idle};
+                    margin: 0px 12px;
+                    min-height: 7px;
+                    border-radius: 999px;
+              }}
+                QSplitter#mainHorizontalSplitter::handle:hover {{
+                    background: {handle_hover};
+                }}
+                QSplitter#mainHorizontalSplitter::handle:pressed {{
+                    background: {handle_pressed};
+                }}
+                """
+            )
+
+        explorer_splitter = getattr(self, "explorer_splitter", None)
+        if isinstance(explorer_splitter, QSplitter):
+            explorer_splitter.setStyleSheet(
+                f"""
+                QSplitter#ExplorerDockSplitter {{
+                    background: {splitter_bg};
+                }}
+                QSplitter#ExplorerDockSplitter::handle:vertical {{
+                    background: {handle_idle};
+                    margin: 0px;
+                    min-width: 7px;
+                    border-radius: 999px;
+              }}
+                QSplitter#ExplorerDockSplitter::handle:horizontal {{
+                    background: {handle_idle};
+                    margin: 0px 12px;
+                    min-height: 7px;
+                    border-radius: 999px;
+              }}
+                QSplitter#ExplorerDockSplitter::handle:hover {{
+                    background: {handle_hover};
+                }}
+                QSplitter#ExplorerDockSplitter::handle:pressed {{
+                    background: {handle_pressed};
+                }}
+                """
+            )
 
     # ----------------------------------------------------------------------
     """ URGENTLY SET FOCUS ON DOCS AND TABS """             """TODO File operations musst be processes on focused tab & doc
@@ -8190,10 +9629,7 @@ class MainAIEditor(QMainWindow):
                 ._about
                 )
         # connect visibility actions
-        self.act_toggle_explorer.toggled.connect(
-            self.files_dock
-                                     .setVisible
-                                                 )
+        self.act_toggle_explorer.triggered.connect(self._toggle_explorer_project_area)
         
         self.act_toggle_tabdock.toggled.connect(
             lambda v:[ 
@@ -8387,11 +9823,10 @@ class MainAIEditor(QMainWindow):
             self.tb_left.addAction(self.act_toggle_control_plane_left)
         if hasattr(self, "act_toggle_explorer"):
             self.tb_left.addAction(self.act_toggle_explorer)
-        if hasattr(self, "act_toggle_control_plane_left"):
-            self._tb_left_spacer = QWidget(self.tb_left)
-            self._tb_left_spacer.setStyleSheet(f"background: {chrome_bg}; border: none;")
-            self._tb_left_spacer.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
-            self.tb_left.addWidget(self._tb_left_spacer)
+        self._tb_left_spacer = QWidget(self.tb_left)
+        self._tb_left_spacer.setStyleSheet(f"background: {chrome_bg}; border: none;")
+        self._tb_left_spacer.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
+        self.tb_left.addWidget(self._tb_left_spacer)
 
     def _normalize_toolbar_layout(self) -> None:
         """Keep the fixed toolbars pinned to their intended window areas."""
@@ -8612,6 +10047,7 @@ class MainAIEditor(QMainWindow):
         self.files_dock.visibilityChanged.connect(
             self.act_toggle_explorer.setChecked
             )
+        self.files_dock.visibilityChanged.connect(self._handle_explorer_visibility_change)
         self.console_dock.visibilityChanged.connect(
             self.act_toggle_console.setChecked
             )
@@ -9162,7 +10598,13 @@ class MainAIEditor(QMainWindow):
         visible_found = left_visible or middle_visible or right_visible
         if not visible_found:
             sizes = preferred_widths
-        splitter.setSizes(sizes)
+
+        normalized_sizes = self._normalize_splitter_sizes(sizes, total=1000)
+        if len(normalized_sizes) != 3:
+            splitter.setSizes([1, 1, 1])
+            return
+
+        splitter.setSizes(normalized_sizes)
 
     # ------------------------------------------------ tab-dock clone ------
 
@@ -9170,6 +10612,8 @@ class MainAIEditor(QMainWindow):
         dock_id = len(self._tab_docks) + 1
         dock = QDockWidget(f"Tab-Dock {dock_id}", self)
         dock.setObjectName(f"TabDock_{dock_id}")
+        dock.setMinimumSize(0, 0)
+        dock.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Expanding)
         tabs = EditorTabs()
         dock.setWidget(tabs)
         # Update Status-Enc when switching tabs
@@ -9177,9 +10621,20 @@ class MainAIEditor(QMainWindow):
 
         self._strip_dock_decoration(dock)
 
-        # Insert above the lower work-surface panel so tabs remain the primary focus.
-        anchor = self.control_plane_dock if self.right_split.indexOf(self.control_plane_dock) >= 0 else self.console_dock
-        self.right_split.insertWidget(max(0, self.right_split.indexOf(anchor)), dock)
+        # Insert into the active workspace splitter (legacy right_split is optional).
+        target_splitter = getattr(self, "right_split", None)
+        if not isinstance(target_splitter, QSplitter):
+            target_splitter = getattr(self, "main_split", None)
+
+        if isinstance(target_splitter, QSplitter):
+            anchor_widget = self.control_plane_dock if target_splitter.indexOf(self.control_plane_dock) >= 0 else self.chat_dock
+            insert_index = target_splitter.indexOf(anchor_widget)
+            if insert_index < 0:
+                insert_index = target_splitter.count()
+            target_splitter.insertWidget(max(0, insert_index), dock)
+        else:
+            dock.setParent(self)
+            dock.hide()
 
         self._tab_docks.append(dock)
         dock.visibilityChanged.connect(
@@ -9272,7 +10727,7 @@ class MainAIEditor(QMainWindow):
         tabs = self._get_focused_tab_dock()
         if tabs is None:
             return
-        idx               = tabs.currentIndex()
+        idx = tabs.currentIndex()
         if idx < 0:
             return
 
@@ -9491,39 +10946,6 @@ class MainAIEditor(QMainWindow):
                 enc_text = f"{dirty}{enc.upper()}"
         if hasattr(self, '_st_enc'):
             self._st_enc.setText(enc_text or "UTF-8")
-
-    def _resolve_env_settings_path(self) -> Path | None:
-        candidates = [
-            Path(__file__).resolve().parents[1] / ".env",
-            Path(__file__).resolve().parents[2] / ".env",
-            Path(__file__).with_suffix(".env"),
-        ]
-        for candidate in candidates:
-            if candidate.exists() and candidate.is_file():
-                return candidate
-        return None
-
-    @Slot()
-    def _open_env_settings(self) -> None:
-        env_path = self._resolve_env_settings_path()
-        if env_path is None:
-            QMessageBox.information(self, "ENV", "Keine .env-Datei gefunden.")
-            return
-
-        tabs = self._get_focused_tab_dock()
-        if tabs is None and hasattr(self, "_clone_tab_dock"):
-            try:
-                self._clone_tab_dock(set_current=True)
-            except Exception:
-                pass
-            tabs = self._get_focused_tab_dock()
-
-        if tabs is None:
-            QMessageBox.information(self, "ENV", f"Kein Tab-Dock verfügbar, um {env_path} zu öffnen.")
-            return
-
-        self._open_path_in_focused_tab(env_path, title=env_path.name)
-        self.statusBar().showMessage(f".env geöffnet: {env_path}", 3200)
 
     def _open_path_in_focused_tab(self, path: Path, *, title: str | None = None) -> None:
         """Open an existing file path in the currently focused tab dock."""
@@ -9751,6 +11173,22 @@ class MainAIEditor(QMainWindow):
                 parsed_widths = []
             if len(parsed_widths) == 3 and all(value > 0 for value in parsed_widths):
                 self._workspace_column_widths = parsed_widths
+
+        stored_explorer_sizes = s.value("explorerSplitterSizes", [380, 130])
+        if isinstance(stored_explorer_sizes, (list, tuple)):
+            try:
+                parsed_explorer_sizes = [int(value) for value in list(stored_explorer_sizes)[:2]]
+            except Exception:
+                parsed_explorer_sizes = []
+            if len(parsed_explorer_sizes) == 2 and all(value > 0 for value in parsed_explorer_sizes):
+                self._explorer_splitter_sizes = parsed_explorer_sizes
+        self._explorer_database_panel_visible = s.value("showExplorerDatabasePanel", False, bool)
+        if isinstance(getattr(self, "explorer_splitter", None), QSplitter):
+            if self._explorer_database_panel_visible:
+                self.explorer_splitter.setSizes(self._normalize_splitter_sizes(list(self._explorer_splitter_sizes), total=1000))
+                self._remember_explorer_splitter_sizes()
+            else:
+                self.explorer_splitter.setSizes([1, 0])
         
         self.chat_dock.setVisible(s.value("showChat", True,  bool))
         self.control_plane_dock.setVisible(s.value("showControlPlane", True, bool))
@@ -9761,6 +11199,8 @@ class MainAIEditor(QMainWindow):
         tab_on = False
         for d in self._tab_docks:
             d.setVisible(False)
+
+        self._rebalance_workspace_columns()
 
         # Tabs rekonstruieren (optional)
 
@@ -9800,8 +11240,16 @@ class MainAIEditor(QMainWindow):
                 s.setValue("controlPlaneRuntimeLayoutPath", control_plane_widget.runtime_layout_path())
             except Exception:
                 pass
+        splitter = getattr(self, "explorer_splitter", None)
+        if isinstance(splitter, QSplitter):
+            sizes = splitter.sizes()
+            if len(sizes) >= 2:
+                self._explorer_database_panel_visible = int(sizes[1]) > 0
         self._remember_workspace_column_widths()
+        self._remember_explorer_splitter_sizes()
         s.setValue("workspaceColumnWidths", list(self._workspace_column_widths))
+        s.setValue("explorerSplitterSizes", list(self._explorer_splitter_sizes))
+        s.setValue("showExplorerDatabasePanel", bool(self._explorer_database_panel_visible))
 
         if self._editor_surface_enabled() and self._tab_docks:
             tabs: EditorTabs = self._tab_docks[0].widget()
@@ -9839,87 +11287,12 @@ class MainAIEditor(QMainWindow):
         except Exception:
             pass
 
-        try:
-            _shutdown_loky_runtime()
-        except Exception:
-            pass
-
         super().closeEvent(ev)
-    
-# ═════════════════════════════  main()  ════════════════════════════════════
-
-def _install_crash_logging(log_path: str) -> None:
-    try:
-        import faulthandler
-        lf = open(log_path, "a", buffering=1)
-        faulthandler.enable(file=lf)  # dump Python stack on segfault
-        def _qt_handler(msg_type, context, message):  # type: ignore
-            try:
-                lf.write(f"[QT] {message}\n")
-            except Exception:
-                pass
-        try:
-            QtCore.qInstallMessageHandler(_qt_handler)
-        except Exception:
-            pass
-        def _excepthook(exc_type, exc, tb):
-            import traceback
-            traceback.print_exception(exc_type, exc, tb, file=lf)
-        sys.excepthook = _excepthook
-    except Exception:
-        pass
 
 
 def main() -> None:
-    # Diagnostics: enable when AI_IDE_SAFE or AI_IDE_QT_DEBUG env vars are set
-    # Keep crash logs inside the workspace by default so they're easy to find.
-    # You can override the directory via AI_IDE_CRASH_LOG_DIR.
-    crash_dir_env = os.getenv("AI_IDE_CRASH_LOG_DIR", "").strip()
-    crash_dir = Path(crash_dir_env).expanduser() if crash_dir_env else (Path(__file__).resolve().parent / "AppData")
-    crash_dir.mkdir(parents=True, exist_ok=True)
-    crash_log = str(crash_dir / "qt_crash.log")
-    _install_crash_logging(crash_log)
-    if os.getenv("AI_IDE_QT_DEBUG", "0") == "1":
-        os.environ.setdefault("QT_DEBUG_PLUGINS", "1")
-
-    safe = os.getenv("AI_IDE_SAFE", "0") == "1"
-    minimal = os.getenv("AI_IDE_MINIMAL", "0") == "1"
-
-    # ------------------------------------------------------------------
-    # Headless/CI helper: run one prompt through the same ChatCom wrapper
-    # and tool-calling loop the GUI uses (AIWidget._send -> ChatCom.get_response).
-    # This avoids starting a Qt event loop and is safe for terminal testing.
-    #
-    # Usage:
-    #   AI_IDE_ONE_SHOT_PROMPT='@_data_dispatcher ...' python alde/ai_ide_v1756.py
-    # ------------------------------------------------------------------
-    one_shot = os.getenv("AI_IDE_ONE_SHOT_PROMPT", "").strip()
-    if one_shot:
-        try:
-            # Import locally to keep Qt startup out of the path.
-            try:
-                from .agents_ccomp import ChatCom  # type: ignore
-            except Exception:
-                from ALDE_Projekt.ALDE.alde.agents_ccomp import ChatCom  # type: ignore
-
-            model_name = os.getenv("AI_IDE_MODEL", "").strip() or "gpt-4.1-mini-2025-04-14"
-            reply = ChatCom(_model=model_name, _input_text=one_shot).get_response()
-            print(str(reply))
-        except Exception as exc:
-            print(f"[ONE_SHOT_ERROR] {exc}")
-            raise
-        finally:
-            # One-shot mode returns before Qt hooks (closeEvent/aboutToQuit)
-            # have a chance to persist chat history.
-            try:
-                _maybe_flush_history()
-            except Exception:
-                pass
-            try:
-                _shutdown_loky_runtime()
-            except Exception:
-                pass
-        return
+    safe = _env_truthy("AI_IDE_SAFE", "0")
+    minimal = _env_truthy("AI_IDE_MINIMAL", "0")
 
     app = QApplication(sys.argv)
 
@@ -9977,7 +11350,7 @@ def main() -> None:
 
     if minimal:
         mini = QMainWindow()
-        mini.setWindowTitle("AI IDE – Minimal Mode")
+        mini.setWindowTitle("AI IDE - Minimal Mode")
         te = QTextEdit()
         te.setPlainText("Minimal mode active. Use normal mode to reproduce crashes.\n\nEnv flags:\n- AI_IDE_SAFE=1\n- AI_IDE_NO_STYLE=1\n- AI_IDE_QT_DEBUG=1")
         mini.setCentralWidget(te)
@@ -10005,6 +11378,7 @@ def main() -> None:
     finally:
         _shutdown_loky_runtime()
     sys.exit(exit_code)
+
 
 if __name__ == "__main__":
     main()

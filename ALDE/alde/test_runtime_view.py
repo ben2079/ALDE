@@ -400,6 +400,65 @@ class TestRuntimeView(unittest.TestCase):
             self.assertIn("repair", snapshot["recent_action_filters"]["audit_types"])
             self.assertIn("queue", snapshot["recent_action_filters"]["action_groups"])
 
+    def test_runtime_observability_snapshot_projects_router_parallel_telemetry(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with patch(
+                "alde.control_plane_runtime.QUEUE_HEALTH_SERVICE.load_queue_health",
+                return_value=("inmemory", True),
+            ), patch(
+                "alde.control_plane_runtime.WORKFLOW_VALIDATION_SERVICE.load_report",
+                return_value={
+                    "valid": True,
+                    "errors": [],
+                    "valid_count": 3,
+                    "invalid_count": 0,
+                },
+            ), patch(
+                "alde.agents_factory.get_router_parallel_runtime_status",
+                return_value={
+                    "total_parallel_runs": 7,
+                    "total_parallel_branches": 19,
+                    "total_completed_branches": 15,
+                    "total_failed_branches": 2,
+                    "total_timeout_branches": 2,
+                    "total_partial_fail_runs": 3,
+                    "total_hard_timeout_runs": 2,
+                    "config": {
+                        "parallel_enabled": True,
+                        "hard_timeout_enabled": True,
+                        "configured_worker_count": 4,
+                        "configured_timeout_seconds": 0.2,
+                        "max_parallel_workers": 16,
+                    },
+                },
+            ):
+                snapshot = load_runtime_observability_snapshot(
+                    base_dir=temp_dir,
+                    session_id="session-router-telemetry",
+                    history_entries=[],
+                )
+                monitoring_snapshot = load_desktop_monitoring_snapshot(
+                    base_dir=temp_dir,
+                    session_id="session-router-telemetry",
+                    history_entries=[],
+                )
+
+            self.assertIn("router_parallel_status", snapshot)
+            self.assertTrue(snapshot["router_parallel_enabled"])
+            self.assertEqual(snapshot["router_parallel_total_runs"], 7)
+            self.assertEqual(snapshot["router_parallel_timeout_branches"], 2)
+            self.assertEqual(snapshot["router_parallel_partial_fail_runs"], 3)
+            self.assertEqual(snapshot["router_parallel_hard_timeout_runs"], 2)
+            self.assertTrue(snapshot["router_parallel_hard_timeout_enabled"])
+            self.assertEqual(snapshot["router_parallel_status"]["total_parallel_branches"], 19)
+
+            self.assertEqual(monitoring_snapshot["summary_metrics"]["router_parallel_runs"], 7)
+            self.assertEqual(monitoring_snapshot["summary_metrics"]["router_parallel_timeout_branches"], 2)
+            self.assertEqual(monitoring_snapshot["summary_metrics"]["router_parallel_partial_fail_runs"], 3)
+            self.assertEqual(monitoring_snapshot["summary_metrics"]["router_parallel_hard_timeout_runs"], 2)
+            self.assertTrue(monitoring_snapshot["summary_metrics"]["router_parallel_hard_timeout_enabled"])
+            self.assertIn("router_parallel_status", monitoring_snapshot)
+
 
 if __name__ == "__main__":
     unittest.main()

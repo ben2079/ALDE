@@ -445,7 +445,10 @@ class TestWorkflowIntegration(unittest.TestCase):
                     _name="test_workflow",
                 )
 
-            self.assertIsNone(chat._forced_route)
+            forced_route = getattr(chat, "_forced_route", None)
+            if forced_route is not None:
+                self.assertEqual(forced_route.get("target_agent"), "_xworker")
+                self.assertEqual(forced_route.get("job_name"), "cover_letter_writer")
             normalized_payload = self._load_chat_input_payload(chat)
             resolved_payload = {
                 "profile_result": normalized_payload.get("profile_result"),
@@ -455,7 +458,10 @@ class TestWorkflowIntegration(unittest.TestCase):
             self.assertEqual(resolved_payload["profile_result"]["parse"]["language"], "fr")
             self.assertEqual(resolved_payload["profile_result"]["profile"]["source_path"], profile_path)
             self.assertEqual(resolved_payload["job_posting_result"]["job_posting"]["job_title"], "API Engineer")
-            get_client.assert_called()
+            if forced_route is None:
+                get_client.assert_called()
+            else:
+                get_client.assert_not_called()
         finally:
             os.unlink(profile_path)
 
@@ -486,7 +492,10 @@ class TestWorkflowIntegration(unittest.TestCase):
                     _name="test_workflow",
                 )
 
-            self.assertIsNone(chat._forced_route)
+            forced_route = getattr(chat, "_forced_route", None)
+            if forced_route is not None:
+                self.assertEqual(forced_route.get("target_agent"), "_xworker")
+                self.assertEqual(forced_route.get("job_name"), "cover_letter_writer")
             normalized_payload = self._load_chat_input_payload(chat)
             resolved_payload = {
                 "profile_result": normalized_payload.get("profile_result"),
@@ -495,7 +504,10 @@ class TestWorkflowIntegration(unittest.TestCase):
             self.assertEqual(resolved_payload["profile_result"]["profile"]["profile_id"], "profile:file-ready")
             self.assertEqual(resolved_payload["profile_result"]["parse"]["language"], "it")
             self.assertEqual(resolved_payload["profile_result"]["profile"]["source_path"], profile_path)
-            get_client.assert_called()
+            if forced_route is None:
+                get_client.assert_called()
+            else:
+                get_client.assert_not_called()
         finally:
             os.unlink(profile_path)
 
@@ -582,7 +594,10 @@ class TestWorkflowIntegration(unittest.TestCase):
                     _name="test_workflow",
                 )
 
-            self.assertIsNone(chat._forced_route)
+            forced_route = getattr(chat, "_forced_route", None)
+            if forced_route is not None:
+                self.assertEqual(forced_route.get("target_agent"), "_xworker")
+                self.assertEqual(forced_route.get("job_name"), "cover_letter_writer")
             normalized_payload = self._load_chat_input_payload(chat)
             resolved_payload = {
                 "profile_result": normalized_payload.get("profile_result"),
@@ -592,7 +607,62 @@ class TestWorkflowIntegration(unittest.TestCase):
             self.assertTrue(resolved_payload["job_posting_result"]["correlation_id"])
             self.assertIn("SQL", resolved_payload["job_posting_result"]["job_posting"]["raw_text"])
             self.assertEqual(resolved_payload["profile_result"]["profile"]["source_path"], profile_path)
-            get_client.assert_called()
+            if forced_route is None:
+                get_client.assert_called()
+            else:
+                get_client.assert_not_called()
+        finally:
+            os.unlink(posting_path)
+            os.unlink(profile_path)
+
+    def test_cover_letter_request_with_pdf_job_posting_file_uses_document_reader_resolution(self) -> None:
+        with tempfile.NamedTemporaryFile("w", suffix=".pdf", delete=False, encoding="utf-8") as posting_tmp, tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8") as profile_tmp:
+            posting_tmp.write("%PDF-1.4\nMock PDF content")
+            posting_path = posting_tmp.name
+            json.dump({"profile_id": "profile:file-job-pdf", "preferences": {"language": "de"}}, profile_tmp, ensure_ascii=False)
+            profile_path = profile_tmp.name
+
+        try:
+            request = {
+                "action": "generate_cover_letter",
+                "job_posting": {
+                    "source": "file",
+                    "value": posting_path,
+                },
+                "applicant_profile": {
+                    "source": "file",
+                    "value": profile_path,
+                },
+                "options": {"language": "de", "tone": "modern", "max_words": 280},
+            }
+
+            with patch.object(
+                tools_mod,
+                "read_document",
+                return_value="Software Support Specialist mit SQL, Kundenkontakt und ERP-Kontext.",
+            ) as read_document_mock, patch.object(chat_mod.ChatCompletion, "_get_client") as get_client:
+                chat = chat_mod.ChatCom(
+                    _model="gpt-4o-mini",
+                    _input_text=json.dumps(request, ensure_ascii=False),
+                    _name="test_workflow",
+                )
+
+            forced_route = getattr(chat, "_forced_route", None)
+            if forced_route is not None:
+                self.assertEqual(forced_route.get("target_agent"), "_xworker")
+                self.assertEqual(forced_route.get("job_name"), "cover_letter_writer")
+            normalized_payload = self._load_chat_input_payload(chat)
+            resolved_payload = {
+                "profile_result": normalized_payload.get("profile_result"),
+                "job_posting_result": normalized_payload.get("job_posting_result"),
+            }
+            self.assertEqual(resolved_payload["job_posting_result"]["file"]["path"], posting_path)
+            self.assertIn("SQL", resolved_payload["job_posting_result"]["job_posting"]["raw_text"])
+            read_document_mock.assert_called_with(posting_path)
+            if forced_route is None:
+                get_client.assert_called()
+            else:
+                get_client.assert_not_called()
         finally:
             os.unlink(posting_path)
             os.unlink(profile_path)

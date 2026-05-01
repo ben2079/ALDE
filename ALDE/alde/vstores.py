@@ -1,7 +1,4 @@
 from __future__ import annotations
-from importlib import metadata
-from unittest import result
-
 from annotated_types import doc
 from numpy import rint
 from sqlalchemy import literal
@@ -17,10 +14,6 @@ import hashlib
 from pathlib import Path
 from typing import Iterable, List, Set, Dict, Any
 import os
-import time
-import logging
-from datetime import datetime
-from dataclasses import dataclass, field
 
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_text_splitters import CharacterTextSplitter, MarkdownTextSplitter, RecursiveCharacterTextSplitter
@@ -861,7 +854,7 @@ class VectorStore():
               filter_dict:dict|None = None) -> list:
         '''Lädt vollständigen Quellcode der ähnlichsten
             Chunks mit Performance-Monitoring.'''
-        filter_dict = filter_dict if filter_dict is not None else {}
+        filter_dict = filter_dict if filter_dict is not None else {} 
         print(f'Filter Dict im Query: {filter_dict}')
         for key in filter_dict:
             print(f'Filter Key im Query: {key} ')
@@ -914,7 +907,7 @@ class VectorStore():
                     pairs.sort(key=lambda x: x[1])
 
             if VSTORE_DEDUP and pairs:
-                best_by_key: dict[str, tuple[Document, float]] = {}
+                best_by_key: dict[str, tuple[Document, float]] = {}  
                 for doc, score in pairs:
                     doc_key = _document_key(doc)
                     prev = best_by_key.get(doc_key)
@@ -1054,7 +1047,7 @@ if __name__ == "__main__":
 #VectorStore(store_path   , manifest_file).build()
 #vsm_application.query(text,k=k=
 #text:dict[str,dict]|strvsmvsm
-#query = "8 punkte learnig path fuer RAG/AI/ML mit LAngChain Torch, "
+#query = "8 punkte learnig path fuer RAG/AI/ML mit LangChain Torch, "
 #filterquery_dict= {'mkeys': {'titel':'test_dict.py'},'rkeys':{'id','source','applied'},'ukeys':{'updated':'08.01.2026'}}
 '''
 k: int= 20

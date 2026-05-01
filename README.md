@@ -39,6 +39,43 @@ Run the app entrypoint:
 python -m ALDE.ALDE.alde
 ```
 
+### Optional Runtime Tuning: Router Parallel Branches
+
+The router can execute multiple `route_to_agent` branches in parallel and merge them deterministically.
+This mode is opt-in and remains disabled by default.
+
+Environment variables:
+
+- `ALDE_ROUTER_BRANCH_PARALLEL_ENABLED` (`0|1`, default: `0`)
+- `ALDE_ROUTER_BRANCH_PARALLEL_WORKERS` (`1..16`, default: `4`)
+- `ALDE_ROUTER_BRANCH_TIMEOUT_SECONDS` (`0.1..600`, default: `30.0`)
+- `ALDE_ROUTER_BRANCH_HARD_TIMEOUT_ENABLED` (`0|1`, default: `0`)
+
+Recommended presets:
+
+```bash
+# Quick load (balanced profile)
+source scripts/router_parallel_presets.env.example
+
+# Quick load (strict-timeout profile)
+source scripts/router_parallel_presets_strict.env.example
+
+# Balanced local development
+export ALDE_ROUTER_BRANCH_PARALLEL_ENABLED=1
+export ALDE_ROUTER_BRANCH_PARALLEL_WORKERS=2
+export ALDE_ROUTER_BRANCH_TIMEOUT_SECONDS=30
+export ALDE_ROUTER_BRANCH_HARD_TIMEOUT_ENABLED=0
+
+# Strict timeout mode (hard kill timed-out branches)
+export ALDE_ROUTER_BRANCH_PARALLEL_ENABLED=1
+export ALDE_ROUTER_BRANCH_PARALLEL_WORKERS=4
+export ALDE_ROUTER_BRANCH_TIMEOUT_SECONDS=10
+export ALDE_ROUTER_BRANCH_HARD_TIMEOUT_ENABLED=1
+```
+
+When hard-timeout mode is enabled, timed-out branches are terminated via subprocess control.
+For runtime telemetry fields and snapshot projection details, see `ALDE/alde/QUICKSTART.md`.
+
 ## Why it may look "incomplete"
 
 This repo is cleaned for **public reference**: local/private runtime artifacts (PDFs, vector stores, histories, caches) are intentionally not tracked.

@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 import json
+import os
 from pathlib import Path
 from threading import Lock
 import uuid
@@ -20,6 +21,85 @@ except ImportError as e:
 
 def _utc_now_iso() -> str:
     return datetime.now(UTC).isoformat()
+
+
+@dataclass(frozen=True)
+class DesktopRunnerConfigObject:
+    object_name: str
+    parallel_enabled: bool
+    max_parallel_workers: int
+    worker_count: int
+    poll_interval_seconds: float
+
+
+class DesktopRunnerConfigService:
+    _PARALLEL_ENABLED_ENV = "ALDE_DESKTOP_PARALLEL_ENABLED"
+    _MAX_WORKERS_ENV = "ALDE_DESKTOP_PARALLEL_WORKERS"
+    _POLL_INTERVAL_ENV = "ALDE_DESKTOP_RUNNER_POLL_SECONDS"
+
+    def load_object(self, object_name: str) -> DesktopRunnerConfigObject:
+        normalized_object_name = str(object_name or "").strip() or "desktop_run_queue"
+        parallel_enabled = self._load_object_bool(
+            self._PARALLEL_ENABLED_ENV,
+            default=False,
+        )
+        max_parallel_workers = self._load_object_int(
+            self._MAX_WORKERS_ENV,
+            default=4,
+            minimum=1,
+            maximum=32,
+        )
+        poll_interval_seconds = self._load_object_float(
+            self._POLL_INTERVAL_ENV,
+            default=0.05,
+            minimum=0.01,
+            maximum=2.0,
+        )
+        worker_count = max_parallel_workers if parallel_enabled else 1
+        return DesktopRunnerConfigObject(
+            object_name=normalized_object_name,
+            parallel_enabled=parallel_enabled,
+            max_parallel_workers=max_parallel_workers,
+            worker_count=worker_count,
+            poll_interval_seconds=poll_interval_seconds,
+        )
+
+    @staticmethod
+    def _load_object_bool(env_name: str, *, default: bool) -> bool:
+        raw_value = str(os.getenv(env_name, "1" if default else "0") or "").strip().lower()
+        if raw_value in {"1", "true", "yes", "on"}:
+            return True
+        if raw_value in {"0", "false", "no", "off"}:
+            return False
+        return bool(default)
+
+    @staticmethod
+    def _load_object_int(
+        env_name: str,
+        *,
+        default: int,
+        minimum: int,
+        maximum: int,
+    ) -> int:
+        try:
+            value = int(str(os.getenv(env_name, str(default)) or str(default)).strip())
+        except Exception:
+            value = int(default)
+        return max(minimum, min(maximum, value))
+
+    @staticmethod
+    def _load_object_float(
+        env_name: str,
+        *,
+        default: float,
+        minimum: float,
+        maximum: float,
+    ) -> float:
+        try:
+            value = float(str(os.getenv(env_name, str(default)) or str(default)).strip())
+        except Exception:
+            value = float(default)
+        return max(minimum, min(maximum, value))
 
 
 @dataclass
@@ -183,15 +263,24 @@ class DesktopAgentRuntimeExecutionService(AgentRuntimeCoreService):
 
 
 class DesktopAgentRunQueueService:
-    def __init__(self, *, store_service: DesktopAgentRunStoreService, execution_service: Any) -> None:
+    def __init__(
+        self,
+        *,
+        store_service: DesktopAgentRunStoreService,
+        execution_service: Any,
+        runner_config_service: DesktopRunnerConfigService | None = None,
+    ) -> None:
         self.store_service = store_service
         self.execution_service = execution_service
+        self.runner_config_service = runner_config_service or DesktopRunnerConfigService()
+        self.runner_config = self.runner_config_service.load_object("desktop_run_queue")
         self.runner_service = InMemoryMessageRunnerService[
             DesktopAgentRun
         ](
             worker_name="alde-desktop-runner",
             process_object_message=self.process_object_run,
-            poll_interval_seconds=0.05,
+            poll_interval_seconds=self.runner_config.poll_interval_seconds,
+            worker_count=self.runner_config.worker_count,
         )
 
     def process_object_run(self, run: DesktopAgentRun) -> None:
@@ -214,7 +303,11 @@ class DesktopAgentRunQueueService:
         self.runner_service.stop_object_runner()
 
     def load_object_health(self) -> dict[str, Any]:
-        return self.runner_service.load_object_health()
+        health = dict(self.runner_service.load_object_health())
+        health["parallel_enabled"] = self.runner_config.parallel_enabled
+        health["max_parallel_workers"] = self.runner_config.max_parallel_workers
+        health["configured_worker_count"] = self.runner_config.worker_count
+        return health
 
 
 class DesktopAgentRunMonitorService:
@@ -314,6 +407,8 @@ class DesktopAgentRunFacadeService:
 
 __all__ = [
     "DesktopAgentRun",
+    "DesktopRunnerConfigObject",
+    "DesktopRunnerConfigService",
     "DesktopAgentRunFacadeService",
     "DesktopAgentRunMonitorService",
     "DesktopAgentRunPersistenceService",

@@ -869,7 +869,7 @@ class KnowledgeRepository():
         image_path = str(
             os.getenv("AI_IDE_KNOWLEDGE_AGENTS_DB_MEMORY_IMAGE_PATH", "")
             or os.getenv("AI_IDE_KNOWLEDGE_AGENTS_DB_FLUSH_IMAGE_PATH", "")
-            or os.path.join("AppData", "agentsdb_memory_image.json")
+            or os.path.join("AppData", "agentsdb.json")
         ).strip()
         return cls(image_path=image_path)
 
@@ -1429,7 +1429,7 @@ class AgentDbSocketServerService:
         memory_image_path = str(
             os.getenv("AI_IDE_KNOWLEDGE_AGENTS_DB_MEMORY_IMAGE_PATH", "")
             or os.getenv("AI_IDE_KNOWLEDGE_AGENTS_DB_FLUSH_IMAGE_PATH", "")
-            or os.path.join("AppData", "agentsdb_memory_image.json"),
+            or os.path.join("AppData", "agentsdb.json"),
         ).strip()
         if not memory_image_path:
             memory_image_path = _connection_config_value(connection_config, ("memory_image_path", "flush_image_path"))
@@ -1688,6 +1688,258 @@ class KnowledgeObjectService:
             owner_type=owner_type,
             limit=limit,
         )
+
+
+class EntityRelationEmbeddingService:
+    """Domain service for generating and persisting embeddings from EntityObjects and EntityRelationObjects.
+
+    Pattern: Domain -> Object -> Function
+    - Domain:    entity/relation knowledge graph
+    - Object:    EntityRelationEmbeddingService
+    - Functions: build_object_text, embed_object, store_object, process_object
+
+    All methods accept object_name ("entity" or "relation") as an explicit
+    parameter so that one generic service handles both owner types without
+    object-specific branching.
+
+    Environment variables:
+        AI_IDE_ENTITY_EMBEDDING_MODEL  – HuggingFace model name (default: paraphrase-multilingual-MiniLM-L12-v2)
+        AI_IDE_EMBEDDINGS_DEVICE       – "cpu", "cuda", "cuda:N" or "auto" (default: auto)
+    """
+
+    _DEFAULT_MODEL = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+
+    def __init__(
+        self,
+        knowledge_service: KnowledgeObjectService,
+        runtime_config: RuntimeConfigObject,
+    ) -> None:
+        self._knowledge_service = knowledge_service
+        self._runtime_config = runtime_config
+        self._encoder: Any = None
+
+    # ------------------------------------------------------------------
+    # Encoder lifecycle
+    # ------------------------------------------------------------------
+
+    def _model_name(self) -> str:
+        return str(
+            os.getenv("AI_IDE_ENTITY_EMBEDDING_MODEL", "").strip()
+            or self._DEFAULT_MODEL
+        )
+
+    def _select_device(self) -> str:
+        desired = str(os.getenv("AI_IDE_EMBEDDINGS_DEVICE", "auto") or "auto").strip()
+        if desired and desired.lower() != "auto":
+            return desired
+        try:
+            import torch  # type: ignore
+            if torch.cuda.is_available():
+                return "cuda"
+        except Exception:
+            pass
+        return "cpu"
+
+    def _load_encoder(self) -> Any:
+        """Lazy-load HuggingFaceEmbeddings on first use."""
+        if self._encoder is not None:
+            return self._encoder
+        try:
+            from langchain_huggingface import HuggingFaceEmbeddings  # type: ignore
+        except ImportError:
+            from langchain_community.embeddings import HuggingFaceEmbeddings  # type: ignore
+        device = self._select_device()
+        model_name = self._model_name()
+        try:
+            self._encoder = HuggingFaceEmbeddings(
+                model_name=model_name,
+                model_kwargs={"device": device},
+            )
+        except TypeError:
+            self._encoder = HuggingFaceEmbeddings(model_name=model_name)
+        return self._encoder
+
+    # ------------------------------------------------------------------
+    # Domain: build canonical text representation
+    # ------------------------------------------------------------------
+
+    def build_object_text(self, object_name: str, obj: dict[str, Any]) -> str:
+        """Build a stable, canonical text representation for entity or relation dicts.
+
+        Args:
+            object_name: "entity" or "relation"
+            obj:         raw dict payload from EntityObject or EntityRelationObject
+        Returns:
+            Pipe-delimited string of all semantically relevant fields.
+        """
+        parts: list[str] = []
+        if object_name == "entity":
+            for field_name in ("entity_type", "canonical_name", "summary"):
+                value = str(obj.get(field_name) or "").strip()
+                if value:
+                    parts.append(value)
+            for alias_entry in (obj.get("aliases") or []):
+                alias_text = (
+                    str(alias_entry)
+                    if isinstance(alias_entry, str)
+                    else str((alias_entry or {}).get("alias") or "")
+                ).strip()
+                if alias_text:
+                    parts.append(alias_text)
+            attrs = obj.get("attributes") or {}
+            if isinstance(attrs, dict):
+                for k, v in attrs.items():
+                    text = str(v or "").strip()
+                    if text:
+                        parts.append(f"{k}: {text}")
+        elif object_name == "relation":
+            for field_name in ("relation_type", "source_entity_id", "target_entity_id"):
+                value = str(obj.get(field_name) or "").strip()
+                if value:
+                    parts.append(value)
+            weight = obj.get("weight")
+            if weight is not None:
+                parts.append(f"weight:{weight}")
+            conf = obj.get("confidence")
+            if conf is not None:
+                parts.append(f"confidence:{conf}")
+        elif object_name == "block":
+            heading = str(obj.get("heading") or "").strip()
+            content = str(obj.get("content") or "").strip()
+            block_kind = str(obj.get("block_kind") or "").strip()
+            if heading:
+                parts.append(heading)
+            if block_kind and block_kind != "chunk":
+                parts.append(block_kind)
+            if content:
+                parts.append(content[:1200])
+        elif object_name == "document":
+            # Use document_type + title + section_name + summary + data key hints
+            doc_type = str(obj.get("document_type") or "").strip()
+            title = str(obj.get("title") or "").strip()
+            section_name = str(obj.get("section_name") or "").strip()
+            summary = str(obj.get("summary") or "").strip()
+            if doc_type:
+                parts.append(doc_type)
+            if title:
+                parts.append(title)
+            if section_name:
+                parts.append(section_name)
+            if summary:
+                parts.append(summary)
+            # For ai_ide_projection: describe data keys as searchable hints
+            data = obj.get("data")
+            if isinstance(data, dict):
+                top_keys = [str(k) for k in list(data.keys())[:8] if k not in ("schema", "_meta")]
+                if top_keys:
+                    parts.append("contains: " + ", ".join(top_keys))
+            # Fallback: source_uri
+            if not parts:
+                for field_name in ("source_uri", "_id", "id"):
+                    value = str(obj.get(field_name) or "").strip()
+                    if value:
+                        parts.append(value)
+                        break
+        else:
+            # Generic fallback: use id or canonical_name
+            for field_name in ("canonical_name", "id"):
+                value = str(obj.get(field_name) or "").strip()
+                if value:
+                    parts.append(value)
+                    break
+        return " | ".join(p for p in parts if p.strip())
+
+    # ------------------------------------------------------------------
+    # Domain: embed
+    # ------------------------------------------------------------------
+
+    def embed_object(self, object_name: str, text: str) -> list[float]:
+        """Generate an embedding vector for the given canonical object text.
+
+        Args:
+            object_name: owner type label (used only for dispatch tracing)
+            text:        canonical text produced by build_object_text
+        Returns:
+            Dense float vector.
+        """
+        _ = object_name
+        encoder = self._load_encoder()
+        return list(encoder.embed_query(text))
+
+    # ------------------------------------------------------------------
+    # Domain: persist
+    # ------------------------------------------------------------------
+
+    def store_object(
+        self,
+        object_name: str,
+        obj: dict[str, Any],
+        *,
+        owner_id: str,
+    ) -> dict[str, Any]:
+        """Build text, embed, and persist an EmbeddingObject for an entity or relation.
+
+        Args:
+            object_name: "entity" or "relation"
+            obj:         raw dict payload
+            owner_id:    stable entity or relation id used as embedding owner
+        Returns:
+            Status report dict with keys stored, owner_id, dimension, result.
+        """
+        text = self.build_object_text(object_name, obj)
+        if not text.strip():
+            return {"stored": False, "reason": "empty_text", "owner_id": owner_id}
+
+        vector = self.embed_object(object_name, text)
+        content_sha256 = hashlib.sha256(text.encode("utf-8")).hexdigest()
+        model_id = self._model_name()
+
+        emb = EmbeddingObject(
+            tenant_id=self._runtime_config.tenant_id,
+            namespace_id=self._runtime_config.namespace_id,
+            model_id=model_id,
+            owner_type=object_name,
+            owner_id=owner_id,
+            content_sha256=content_sha256,
+            dimension=len(vector),
+            index_namespace=self._runtime_config.namespace_id,
+            index_item_key=f"{object_name}:{owner_id}",
+            embedding=vector,
+            metadata={"source_text": text[:400]},
+        )
+        result = self._knowledge_service.store_embedding_object(emb)
+        return {
+            "stored": True,
+            "owner_id": owner_id,
+            "object_name": object_name,
+            "dimension": len(vector),
+            "model_id": model_id,
+            "result": dict(result or {}),
+        }
+
+    # ------------------------------------------------------------------
+    # Domain: full pipeline entry point
+    # ------------------------------------------------------------------
+
+    def process_object(
+        self,
+        object_name: str,
+        obj: dict[str, Any],
+        *,
+        owner_id: str,
+    ) -> dict[str, Any]:
+        """Full pipeline: build canonical text → embed → persist.
+
+        This is the single entry point for calling code.
+
+        Args:
+            object_name: "entity" or "relation"
+            obj:         raw dict payload
+            owner_id:    stable id used as embedding owner key
+        Returns:
+            Status report dict (see store_object).
+        """
+        return self.store_object(object_name, obj, owner_id=owner_id)
 
 
 class PipelineService:
@@ -2974,6 +3226,7 @@ def load_agentsdb_pipeline_service(runtime_config: RuntimeConfigObject) -> Pipel
         repository: Any = AgentDbSocketRepository.create_from_uri(
             runtime_config.agents_db_uri,
             runtime_config.database_name,
+                
         )
     else:
         repository = KnowledgeRepository.create_from_uri(runtime_config.agents_db_uri, runtime_config.database_name)
@@ -3095,6 +3348,42 @@ def _get_specialized_system_prompt_for_memory(agent_label: str, memory_slot: str
         return ""
 
 
+def _get_job_config_for_memory(job_name: str) -> dict[str, Any]:
+    try:
+        try:
+            from .agents_config import get_job_config  # type: ignore
+        except ImportError:
+            from alde.agents_config import get_job_config  # type: ignore
+        loaded_config = get_job_config(str(job_name or "").strip())
+        return dict(loaded_config) if isinstance(loaded_config, Mapping) else {}
+    except Exception:
+        return {}
+
+
+def _get_workflow_config_for_memory(workflow_name: str) -> dict[str, Any]:
+    try:
+        try:
+            from .agents_config import get_workflow_config  # type: ignore
+        except ImportError:
+            from alde.agents_config import get_workflow_config  # type: ignore
+        loaded_config = get_workflow_config(str(workflow_name or "").strip())
+        return dict(loaded_config) if isinstance(loaded_config, Mapping) else {}
+    except Exception:
+        return {}
+
+
+def _get_skill_profile_config_for_memory(skill_profile_name: str) -> dict[str, Any]:
+    try:
+        try:
+            from .agents_config import AGENT_SKILL_PROFILES  # type: ignore
+        except ImportError:
+            from alde.agents_config import AGENT_SKILL_PROFILES  # type: ignore
+        loaded_config = (AGENT_SKILL_PROFILES or {}).get(str(skill_profile_name or "").strip())
+        return dict(loaded_config) if isinstance(loaded_config, Mapping) else {}
+    except Exception:
+        return {}
+
+
 def _get_document_repository_for_memory() -> Any:
     try:
         try:
@@ -3131,7 +3420,80 @@ class AgentMemoryService:
     MAX_MESSAGE_CONTEXT_ENTRIES = 3
     MAX_MESSAGE_PAYLOAD_CHARS = 2500
 
+    # Backward-compatibility wrappers for legacy call sites.
     def load_memory_slot(
+        self,
+        *,
+        job_name: str | None = None,
+        tool_name: str | None = None,
+    ) -> str:
+        return self.load_amemo_slot(job_name=job_name, tool_name=tool_name)
+
+    def load_object_record(
+        self,
+        *,
+        agent_label: str,
+        memory_slot: str,
+        scope_key: str,
+    ) -> dict[str, Any]:
+        return self.load_amemo(
+            agent_label=agent_label,
+            memory_slot=memory_slot,
+            scope_key=scope_key,
+        )
+
+    def store_object_record(
+        self,
+        *,
+        agent_label: str,
+        memory_slot: str,
+        scope_key: str,
+        object_memory: dict[str, Any],
+        source_agent_label: str | None = None,
+    ) -> bool:
+        return self.store_amemo(
+            agent_label=agent_label,
+            memory_slot=memory_slot,
+            scope_key=scope_key,
+            object_memory=object_memory,
+            source_agent_label=source_agent_label,
+        )
+
+    def build_object_profile(
+        self,
+        *,
+        agent_label: str,
+        memory_slot: str,
+        runtime_metadata: dict[str, Any] | None,
+        system_prompt: str,
+    ) -> dict[str, Any]:
+        return self.amemo_profile(
+            agent_label=agent_label,
+            memory_slot=memory_slot,
+            runtime_metadata=runtime_metadata,
+            system_prompt=system_prompt,
+        )
+
+    def ensure_object_memory(
+        self,
+        *,
+        agent_label: str,
+        memory_slot: str,
+        scope_key: str,
+        runtime_metadata: dict[str, Any] | None,
+        system_prompt: str,
+        source_agent_label: str | None = None,
+    ) -> dict[str, Any]:
+        return self.ensure_amemo(
+            agent_label=agent_label,
+            memory_slot=memory_slot,
+            scope_key=scope_key,
+            runtime_metadata=runtime_metadata,
+            system_prompt=system_prompt,
+            source_agent_label=source_agent_label,
+        )
+
+    def load_amemo_slot(
         self,
         *,
         job_name: str | None = None,
@@ -3185,7 +3547,7 @@ class AgentMemoryService:
             "preview": serialized_payload[: self.MAX_MESSAGE_PAYLOAD_CHARS],
         }
 
-    def load_object_record(
+    def load_amemo(
         self,
         *,
         agent_label: str,
@@ -3215,7 +3577,7 @@ class AgentMemoryService:
             return dict(section)
         return {}
 
-    def store_object_record(
+    def store_amemo(
         self,
         *,
         agent_label: str,
@@ -3260,7 +3622,7 @@ class AgentMemoryService:
             return False
         return True
 
-    def build_object_profile(
+    def amemo_profile(
         self,
         *,
         agent_label: str,
@@ -3306,7 +3668,7 @@ class AgentMemoryService:
             "updated_at": datetime.now(UTC).isoformat(timespec="seconds"),
         }
 
-    def ensure_object_memory(
+    def ensure_amemo(
         self,
         *,
         agent_label: str,
@@ -3316,16 +3678,16 @@ class AgentMemoryService:
         system_prompt: str,
         source_agent_label: str | None = None,
     ) -> dict[str, Any]:
-        normalized_slot = self.load_memory_slot(job_name=memory_slot, tool_name="")
+        normalized_slot = self.load_amemo_slot(job_name=memory_slot, tool_name="")
         normalized_scope_key = self.load_session_scope_key(scope_key=scope_key)
-        existing_memory = self.load_object_record(
+        existing_memory = self.load_amemo(
             agent_label=agent_label,
             memory_slot=normalized_slot,
             scope_key=normalized_scope_key,
         )
         baseline_memory = _deepcopy_object(existing_memory) if isinstance(existing_memory, dict) else {}
 
-        baseline_memory["agent_profile"] = self.build_object_profile(
+        baseline_memory["agent_profile"] = self.amemo_profile(
             agent_label=agent_label,
             memory_slot=normalized_slot,
             runtime_metadata=runtime_metadata,
@@ -3343,7 +3705,7 @@ class AgentMemoryService:
         baseline_memory["updated_at"] = datetime.now(UTC).isoformat(timespec="seconds")
 
         if self._stable_payload(existing_memory) != self._stable_payload(baseline_memory):
-            self.store_object_record(
+            self.store_amemo(
                 agent_label=agent_label,
                 memory_slot=normalized_slot,
                 scope_key=normalized_scope_key,
@@ -3364,7 +3726,7 @@ class AgentMemoryService:
         system_prompt: str,
         source_agent_label: str | None = None,
     ) -> bool:
-        object_memory = self.ensure_object_memory(
+        object_memory = self.ensure_amemo(
             agent_label=agent_label,
             memory_slot=memory_slot,
             scope_key=scope_key,
@@ -3405,7 +3767,7 @@ class AgentMemoryService:
         object_memory["session_context"] = session_context
         object_memory["updated_at"] = datetime.now(UTC).isoformat(timespec="seconds")
 
-        return self.store_object_record(
+        return self.store_amemo(
             agent_label=agent_label,
             memory_slot=memory_slot,
             scope_key=scope_key,
@@ -3420,7 +3782,7 @@ class AgentMemoryService:
         memory_slot: str,
         scope_key: str,
     ) -> dict[str, str] | None:
-        object_memory = self.load_object_record(
+        object_memory = self.load_amemo(
             agent_label=agent_label,
             memory_slot=memory_slot,
             scope_key=scope_key,
@@ -3470,24 +3832,27 @@ class AgentMemoryService:
         fallback_memory_slot: str,
         handoff_metadata: dict[str, Any],
         output_payload: dict[str, Any],
+        action_object: str,
     ) -> str:
         sequence_payload = output_payload.get("sequence") if isinstance(output_payload.get("sequence"), dict) else {}
         for candidate in (
             handoff_metadata.get("session_cache_memory_slot"),
+            handoff_metadata.get("memory_slot"),
             handoff_metadata.get("writer_job_name"),
             output_payload.get("memory_slot"),
-            output_payload.get("job_name"),
             output_payload.get("writer_job_name"),
-            sequence_payload.get("writer_job_name"),
+            output_payload.get("job_name"),
             sequence_payload.get("job_name"),
+            sequence_payload.get("writer_job_name"),
+            handoff_metadata.get("job_name"),
             fallback_memory_slot,
         ):
             if isinstance(candidate, str) and candidate.strip():
                 return candidate.strip()
 
         resolved_action = str(output_payload.get("action") or "").strip().lower()
-        if resolved_action == "generate_cover_letter":
-            return "cover_letter_writer"
+        if resolved_action == action_object:
+            return action_object
         return str(fallback_memory_slot or "").strip()
 
     def load_handoff_session_context_entries(
@@ -3512,11 +3877,12 @@ class AgentMemoryService:
                 payload["options"] = _deepcopy_object(options_payload)
             context_entries.append((context_type, payload))
 
-        _append_dict_context("applicant_profile", "applicant_profile")
-        _append_dict_context("profile_result", "profile_result", include_options=True)
-        _append_dict_context("job_posting_result", "job_posting_result", include_options=True)
         _append_dict_context("object_result", "object_result")
+        _append_dict_context("object_result", "object_result", include_options=True)
         _append_dict_context("dispatcher_updates", "dispatcher_updates")
+        _append_dict_context("applicant_profile", "applicant_profile")
+        _append_dict_context("profile_result", "profile_result")
+        _append_dict_context("job_posting_result", "job_posting_result")
 
         if isinstance(options_payload, dict):
             context_entries.append(("options", {"options": _deepcopy_object(options_payload)}))
@@ -3549,6 +3915,7 @@ class AgentMemoryService:
             fallback_memory_slot=target_memory_slot,
             handoff_metadata=metadata,
             output_payload=output_payload,
+            action_object=str(target_memory_slot or "").strip(),
         )
         if not resolved_memory_slot:
             return False
@@ -3572,7 +3939,7 @@ class AgentMemoryService:
                 system_prompt=system_prompt,
                 source_agent_label=source_agent_label,
             ) or stored_any
-        stored_attachments = AGENT_MEMORY_ATTACHMENT_SERVICE.cache_handoff_attachment_context(
+        stored_attachments = OBJECT_MEMORY_ATTACHMENT_SERVICE.cache_attachment_context(
             target_agent_label=target_agent_label,
             target_memory_slot=resolved_memory_slot,
             source_agent_label=source_agent_label,
@@ -3609,8 +3976,29 @@ class AgentMemoryService:
 
 
 class AgentMemoryAttachmentService:
+    
     ATTACHMENT_CONTEXT_TYPE = "ATTACHMENT"
     MAX_ATTACHMENT_DOCUMENTS = 4
+    GENERIC_CORRELATION_KEYS: tuple[str, ...] = (
+        "correlation_id",
+        "id",
+        "_id",
+        "content_sha256",
+        "sha256",
+        "profile_id",
+        "job_id",
+        "uuid",
+        "j_id",
+    )
+    GENERIC_OBJECT_NAME_KEYS: tuple[str, ...] = (
+        "obj_name",
+        "object_name",
+        "object",
+        "entity",
+        "kind",
+        "type",
+    )
+    GENERIC_RESULT_CONTAINER_KEYS: tuple[str, ...] = ("result", "parsed")
 
     def __init__(self, agent_memory_service: AgentMemoryService) -> None:
         self.agent_memory_service = agent_memory_service
@@ -3633,6 +4021,315 @@ class AgentMemoryAttachmentService:
             "parsed_job_posting": "job_postings",
         }
         return alias_map.get(normalized_value, normalized_value)
+
+    def _collect_runtime_job_names(
+        self,
+        *,
+        handoff_metadata: dict[str, Any],
+        output_payload: dict[str, Any],
+        runtime_metadata: dict[str, Any],
+    ) -> list[str]:
+        resolved_names: list[str] = []
+        seen_names: set[str] = set()
+
+        def _append_name(candidate: Any) -> None:
+            normalized = str(candidate or "").strip()
+            if not normalized or normalized in seen_names:
+                return
+            seen_names.add(normalized)
+            resolved_names.append(normalized)
+
+        sequence_payload = output_payload.get("sequence") if isinstance(output_payload.get("sequence"), Mapping) else {}
+        for candidate in (
+            handoff_metadata.get("job_name"),
+            output_payload.get("job_name"),
+            sequence_payload.get("job_name") if isinstance(sequence_payload, Mapping) else None,
+            runtime_metadata.get("job_name"),
+        ):
+            _append_name(candidate)
+
+        runtime_job_skill_profiles = runtime_metadata.get("job_skill_profiles")
+        if isinstance(runtime_job_skill_profiles, Mapping):
+            for job_name in runtime_job_skill_profiles.keys():
+                _append_name(job_name)
+
+        return resolved_names
+
+    def _collect_runtime_skill_profiles(
+        self,
+        *,
+        runtime_metadata: dict[str, Any],
+        job_names: Sequence[str],
+    ) -> list[str]:
+        resolved_profiles: list[str] = []
+        seen_profiles: set[str] = set()
+
+        def _append_profile(candidate: Any) -> None:
+            normalized = str(candidate or "").strip()
+            if not normalized or normalized in seen_profiles:
+                return
+            seen_profiles.add(normalized)
+            resolved_profiles.append(normalized)
+
+        _append_profile(runtime_metadata.get("skill_profile"))
+        runtime_job_skill_profiles = runtime_metadata.get("job_skill_profiles")
+        if isinstance(runtime_job_skill_profiles, Mapping):
+            for job_name in job_names:
+                _append_profile(runtime_job_skill_profiles.get(job_name))
+
+        for job_name in job_names:
+            job_config = _get_job_config_for_memory(job_name)
+            if not job_config:
+                continue
+            _append_profile(job_config.get("skill_profile"))
+
+        return resolved_profiles
+
+    def _collect_runtime_workflow_names(self, *, job_names: Sequence[str]) -> list[str]:
+        resolved_workflows: list[str] = []
+        seen_workflows: set[str] = set()
+        for job_name in job_names:
+            job_config = _get_job_config_for_memory(job_name)
+            workflow_name = str(job_config.get("workflow_name") or "").strip()
+            if not workflow_name or workflow_name in seen_workflows:
+                continue
+            seen_workflows.add(workflow_name)
+            resolved_workflows.append(workflow_name)
+        return resolved_workflows
+
+    def _collect_runtime_default_obj_names(self, *, job_names: Sequence[str]) -> list[str]:
+        resolved_names: list[str] = []
+        seen_names: set[str] = set()
+
+        def _append_obj_name(candidate: Any) -> None:
+            normalized = self._normalize_attachment_obj_name(str(candidate or ""))
+            if not normalized or normalized in seen_names:
+                return
+            seen_names.add(normalized)
+            resolved_names.append(normalized)
+
+        for job_name in job_names:
+            job_config = _get_job_config_for_memory(job_name)
+            _append_obj_name(job_config.get("default_object_name"))
+
+            workflow_name = str(job_config.get("workflow_name") or "").strip()
+            if not workflow_name:
+                continue
+            workflow_config = _get_workflow_config_for_memory(workflow_name)
+            _append_obj_name(workflow_config.get("default_object_name"))
+            workflow_object_defaults = workflow_config.get("object_defaults")
+            if isinstance(workflow_object_defaults, Mapping):
+                for value in workflow_object_defaults.values():
+                    _append_obj_name(value)
+
+        return resolved_names
+
+    def _load_runtime_key_hints(
+        self,
+        *,
+        handoff_metadata: dict[str, Any],
+        output_payload: dict[str, Any],
+        runtime_metadata: dict[str, Any],
+        job_names: Sequence[str],
+        skill_profiles: Sequence[str],
+        workflow_names: Sequence[str],
+        default_obj_names: Sequence[str],
+    ) -> list[str]:
+        key_hints: set[str] = {
+            "correlation_id",
+            "obj_name",
+            "parsed",
+            "result",
+            "id",
+            "object_result",
+            "dispatcher_updates",
+        }
+
+        sequence_payload = output_payload.get("sequence") if isinstance(output_payload.get("sequence"), Mapping) else {}
+        for candidate in (
+            handoff_metadata.get("result_field"),
+            handoff_metadata.get("parsed_field"),
+            handoff_metadata.get("payload_field"),
+            handoff_metadata.get("correlation_field"),
+            output_payload.get("result_field"),
+            output_payload.get("parsed_field"),
+            output_payload.get("payload_field"),
+            output_payload.get("correlation_field"),
+            sequence_payload.get("result_field") if isinstance(sequence_payload, Mapping) else None,
+            sequence_payload.get("parsed_field") if isinstance(sequence_payload, Mapping) else None,
+            sequence_payload.get("payload_field") if isinstance(sequence_payload, Mapping) else None,
+            sequence_payload.get("correlation_field") if isinstance(sequence_payload, Mapping) else None,
+        ):
+            normalized = re.sub(r"[^a-z0-9_]+", "_", str(candidate or "").strip().lower()).strip("_")
+            if normalized:
+                key_hints.add(normalized)
+
+        runtime_text_hints = [
+            str(item)
+            for item in (
+                *job_names,
+                *skill_profiles,
+                *workflow_names,
+                str(handoff_metadata.get("handoff_schema") or ""),
+                str(handoff_metadata.get("sequence_name") or ""),
+            )
+            if str(item or "").strip()
+        ]
+        for hint in runtime_text_hints:
+            normalized_hint = re.sub(r"[^a-z0-9_]+", "_", hint.lower()).strip("_")
+            if not normalized_hint:
+                continue
+            if "profile" in normalized_hint:
+                key_hints.update({"applicant_profile", "profile_result", "profile", "parsed_profile"})
+            if "job_posting" in normalized_hint or "posting" in normalized_hint:
+                key_hints.update({"job_posting_result", "job_posting", "parsed_job_posting"})
+            if "dispatch" in normalized_hint or "object" in normalized_hint:
+                key_hints.update({"object_result", "dispatcher_updates", "result", "parsed"})
+            if "writer" in normalized_hint or "cover_letter" in normalized_hint:
+                key_hints.update({"cover_letter", "cover_letter_result", "document"})
+            if "parser" in normalized_hint:
+                key_hints.update({"parsed", "result"})
+
+        for default_obj_name in default_obj_names:
+            if default_obj_name == "profiles":
+                key_hints.update({"applicant_profile", "profile_result", "profile", "parsed_profile"})
+            elif default_obj_name == "job_postings":
+                key_hints.update({"job_posting_result", "job_posting", "parsed_job_posting"})
+            elif default_obj_name == "cover_letters":
+                key_hints.update({"cover_letter", "cover_letter_result", "document"})
+            elif default_obj_name == "emails":
+                key_hints.update({"email", "email_result", "message"})
+            elif default_obj_name == "documents":
+                key_hints.update({"document", "object_result", "result", "parsed"})
+
+        for skill_profile_name in skill_profiles:
+            skill_profile = _get_skill_profile_config_for_memory(skill_profile_name)
+            normalized_job_name = str(skill_profile.get("job_name") or "").strip().lower()
+            if "profile" in normalized_job_name:
+                key_hints.update({"applicant_profile", "profile_result"})
+            if "posting" in normalized_job_name:
+                key_hints.update({"job_posting_result", "job_posting"})
+
+        return [key for key in sorted(key_hints) if key]
+
+    def _load_correlation_candidates_from_payload(self, payload_value: Mapping[str, Any]) -> list[Any]:
+        candidates: list[Any] = []
+
+        nested_payloads: list[Mapping[str, Any]] = [payload_value]
+        for container_key in ("metadata", "value", *self.GENERIC_RESULT_CONTAINER_KEYS):
+            container = payload_value.get(container_key)
+            if isinstance(container, Mapping):
+                nested_payloads.append(container)
+
+        for nested_payload in nested_payloads:
+            for key_name in self.GENERIC_CORRELATION_KEYS:
+                candidates.append(nested_payload.get(key_name))
+
+        return candidates
+
+    def _infer_obj_name_from_field(
+        self,
+        *,
+        source_field: str,
+        default_obj_names: Sequence[str],
+    ) -> str:
+        normalized_field = re.sub(r"[^a-z0-9_]+", "_", str(source_field or "").strip().lower()).strip("_")
+        if "profile" in normalized_field:
+            return "profiles"
+        if "job_posting" in normalized_field or "posting" in normalized_field:
+            return "job_postings"
+        if "cover_letter" in normalized_field or normalized_field.startswith("cv"):
+            return "cover_letters"
+        if "mail" in normalized_field or "email" in normalized_field:
+            return "emails"
+        if default_obj_names:
+            return str(default_obj_names[0] or "")
+        return ""
+
+    def _iter_attachment_source_objects(
+        self,
+        *,
+        output_payload: dict[str, Any],
+        key_hints: Sequence[str],
+    ) -> Iterable[tuple[str, dict[str, Any]]]:
+        emitted_keys: set[tuple[str, int]] = set()
+
+        def _emit(source_field: str, source_value: Any) -> Iterable[tuple[str, dict[str, Any]]]:
+            if not isinstance(source_value, Mapping):
+                return []
+            cache_key = (str(source_field), id(source_value))
+            if cache_key in emitted_keys:
+                return []
+            emitted_keys.add(cache_key)
+            return [(str(source_field), dict(source_value))]
+
+        for key_hint in key_hints:
+            if key_hint in output_payload:
+                for emitted in _emit(key_hint, output_payload.get(key_hint)):
+                    yield emitted
+
+        for source_field, source_value in output_payload.items():
+            if not isinstance(source_value, Mapping):
+                continue
+            for emitted in _emit(str(source_field), source_value):
+                yield emitted
+
+        for container_key in self.GENERIC_RESULT_CONTAINER_KEYS:
+            container_payload = output_payload.get(container_key)
+            if not isinstance(container_payload, Mapping):
+                continue
+            for emitted in _emit(container_key, container_payload):
+                yield emitted
+            for nested_key, nested_value in container_payload.items():
+                if not isinstance(nested_value, Mapping):
+                    continue
+                source_field = f"{container_key}.{nested_key}"
+                for emitted in _emit(source_field, nested_value):
+                    yield emitted
+
+    def _append_attachment_from_source(
+        self,
+        attachment_objects: list[dict[str, Any]],
+        *,
+        source_field: str,
+        source_payload: dict[str, Any],
+        metadata: dict[str, Any],
+        output_payload: dict[str, Any],
+        default_obj_names: Sequence[str],
+    ) -> None:
+        correlation_candidates = self._load_correlation_candidates_from_payload(source_payload)
+        correlation_candidates.extend(
+            [
+                output_payload.get("correlation_id"),
+                output_payload.get("id"),
+                metadata.get("correlation_id"),
+                metadata.get("id"),
+                metadata.get("_id"),
+            ]
+        )
+
+        obj_name_candidates: list[Any] = [
+            source_payload.get(key_name)
+            for key_name in self.GENERIC_OBJECT_NAME_KEYS
+        ]
+        inferred_obj_name = self._infer_obj_name_from_field(
+            source_field=source_field,
+            default_obj_names=default_obj_names,
+        )
+        if inferred_obj_name:
+            obj_name_candidates.append(inferred_obj_name)
+
+        resolved_obj_name = self._first_non_empty(obj_name_candidates)
+        if not resolved_obj_name:
+            return
+
+        self._append_attachment_object(
+            attachment_objects,
+            attachment_type=source_field,
+            obj_name=resolved_obj_name,
+            correlation_candidates=tuple(correlation_candidates),
+            source_field=source_field,
+        )
 
     def _append_attachment_object(
         self,
@@ -3671,73 +4368,97 @@ class AgentMemoryAttachmentService:
             }
         )
 
-    def load_handoff_attachment_payload(
+    def load_attachment_payload(
         self,
         *,
         handoff_payload: dict[str, Any] | None,
         handoff_metadata: dict[str, Any] | None,
+        runtime_metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         payload = dict(handoff_payload or {})
         metadata = dict(handoff_metadata or {})
+        runtime = dict(runtime_metadata or {})
         output_payload = payload.get("output") if isinstance(payload.get("output"), dict) else {}
         if not isinstance(output_payload, dict):
             return {}
 
-        attachment_objects: list[dict[str, Any]] = []
-        profile_result = output_payload.get("profile_result") if isinstance(output_payload.get("profile_result"), dict) else {}
-        applicant_profile = output_payload.get("applicant_profile") if isinstance(output_payload.get("applicant_profile"), dict) else {}
-        applicant_profile_value = applicant_profile.get("value") if isinstance(applicant_profile.get("value"), dict) else {}
-        profile_payload = profile_result.get("profile") if isinstance(profile_result.get("profile"), dict) else {}
-        self._append_attachment_object(
-            attachment_objects,
-            attachment_type="applicant_profile",
-            obj_name="profiles",
-            correlation_candidates=(
-                profile_result.get("correlation_id"),
-                profile_result.get("profile_id"),
-                profile_payload.get("profile_id"),
-                applicant_profile.get("profile_id"),
-                applicant_profile_value.get("profile_id"),
-                output_payload.get("profile_id"),
-                metadata.get("profile_id"),
-            ),
-            source_field="profile_result.correlation_id",
+        runtime_job_names = self._collect_runtime_job_names(
+            handoff_metadata=metadata,
+            output_payload=output_payload,
+            runtime_metadata=runtime,
+        )
+        runtime_skill_profiles = self._collect_runtime_skill_profiles(
+            runtime_metadata=runtime,
+            job_names=runtime_job_names,
+        )
+        runtime_workflow_names = self._collect_runtime_workflow_names(job_names=runtime_job_names)
+        runtime_default_obj_names = self._collect_runtime_default_obj_names(job_names=runtime_job_names)
+        key_hints = self._load_runtime_key_hints(
+            handoff_metadata=metadata,
+            output_payload=output_payload,
+            runtime_metadata=runtime,
+            job_names=runtime_job_names,
+            skill_profiles=runtime_skill_profiles,
+            workflow_names=runtime_workflow_names,
+            default_obj_names=runtime_default_obj_names,
         )
 
-        job_posting_result = output_payload.get("job_posting_result") if isinstance(output_payload.get("job_posting_result"), dict) else {}
-        sequence_payload = output_payload.get("sequence") if isinstance(output_payload.get("sequence"), dict) else {}
-        self._append_attachment_object(
+        attachment_objects: list[dict[str, Any]] = []
+        for source_field, source_payload in self._iter_attachment_source_objects(
+            output_payload=output_payload,
+            key_hints=key_hints,
+        ):
+            self._append_attachment_from_source(
+                attachment_objects,
+                source_field=source_field,
+                source_payload=source_payload,
+                metadata=metadata,
+                output_payload=output_payload,
+                default_obj_names=runtime_default_obj_names,
+            )
+
+        # Fall back to top-level generic keys whenever possible.
+        self._append_attachment_from_source(
             attachment_objects,
-            attachment_type="parsed_job_posting",
-            obj_name="job_postings",
-            correlation_candidates=(
-                job_posting_result.get("correlation_id"),
-                job_posting_result.get("content_sha256"),
-                output_payload.get("job_posting_id"),
-                output_payload.get("job_posting_correlation_id"),
-                metadata.get("job_posting_id"),
-                metadata.get("job_posting_correlation_id"),
-                sequence_payload.get("job_posting_correlation_id"),
-            ),
-            source_field="job_posting_result.correlation_id",
+            source_field="output",
+            source_payload=output_payload,
+            metadata=metadata,
+            output_payload=output_payload,
+            default_obj_names=runtime_default_obj_names,
         )
 
         if not attachment_objects:
             return {}
 
+        sequence_payload = output_payload.get("sequence") if isinstance(output_payload.get("sequence"), dict) else {}
         return {
             "attachments": attachment_objects,
-            "writer_job_name": self._first_non_empty(
+            "job_name": self._first_non_empty(
                 (
-                    metadata.get("writer_job_name"),
-                    output_payload.get("writer_job_name"),
-                    sequence_payload.get("writer_job_name"),
+                    metadata.get("job_name"),
+                    output_payload.get("job_name"),
+                    sequence_payload.get("job_name"),
+                    runtime.get("job_name"),
                 )
             ),
             "cached_at": datetime.now(UTC).isoformat(timespec="seconds"),
         }
 
-    def cache_handoff_attachment_context(
+    def load_handoff_attachment_payload(
+        self,
+        *,
+        handoff_payload: dict[str, Any] | None,
+        handoff_metadata: dict[str, Any] | None,
+        runtime_metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Compatibility wrapper for the legacy handoff-specific method name."""
+        return self.load_attachment_payload(
+            handoff_payload=handoff_payload,
+            handoff_metadata=handoff_metadata,
+            runtime_metadata=runtime_metadata,
+        )
+
+    def cache_attachment_context(
         self,
         *,
         target_agent_label: str,
@@ -3749,9 +4470,10 @@ class AgentMemoryAttachmentService:
         runtime_metadata: dict[str, Any] | None,
         system_prompt: str,
     ) -> bool:
-        attachment_payload = self.load_handoff_attachment_payload(
+        attachment_payload = self.load_attachment_payload(
             handoff_payload=handoff_payload,
             handoff_metadata=handoff_metadata,
+            runtime_metadata=runtime_metadata,
         )
         if not attachment_payload:
             return False
@@ -3767,6 +4489,30 @@ class AgentMemoryAttachmentService:
             source_agent_label=source_agent_label,
         )
 
+    def cache_handoff_attachment_context(
+        self,
+        *,
+        target_agent_label: str,
+        target_memory_slot: str,
+        source_agent_label: str | None,
+        handoff_payload: dict[str, Any] | None,
+        handoff_metadata: dict[str, Any] | None,
+        scope_key: str,
+        runtime_metadata: dict[str, Any] | None,
+        system_prompt: str,
+    ) -> bool:
+        """Compatibility wrapper for the legacy handoff-specific method name."""
+        return self.cache_attachment_context(
+            target_agent_label=target_agent_label,
+            target_memory_slot=target_memory_slot,
+            source_agent_label=source_agent_label,
+            handoff_payload=handoff_payload,
+            handoff_metadata=handoff_metadata,
+            scope_key=scope_key,
+            runtime_metadata=runtime_metadata,
+            system_prompt=system_prompt,
+        )
+
     def load_object_attachment_entries(
         self,
         *,
@@ -3774,7 +4520,7 @@ class AgentMemoryAttachmentService:
         memory_slot: str,
         scope_key: str,
     ) -> list[dict[str, Any]]:
-        object_memory = self.agent_memory_service.load_object_record(
+        object_memory = self.agent_memory_service.load_amemo(
             agent_label=agent_label,
             memory_slot=memory_slot,
             scope_key=scope_key,
@@ -3918,5 +4664,9 @@ class AgentMemoryAttachmentService:
 
 
 AGENT_MEMORY_SERVICE = AgentMemoryService()
-AGENT_MEMORY_ATTACHMENT_SERVICE = AgentMemoryAttachmentService(AGENT_MEMORY_SERVICE)
+OBJECT_MEMORY_ATTACHMENT_SERVICE = AgentMemoryAttachmentService(AGENT_MEMORY_SERVICE)
+AGENT_MEMORY_ATTACHMENT_SERVICE = OBJECT_MEMORY_ATTACHMENT_SERVICE
+
+# Backward-compatibility exports for legacy imports.
+ObjectMemoryAttachmentService = AgentMemoryAttachmentService
 

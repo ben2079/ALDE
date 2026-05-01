@@ -334,6 +334,63 @@ ALDE/ALDE/AppData/VSM_4_Data/applicant_profile.json
 
 ---
 
+## Router Parallel Branch Runtime (Optional)
+
+The runtime can parallelize multiple `route_to_agent` branches from `_xplaner_xrouter` and merge them in tool-call order.
+This mode is opt-in.
+
+### Environment Variables
+
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `ALDE_ROUTER_BRANCH_PARALLEL_ENABLED` | `0` | Enable parallel execution for multi-branch `route_to_agent` tool-call groups |
+| `ALDE_ROUTER_BRANCH_PARALLEL_WORKERS` | `4` | Maximum worker concurrency (`1..16`) |
+| `ALDE_ROUTER_BRANCH_TIMEOUT_SECONDS` | `30.0` | Per-branch timeout threshold used by timeout classification (`0.1..600`) |
+| `ALDE_ROUTER_BRANCH_HARD_TIMEOUT_ENABLED` | `0` | Use hard timeout mode with subprocess termination for overdue branches |
+
+### Recommended Presets
+
+Balanced local profile:
+
+```bash
+source scripts/router_parallel_presets.env.example
+
+export ALDE_ROUTER_BRANCH_PARALLEL_ENABLED=1
+export ALDE_ROUTER_BRANCH_PARALLEL_WORKERS=2
+export ALDE_ROUTER_BRANCH_TIMEOUT_SECONDS=30
+export ALDE_ROUTER_BRANCH_HARD_TIMEOUT_ENABLED=0
+```
+
+Strict timeout profile:
+
+```bash
+source scripts/router_parallel_presets_strict.env.example
+
+export ALDE_ROUTER_BRANCH_PARALLEL_ENABLED=1
+export ALDE_ROUTER_BRANCH_PARALLEL_WORKERS=4
+export ALDE_ROUTER_BRANCH_TIMEOUT_SECONDS=10
+export ALDE_ROUTER_BRANCH_HARD_TIMEOUT_ENABLED=1
+```
+
+### Runtime Semantics
+
+1. Result merge order remains deterministic (tool-call order), even when branches execute concurrently.
+2. Partial failure is reported when at least one branch is `failed` or `timeout`.
+3. In hard-timeout mode, timed-out branches are actively terminated via subprocess control.
+4. In non-hard mode, timeout status is classification-based (no forced cancellation).
+
+### Observability Fields
+
+Runtime observability and desktop monitoring snapshots project router-branch telemetry through:
+
+- `router_parallel_total_runs`
+- `router_parallel_timeout_branches`
+- `router_parallel_partial_fail_runs`
+- `router_parallel_hard_timeout_runs`
+- `router_parallel_hard_timeout_enabled`
+
+---
+
 ## Next Steps
 
 1. **Read**: [ORCHESTRATOR_USAGE.md](ORCHESTRATOR_USAGE.md) for detailed reference

@@ -24,11 +24,12 @@ import importlib
 import importlib.util
 import json
 import os
+import re
 from pathlib import Path
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
-from PySide6.QtCore import Qt, QTimer, Slot
+from PySide6.QtCore import Qt, QTimer, Slot, QSize
 from PySide6.QtGui import (
     QColor,
     QFont,
@@ -49,6 +50,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QHBoxLayout,
     QFrame,
+    QSizePolicy,
 )
 
 try:
@@ -81,11 +83,15 @@ def _load_optional_mongo_client_class() -> Any | None:
 
 
 class TreeDataPersistenceService:
-    """Persist tree data either in MongoDB or in a local JSON fallback file."""
+    """Persist tree data either in AgentDB or in a local JSON fallback file."""
+
+    _ENV_ASSIGNMENT_PATTERN = re.compile(r"^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$")
+    _ENV_OBJECT_NAME_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
     _AI_IDE_SECTION_NAME_ORDER: tuple[str, ...] = (
         "PROJECTS",
         "RUNTIME",
+        "ENV",
         "TEMPLATES",
         "DATABASES",
         "CHAT_HISTORY",
@@ -96,8 +102,7 @@ class TreeDataPersistenceService:
         "HISTORY",
     )
     _PROJECTION_SOURCE_OBJECT_DEFINITION: tuple[dict[str, Any], ...] = (
-        {"section": "RUNTIME", "key": "runtime_config_db", "kind": "json_file", "file_name": "runtime_config_db.json"},
-        {"section": "RUNTIME", "key": "runtime_config2_db", "kind": "json_file", "file_name": "runtime_config#2_db.json"},
+        {"section": "ENV", "key": ".env", "kind": "env_file", "file_name": ".env"},
         {"section": "RUNTIME_VIEWS", "key": "runtime_tabs", "kind": "json_file", "file_name": "control_plane_runtime_tabs.json"},
         {"section": "DISPATCHER_DB", "key": "dispatcher_doc_db", "kind": "json_file", "file_name": "dispatcher_doc_db.json"},
         {"section": "DATABASES", "key": "agentsdb_connection", "kind": "json_file", "file_name": "agentsdb_connection.json"},
@@ -188,7 +193,9 @@ class TreeDataPersistenceService:
             except Exception:
                 raw_path = ""
             if raw_path:
-                return Path(raw_path)
+                path = Path(raw_path)
+                if path.exists() and path.is_file():
+                    return path
         return None
 
     def _tree_data_content_hash(self, data: Any) -> str:
@@ -418,6 +425,246 @@ class TreeDataPersistenceService:
             "entries": entry_list,
         }
 
+    def _env_projection_path_candidates(self, app_data_dir_list: list[Path]) -> list[Path]:
+        source_file = Path(__file__).resolve()
+        candidate_path_list: list[Path] = [
+            source_file.parents[1] / ".env",
+            source_file.parents[2] / ".env",
+            source_file.with_suffix(".env"),
+        ]
+
+        for app_data_dir in app_data_dir_list:
+            candidate_path_list.append(app_data_dir.parent / ".env")
+            candidate_path_list.append(app_data_dir.parent.parent / ".env")
+
+        unique_candidate_path_list: list[Path] = []
+        seen_path_set: set[str] = set()
+        for candidate_path in candidate_path_list:
+            expanded_candidate_path = candidate_path.expanduser()
+            try:
+                normalized_candidate_path = str(expanded_candidate_path.resolve())
+            except Exception:
+                normalized_candidate_path = str(expanded_candidate_path)
+            if normalized_candidate_path in seen_path_set:
+                continue
+            seen_path_set.add(normalized_candidate_path)
+            unique_candidate_path_list.append(expanded_candidate_path)
+
+        return unique_candidate_path_list
+
+    def _load_env_projection_object(self, env_path: Path) -> dict[str, Any] | None:
+        if not env_path.is_file():
+            return None
+
+        try:
+            line_list = env_path.read_text(encoding="utf-8", errors="replace").splitlines()
+        except Exception:
+            return None
+
+        section_payload_map: dict[str, dict[str, dict[str, Any]]] = {}
+
+        def ensure_section_payload(section_name: str) -> str:
+            normalized_section_name = str(section_name or "").strip() or "General"
+            if normalized_section_name not in section_payload_map:
+                section_payload_map[normalized_section_name] = {}
+            return normalized_section_name
+
+        current_section_name = ensure_section_payload("General")
+
+        for raw_line in line_list:
+            stripped_line = str(raw_line or "").strip()
+            if not stripped_line:
+                continue
+
+            if stripped_line.startswith("#"):
+                comment_payload = stripped_line[1:].strip()
+                if not comment_payload:
+                    continue
+
+                disabled_assignment_match = self._ENV_ASSIGNMENT_PATTERN.match(comment_payload)
+                if disabled_assignment_match is not None:
+                    variable_name = str(disabled_assignment_match.group(1) or "").strip()
+                    if not variable_name:
+                        continue
+                    section_payload_map[current_section_name][variable_name] = {
+                        "value": str(disabled_assignment_match.group(2) or ""),
+                        "enabled": False,
+                    }
+                    continue
+
+                # Treat comment lines without key/value assignment as section headers.
+                if "=" not in comment_payload:
+                    current_section_name = ensure_section_payload(comment_payload)
+                continue
+
+            assignment_match = self._ENV_ASSIGNMENT_PATTERN.match(stripped_line)
+            if assignment_match is None:
+                continue
+
+            variable_name = str(assignment_match.group(1) or "").strip()
+            if not variable_name:
+                continue
+
+            section_payload_map[current_section_name][variable_name] = {
+                "value": str(assignment_match.group(2) or ""),
+                "enabled": True,
+            }
+
+        variable_count = 0
+        enabled_count = 0
+        for section_payload in section_payload_map.values():
+            for field_payload in section_payload.values():
+                variable_count += 1
+                if bool(field_payload.get("enabled")):
+                    enabled_count += 1
+
+        return {
+            "_meta": {
+                "source_path": str(env_path),
+                "section_count": len(section_payload_map),
+                "variable_count": variable_count,
+                "enabled_count": enabled_count,
+                "disabled_count": max(0, variable_count - enabled_count),
+            },
+            "sections": section_payload_map,
+        }
+
+    @staticmethod
+    def _env_projection_payload_from_tree_data(data: dict[str, Any]) -> dict[str, Any] | None:
+        env_section_payload = data.get("ENV") if isinstance(data, dict) else None
+        if not isinstance(env_section_payload, dict):
+            return None
+
+        preferred_payload = env_section_payload.get(".env")
+        if isinstance(preferred_payload, dict) and isinstance(preferred_payload.get("sections"), dict):
+            return preferred_payload
+
+        for payload in env_section_payload.values():
+            if isinstance(payload, dict) and isinstance(payload.get("sections"), dict):
+                return payload
+        return None
+
+    def _resolve_env_projection_write_path(self, env_projection_payload: dict[str, Any]) -> Path | None:
+        meta_payload = env_projection_payload.get("_meta") if isinstance(env_projection_payload, dict) else None
+        configured_source_path = str((meta_payload or {}).get("source_path") or "").strip()
+        if configured_source_path:
+            return Path(configured_source_path).expanduser()
+
+        app_data_dir_list = self._projection_app_data_dir_list()
+        candidate_path_list = self._env_projection_path_candidates(app_data_dir_list)
+        for candidate_path in candidate_path_list:
+            if candidate_path.exists() and candidate_path.is_file():
+                return candidate_path
+        if candidate_path_list:
+            return candidate_path_list[0]
+        return None
+
+    @staticmethod
+    def _serialize_env_projection_value(value: Any) -> str:
+        if value is None:
+            return ""
+        if isinstance(value, bool):
+            return "true" if value else "false"
+        if isinstance(value, (dict, list, tuple)):
+            try:
+                return json.dumps(value, ensure_ascii=False)
+            except Exception:
+                return str(value)
+        return str(value)
+
+    def _serialize_env_projection_sections(
+        self,
+        sections_payload: dict[str, Any],
+    ) -> tuple[str, int, int, int]:
+        section_block_list: list[list[str]] = []
+        section_count = 0
+        variable_count = 0
+        enabled_count = 0
+
+        for raw_section_name, section_payload in sections_payload.items():
+            section_name = str(raw_section_name or "").strip() or "General"
+            section_variable_payload = section_payload if isinstance(section_payload, dict) else {}
+
+            section_line_list: list[str] = []
+            include_header = section_name.lower() != "general"
+            if include_header:
+                section_line_list.append(f"# {section_name}")
+
+            section_variable_count = 0
+            for raw_variable_name, raw_variable_payload in section_variable_payload.items():
+                variable_name = str(raw_variable_name or "").strip()
+                if not self._ENV_OBJECT_NAME_PATTERN.match(variable_name):
+                    continue
+
+                if isinstance(raw_variable_payload, dict):
+                    value_payload = raw_variable_payload.get("value", "")
+                    enabled_payload = bool(raw_variable_payload.get("enabled", True))
+                else:
+                    value_payload = raw_variable_payload
+                    enabled_payload = True
+
+                value_text = self._serialize_env_projection_value(value_payload)
+                line_prefix = "" if enabled_payload else "# "
+                section_line_list.append(f"{line_prefix}{variable_name}={value_text}")
+                section_variable_count += 1
+                variable_count += 1
+                if enabled_payload:
+                    enabled_count += 1
+
+            if section_variable_count <= 0:
+                continue
+            section_count += 1
+            section_block_list.append(section_line_list)
+
+        serialized_line_list: list[str] = []
+        for block_index, section_block in enumerate(section_block_list):
+            if block_index > 0:
+                serialized_line_list.append("")
+            serialized_line_list.extend(section_block)
+
+        serialized_payload = "\n".join(serialized_line_list).rstrip()
+        if serialized_payload:
+            serialized_payload += "\n"
+        return serialized_payload, section_count, variable_count, enabled_count
+
+    def persist_env_projection_from_tree_data(self, data: dict[str, Any]) -> Path | None:
+        env_projection_payload = self._env_projection_payload_from_tree_data(data)
+        if not isinstance(env_projection_payload, dict):
+            return None
+
+        sections_payload = env_projection_payload.get("sections")
+        if not isinstance(sections_payload, dict):
+            return None
+
+        env_path = self._resolve_env_projection_write_path(env_projection_payload)
+        if env_path is None:
+            return None
+
+        serialized_payload, section_count, variable_count, enabled_count = self._serialize_env_projection_sections(sections_payload)
+
+        existing_payload: str | None = None
+        if env_path.exists() and env_path.is_file():
+            try:
+                existing_payload = env_path.read_text(encoding="utf-8", errors="replace")
+            except Exception:
+                existing_payload = None
+
+        if existing_payload != serialized_payload:
+            env_path.parent.mkdir(parents=True, exist_ok=True)
+            env_path.write_text(serialized_payload, encoding="utf-8")
+
+        meta_payload = env_projection_payload.get("_meta")
+        if not isinstance(meta_payload, dict):
+            meta_payload = {}
+            env_projection_payload["_meta"] = meta_payload
+        meta_payload["source_path"] = str(env_path)
+        meta_payload["section_count"] = section_count
+        meta_payload["variable_count"] = variable_count
+        meta_payload["enabled_count"] = enabled_count
+        meta_payload["disabled_count"] = max(0, variable_count - enabled_count)
+
+        return env_path
+
     def _load_projection_payload_from_local_source(
         self,
         source_object: dict[str, Any],
@@ -443,6 +690,35 @@ class TreeDataPersistenceService:
                 return history_payload, history_uri, history_mtime
             except Exception:
                 return None, "", None
+
+        if source_kind == "env_file":
+            configured_file_name = str(source_object.get("file_name") or ".env").strip() or ".env"
+            configured_path = Path(configured_file_name).expanduser()
+
+            candidate_path_list: list[Path] = []
+            if configured_path.is_absolute():
+                candidate_path_list.append(configured_path)
+
+            for env_candidate_path in self._env_projection_path_candidates(app_data_dir_list):
+                if configured_path.is_absolute() or env_candidate_path.name == configured_path.name:
+                    candidate_path_list.append(env_candidate_path)
+
+            seen_path_set: set[str] = set()
+            for candidate_path in candidate_path_list:
+                expanded_candidate_path = candidate_path.expanduser()
+                try:
+                    normalized_candidate_path = str(expanded_candidate_path.resolve())
+                except Exception:
+                    normalized_candidate_path = str(expanded_candidate_path)
+                if normalized_candidate_path in seen_path_set:
+                    continue
+                seen_path_set.add(normalized_candidate_path)
+
+                payload = self._load_env_projection_object(expanded_candidate_path)
+                if payload is not None:
+                    return payload, str(expanded_candidate_path), self._mtime_iso(expanded_candidate_path)
+
+            return None, "", None
 
         if source_kind == "json_file":
             file_name = str(source_object.get("file_name") or "").strip()
@@ -755,39 +1031,35 @@ class TreeDataPersistenceService:
             parsed_backend_uri = urlparse(agentsdb_backend_uri)
             if parsed_backend_uri.scheme in {"mongodb", "mongodb+srv"}:
                 return agentsdb_backend_uri
-
-        # Legacy fallback for previous Mongo env variable naming.
-        knowledge_uri = str(os.getenv("AI_IDE_KNOWLEDGE_MONGO_URI", "")).strip()
-        return knowledge_uri or "mongodb://localhost:27017"
-
-    def _mongo_database_name(self) -> str:
-        configured = str(os.getenv("ALDE_TREE_MONGO_DB", "")).strip()
+            
+    def _database_name(self) -> str:
+        configured = str(os.getenv("ALDE_TREE_AGENT_DB", "")).strip()
         if not configured:
             configured = str(self._load_storage_config().get("mongo_database", "")).strip()
         if configured:
             return configured
 
-        knowledge_db = str(os.getenv("AI_IDE_KNOWLEDGE_AGENTS_DB_NAME", "")).strip()
+        knowledge_db = str(os.getenv("AI_IDE_KNOWLEDGE_AGENT_DB", "")).strip()
         if not knowledge_db:
-            knowledge_db = str(os.getenv("AI_IDE_KNOWLEDGE_MONGO_DB", "")).strip()
+            knowledge_db = str(os.getenv("AI_IDE_KNOWLEDGE_AGENT_DB", "")).strip()
         return knowledge_db or "alde_tree_data"
 
-    def _mongo_collection_name(self) -> str:
-        configured = str(os.getenv("ALDE_TREE_MONGO_COLLECTION", "")).strip()
+    def _collection_name(self) -> str:
+        configured = str(os.getenv("ALDE_TREE_COLLECTION", "")).strip()
         if not configured:
-            configured = str(self._load_storage_config().get("mongo_collection", "")).strip()
+            configured = str(self._load_storage_config().get("collection", "")).strip()
         return configured or "tree_widget"
 
-    def _mongo_document_key(self) -> str:
-        configured = str(os.getenv("ALDE_TREE_MONGO_DOCUMENT_KEY", "")).strip()
+    def _document_key(self) -> str:
+        configured = str(os.getenv("ALDE_TREE_DOCUMENT_KEY", "")).strip()
         if not configured:
-            configured = str(self._load_storage_config().get("mongo_document_key", "")).strip()
+            configured = str(self._load_storage_config().get("document_key", "")).strip()
         return configured or "tree_data"
 
-    def _mongo_target_label(self) -> str:
-        return f"{self._mongo_database_name()}.{self._mongo_collection_name()}/{self._mongo_document_key()}"
+    def _target_label(self) -> str:
+        return f"{self._database_name()}.{self._collection_name()}/{self._document_key()}"
 
-    def _get_mongo_collection(self) -> Any | None:
+    def _get_collection(self) -> Any | None:
         if self._mongo_disabled:
             return None
         if self._mongo_collection is not None:
@@ -803,8 +1075,8 @@ class TreeDataPersistenceService:
 
         try:
             self._mongo_client = mongo_client_class(self._mongo_uri(), serverSelectionTimeoutMS=1500)
-            database = self._mongo_client[self._mongo_database_name()]
-            self._mongo_collection = database[self._mongo_collection_name()]
+            database = self._mongo_client[self._database_name()]
+            self._mongo_collection = database[self._collection_name()]
             return self._mongo_collection
         except Exception:
             self._mongo_disabled = True
@@ -848,10 +1120,10 @@ class TreeDataPersistenceService:
                     raise RuntimeError(f"agents_db tree load failed: {exc}") from exc
                 print(f"[WARNING] agents_db tree load failed, trying legacy backends: {exc}")
 
-        mongo_collection = self._get_mongo_collection()
+        mongo_collection = self._get_collection()
         if mongo_collection is not None:
             try:
-                document = mongo_collection.find_one({"_id": self._mongo_document_key()})
+                document = mongo_collection.find_one({"_id": self._document_key()})
                 payload = document.get("data") if isinstance(document, dict) else None
                 if isinstance(payload, dict):
                     normalized_payload = self._merge_local_projection_sections(
@@ -923,11 +1195,11 @@ class TreeDataPersistenceService:
             else:
                 self._purge_agentsdb_tree_object(repository)
 
-        mongo_collection = self._get_mongo_collection()
-        if mongo_collection is not None:
+        _collection = self._get_collection()
+        if _collection is not None:
             try:
-                mongo_collection.update_one(
-                    {"_id": self._mongo_document_key()},
+                _collection.upsert_object(
+                    {"_id": self._document_key()},
                     {
                         "$set": {
                             "data": normalized_data,
@@ -936,7 +1208,7 @@ class TreeDataPersistenceService:
                     },
                     upsert=True,
                 )
-                return "mongodb", self._mongo_target_label()
+                return "mongodb", self._target_label()
             except Exception as exc:
                 print(f"[WARNING] MongoDB tree save failed, falling back to JSON: {exc}")
 
@@ -1217,10 +1489,18 @@ def _icon_from_url(url: str, *, timeout_s: float = 3.0) -> QIcon:
 # ------------------------- JsonTreeWidgetWithToolbar -------------------------------
 class JsonTreeWidgetWithToolbar(QWidget):
     """Wrapper widget that contains toolbar buttons above the JsonTreeWidget."""
+
+    def minimumSizeHint(self) -> QSize:
+        return QSize(0, 0)
+
+    def sizeHint(self) -> QSize:
+        return QSize(220, 180)
     
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setObjectName("JsonTreeWidgetWithToolbar")
+        self.setMinimumSize(0, 0)
+        self.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Expanding)
         
         # Create main layout
         layout = QVBoxLayout(self)
@@ -1270,6 +1550,8 @@ class JsonTreeWidgetWithToolbar(QWidget):
         
         # Create tree widget
         self.tree = JsonTreeWidget(self)
+        self.tree.setMinimumSize(0, 0)
+        self.tree.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Expanding)
         
         # Create buttons
         self._btn_load_history = QToolButton(toolbar)
@@ -1302,16 +1584,6 @@ class JsonTreeWidgetWithToolbar(QWidget):
         self._btn_add_project.setFixedSize(26, 26)
         self._btn_add_project.clicked.connect(self.tree._add_project_root)
         
-        self._btn_add_database = QToolButton(toolbar)
-        icon_db = _icon("swap.svg")
-        if not icon_db.isNull():
-            self._btn_add_database.setIcon(icon_db)
-        else:
-            self._btn_add_database.setText("🗄")
-        self._btn_add_database.setToolTip("Add database connection")
-        self._btn_add_database.setFixedSize(26, 26)
-        self._btn_add_database.clicked.connect(self.tree._add_database_root)
-        
         self._btn_import_json = QToolButton(toolbar)
         # General import entry point for JSON/YAML/TOML/Python data files.
         icon_import = _icon("open_file.svg")
@@ -1334,7 +1606,7 @@ class JsonTreeWidgetWithToolbar(QWidget):
         self._btn_export_json.clicked.connect(self.tree._export_json_file)
         
         self._btn_templates = QToolButton(toolbar)
-        icon_template = _icon("toolbar_24dp_666666_FILL0_wght400_GRAD0_opsz24.svg")
+        icon_template = _icon("schema_25dp_B7B7B7_FILL0_wght500_GRAD0_opsz24.svg")
         if not icon_template.isNull():
             self._btn_templates.setIcon(icon_template)
         else:
@@ -1343,25 +1615,13 @@ class JsonTreeWidgetWithToolbar(QWidget):
         self._btn_templates.setFixedSize(26, 26)
         self._btn_templates.clicked.connect(self.tree._load_template)
         
-        self._btn_save_template = QToolButton(toolbar)
-        icon_save_template = _icon("save_.svg")
-        if not icon_save_template.isNull():
-            self._btn_save_template.setIcon(icon_save_template)
-        else:
-            self._btn_save_template.setText("💾")
-        self._btn_save_template.setToolTip("Save as template")
-        self._btn_save_template.setFixedSize(26, 26)
-        self._btn_save_template.clicked.connect(self.tree._save_as_template)
-        
         # Add buttons to toolbar
         toolbar_layout.addWidget(self._btn_load_history)
         toolbar_layout.addWidget(self._btn_collapse_all)
         toolbar_layout.addWidget(self._btn_add_project)
-        toolbar_layout.addWidget(self._btn_add_database)
         toolbar_layout.addWidget(self._btn_import_json)
         toolbar_layout.addWidget(self._btn_export_json)
         toolbar_layout.addWidget(self._btn_templates)
-        toolbar_layout.addWidget(self._btn_save_template)
         toolbar_layout.addStretch()
         
         # Add widgets to main layout
@@ -1445,6 +1705,7 @@ class JsonTreeWidget(QTreeWidget):
     _DEFAULT_ROOT_SECTION_LAYOUT: tuple[tuple[str, bool], ...] = (
         ("PROJECTS", False),
         ("RUNTIME", True),
+        ("ENV", True),
         ("TEMPLATES", True),
         ("DATABASES", True),
         ("CHAT_HISTORY", True),
@@ -1456,9 +1717,17 @@ class JsonTreeWidget(QTreeWidget):
     )
     _SMALL_FONT_SECTION_NAMES: set[str] = {"PROJECTS", "CHAT_HISTORY", "HISTORY"}
     _HISTORY_SECTION_NAMES: set[str] = {"CHAT_HISTORY", "HISTORY"}
+
+    def minimumSizeHint(self) -> QSize:
+        return QSize(0, 0)
+
+    def sizeHint(self) -> QSize:
+        return QSize(200, 160)
     
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
+        self.setMinimumSize(0, 0)
+        self.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Expanding)
         self.setHeaderHidden(True)
         self.setUniformRowHeights(True)
         self.setAnimated(True)
@@ -1602,12 +1871,13 @@ class JsonTreeWidget(QTreeWidget):
         return {
             "PROJECTS": "deployed_code.svg",
             "RUNTIME": "deployed_code.svg",
-            "TEMPLATES": "toolbar_24dp_666666_FILL0_wght400_GRAD0_opsz24.svg",
-            "DATABASES": "swap.svg",
+            "ENV": "variable_add_26dp_E3E3E3_FILL0_wght600_GRAD0_opsz24.svg",
+            "TEMPLATES": "schema_25dp_B7B7B7_FILL0_wght500_GRAD0_opsz24.svg",
+            "DATABASES": "database_25dp_B7B7B7_FILL0_wght500_GRAD0_opsz24.svg",
             "CHAT_HISTORY": "load_content.svg",
             "DOCUMENTS": "open_file.svg",
             "RUNTIME_VIEWS": "expansion_panels.svg",
-            "DISPATCHER_DB": "swap.svg",
+            "DISPATCHER_DB": "database_25dp_B7B7B7_FILL0_wght500_GRAD0_opsz24.svg",
             "GENERATED_DATA": "file_export_24dp_666666_FILL0_wght400_GRAD0_opsz24.svg",
             "HISTORY": "load_content.svg",
         }.get(str(section_name or "").strip().upper())
@@ -2293,6 +2563,13 @@ class JsonTreeWidget(QTreeWidget):
     def _save_data(self) -> None:
         """Save the current data structure to the configured storage backend."""
         try:
+            try:
+                env_path = self._persistence_service.persist_env_projection_from_tree_data(self._data)
+                if env_path is not None:
+                    print(f"[INFO] ENV projection written to {env_path}")
+            except Exception as env_exc:
+                print(f"[WARNING] Could not write ENV projection: {env_exc}")
+
             payload = json.dumps(self._data, ensure_ascii=False, sort_keys=True)
             payload_hash = hashlib.sha256(payload.encode("utf-8")).hexdigest()
             if self._last_saved_hash == payload_hash:
@@ -2826,6 +3103,7 @@ class JsonTreeWidget(QTreeWidget):
             "Empty Workspace": {
                 "PROJECTS": {},
                 "RUNTIME": {},
+                "ENV": {},
                 "TEMPLATES": {},
                 "DATABASES": {},
                 "CHAT_HISTORY": {},

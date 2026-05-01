@@ -287,20 +287,13 @@ class ChatHistory(VectorStore):
     _ROOT_DIR = str(_VSM3_CANON)
     _APP_DIR = str(_VSM3_CANON)
 
-    # Vector-store metadata lives in manifest.json; chat history lives in history.json.
+    # Vector-store metadata lives in manifest.json.
     _MANIFEST_PATH = str(_MANIFEST_CANON)
-    _HISTORY_PATH = str(_HISTORY_CANON)
-
-    # Legacy locations (read-only / migration sources)
-    _LEGACY_HISTORY_PATHS = [
-        str(_HISTORY_CANON),
-        str(_HISTORY_LEGACY),
-        str(_HISTORY_CANON_TRAILING),
-        str(_HISTORY_LEGACY_TRAILING),
-    ]
-
-    # Backward-compat alias used in some older call sites.
-    _FINAL_PATH = _HISTORY_PATH
+    # File-based history persistence is disabled.
+    # History is stored and restored from agentsdb agent_memory only.
+    _HISTORY_PATH = ""
+    _LEGACY_HISTORY_PATHS: list[str] = []
+    _FINAL_PATH = ""
 
     # Autosave (throttled): helps ensure the most recent GUI run is persisted
     # even if the process crashes or is terminated before Qt shutdown hooks run.
@@ -346,6 +339,11 @@ class ChatHistory(VectorStore):
     _sys:bool | None = None
     _dev_state:bool | None = None
     _sys_state:bool | None = None
+    _AGENT_MEMORY_SYNC_ENV = "AI_IDE_HISTORY_AGENT_MEMORY_SYNC"
+    _AGENT_MEMORY_AGENT_LABEL_ENV = "AI_IDE_HISTORY_AGENT_MEMORY_AGENT_LABEL"
+    _AGENT_MEMORY_SLOT_ENV = "AI_IDE_HISTORY_AGENT_MEMORY_SLOT"
+    _AGENT_MEMORY_CONTEXT_TYPE_ENV = "AI_IDE_HISTORY_AGENT_MEMORY_CONTEXT_TYPE"
+    _AGENT_MEMORY_SCOPE_KEY_ENV = "AI_IDE_HISTORY_AGENT_MEMORY_SCOPE_KEY"
 
     # Ensure app dir exists (safe if already present).
     try:
@@ -487,167 +485,211 @@ class ChatHistory(VectorStore):
 
         cls._value_name = None
         return None
+
+    @classmethod
+    def _history_agent_label(cls) -> str:
+        return str(os.getenv(cls._AGENT_MEMORY_AGENT_LABEL_ENV, "_chat_history")).strip() or "_chat_history"
+
+    @classmethod
+    def _history_context_type(cls) -> str:
+        return str(os.getenv(cls._AGENT_MEMORY_CONTEXT_TYPE_ENV, "history.msg")).strip() or "history.msg"
+
+    @staticmethod
+    def _history_message_from_session_payload(payload: Any) -> dict[str, Any] | None:
+        if not isinstance(payload, dict):
+            return None
+
+        history_message_payload = payload.get("history.msg")
+        if not isinstance(history_message_payload, dict):
+            session_payload = payload.get("session")
+            if isinstance(session_payload, dict):
+                agent_memory_payload = session_payload.get("agent_memory")
+                if isinstance(agent_memory_payload, dict):
+                    history_message_payload = agent_memory_payload.get("history.msg")
+
+        if not isinstance(history_message_payload, dict):
+            return None
+
+        content_payload = history_message_payload.get("content")
+        if isinstance(content_payload, (dict, list, tuple)):
+            try:
+                content_payload = json.dumps(content_payload, ensure_ascii=False)
+            except Exception:
+                content_payload = str(content_payload)
+        elif content_payload is None:
+            content_payload = ""
+        elif not isinstance(content_payload, (str, int, float, bool)):
+            content_payload = str(content_payload)
+
+        tool_name = str(history_message_payload.get("tool_name") or "").strip()
+        tool_call_id = str(history_message_payload.get("tool_call_id") or "").strip()
+
+        normalized_message: dict[str, Any] = {
+            "message-id": history_message_payload.get("message_id"),
+            "role": str(history_message_payload.get("role") or "user").strip() or "user",
+            "content": content_payload,
+            "object": str(history_message_payload.get("object_name") or "chat"),
+            "date": str(history_message_payload.get("date") or ""),
+            "time": str(history_message_payload.get("time") or ""),
+            "thread-name": str(history_message_payload.get("thread_name") or ""),
+            "thread-id": history_message_payload.get("thread_id"),
+            "assistant-name": str(history_message_payload.get("assistant_name") or ""),
+            "assistant-id": str(history_message_payload.get("assistant_id") or ""),
+            "tools": [],
+            "data": None,
+            "tool_choices": "auto",
+            "dev": None,
+            "sys": None,
+            "tool_calls": [],
+            "tool_response_required": True,
+        }
+        if tool_name:
+            normalized_message["name"] = tool_name
+        if tool_call_id:
+            normalized_message["tool_call_id"] = tool_call_id
+        return normalized_message
+
+    @classmethod
+    def _load_history_messages_from_agent_memory(cls) -> list[dict[str, Any]]:
+        try:
+            try:
+                from .agents_db import AGENT_MEMORY_SERVICE  # type: ignore
+            except ImportError as e:
+                msg = str(e)
+                if "attempted relative import" in msg or "no known parent package" in msg:
+                    try:
+                        from alde.agents_db import AGENT_MEMORY_SERVICE  # type: ignore
+                    except ImportError:
+                        from agents_db import AGENT_MEMORY_SERVICE  # type: ignore
+                else:
+                    raise
+        except Exception:
+            return []
+
+        try:
+            try:
+                from .agents_tools import DOCUMENT_REPOSITORY  # type: ignore
+            except ImportError as e:
+                msg = str(e)
+                if "attempted relative import" in msg or "no known parent package" in msg:
+                    try:
+                        from alde.agents_tools import DOCUMENT_REPOSITORY  # type: ignore
+                    except ImportError:
+                        from agents_tools import DOCUMENT_REPOSITORY  # type: ignore
+                else:
+                    raise
+        except Exception:
+            DOCUMENT_REPOSITORY = None  # type: ignore[assignment]
+
+        configured_scope_key = str(os.getenv(cls._AGENT_MEMORY_SCOPE_KEY_ENV, "")).strip()
+        history_agent_label = cls._history_agent_label()
+        history_context_type = cls._history_context_type()
+        history_memory_slot = AGENT_MEMORY_SERVICE.load_amemo_slot(
+            job_name=str(os.getenv(cls._AGENT_MEMORY_SLOT_ENV, "history.msg")).strip() or "history.msg",
+            tool_name="chat_history",
+        )
+
+        history_entry_list: list[tuple[str, int, dict[str, Any]]] = []
+
+        def collect_entry_payloads(object_memory: Any) -> None:
+            if not isinstance(object_memory, dict):
+                return
+            session_context = object_memory.get("session_context")
+            if not isinstance(session_context, dict):
+                return
+            entry_list = session_context.get("entries")
+            if not isinstance(entry_list, list):
+                return
+
+            for entry_index, entry_payload in enumerate(entry_list):
+                if not isinstance(entry_payload, dict):
+                    continue
+                if str(entry_payload.get("context_type") or "").strip() != history_context_type:
+                    continue
+                normalized_message = cls._history_message_from_session_payload(entry_payload.get("payload"))
+                if not isinstance(normalized_message, dict):
+                    continue
+                entry_timestamp = str(entry_payload.get("timestamp") or "").strip()
+                history_entry_list.append((entry_timestamp, entry_index, normalized_message))
+
+        if configured_scope_key:
+            resolved_scope_key = AGENT_MEMORY_SERVICE.load_session_scope_key(
+                scope_key=configured_scope_key,
+                thread_id=None,
+            )
+            object_memory = AGENT_MEMORY_SERVICE.load_amemo(
+                agent_label=history_agent_label,
+                memory_slot=history_memory_slot,
+                scope_key=resolved_scope_key,
+            )
+            collect_entry_payloads(object_memory)
+        elif DOCUMENT_REPOSITORY is not None:
+            try:
+                agent_memory_db = DOCUMENT_REPOSITORY.load_db(
+                    db_name=AGENT_MEMORY_SERVICE.AGENT_MEMORY_OBJECT_NAME,
+                    obj_name=AGENT_MEMORY_SERVICE.AGENT_MEMORY_OBJECT_NAME,
+                )
+            except Exception:
+                agent_memory_db = {}
+
+            record_map = agent_memory_db.get(AGENT_MEMORY_SERVICE.AGENT_MEMORY_OBJECT_NAME)
+            if isinstance(record_map, dict):
+                for record_payload in record_map.values():
+                    if not isinstance(record_payload, dict):
+                        continue
+                    record_job_name = str(record_payload.get("job_name") or "").strip()
+                    if record_job_name and record_job_name != history_memory_slot:
+                        continue
+                    record_agent_label = str(record_payload.get("agent") or "").strip()
+                    if record_agent_label and record_agent_label != history_agent_label:
+                        continue
+
+                    object_memory = record_payload.get(AGENT_MEMORY_SERVICE.AGENT_MEMORY_OBJECT_NAME)
+                    collect_entry_payloads(object_memory)
+
+        history_entry_list.sort(
+            key=lambda item: (
+                str(item[0] or ""),
+                str((item[2] or {}).get("message-id") or ""),
+                int(item[1]),
+            )
+        )
+
+        deduplicated_history: list[dict[str, Any]] = []
+        seen_fingerprint_set: set[str] = set()
+        for _timestamp, _entry_index, message_payload in history_entry_list:
+            try:
+                fingerprint = json.dumps(
+                    {
+                        "message-id": message_payload.get("message-id"),
+                        "role": message_payload.get("role"),
+                        "thread-id": message_payload.get("thread-id"),
+                        "content": message_payload.get("content"),
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    default=str,
+                )
+            except Exception:
+                fingerprint = str(message_payload)
+
+            if fingerprint in seen_fingerprint_set:
+                continue
+            seen_fingerprint_set.add(fingerprint)
+            deduplicated_history.append(message_payload)
+
+        return deduplicated_history
+
     @classmethod
     def _load(cls,path:str|None=None) -> List[Any]:
-            '''
-            Try to read *.json* and return the list that was stored before.
-            Returns an empty list if the file is missing or unreadable.
-            ---
-            path: str - Path to the JSON file to load.
-    
-            '''
-            # Prefer canonical history.json; fall back to legacy locations.
-            primary = str(path) if path else str(getattr(cls, "_HISTORY_PATH", "") or "")
-            candidates: list[str] = []
-            if primary:
-                candidates.append(primary)
-            # Always try canonical then known legacy paths.
-            try:
-                candidates.extend([p for p in (cls._LEGACY_HISTORY_PATHS or []) if p])
-            except Exception:
-                candidates.extend([str(getattr(cls, "_HISTORY_PATH", "") or "")])
-            # Back-compat alias (some older code overwrote it).
-            try:
-                if getattr(cls, "_FINAL_PATH", None):
-                    candidates.append(str(getattr(cls, "_FINAL_PATH")))
-            except Exception:
-                pass
-            seen: set[str] = set()
-
-            for p in candidates:
-                if not p:
-                    continue
-                p = str(p)
-                if p in seen:
-                    continue
-                seen.add(p)
-                try:
-                    with open(p, "r", encoding="utf-8") as fp:
-                        data = json.load(fp)
-                    # Chat history is expected to be a list of message dicts.
-                    if isinstance(data, list):
-                        # Remember where we read from (debuggable), but always
-                        # write to the canonical path.
-                        try:
-                            setattr(cls, "_LAST_READ_HISTORY_PATH", p)
-                        except Exception:
-                            pass
-
-                        # One-time migration: if we loaded from a legacy path
-                        # and canonical file is missing, write canonical.
-                        try:
-                            canon = str(getattr(cls, "_HISTORY_PATH", "") or "")
-                            if canon and os.path.abspath(p) != os.path.abspath(canon):
-                                canon_parent = os.path.dirname(canon)
-                                os.makedirs(canon_parent, exist_ok=True)
-                                if not os.path.exists(canon):
-                                    tmp = canon + ".migrated.tmp"
-                                    with open(tmp, "w", encoding="utf-8") as out:
-                                        json.dump(data, out, indent=2, ensure_ascii=False)
-                                    os.replace(tmp, canon)
-                        except Exception as exc:
-                            print(f"[WARNING] cannot migrate chat history to canonical path: {exc!s}")
-
-                        # Optional legacy cleanup: once canonical exists (either
-                        # because we migrated or it already existed), we can
-                        # remove/backup the historical duplicate files to avoid
-                        # future confusion.
-                        try:
-                            cls._cleanup_legacy_history_files(loaded_data=data)
-                        except Exception:
-                            pass
-                        return data
-                except FileNotFoundError:
-                    continue
-                except (OSError, json.JSONDecodeError) as exc:
-                    print(f"[WARNING] cannot read chat history from {p}: {exc!s}")
-                    continue
-
-            return []
+            _ = path
+            return cls._load_history_messages_from_agent_memory()
 
     @classmethod
     def _cleanup_legacy_history_files(cls, *, loaded_data: list[Any] | None = None) -> None:
-        """Backup or delete legacy history files once canonical is valid.
-
-        Behavior:
-        - Default: rename legacy duplicates to `*.legacy.bak` (non-destructive).
-        - If `AI_IDE_HISTORY_DELETE_LEGACY=1`: delete them instead.
-
-        Safety:
-        - Only touches legacy paths if canonical exists and (when readable)
-          contains the same JSON as the loaded data.
-        - Runs at most once per process.
-        """
-
-        if getattr(cls, "_legacy_cleanup_done", False):
-            return
-        cls._legacy_cleanup_done = True
-
-        canon = str(getattr(cls, "_HISTORY_PATH", "") or "")
-        if not canon:
-            return
-        if not os.path.exists(canon):
-            return
-
-        # Determine canonical content for equality checks.
-        canon_data = None
-        try:
-            with open(canon, "r", encoding="utf-8") as fp:
-                canon_data = json.load(fp)
-        except Exception:
-            canon_data = None
-
-        # Prefer comparing against the data we just loaded/migrated.
-        reference = loaded_data if loaded_data is not None else canon_data
-        if reference is None:
-            return
-
-        delete = os.getenv("AI_IDE_HISTORY_DELETE_LEGACY", "0").strip() in {"1", "true", "True", "yes", "Yes", "on", "On"}
-
-        legacy_candidates: list[str] = []
-        try:
-            # From the fixed constants at module-level.
-            legacy_candidates.extend(
-                [
-                    str(_HISTORY_LEGACY),
-                    str(_HISTORY_LEGACY_TRAILING),
-                    str(_HISTORY_CANON_TRAILING),
-                ]
-            )
-        except Exception:
-            pass
-
-        canon_abs = os.path.abspath(canon)
-        seen: set[str] = set()
-        for lp in legacy_candidates:
-            if not lp:
-                continue
-            lp = str(lp)
-            if lp in seen:
-                continue
-            seen.add(lp)
-
-            try:
-                if os.path.abspath(lp) == canon_abs:
-                    continue
-                if not os.path.exists(lp):
-                    continue
-
-                with open(lp, "r", encoding="utf-8") as fp:
-                    legacy_data = json.load(fp)
-                if legacy_data != reference:
-                    continue
-
-                if delete:
-                    os.remove(lp)
-                else:
-                    bak = lp + ".legacy.bak"
-                    # Avoid clobbering an existing backup.
-                    if os.path.exists(bak):
-                        bak = lp + f".legacy.{int(time.time())}.bak"
-                    os.replace(lp, bak)
-            except Exception:
-                continue
+        _ = loaded_data
+        # File-based history behavior is disabled.
+        return
   
     """
     Hält den kompletten Nachrichten­verlauf **prozessweit** vor.
@@ -663,61 +705,14 @@ class ChatHistory(VectorStore):
     """
     @classmethod
     def _flush(cls) -> None:
-        """Atomically dump chat history to disk."""
-        if getattr(cls, "_is_flushing", False):
-            return
-        cls._is_flushing = True
-        try:
-            target = getattr(cls, "_HISTORY_PATH", None) or cls._FINAL_PATH
-            tmp = f"{target}.tmp"
-
-            def _sanitize(obj: Any) -> Any:
-                """Recursively coerce data into JSON-safe types."""
-                if isinstance(obj, dict):
-                    safe: dict[str, Any] = {}
-                    for k, v in obj.items():
-                        key = k if isinstance(k, (str, int, float, bool)) or k is None else str(k)
-                        safe[str(key)] = _sanitize(v)
-                    return safe
-                if isinstance(obj, list):
-                    return [_sanitize(x) for x in obj]
-                if isinstance(obj, (str, int, float, bool)) or obj is None:
-                    return obj
-                # Avoid str()/repr() on arbitrary extension objects (e.g. Qt/PySide)
-                # which may segfault during shutdown.
-                t = type(obj)
-                return f"[{t.__module__}.{t.__name__}]"
-
-            if cls._history_:
-                with open(tmp, "w", encoding="utf-8") as fp:
-                    json.dump(_sanitize(cls._history_), fp, indent=2, ensure_ascii=False)
-                os.replace(tmp, target)
-        except Exception as exc:
-            print(f"ERROR:{exc}")
-        finally:
-            cls._is_flushing = False
+        # File-based persistence is disabled. History is synced per message
+        # via _store_history_msg_to_session_agent_memory.
+        return
 
     @classmethod
     def _maybe_autosave(cls) -> None:
-        """Best-effort, throttled autosave."""
-        if not getattr(cls, "_AUTOSAVE_ENABLED", False):
-            return
-        # Respect the global disable switch used by the GUI shutdown logic.
-        if os.getenv("AI_IDE_DISABLE_HISTORY_FLUSH", "0").strip() in {"1", "true", "True", "yes", "Yes", "on", "On"}:
-            return
-        try:
-            cls._autosave_dirty_count = int(getattr(cls, "_autosave_dirty_count", 0)) + 1
-        except Exception:
-            cls._autosave_dirty_count = 1
-        now = time.time()
-        last = float(getattr(cls, "_autosave_last_ts", 0.0) or 0.0)
-        if cls._autosave_dirty_count < int(getattr(cls, "_AUTOSAVE_EVERY_N", 8) or 8):
-            return
-        if now - last < float(getattr(cls, "_AUTOSAVE_MIN_SECONDS", 3.0) or 3.0):
-            return
-        cls._autosave_dirty_count = 0
-        cls._autosave_last_ts = now
-        cls._flush()
+        # File autosave is disabled together with file history persistence.
+        return
 
     # ------------------------------------------------------------------
     #                         __init__()
@@ -822,6 +817,106 @@ class ChatHistory(VectorStore):
 
     def get_history(): return ChatHistory._history_           # <- hinzugefuegt am 24.08.2025
     """Initialize vector stores lazily - call this when you actually need them."""
+
+    @classmethod
+    def _store_history_msg_to_session_agent_memory(cls, message_payload: dict[str, Any]) -> None:
+        if not isinstance(message_payload, dict):
+            return
+
+        sync_enabled = str(os.getenv(cls._AGENT_MEMORY_SYNC_ENV, "1")).strip().lower()
+        if sync_enabled in {"0", "false", "no", "off"}:
+            return
+
+        try:
+            try:
+                from .agents_db import AGENT_MEMORY_SERVICE  # type: ignore
+            except ImportError as e:
+                msg = str(e)
+                if "attempted relative import" in msg or "no known parent package" in msg:
+                    try:
+                        from alde.agents_db import AGENT_MEMORY_SERVICE  # type: ignore
+                    except ImportError:
+                        from agents_db import AGENT_MEMORY_SERVICE  # type: ignore
+                else:
+                    raise
+        except Exception:
+            return
+
+        raw_thread_id = message_payload.get("thread-id")
+        thread_id: int | None = None
+        if isinstance(raw_thread_id, int):
+            thread_id = raw_thread_id
+        elif isinstance(raw_thread_id, str):
+            normalized_thread_id = raw_thread_id.strip()
+            if normalized_thread_id.isdigit():
+                try:
+                    thread_id = int(normalized_thread_id)
+                except Exception:
+                    thread_id = None
+
+        configured_scope_key = str(os.getenv(cls._AGENT_MEMORY_SCOPE_KEY_ENV, "")).strip() or None
+        scope_key = AGENT_MEMORY_SERVICE.load_session_scope_key(
+            scope_key=configured_scope_key,
+            thread_id=thread_id,
+        )
+
+        agent_label = str(os.getenv(cls._AGENT_MEMORY_AGENT_LABEL_ENV, "_chat_history")).strip() or "_chat_history"
+        memory_slot = AGENT_MEMORY_SERVICE.load_amemo_slot(
+            job_name=str(os.getenv(cls._AGENT_MEMORY_SLOT_ENV, "history.msg")).strip() or "history.msg",
+            tool_name="chat_history",
+        )
+        context_type = str(os.getenv(cls._AGENT_MEMORY_CONTEXT_TYPE_ENV, "history.msg")).strip() or "history.msg"
+
+        content_payload = message_payload.get("content")
+        if isinstance(content_payload, (dict, list, tuple)):
+            try:
+                content_payload = json.dumps(content_payload, ensure_ascii=False)
+            except Exception:
+                content_payload = str(content_payload)
+        elif not isinstance(content_payload, (str, int, float, bool)) and content_payload is not None:
+            content_payload = str(content_payload)
+
+        history_message_payload = {
+            "message_id": message_payload.get("message-id"),
+            "role": str(message_payload.get("role") or ""),
+            "content": content_payload,
+            "date": str(message_payload.get("date") or ""),
+            "time": str(message_payload.get("time") or ""),
+            "thread_name": str(message_payload.get("thread-name") or ""),
+            "thread_id": thread_id,
+            "assistant_name": str(message_payload.get("assistant-name") or ""),
+            "assistant_id": str(message_payload.get("assistant-id") or ""),
+            "tool_call_id": str(message_payload.get("tool_call_id") or ""),
+            "tool_name": str(message_payload.get("name") or ""),
+            "object_name": str(message_payload.get("object") or "chat"),
+        }
+        session_payload = {
+            "history.msg": history_message_payload,
+            "session": {
+                "agent_memory": {
+                    "history.msg": history_message_payload,
+                }
+            },
+        }
+
+        try:
+            AGENT_MEMORY_SERVICE.append_session_context(
+                agent_label=agent_label,
+                memory_slot=memory_slot,
+                scope_key=scope_key,
+                context_type=context_type,
+                payload=session_payload,
+                runtime_metadata={
+                    "job_name": memory_slot,
+                    "tool_name": "chat_history",
+                    "workflow_name": "chat_runtime",
+                    "role": "chat_history",
+                },
+                system_prompt="ChatHistory session cache for history.msg",
+                source_agent_label=agent_label,
+            )
+        except Exception:
+            pass
 
     def _log(
         self,
@@ -933,34 +1028,47 @@ class ChatHistory(VectorStore):
                                           # object as an general classification, objects are predefined.
                                           # a new assistant must match a classification, if not its creation is omitted.
                                           # Validierungs-/Debug-Ausgabe   (kann später entfernt werden)
+
+        message_logged = False
        
         if ChatHistory._dev_state == False and _role == "developer" and _dev == True:
             ChatHistory._dev_state = True
             try:           
-                ChatHistory._history_.append(_message)  
+                ChatHistory._history_.append(_message)
+                message_logged = True
             except Exception as e:
                 print(f'Error during log messages to history: {e}')       
         elif ChatHistory._sys_state == False and _role == "system" and _sys == True:
             ChatHistory._sys_state = False
             try:
-                ChatHistory._history_.append(_message)  
+                ChatHistory._history_.append(_message)
+                message_logged = True
             except Exception as e:
                 print(f'Error during log messages to history: {e}')       
         elif _role == "user":
             try:  
-                ChatHistory._history_.append(_message)  
+                ChatHistory._history_.append(_message)
+                message_logged = True
             except Exception as e:
                 print(f'Error during log messages to history: {e}')       
         elif _role == "assistant":
             try:  
-                ChatHistory._history_.append(_message)  
+                ChatHistory._history_.append(_message)
+                message_logged = True
             except Exception as e:
                 print(f'Error during log messages to history: {e}')   
         elif _role == "tool":
             try:
                 ChatHistory._history_.append(_message)
+                message_logged = True
             except Exception as e:
                 print(f'Error during log messages to history: {e}')
+
+        if message_logged:
+            try:
+                ChatHistory._store_history_msg_to_session_agent_memory(_message)
+            except Exception:
+                pass
 
         # Throttled autosave to reduce history loss on crashes.
         try:

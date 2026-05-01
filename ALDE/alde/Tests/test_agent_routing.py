@@ -4,6 +4,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -825,25 +826,6 @@ class TestAgentRouting(unittest.TestCase):
         )
         self.assertEqual((output.get("job_posting") or {}).get("job_title"), "AI Engineer")
 
-    def test_initialize_router_planner_cover_letter_sequence_helper_routes_to_worker(self) -> None:
-        result, route = agents_factory.initialize_router_planner_cover_letter_sequence(
-            {
-                "applicant_profile": {
-                    "personal_info": {
-                        "full_name": "Grace Hopper",
-                    }
-                },
-                "job_posting_result": {
-                    "job_posting": {
-                        "job_title": "Compiler Engineer",
-                    }
-                },
-                "options": {
-                    "language": "en",
-                },
-            },
-            source_agent_label="_xrouter_xplanner",
-        )
 
         self.assertEqual(result, "Routing to _xworker")
         self.assertIsInstance(route, dict)
@@ -1013,6 +995,349 @@ class TestAgentRouting(unittest.TestCase):
         parsed_result = json.loads(result)
         self.assertEqual(len(parsed_result.get("handoff_results") or []), 2)
         self.assertEqual(parsed_result["handoff_results"], ["xworker ok", "xworker ok"])
+
+    def test_dispatch_documents_parallel_fanout_preserves_handoff_result_order(self) -> None:
+        history = agents_factory.get_history()
+        history._thread_iD = 657
+        history._history_ = [{"role": "user", "content": "scan folder and parse all", "thread-id": history._thread_iD}]
+
+        dispatch_result = {
+            "agent": "xworker",
+            "job_name": "document_dispatch",
+            "scan_dir": "/tmp/jobs",
+            "handoff_messages": [
+                {
+                    "target_agent": "_xworker",
+                    "handoff_protocol": "agent_handoff_v1",
+                    "handoff_payload": {
+                        "agent_label": "_xworker",
+                        "handoff_to": "_xworker",
+                        "output": {
+                            "job_name": "job_posting_parser",
+                            "correlation_id": "sha-1",
+                            "file": {"path": "/tmp/jobs/a.pdf", "content_sha256": "sha-1"},
+                            "requested_actions": ["parse"],
+                        },
+                    },
+                    "handoff_metadata": {"correlation_id": "sha-1"},
+                },
+                {
+                    "target_agent": "_xworker",
+                    "handoff_protocol": "agent_handoff_v1",
+                    "handoff_payload": {
+                        "agent_label": "_xworker",
+                        "handoff_to": "_xworker",
+                        "output": {
+                            "correlation_id": "sha-2",
+                            "file": {"path": "/tmp/jobs/b.pdf", "content_sha256": "sha-2"},
+                            "requested_actions": ["parse"],
+                        },
+                    },
+                    "handoff_metadata": {"correlation_id": "sha-2", "parser_job_name": "job_posting_parser"},
+                },
+            ],
+        }
+
+        execute_calls: list[tuple[str, dict]] = []
+
+        class _EchoChatComE:
+            def __init__(self, _model: str, _messages: list, tools: list[dict], tool_choice: str) -> None:
+                self.messages = list(_messages)
+
+            def _response(self):
+                user_content = ""
+                for message in reversed(self.messages):
+                    if isinstance(message, dict) and str(message.get("role") or "").strip().lower() == "user":
+                        user_content = str(message.get("content") or "")
+                        break
+                return SimpleNamespace(
+                    choices=[
+                        SimpleNamespace(
+                            message=SimpleNamespace(content=user_content, tool_calls=None)
+                        )
+                    ]
+                )
+
+        def _execute_tool(name: str, args: dict, tool_call_id: str | None = None, source_agent_label: str | None = None):
+            execute_calls.append((name, dict(args or {})))
+            if name == "dispatch_documents":
+                return dispatch_result, None
+            if name == "route_to_agent":
+                correlation_id = str((args.get("handoff_metadata") or {}).get("correlation_id") or "")
+                if correlation_id == "sha-1":
+                    time.sleep(0.05)
+                else:
+                    time.sleep(0.01)
+                return (
+                    f"Routing to _xworker ({correlation_id})",
+                    {
+                        "messages": [
+                            {"role": "system", "content": "xworker system"},
+                            {"role": "user", "content": correlation_id},
+                        ],
+                        "tools": [],
+                        "model": "gpt-test",
+                        "agent_label": "_xworker",
+                        "include_history": False,
+                    },
+                )
+            return "ok", None
+
+        agent_msg = SimpleNamespace(
+            content="",
+            tool_calls=[
+                _tool_call(
+                    "dispatch_documents",
+                    json.dumps({"scan_dir": "/tmp/jobs", "db_path": "/tmp/dispatcher.json"}, ensure_ascii=False),
+                    call_id="call_dispatcher_parallel",
+                )
+            ],
+        )
+
+        with patch.dict(
+            os.environ,
+            {
+                "ALDE_HANDOFF_PARALLEL_ENABLED": "1",
+                "ALDE_HANDOFF_PARALLEL_WORKERS": "3",
+            },
+            clear=False,
+        ), patch("alde.chat_completion.ChatComE", _EchoChatComE), patch(
+            "alde.agents_factory.execute_tool",
+            side_effect=_execute_tool,
+        ):
+            config = agents_factory.TOOL_CALL_EXECUTION_SERVICE.load_handoff_parallel_object_config("tool_handoff")
+            self.assertTrue(config["parallel_enabled"])
+            self.assertEqual(config["worker_count"], 3)
+            result = agents_factory._handle_tool_calls(agent_msg, agent_label="_xworker")
+
+        route_calls = [args for tool_name, args in execute_calls if tool_name == "route_to_agent"]
+        self.assertEqual(len(route_calls), 2)
+
+        parsed_result = json.loads(result)
+        self.assertEqual(parsed_result.get("handoff_results"), ["sha-1", "sha-2"])
+
+    def test_router_parallel_branch_mode_merges_results_in_tool_call_order(self) -> None:
+        history = agents_factory.get_history()
+        history._thread_iD = 658
+        history._history_ = [{"role": "user", "content": "run two routed branches", "thread-id": history._thread_iD}]
+
+        execute_calls: list[tuple[str, dict]] = []
+
+        class _EchoChatComE:
+            def __init__(self, _model: str, _messages: list, tools: list[dict], tool_choice: str) -> None:
+                self.messages = list(_messages)
+
+            def _response(self):
+                user_content = ""
+                for message in reversed(self.messages):
+                    if isinstance(message, dict) and str(message.get("role") or "").strip().lower() == "user":
+                        user_content = str(message.get("content") or "")
+                        break
+                return SimpleNamespace(
+                    choices=[
+                        SimpleNamespace(
+                            message=SimpleNamespace(content=user_content, tool_calls=None)
+                        )
+                    ]
+                )
+
+        def _execute_tool(name: str, args: dict, tool_call_id: str | None = None, source_agent_label: str | None = None):
+            execute_calls.append((name, dict(args or {})))
+            if name == "route_to_agent":
+                branch_name = str(args.get("user_question") or "")
+                if branch_name == "branch-1":
+                    time.sleep(0.05)
+                else:
+                    time.sleep(0.01)
+                return (
+                    f"Routing to _xworker ({branch_name})",
+                    {
+                        "messages": [
+                            {"role": "system", "content": "xworker system"},
+                            {"role": "user", "content": branch_name},
+                        ],
+                        "tools": [],
+                        "model": "gpt-test",
+                        "agent_label": "_xworker",
+                        "include_history": False,
+                    },
+                )
+            return "ok", None
+
+        agent_msg = SimpleNamespace(
+            content="",
+            tool_calls=[
+                _tool_call(
+                    "route_to_agent",
+                    json.dumps(
+                        {
+                            "target_agent": "_xworker",
+                            "job_name": "cover_letter_writer",
+                            "user_question": "branch-1",
+                        },
+                        ensure_ascii=False,
+                    ),
+                    call_id="route_branch_1",
+                ),
+                _tool_call(
+                    "route_to_agent",
+                    json.dumps(
+                        {
+                            "target_agent": "_xworker",
+                            "job_name": "cover_letter_writer",
+                            "user_question": "branch-2",
+                        },
+                        ensure_ascii=False,
+                    ),
+                    call_id="route_branch_2",
+                ),
+            ],
+        )
+
+        with patch.dict(
+            os.environ,
+            {
+                "ALDE_ROUTER_BRANCH_PARALLEL_ENABLED": "1",
+                "ALDE_ROUTER_BRANCH_PARALLEL_WORKERS": "4",
+            },
+            clear=False,
+        ), patch("alde.chat_completion.ChatComE", _EchoChatComE), patch(
+            "alde.agents_factory.execute_tool",
+            side_effect=_execute_tool,
+        ):
+            config = agents_factory.TOOL_CALL_EXECUTION_SERVICE.load_router_branch_parallel_object_config("router_branch")
+            self.assertTrue(config["parallel_enabled"])
+            self.assertEqual(config["worker_count"], 4)
+            result = agents_factory._handle_tool_calls(agent_msg, agent_label="_xplaner_xrouter")
+
+        route_calls = [args for tool_name, args in execute_calls if tool_name == "route_to_agent"]
+        self.assertEqual(len(route_calls), 2)
+
+        parsed_result = json.loads(result)
+        self.assertEqual(parsed_result.get("mode"), "router_parallel_branches")
+        self.assertEqual(parsed_result.get("branch_count"), 2)
+        self.assertEqual(parsed_result.get("branch_results"), ["branch-1", "branch-2"])
+
+    def test_router_parallel_branch_mode_marks_partial_fail_on_timeout(self) -> None:
+        history = agents_factory.get_history()
+        history._thread_iD = 659
+        history._history_ = [{"role": "user", "content": "run timeout branch", "thread-id": history._thread_iD}]
+
+        class _EchoChatComE:
+            def __init__(self, _model: str, _messages: list, tools: list[dict], tool_choice: str) -> None:
+                self.messages = list(_messages)
+
+            def _response(self):
+                user_content = ""
+                for message in reversed(self.messages):
+                    if isinstance(message, dict) and str(message.get("role") or "").strip().lower() == "user":
+                        user_content = str(message.get("content") or "")
+                        break
+                return SimpleNamespace(
+                    choices=[
+                        SimpleNamespace(
+                            message=SimpleNamespace(content=user_content, tool_calls=None)
+                        )
+                    ]
+                )
+
+        def _execute_tool(name: str, args: dict, tool_call_id: str | None = None, source_agent_label: str | None = None):
+            if name == "route_to_agent":
+                branch_name = str(args.get("user_question") or "")
+                if branch_name == "branch-timeout":
+                    time.sleep(0.12)
+                else:
+                    time.sleep(0.01)
+                return (
+                    f"Routing to _xworker ({branch_name})",
+                    {
+                        "messages": [
+                            {"role": "system", "content": "xworker system"},
+                            {"role": "user", "content": branch_name},
+                        ],
+                        "tools": [],
+                        "model": "gpt-test",
+                        "agent_label": "_xworker",
+                        "include_history": False,
+                    },
+                )
+            return "ok", None
+
+        agent_msg = SimpleNamespace(
+            content="",
+            tool_calls=[
+                _tool_call(
+                    "route_to_agent",
+                    json.dumps(
+                        {
+                            "target_agent": "_xworker",
+                            "job_name": "cover_letter_writer",
+                            "user_question": "branch-timeout",
+                        },
+                        ensure_ascii=False,
+                    ),
+                    call_id="route_branch_timeout",
+                ),
+                _tool_call(
+                    "route_to_agent",
+                    json.dumps(
+                        {
+                            "target_agent": "_xworker",
+                            "job_name": "cover_letter_writer",
+                            "user_question": "branch-ok",
+                        },
+                        ensure_ascii=False,
+                    ),
+                    call_id="route_branch_ok",
+                ),
+            ],
+        )
+
+        with patch.dict(
+            os.environ,
+            {
+                "ALDE_ROUTER_BRANCH_PARALLEL_ENABLED": "1",
+                "ALDE_ROUTER_BRANCH_PARALLEL_WORKERS": "2",
+                "ALDE_ROUTER_BRANCH_TIMEOUT_SECONDS": "0.05",
+            },
+            clear=False,
+        ), patch("alde.chat_completion.ChatComE", _EchoChatComE), patch(
+            "alde.agents_factory.execute_tool",
+            side_effect=_execute_tool,
+        ):
+            result = agents_factory._handle_tool_calls(agent_msg, agent_label="_xplaner_xrouter")
+            runtime_status = agents_factory.get_router_parallel_runtime_status()
+
+        parsed_result = json.loads(result)
+        self.assertEqual(parsed_result.get("mode"), "router_parallel_branches")
+        self.assertTrue(parsed_result.get("partial_fail"))
+        self.assertEqual(parsed_result.get("timeout_branch_count"), 1)
+        self.assertEqual((parsed_result.get("branch_status_counts") or {}).get("timeout"), 1)
+        branch_results = parsed_result.get("branch_results") or []
+        self.assertEqual(len(branch_results), 2)
+        self.assertIsInstance(branch_results[0], dict)
+        self.assertEqual(branch_results[0].get("status"), "timeout")
+        self.assertEqual(branch_results[1], "branch-ok")
+        self.assertGreaterEqual(int(runtime_status.get("total_timeout_branches") or 0), 1)
+        self.assertTrue(bool((runtime_status.get("config") or {}).get("parallel_enabled")))
+
+    def test_router_parallel_branch_config_reads_hard_timeout_flag(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "ALDE_ROUTER_BRANCH_PARALLEL_ENABLED": "1",
+                "ALDE_ROUTER_BRANCH_PARALLEL_WORKERS": "5",
+                "ALDE_ROUTER_BRANCH_TIMEOUT_SECONDS": "2.5",
+                "ALDE_ROUTER_BRANCH_HARD_TIMEOUT_ENABLED": "1",
+            },
+            clear=False,
+        ):
+            config = agents_factory.TOOL_CALL_EXECUTION_SERVICE.load_router_branch_parallel_object_config("router_branch")
+
+        self.assertTrue(config["parallel_enabled"])
+        self.assertEqual(config["worker_count"], 5)
+        self.assertEqual(config["timeout_seconds"], 2.5)
+        self.assertTrue(config["hard_timeout_enabled"])
 
     def test_dispatch_documents_returns_tool_result_without_followup_when_no_handoff_exists(self) -> None:
         history = agents_factory.get_history()

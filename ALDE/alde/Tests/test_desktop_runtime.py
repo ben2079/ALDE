@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import sys
 import tempfile
 import time
@@ -157,6 +158,62 @@ class TestDesktopRuntime(unittest.TestCase):
             self.assertEqual(runner.load_object_health()["backend"], "inmemory")
         finally:
             runner.stop_object_runner()
+
+    def test_inmemory_message_runner_starts_configured_worker_pool(self) -> None:
+        processed: list[str] = []
+        runner = InMemoryMessageRunnerService[str](
+            worker_name="alde-test-runner-pool",
+            process_object_message=processed.append,
+            poll_interval_seconds=0.05,
+            worker_count=3,
+        )
+
+        try:
+            runner.start_object_runner()
+            deadline = time.time() + 1.0
+            health = runner.load_object_health()
+            while time.time() < deadline and int(health.get("runner_count") or 0) < 3:
+                time.sleep(0.02)
+                health = runner.load_object_health()
+
+            self.assertEqual(health["configured_runner_count"], 3)
+            self.assertEqual(health["runner_count"], 3)
+        finally:
+            runner.stop_object_runner()
+
+    def test_queue_service_reads_parallel_runner_configuration_from_env(self) -> None:
+        class _IdleExecutionService:
+            def execute_object_run(self, run: DesktopAgentRun) -> str:
+                return "ok"
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store_service = DesktopAgentRunStoreService(
+                persistence_service=DesktopAgentRunPersistenceService(
+                    storage_path=Path(temp_dir) / "desktop_runs.json",
+                )
+            )
+            with patch.dict(
+                os.environ,
+                {
+                    "ALDE_DESKTOP_PARALLEL_ENABLED": "1",
+                    "ALDE_DESKTOP_PARALLEL_WORKERS": "3",
+                    "ALDE_DESKTOP_RUNNER_POLL_SECONDS": "0.03",
+                },
+                clear=False,
+            ):
+                queue_service = DesktopAgentRunQueueService(
+                    store_service=store_service,
+                    execution_service=_IdleExecutionService(),
+                )
+
+                try:
+                    health = queue_service.load_object_health()
+                    self.assertTrue(health["parallel_enabled"])
+                    self.assertEqual(health["max_parallel_workers"], 3)
+                    self.assertEqual(health["configured_worker_count"], 3)
+                    self.assertEqual(health["configured_runner_count"], 3)
+                finally:
+                    queue_service.stop_object_runner()
 
     def test_queue_object_run_completes_in_background(self) -> None:
         class _FakeExecutionService:

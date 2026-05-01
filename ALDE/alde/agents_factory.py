@@ -5,11 +5,14 @@ from __future__ import annotations
 from pathlib import Path
 from importlib.metadata import metadata
 from copy import deepcopy
+from concurrent.futures import ThreadPoolExecutor
+from threading import Lock
 import sys
 import json
 import os
 import atexit
 import hashlib
+import time
 from types import SimpleNamespace
 from typing import Any
 from datetime import datetime
@@ -203,7 +206,7 @@ class AgentRuntimeConfigService:
     ) -> list[dict[str, Any]]:
         if not agent_name:
             return []
-        resolved_memory_slot = AGENT_MEMORY_SERVICE.load_memory_slot(
+        resolved_memory_slot = AGENT_MEMORY_SERVICE.load_amemo_slot(
             job_name=job_name,
             tool_name=tool_name,
         )
@@ -211,7 +214,7 @@ class AgentRuntimeConfigService:
             scope_key=scope_key,
             thread_id=thread_id,
         )
-        return AGENT_MEMORY_ATTACHMENT_SERVICE.load_object_attachment_entries(
+        return OBJECT_MEMORY_ATTACHMENT_SERVICE.load_object_attachment_entries(
             agent_label=agent_name,
             memory_slot=resolved_memory_slot,
             scope_key=resolved_scope_key,
@@ -228,7 +231,7 @@ class AgentRuntimeConfigService:
     ) -> list[dict[str, Any]]:
         if not agent_name:
             return []
-        resolved_memory_slot = AGENT_MEMORY_SERVICE.load_memory_slot(
+        resolved_memory_slot = AGENT_MEMORY_SERVICE.load_amemo_slot(
             job_name=job_name,
             tool_name=tool_name,
         )
@@ -236,7 +239,7 @@ class AgentRuntimeConfigService:
             scope_key=scope_key,
             thread_id=thread_id,
         )
-        return AGENT_MEMORY_ATTACHMENT_SERVICE.load_object_attachment_documents(
+        return OBJECT_MEMORY_ATTACHMENT_SERVICE.load_object_attachment_documents(
             agent_label=agent_name,
             memory_slot=resolved_memory_slot,
             scope_key=resolved_scope_key,
@@ -253,7 +256,7 @@ class AgentRuntimeConfigService:
     ) -> dict[str, str] | None:
         if not agent_name:
             return None
-        resolved_memory_slot = AGENT_MEMORY_SERVICE.load_memory_slot(
+        resolved_memory_slot = AGENT_MEMORY_SERVICE.load_amemo_slot(
             job_name=job_name,
             tool_name=tool_name,
         )
@@ -261,7 +264,7 @@ class AgentRuntimeConfigService:
             scope_key=scope_key,
             thread_id=thread_id,
         )
-        return AGENT_MEMORY_ATTACHMENT_SERVICE.load_attachment_context_message(
+        return OBJECT_MEMORY_ATTACHMENT_SERVICE.load_attachment_context_message(
             agent_label=agent_name,
             memory_slot=resolved_memory_slot,
             scope_key=resolved_scope_key,
@@ -1082,15 +1085,19 @@ WORKFLOW_HISTORY_LOG_SERVICE = WorkflowHistoryLogService()
 # Re-exported here to preserve the existing public API.
 try:
     from .agents_db import (  # type: ignore
+        ObjectMemoryAttachmentService,
         AgentMemoryAttachmentService,
         AgentMemoryService,
+        OBJECT_MEMORY_ATTACHMENT_SERVICE,
         AGENT_MEMORY_ATTACHMENT_SERVICE,
         AGENT_MEMORY_SERVICE,
     )
 except ImportError:
     from alde.agents_db import (  # type: ignore
+        ObjectMemoryAttachmentService,
         AgentMemoryAttachmentService,
         AgentMemoryService,
+        OBJECT_MEMORY_ATTACHMENT_SERVICE,
         AGENT_MEMORY_ATTACHMENT_SERVICE,
         AGENT_MEMORY_SERVICE,
     )
@@ -2001,6 +2008,24 @@ AGENT_EXECUTION_SELECTION_SERVICE = AgentExecutionSelectionService()
 
 
 class AgentRoutingDispatcher:
+    def _load_canonical_job_name(self, job_name: str | None) -> str | None:
+        normalized_job_name = str(job_name or "").strip()
+        if not normalized_job_name:
+            return None
+
+        canonical_aliases = {
+            "dispatch_document": "document_dispatch",
+        }
+        candidate_job_names: list[str] = [normalized_job_name]
+        alias_job_name = str(canonical_aliases.get(normalized_job_name) or "").strip()
+        if alias_job_name and alias_job_name not in candidate_job_names:
+            candidate_job_names.append(alias_job_name)
+
+        for candidate_job_name in candidate_job_names:
+            if get_job_config(candidate_job_name):
+                return candidate_job_name
+        return normalized_job_name
+
     def _load_route_defaults(self, job_name: str | None) -> dict[str, Any]:
         normalized_job_name = str(job_name or "").strip()
         if not normalized_job_name:
@@ -2100,6 +2125,10 @@ class AgentRoutingDispatcher:
             output_payload = handoff_payload.get('output') if isinstance(handoff_payload.get('output'), dict) else {}
             nested_tool_name = str(handoff_payload.get('tool_name') or output_payload.get('tool_name') or '').strip() or None
         job_name = str(args.get('job_name') or '').strip() or nested_job_name or None
+        canonical_job_name = self._load_canonical_job_name(job_name)
+        if canonical_job_name:
+            job_name = canonical_job_name
+            args['job_name'] = canonical_job_name
         explicit_tools = [
             str(value).strip()
             for value in (args.get('tools') or [])
@@ -2325,19 +2354,42 @@ class AgentRoutingRequestService:
             handoff_payload=initial_handoff_payload,
             handoff_metadata=resolved_handoff_metadata,
         )
-        resolved_protocol = handoff_protocol or str(handoff_contract.get("protocol") or "").strip() or (
+        requested_protocol = str(handoff_protocol or "").strip()
+        handoff_schema = dict(handoff_contract.get("schema") or {})
+        schema_protocol = str(handoff_schema.get("protocol") or "").strip()
+        schema_required_payload_any = [
+            str(value).strip()
+            for value in (handoff_schema.get("required_payload_any") or [])
+            if str(value).strip()
+        ]
+        if schema_protocol and requested_protocol and requested_protocol != schema_protocol:
+            requested_protocol = schema_protocol
+
+        resolved_protocol = requested_protocol or str(handoff_contract.get("protocol") or "").strip() or (
             "agent_handoff_v1"
             if agent_response is not None or handoff_payload is not None
             else str(source_handoff_policy.get("default_protocol") or "message_text")
         )
+
+        resolved_agent_response = agent_response
+        resolved_handoff_payload = handoff_payload
+        if resolved_protocol == "message_text" and schema_required_payload_any:
+            resolved_protocol = "agent_handoff_v1"
+        if (
+            resolved_protocol == "agent_handoff_v1"
+            and resolved_agent_response is None
+            and resolved_handoff_payload is None
+            and str(user_question or "").strip()
+        ):
+            resolved_handoff_payload = {"msg": str(user_question).strip()}
 
         handoff = build_agent_handoff(
             source_agent_label=source_agent_label,
             target_agent=target,
             protocol=resolved_protocol,
             message_text=user_question,
-            agent_response=agent_response,
-            handoff_payload=handoff_payload,
+            agent_response=resolved_agent_response,
+            handoff_payload=resolved_handoff_payload,
             handoff_metadata=resolved_handoff_metadata,
         )
 
@@ -2382,7 +2434,7 @@ class AgentRoutingRequestService:
             explicit_tools=tools,
         )
         current_thread_id = WORKFLOW_CONTEXT_SERVICE.load_current_thread_id()
-        memory_slot = AGENT_MEMORY_SERVICE.load_memory_slot(
+        memory_slot = AGENT_MEMORY_SERVICE.load_amemo_slot(
             job_name=str(runtime_metadata.get("job_name") or "").strip() or job_name,
             tool_name=str(runtime_metadata.get("tool_name") or "").strip() or tool_name,
         )
@@ -2401,7 +2453,7 @@ class AgentRoutingRequestService:
             runtime_metadata["attachment_documents"] = scoped_attachment_documents
             runtime_metadata["attachment_count"] = len(scoped_attachment_documents)
 
-        AGENT_MEMORY_SERVICE.ensure_object_memory(
+        AGENT_MEMORY_SERVICE.ensure_amemo(
             agent_label=target,
             memory_slot=memory_slot,
             scope_key=session_cache_scope_key,
@@ -2677,17 +2729,7 @@ def execute_route_to_agent(
     )
 
 
-def initialize_router_planner_cover_letter_sequence(
-    args: dict[str, Any] | None = None,
-    *,
-    source_agent_label: str | None = "_xrouter_xplanner",
-) -> tuple[str, dict | None]:
-    route_args = dict(args or {})
-    route_args["job_name"] = "router_planner_cover_letter_sequence"
-    return execute_route_to_agent(
-        route_args,
-        source_agent_label=source_agent_label or "_xrouter_xplanner",
-    )
+
 
 
 
@@ -3885,7 +3927,76 @@ class RoutingResultPostprocessService:
 ROUTING_RESULT_POSTPROCESS_SERVICE = RoutingResultPostprocessService()
 
 
+def _execute_router_branch_process_object_call(result_queue: Any, branch_payload: dict[str, Any]) -> None:
+    branch_index = int(branch_payload.get("branch_index") or 0)
+    started = time.perf_counter()
+    try:
+        tool_call = SimpleNamespace(
+            id=str(branch_payload.get("tool_call_id") or f"parallel_route_group_branch_{branch_index}"),
+            function=SimpleNamespace(
+                name=str(branch_payload.get("tool_name") or "route_to_agent"),
+                arguments=str(branch_payload.get("tool_arguments") or "{}"),
+            ),
+        )
+        depth = int(branch_payload.get("depth") or 0)
+        agent_label = str(branch_payload.get("agent_label") or "")
+        result = _handle_tool_calls(
+            SimpleNamespace(content="", tool_calls=[tool_call]),
+            depth=depth + 1,
+            ChatCom=None,
+            agent_label=agent_label,
+        )
+        result_queue.put(
+            {
+                "branch_index": branch_index,
+                "status": "completed",
+                "timed_out": False,
+                "duration_ms": round(max(time.perf_counter() - started, 0.0) * 1000.0, 2),
+                "result": result,
+                "error": "",
+            }
+        )
+    except Exception as exc:
+        result_queue.put(
+            {
+                "branch_index": branch_index,
+                "status": "failed",
+                "timed_out": False,
+                "duration_ms": round(max(time.perf_counter() - started, 0.0) * 1000.0, 2),
+                "result": None,
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+        )
+
+
 class ToolCallExecutionService:
+    _HANDOFF_PARALLEL_ENABLED_ENV = "ALDE_HANDOFF_PARALLEL_ENABLED"
+    _HANDOFF_PARALLEL_WORKERS_ENV = "ALDE_HANDOFF_PARALLEL_WORKERS"
+    _ROUTER_BRANCH_PARALLEL_ENABLED_ENV = "ALDE_ROUTER_BRANCH_PARALLEL_ENABLED"
+    _ROUTER_BRANCH_PARALLEL_WORKERS_ENV = "ALDE_ROUTER_BRANCH_PARALLEL_WORKERS"
+    _ROUTER_BRANCH_TIMEOUT_SECONDS_ENV = "ALDE_ROUTER_BRANCH_TIMEOUT_SECONDS"
+    _ROUTER_BRANCH_HARD_TIMEOUT_ENABLED_ENV = "ALDE_ROUTER_BRANCH_HARD_TIMEOUT_ENABLED"
+
+    def __init__(self) -> None:
+        self._router_parallel_status_lock = Lock()
+        self._router_parallel_status = {
+            "total_parallel_runs": 0,
+            "total_parallel_branches": 0,
+            "total_completed_branches": 0,
+            "total_failed_branches": 0,
+            "total_timeout_branches": 0,
+            "total_partial_fail_runs": 0,
+            "total_hard_timeout_runs": 0,
+            "last_run_at": "",
+            "last_run_duration_ms": 0.0,
+            "last_run_branch_count": 0,
+            "last_run_partial_fail": False,
+            "last_run_hard_timeout_enabled": False,
+            "last_run_status_counts": {"completed": 0, "failed": 0, "timeout": 0},
+            "last_run_worker_count": 1,
+            "last_run_timeout_seconds": 0.0,
+        }
+
     def sanitize_object(self, value: Any) -> Any:
         if isinstance(value, dict):
             safe: dict[str, Any] = {}
@@ -3910,6 +4021,627 @@ class ToolCallExecutionService:
         except Exception:
             return "[unprintable tool result]"
 
+    def load_handoff_parallel_object_config(self, object_name: str) -> dict[str, Any]:
+        normalized_object_name = str(object_name or "").strip() or "tool_handoff"
+        parallel_enabled = self._load_object_bool_from_env(
+            self._HANDOFF_PARALLEL_ENABLED_ENV,
+            default=False,
+        )
+        max_parallel_workers = self._load_object_int_from_env(
+            self._HANDOFF_PARALLEL_WORKERS_ENV,
+            default=4,
+            minimum=1,
+            maximum=16,
+        )
+        return {
+            "object_name": normalized_object_name,
+            "parallel_enabled": parallel_enabled,
+            "max_parallel_workers": max_parallel_workers,
+            "worker_count": max_parallel_workers if parallel_enabled else 1,
+        }
+
+    def load_router_branch_parallel_object_config(self, object_name: str) -> dict[str, Any]:
+        normalized_object_name = str(object_name or "").strip() or "router_branch"
+        parallel_enabled = self._load_object_bool_from_env(
+            self._ROUTER_BRANCH_PARALLEL_ENABLED_ENV,
+            default=False,
+        )
+        max_parallel_workers = self._load_object_int_from_env(
+            self._ROUTER_BRANCH_PARALLEL_WORKERS_ENV,
+            default=4,
+            minimum=1,
+            maximum=16,
+        )
+        timeout_seconds = self._load_object_float_from_env(
+            self._ROUTER_BRANCH_TIMEOUT_SECONDS_ENV,
+            default=30.0,
+            minimum=0.1,
+            maximum=600.0,
+        )
+        hard_timeout_enabled = self._load_object_bool_from_env(
+            self._ROUTER_BRANCH_HARD_TIMEOUT_ENABLED_ENV,
+            default=False,
+        )
+        return {
+            "object_name": normalized_object_name,
+            "parallel_enabled": parallel_enabled,
+            "max_parallel_workers": max_parallel_workers,
+            "worker_count": max_parallel_workers if parallel_enabled else 1,
+            "timeout_seconds": timeout_seconds,
+            "hard_timeout_enabled": hard_timeout_enabled,
+        }
+
+    @staticmethod
+    def _load_object_bool_from_env(env_name: str, *, default: bool) -> bool:
+        raw_value = str(os.getenv(env_name, "1" if default else "0") or "").strip().lower()
+        if raw_value in {"1", "true", "yes", "on"}:
+            return True
+        if raw_value in {"0", "false", "no", "off"}:
+            return False
+        return bool(default)
+
+    @staticmethod
+    def _load_object_int_from_env(
+        env_name: str,
+        *,
+        default: int,
+        minimum: int,
+        maximum: int,
+    ) -> int:
+        try:
+            loaded_value = int(str(os.getenv(env_name, str(default)) or str(default)).strip())
+        except Exception:
+            loaded_value = int(default)
+        return max(minimum, min(maximum, loaded_value))
+
+    @staticmethod
+    def _load_object_float_from_env(
+        env_name: str,
+        *,
+        default: float,
+        minimum: float,
+        maximum: float,
+    ) -> float:
+        try:
+            loaded_value = float(str(os.getenv(env_name, str(default)) or str(default)).strip())
+        except Exception:
+            loaded_value = float(default)
+        return max(minimum, min(maximum, loaded_value))
+
+    def build_handoff_object_tool_call(
+        self,
+        *,
+        parent_tool_call_id: str,
+        handoff_index: int,
+        handoff_args: dict[str, Any],
+    ) -> SimpleNamespace:
+        return SimpleNamespace(
+            id=f"{parent_tool_call_id}_handoff_{handoff_index}",
+            function=SimpleNamespace(
+                name="route_to_agent",
+                arguments=json.dumps(handoff_args, ensure_ascii=False),
+            ),
+        )
+
+    def execute_handoff_object_message(
+        self,
+        *,
+        parent_tool_call_id: str,
+        handoff_index: int,
+        handoff_args: dict[str, Any],
+        depth: int,
+        ChatCom,
+        agent_label: str,
+    ) -> Any:
+        synthetic_tool_call = self.build_handoff_object_tool_call(
+            parent_tool_call_id=parent_tool_call_id,
+            handoff_index=handoff_index,
+            handoff_args=handoff_args,
+        )
+        return _handle_tool_calls(
+            SimpleNamespace(content="", tool_calls=[synthetic_tool_call]),
+            depth=depth + 1,
+            ChatCom=ChatCom,
+            agent_label=agent_label,
+        )
+
+    def execute_handoff_object_messages(
+        self,
+        *,
+        parent_tool_call_id: str,
+        handoff_messages: list[dict[str, Any]],
+        depth: int,
+        ChatCom,
+        agent_label: str,
+    ) -> list[Any]:
+        handoff_items = [
+            (index, dict(handoff_args or {}))
+            for index, handoff_args in enumerate(handoff_messages, start=1)
+        ]
+        if not handoff_items:
+            return []
+
+        config = self.load_handoff_parallel_object_config("tool_handoff")
+        worker_count = min(
+            int(config.get("worker_count") or 1),
+            len(handoff_items),
+        )
+        if worker_count <= 1:
+            return [
+                self.execute_handoff_object_message(
+                    parent_tool_call_id=parent_tool_call_id,
+                    handoff_index=handoff_index,
+                    handoff_args=handoff_args,
+                    depth=depth,
+                    ChatCom=ChatCom,
+                    agent_label=agent_label,
+                )
+                for handoff_index, handoff_args in handoff_items
+            ]
+
+        futures = []
+        with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="alde-handoff") as executor:
+            for handoff_index, handoff_args in handoff_items:
+                futures.append(
+                    executor.submit(
+                        self.execute_handoff_object_message,
+                        parent_tool_call_id=parent_tool_call_id,
+                        handoff_index=handoff_index,
+                        handoff_args=handoff_args,
+                        depth=depth,
+                        ChatCom=ChatCom,
+                        agent_label=agent_label,
+                    )
+                )
+
+            ordered_results: list[Any] = []
+            for future in futures:
+                try:
+                    ordered_results.append(future.result())
+                except Exception as exc:
+                    ordered_results.append(f"Handoff execution failed: {exc}")
+        return ordered_results
+
+    def _load_tool_call_object_name(self, tool_call: Any) -> str:
+        tool_function = getattr(tool_call, "function", None)
+        return normalize_tool_name(str(getattr(tool_function, "name", "") or ""))
+
+    def should_execute_router_parallel_object_calls(
+        self,
+        *,
+        agent_msg: Any,
+        agent_label: str,
+    ) -> bool:
+        config = self.load_router_branch_parallel_object_config("router_branch")
+        if not bool(config.get("parallel_enabled")):
+            return False
+        if not _agent_can_route(agent_label):
+            return False
+
+        tool_calls = list(getattr(agent_msg, "tool_calls", []) or [])
+        if len(tool_calls) < 2:
+            return False
+
+        return all(
+            self._load_tool_call_object_name(tool_call) == "route_to_agent"
+            for tool_call in tool_calls
+        )
+
+    def build_router_branch_object_tool_call(
+        self,
+        *,
+        parent_tool_call_id: str,
+        branch_index: int,
+        tool_call: Any,
+    ) -> SimpleNamespace:
+        tool_function = getattr(tool_call, "function", None)
+        tool_name = str(getattr(tool_function, "name", "") or "")
+        tool_arguments = str(getattr(tool_function, "arguments", "{}") or "{}")
+        return SimpleNamespace(
+            id=f"{parent_tool_call_id}_branch_{branch_index}",
+            function=SimpleNamespace(
+                name=tool_name,
+                arguments=tool_arguments,
+            ),
+        )
+
+    def execute_router_branch_object_call(
+        self,
+        *,
+        branch_tool_call: Any,
+        branch_index: int,
+        depth: int,
+        ChatCom,
+        agent_label: str,
+        timeout_seconds: float,
+    ) -> dict[str, Any]:
+        started = time.perf_counter()
+        try:
+            branch_result = _handle_tool_calls(
+                SimpleNamespace(content="", tool_calls=[branch_tool_call]),
+                depth=depth + 1,
+                ChatCom=ChatCom,
+                agent_label=agent_label,
+            )
+            duration_seconds = max(time.perf_counter() - started, 0.0)
+            duration_ms = round(duration_seconds * 1000.0, 2)
+            timed_out = bool(timeout_seconds > 0.0 and duration_seconds > timeout_seconds)
+            if timed_out:
+                return {
+                    "branch_index": int(branch_index),
+                    "status": "timeout",
+                    "timed_out": True,
+                    "duration_ms": duration_ms,
+                    "result": branch_result,
+                    "error": f"branch exceeded timeout ({duration_seconds:.2f}s > {timeout_seconds:.2f}s)",
+                }
+            return {
+                "branch_index": int(branch_index),
+                "status": "completed",
+                "timed_out": False,
+                "duration_ms": duration_ms,
+                "result": branch_result,
+                "error": "",
+            }
+        except Exception as exc:
+            duration_seconds = max(time.perf_counter() - started, 0.0)
+            return {
+                "branch_index": int(branch_index),
+                "status": "failed",
+                "timed_out": False,
+                "duration_ms": round(duration_seconds * 1000.0, 2),
+                "result": None,
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+
+    def _project_router_branch_object_result(self, branch_outcome: dict[str, Any]) -> Any:
+        if not isinstance(branch_outcome, dict):
+            return {
+                "status": "failed",
+                "error": "invalid branch outcome",
+            }
+        status = str(branch_outcome.get("status") or "").strip().lower()
+        if status == "completed":
+            return branch_outcome.get("result")
+        return {
+            "branch_index": int(branch_outcome.get("branch_index") or 0),
+            "status": status or "failed",
+            "timed_out": bool(branch_outcome.get("timed_out")),
+            "duration_ms": float(branch_outcome.get("duration_ms") or 0.0),
+            "error": str(branch_outcome.get("error") or "").strip(),
+        }
+
+    def _execute_router_branch_object_calls_hard_timeout(
+        self,
+        *,
+        branch_calls: list[Any],
+        depth: int,
+        agent_label: str,
+        worker_count: int,
+        timeout_seconds: float,
+    ) -> list[dict[str, Any]]:
+        import multiprocessing
+        import queue as std_queue
+
+        preferred_start_method = "spawn" if os.name == "nt" else "fork"
+        try:
+            process_context = multiprocessing.get_context(preferred_start_method)
+        except Exception:
+            process_context = multiprocessing.get_context("spawn")
+        result_queue: Any = process_context.Queue()
+        pending_items = list(enumerate(branch_calls, start=1))
+        active_items: dict[int, dict[str, Any]] = {}
+        outcomes_by_index: dict[int, dict[str, Any]] = {}
+
+        def _start_object_items() -> None:
+            while len(active_items) < worker_count and pending_items:
+                branch_index, branch_tool_call = pending_items.pop(0)
+                tool_function = getattr(branch_tool_call, "function", None)
+                branch_payload = {
+                    "branch_index": int(branch_index),
+                    "tool_call_id": str(getattr(branch_tool_call, "id", "") or f"parallel_route_group_branch_{branch_index}"),
+                    "tool_name": str(getattr(tool_function, "name", "") or "route_to_agent"),
+                    "tool_arguments": str(getattr(tool_function, "arguments", "{}") or "{}"),
+                    "depth": int(depth),
+                    "agent_label": str(agent_label or ""),
+                }
+                process = process_context.Process(
+                    target=_execute_router_branch_process_object_call,
+                    args=(result_queue, branch_payload),
+                    daemon=True,
+                )
+                process.start()
+                active_items[int(branch_index)] = {
+                    "process": process,
+                    "started_at": time.perf_counter(),
+                }
+
+        _start_object_items()
+
+        while active_items:
+            received_message = None
+            try:
+                received_message = result_queue.get(timeout=0.02)
+            except std_queue.Empty:
+                received_message = None
+            except Exception:
+                received_message = None
+
+            if isinstance(received_message, dict):
+                branch_index = int(received_message.get("branch_index") or 0)
+                active_state = active_items.pop(branch_index, None)
+                if active_state is not None:
+                    process = active_state.get("process")
+                    if process is not None:
+                        try:
+                            process.join(timeout=0.05)
+                        except Exception:
+                            pass
+                    if not received_message.get("duration_ms"):
+                        started_at = float(active_state.get("started_at") or 0.0)
+                        received_message["duration_ms"] = round(max(time.perf_counter() - started_at, 0.0) * 1000.0, 2)
+
+                if branch_index <= 0:
+                    branch_index = len(outcomes_by_index) + 1
+                    received_message["branch_index"] = branch_index
+                received_message.setdefault("status", "failed")
+                received_message["timed_out"] = bool(received_message.get("timed_out"))
+                outcomes_by_index[branch_index] = dict(received_message)
+                _start_object_items()
+                continue
+
+            now = time.perf_counter()
+            timed_out_branch_indexes: list[int] = []
+            exited_branch_indexes: list[int] = []
+
+            for branch_index, active_state in list(active_items.items()):
+                process = active_state.get("process")
+                started_at = float(active_state.get("started_at") or 0.0)
+                elapsed_seconds = max(now - started_at, 0.0)
+
+                if timeout_seconds > 0.0 and elapsed_seconds > timeout_seconds:
+                    timed_out_branch_indexes.append(branch_index)
+                    continue
+
+                if process is not None and not process.is_alive() and process.exitcode is not None:
+                    exited_branch_indexes.append(branch_index)
+
+            for branch_index in timed_out_branch_indexes:
+                active_state = active_items.pop(branch_index, None)
+                if active_state is None:
+                    continue
+                process = active_state.get("process")
+                if process is not None and process.is_alive():
+                    try:
+                        process.terminate()
+                    except Exception:
+                        pass
+                    try:
+                        process.join(timeout=0.5)
+                    except Exception:
+                        pass
+
+                started_at = float(active_state.get("started_at") or 0.0)
+                elapsed_seconds = max(time.perf_counter() - started_at, 0.0)
+                outcomes_by_index[branch_index] = {
+                    "branch_index": int(branch_index),
+                    "status": "timeout",
+                    "timed_out": True,
+                    "duration_ms": round(elapsed_seconds * 1000.0, 2),
+                    "result": None,
+                    "error": f"branch exceeded hard timeout ({elapsed_seconds:.2f}s > {timeout_seconds:.2f}s)",
+                }
+                _start_object_items()
+
+            for branch_index in exited_branch_indexes:
+                active_state = active_items.pop(branch_index, None)
+                if active_state is None:
+                    continue
+                process = active_state.get("process")
+                exit_code = None
+                if process is not None:
+                    exit_code = process.exitcode
+                    try:
+                        process.join(timeout=0.05)
+                    except Exception:
+                        pass
+
+                started_at = float(active_state.get("started_at") or 0.0)
+                elapsed_seconds = max(time.perf_counter() - started_at, 0.0)
+                outcomes_by_index[branch_index] = {
+                    "branch_index": int(branch_index),
+                    "status": "failed",
+                    "timed_out": False,
+                    "duration_ms": round(elapsed_seconds * 1000.0, 2),
+                    "result": None,
+                    "error": f"branch process exited without result (code {exit_code})",
+                }
+                _start_object_items()
+
+        outcomes: list[dict[str, Any]] = []
+        for branch_index in range(1, len(branch_calls) + 1):
+            outcomes.append(
+                dict(
+                    outcomes_by_index.get(
+                        branch_index,
+                        {
+                            "branch_index": int(branch_index),
+                            "status": "failed",
+                            "timed_out": False,
+                            "duration_ms": 0.0,
+                            "result": None,
+                            "error": "branch result missing",
+                        },
+                    )
+                )
+            )
+
+        try:
+            result_queue.close()
+        except Exception:
+            pass
+        try:
+            result_queue.join_thread()
+        except Exception:
+            pass
+
+        return outcomes
+
+    def execute_router_branch_object_calls(
+        self,
+        *,
+        tool_calls: list[Any],
+        depth: int,
+        ChatCom,
+        agent_label: str,
+    ) -> dict[str, Any]:
+        execution_started = time.perf_counter()
+        branch_calls: list[Any] = [
+            self.build_router_branch_object_tool_call(
+                parent_tool_call_id="parallel_route_group",
+                branch_index=branch_index,
+                tool_call=tool_call,
+            )
+            for branch_index, tool_call in enumerate(tool_calls, start=1)
+        ]
+        if not branch_calls:
+            return {
+                "outcomes": [],
+                "results": [],
+                "status_counts": {"completed": 0, "failed": 0, "timeout": 0},
+                "partial_fail": False,
+                "branch_count": 0,
+                "worker_count": 1,
+                "timeout_seconds": 0.0,
+                "duration_ms": 0.0,
+            }
+
+        config = self.load_router_branch_parallel_object_config("router_branch")
+        worker_count = min(
+            int(config.get("worker_count") or 1),
+            len(branch_calls),
+        )
+        timeout_seconds = float(config.get("timeout_seconds") or 0.0)
+        hard_timeout_enabled = bool(config.get("hard_timeout_enabled"))
+        if worker_count <= 1:
+            branch_outcomes = [
+                self.execute_router_branch_object_call(
+                    branch_tool_call=branch_tool_call,
+                    branch_index=branch_index,
+                    depth=depth,
+                    ChatCom=ChatCom,
+                    agent_label=agent_label,
+                    timeout_seconds=timeout_seconds,
+                )
+                for branch_index, branch_tool_call in enumerate(branch_calls, start=1)
+            ]
+        elif hard_timeout_enabled:
+            branch_outcomes = self._execute_router_branch_object_calls_hard_timeout(
+                branch_calls=branch_calls,
+                depth=depth,
+                agent_label=agent_label,
+                worker_count=worker_count,
+                timeout_seconds=timeout_seconds,
+            )
+        else:
+            futures = []
+            with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="alde-router-branch") as executor:
+                for branch_index, branch_tool_call in enumerate(branch_calls, start=1):
+                    futures.append(
+                        executor.submit(
+                            self.execute_router_branch_object_call,
+                            branch_tool_call=branch_tool_call,
+                            branch_index=branch_index,
+                            depth=depth,
+                            ChatCom=ChatCom,
+                            agent_label=agent_label,
+                            timeout_seconds=timeout_seconds,
+                        )
+                    )
+
+                branch_outcomes = []
+                for future_index, future in enumerate(futures, start=1):
+                    try:
+                        branch_outcomes.append(dict(future.result() or {}))
+                    except Exception as exc:
+                        branch_outcomes.append(
+                            {
+                                "branch_index": int(future_index),
+                                "status": "failed",
+                                "timed_out": False,
+                                "duration_ms": 0.0,
+                                "result": None,
+                                "error": f"Router branch execution failed: {exc}",
+                            }
+                        )
+
+        status_counts = {
+            "completed": 0,
+            "failed": 0,
+            "timeout": 0,
+        }
+        for branch_outcome in branch_outcomes:
+            status_name = str(branch_outcome.get("status") or "failed").strip().lower()
+            if status_name not in status_counts:
+                status_name = "failed"
+            status_counts[status_name] += 1
+
+        projected_results = [
+            self._project_router_branch_object_result(branch_outcome)
+            for branch_outcome in branch_outcomes
+        ]
+        partial_fail = bool(status_counts["failed"] or status_counts["timeout"])
+        return {
+            "outcomes": branch_outcomes,
+            "results": projected_results,
+            "status_counts": status_counts,
+            "partial_fail": partial_fail,
+            "branch_count": len(branch_outcomes),
+            "worker_count": worker_count,
+            "timeout_seconds": timeout_seconds,
+            "hard_timeout_enabled": hard_timeout_enabled,
+            "duration_ms": round(max(time.perf_counter() - execution_started, 0.0) * 1000.0, 2),
+        }
+
+    def record_router_parallel_runtime_status(self, branch_execution: dict[str, Any]) -> None:
+        branch_count = int(branch_execution.get("branch_count") or 0)
+        status_counts = dict(branch_execution.get("status_counts") or {})
+        with self._router_parallel_status_lock:
+            self._router_parallel_status["total_parallel_runs"] = int(self._router_parallel_status.get("total_parallel_runs") or 0) + 1
+            self._router_parallel_status["total_parallel_branches"] = int(self._router_parallel_status.get("total_parallel_branches") or 0) + branch_count
+            self._router_parallel_status["total_completed_branches"] = int(self._router_parallel_status.get("total_completed_branches") or 0) + int(status_counts.get("completed") or 0)
+            self._router_parallel_status["total_failed_branches"] = int(self._router_parallel_status.get("total_failed_branches") or 0) + int(status_counts.get("failed") or 0)
+            self._router_parallel_status["total_timeout_branches"] = int(self._router_parallel_status.get("total_timeout_branches") or 0) + int(status_counts.get("timeout") or 0)
+            if bool(branch_execution.get("partial_fail")):
+                self._router_parallel_status["total_partial_fail_runs"] = int(self._router_parallel_status.get("total_partial_fail_runs") or 0) + 1
+            if bool(branch_execution.get("hard_timeout_enabled")):
+                self._router_parallel_status["total_hard_timeout_runs"] = int(self._router_parallel_status.get("total_hard_timeout_runs") or 0) + 1
+            self._router_parallel_status["last_run_at"] = datetime.now().isoformat(timespec="seconds")
+            self._router_parallel_status["last_run_duration_ms"] = float(branch_execution.get("duration_ms") or 0.0)
+            self._router_parallel_status["last_run_branch_count"] = branch_count
+            self._router_parallel_status["last_run_partial_fail"] = bool(branch_execution.get("partial_fail"))
+            self._router_parallel_status["last_run_hard_timeout_enabled"] = bool(branch_execution.get("hard_timeout_enabled"))
+            self._router_parallel_status["last_run_status_counts"] = {
+                "completed": int(status_counts.get("completed") or 0),
+                "failed": int(status_counts.get("failed") or 0),
+                "timeout": int(status_counts.get("timeout") or 0),
+            }
+            self._router_parallel_status["last_run_worker_count"] = int(branch_execution.get("worker_count") or 1)
+            self._router_parallel_status["last_run_timeout_seconds"] = float(branch_execution.get("timeout_seconds") or 0.0)
+
+    def load_router_parallel_runtime_status(self) -> dict[str, Any]:
+        config = self.load_router_branch_parallel_object_config("router_branch")
+        with self._router_parallel_status_lock:
+            status = dict(self._router_parallel_status)
+        status["config"] = {
+            "parallel_enabled": bool(config.get("parallel_enabled")),
+            "configured_worker_count": int(config.get("worker_count") or 1),
+            "configured_timeout_seconds": float(config.get("timeout_seconds") or 0.0),
+            "hard_timeout_enabled": bool(config.get("hard_timeout_enabled")),
+            "max_parallel_workers": int(config.get("max_parallel_workers") or 1),
+        }
+        return status
+
     def process_object_calls(
         self,
         *,
@@ -3932,6 +4664,117 @@ class ToolCallExecutionService:
             workflow_session=workflow_session,
         )
 
+        if self.should_execute_router_parallel_object_calls(
+            agent_msg=agent_msg,
+            agent_label=agent_label,
+        ):
+            route_tool_spec = get_tool_spec("route_to_agent")
+            route_tool_response_required = bool(getattr(route_tool_spec, "tool_response_required", True))
+            branch_execution = self.execute_router_branch_object_calls(
+                tool_calls=list(agent_msg.tool_calls),
+                depth=depth,
+                ChatCom=ChatCom,
+                agent_label=agent_label,
+            )
+            branch_results = list(branch_execution.get("results") or [])
+            branch_outcomes = list(branch_execution.get("outcomes") or [])
+            branch_status_counts = dict(branch_execution.get("status_counts") or {})
+            timeout_branch_count = int(branch_status_counts.get("timeout") or 0)
+            failed_branch_count = int(branch_status_counts.get("failed") or 0)
+            completed_branch_count = int(branch_status_counts.get("completed") or 0)
+            partial_fail = bool(branch_execution.get("partial_fail"))
+            self.record_router_parallel_runtime_status(branch_execution)
+            merged_result = {
+                "mode": "router_parallel_branches",
+                "branch_count": int(branch_execution.get("branch_count") or len(branch_results)),
+                "branch_results": branch_results,
+                "branch_outcomes": branch_outcomes,
+                "branch_status_counts": branch_status_counts,
+                "partial_fail": partial_fail,
+                "timeout_branch_count": timeout_branch_count,
+                "failed_branch_count": failed_branch_count,
+                "completed_branch_count": completed_branch_count,
+                "configured_worker_count": int(branch_execution.get("worker_count") or 1),
+                "configured_timeout_seconds": float(branch_execution.get("timeout_seconds") or 0.0),
+                "hard_timeout_enabled": bool(branch_execution.get("hard_timeout_enabled")),
+                "run_duration_ms": float(branch_execution.get("duration_ms") or 0.0),
+            }
+            tool_content = self.render_object_result(merged_result)
+            tool_results.append(tool_content)
+
+            branch_payload = {
+                "parallel_branches": int(branch_execution.get("branch_count") or len(branch_results)),
+                "branch_mode": "router_parallel_branches",
+                "partial_fail": partial_fail,
+                "timeout_branch_count": timeout_branch_count,
+                "failed_branch_count": failed_branch_count,
+                "completed_branch_count": completed_branch_count,
+                "hard_timeout_enabled": bool(branch_execution.get("hard_timeout_enabled")),
+            }
+            branch_failed = partial_fail
+            if branch_failed:
+                workflow_session = _advance_workflow_session(
+                    workflow_session,
+                    event_kind="state",
+                    event_name="tool_failed",
+                    payload={
+                        "tool_name": "route_to_agent",
+                        "result": tool_content,
+                        **branch_payload,
+                    },
+                )
+                workflow_history_event_kind = "state"
+                workflow_history_event_name = "tool_failed"
+                workflow_history_payload = {
+                    "tool_name": "route_to_agent",
+                    "result": tool_content,
+                    **branch_payload,
+                }
+            else:
+                workflow_session = _advance_workflow_session(
+                    workflow_session,
+                    event_kind="tool",
+                    event_name="route_to_agent",
+                    payload=branch_payload,
+                )
+                workflow_session = _advance_workflow_session(
+                    workflow_session,
+                    event_kind="state",
+                    event_name="tool_complete",
+                    payload={
+                        "tool_name": "route_to_agent",
+                        "result": tool_content,
+                        **branch_payload,
+                    },
+                )
+                workflow_history_event_kind = "tool"
+                workflow_history_event_name = "route_to_agent"
+                workflow_history_payload = branch_payload
+
+            terminal_tool_result = tool_content
+            terminal_tool_name = "route_to_agent"
+
+            WORKFLOW_HISTORY_LOG_SERVICE.log_tool_result(
+                history,
+                tool_content=tool_content,
+                agent_label=agent_label,
+                tool_call_id="parallel_route_group",
+                tool_name="route_to_agent",
+                workflow_session=workflow_session,
+                event_kind=workflow_history_event_kind,
+                event_name=workflow_history_event_name,
+                payload=workflow_history_payload,
+                tool_response_required=route_tool_response_required,
+            )
+
+            return {
+                "workflow_session": workflow_session,
+                "routing_request": routing_request,
+                "tool_results": tool_results,
+                "terminal_tool_result": terminal_tool_result,
+                "terminal_tool_name": terminal_tool_name,
+            }
+
         for tool_call in agent_msg.tool_calls:
             tool_name = tool_call.function.name
             tool_spec = get_tool_spec(tool_name)
@@ -3947,21 +4790,13 @@ class ToolCallExecutionService:
             auto_handoff_results: list[Any] = []
             auto_handoff_messages = _extract_tool_handoff_messages(result)
             if auto_handoff_messages and request is None:
-                for index, handoff_args in enumerate(auto_handoff_messages, start=1):
-                    synthetic_tool_call = SimpleNamespace(
-                        id=f"{getattr(tool_call, 'id', 'call')}_handoff_{index}",
-                        function=SimpleNamespace(
-                            name="route_to_agent",
-                            arguments=json.dumps(handoff_args, ensure_ascii=False),
-                        ),
-                    )
-                    nested_result = _handle_tool_calls(
-                        SimpleNamespace(content="", tool_calls=[synthetic_tool_call]),
-                        depth=depth + 1,
-                        ChatCom=ChatCom,
-                        agent_label=agent_label,
-                    )
-                    auto_handoff_results.append(nested_result)
+                auto_handoff_results = self.execute_handoff_object_messages(
+                    parent_tool_call_id=str(getattr(tool_call, "id", "call")),
+                    handoff_messages=auto_handoff_messages,
+                    depth=depth,
+                    ChatCom=ChatCom,
+                    agent_label=agent_label,
+                )
                 if isinstance(result, dict):
                     result = dict(result)
                     result["handoff_results"] = auto_handoff_results
@@ -4050,6 +4885,10 @@ class ToolCallExecutionService:
 
 
 TOOL_CALL_EXECUTION_SERVICE = ToolCallExecutionService()
+
+
+def get_router_parallel_runtime_status() -> dict[str, Any]:
+    return TOOL_CALL_EXECUTION_SERVICE.load_router_parallel_runtime_status()
 
 
 class ToolCallFollowupService:

@@ -1899,10 +1899,71 @@ class RequestObjectResolutionService:
             }
         return None
 
+    def _load_result_from_legacy_db_file(
+        self,
+        *,
+        correlation_id: str,
+        obj_name: str,
+        db_path: str | None,
+    ) -> dict[str, Any] | None:
+        if not isinstance(db_path, str) or not db_path.strip():
+            return None
+
+        resolved_path = os.path.abspath(os.path.expanduser(db_path))
+        if not os.path.isfile(resolved_path):
+            return None
+
+        try:
+            raw_db_payload = _load_json_file(resolved_path)
+        except Exception:
+            return None
+
+        if not isinstance(raw_db_payload, dict):
+            return None
+
+        resolved_obj_name = _normalize_document_obj_name(obj_name)
+        object_bucket = raw_db_payload.get(resolved_obj_name)
+        if not isinstance(object_bucket, dict):
+            return None
+
+        stored_record = object_bucket.get(correlation_id)
+        if not isinstance(stored_record, dict):
+            return None
+
+        result_key = _document_section_key(resolved_obj_name)
+        if isinstance(stored_record.get(result_key), dict):
+            result_payload: dict[str, Any] = {
+                "agent": str(stored_record.get("source_agent") or stored_record.get("agent") or _document_default_agent(resolved_obj_name)),
+                "correlation_id": str(stored_record.get("correlation_id") or correlation_id),
+                "link": deepcopy(stored_record.get("link") or {}),
+                "file": deepcopy(stored_record.get("file") or {}),
+                "parse": deepcopy(stored_record.get("parse") or {}),
+                result_key: deepcopy(stored_record.get(result_key) or {}),
+                "db_updates": deepcopy(stored_record.get("db_updates") or {}),
+            }
+            for explicit_key in ("raw_text_document", "entity_objects", "relation_objects"):
+                explicit_value = stored_record.get(explicit_key)
+                if explicit_value is not None:
+                    result_payload[explicit_key] = deepcopy(explicit_value)
+            return result_payload
+
+        inline_result = self.build_inline_result(stored_record, obj_name=resolved_obj_name)
+        if not isinstance(inline_result, dict):
+            return None
+        inline_result["correlation_id"] = str(inline_result.get("correlation_id") or correlation_id)
+        return inline_result
+
     def load_result_from_store(self, *, correlation_id: str, obj_name: str, db_path: str | None) -> dict[str, Any] | None:
         if not correlation_id:
             return None
-        return DOCUMENT_REPOSITORY.get_document(correlation_id, db_path=db_path, obj_name=obj_name)
+        result = DOCUMENT_REPOSITORY.get_document(correlation_id, db_path=db_path, obj_name=obj_name)
+        if isinstance(result, dict):
+            return result
+        return self._load_result_from_legacy_db_file(
+            correlation_id=correlation_id,
+            obj_name=obj_name,
+            db_path=db_path,
+        )
 
     def load_result_from_file(self, *, source_path: str, obj_name: str) -> dict[str, Any] | None:
         resolved_path = os.path.abspath(os.path.expanduser(source_path))
@@ -1915,9 +1976,12 @@ class RequestObjectResolutionService:
             result = None
         if not isinstance(result, dict):
             try:
-                with open(resolved_path, "r", encoding="utf-8") as file_handle:
-                    result = self.build_inline_result(file_handle.read(), obj_name=obj_name, source_path=resolved_path)
+                document_text = str(read_document(resolved_path) or "").strip()
             except Exception:
+                document_text = ""
+            if document_text and not document_text.lower().startswith("error"):
+                result = self.build_inline_result(document_text, obj_name=obj_name, source_path=resolved_path)
+            else:
                 return None
         if not isinstance(result, dict):
             return None

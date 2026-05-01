@@ -1411,7 +1411,15 @@ class HandoffRouteService:
         protocol = str(handoff.get("protocol") or "message_text").strip()
         target_policy = get_agent_handoff_policy(target_label)
         source_policy = get_agent_handoff_policy(source_label) if source_label else {}
-        contract = self.load_route_contract(source_label, target_label, protocol=protocol)
+        handoff_payload = handoff.get("handoff_payload") if isinstance(handoff.get("handoff_payload"), dict) else {}
+        metadata = handoff.get("metadata") if isinstance(handoff.get("metadata"), dict) else {}
+        contract = self.load_route_contract(
+            source_label,
+            target_label,
+            protocol=protocol,
+            handoff_payload=handoff_payload,
+            handoff_metadata=metadata,
+        )
         schema = dict(contract.get("schema") or {})
         errors: list[str] = []
 
@@ -1438,16 +1446,6 @@ class HandoffRouteService:
         if bool(schema.get("required_message_text")) and not self.extract_object_text(handoff.get("message_text")):
             errors.append("handoff schema requires non-empty message_text")
 
-        handoff_payload = handoff.get("handoff_payload") if isinstance(handoff.get("handoff_payload"), dict) else {}
-        metadata = handoff.get("metadata") if isinstance(handoff.get("metadata"), dict) else {}
-        contract = self.load_route_contract(
-            source_label,
-            target_label,
-            protocol=protocol,
-            handoff_payload=handoff_payload,
-            handoff_metadata=metadata,
-        )
-        schema = dict(contract.get("schema") or {})
         for key_path in schema.get("required_payload_paths") or []:
             if not _handoff_path_exists(handoff_payload, str(key_path)):
                 errors.append(f"handoff payload is missing required path '{key_path}'")
@@ -2631,9 +2629,9 @@ class AgentBasicConfigService:
                 "states.planner_ready.actor.kind": "agent",
                 f"states.planner_ready.actor.name": planner_agent_name,
                 "states.planner_ready.terminal": False,
-                "states.builder_delegated.actor.kind": "tool",
-                "states.builder_delegated.actor.name": "route_to_agent",
-                "states.builder_delegated.terminal": False,
+                "states.worker_delegated.actor.kind": "tool",
+                "states.worker_delegated.actor.name": "route_to_agent",
+                "states.worker_delegated.terminal": False,
                 "states.planner_retry_pending.actor.kind": "state",
                 "states.planner_retry_pending.actor.name": "retry_pending",
                 "states.planner_retry_pending.terminal": False,
@@ -2651,10 +2649,10 @@ class AgentBasicConfigService:
                             "name": "route_to_agent",
                             "conditions": {"target_agent": worker_agent_name},
                         },
-                        "to": "builder_delegated",
+                        "to": "worker_delegated",
                     },
                     {
-                        "from": "builder_delegated",
+                        "from": "worker_delegated",
                         "on": {
                             "kind": "state",
                             "name": "routed_agent_complete",
@@ -2663,7 +2661,7 @@ class AgentBasicConfigService:
                         "to": "workflow_complete",
                     },
                     {
-                        "from": ["planner_ready", "builder_delegated"],
+                        "from": ["planner_ready", "worker_delegated"],
                         "on": {
                             "kind": "state",
                             "name": ["model_failed", "routed_agent_failed"],
@@ -2724,8 +2722,8 @@ class AgentBasicConfigService:
                 {
                     "name": request.load_route_name(),
                     "trigger": {
-                        "type": "text_prefix",
-                        "prefix": route_prefix,
+                        "type": "slash_prefix",
+                        "prefix": '/',
                         "ignore_case": True,
                     },
                     "route": {

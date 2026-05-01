@@ -1265,6 +1265,51 @@ class RuntimeObservabilityService:
         self._validation_service = validation_service
         self._queue_health_service = queue_health_service
 
+    def load_router_parallel_status(self) -> dict[str, Any]:
+        try:
+            load_router_parallel_runtime_status = _load_symbol("agents_factory", "get_router_parallel_runtime_status")
+        except Exception:
+            return {
+                "available": False,
+                "config": {
+                    "parallel_enabled": False,
+                    "configured_worker_count": 1,
+                    "configured_timeout_seconds": 30.0,
+                    "max_parallel_workers": 1,
+                },
+                "total_parallel_runs": 0,
+                "total_parallel_branches": 0,
+                "total_completed_branches": 0,
+                "total_failed_branches": 0,
+                "total_timeout_branches": 0,
+                "total_partial_fail_runs": 0,
+            }
+
+        try:
+            status = load_router_parallel_runtime_status()
+        except Exception as exc:
+            return {
+                "available": False,
+                "error": f"router parallel status unavailable: {type(exc).__name__}: {exc}",
+                "config": {
+                    "parallel_enabled": False,
+                    "configured_worker_count": 1,
+                    "configured_timeout_seconds": 30.0,
+                    "max_parallel_workers": 1,
+                },
+                "total_parallel_runs": 0,
+                "total_parallel_branches": 0,
+                "total_completed_branches": 0,
+                "total_failed_branches": 0,
+                "total_timeout_branches": 0,
+                "total_partial_fail_runs": 0,
+            }
+
+        normalized_status = dict(status if isinstance(status, dict) else {})
+        normalized_status.setdefault("config", {})
+        normalized_status["available"] = True
+        return normalized_status
+
     def load_snapshot(
         self,
         *,
@@ -1293,6 +1338,12 @@ class RuntimeObservabilityService:
             reverse=True,
         )[:5]
         metrics = runtime_view.get("metrics") if isinstance(runtime_view.get("metrics"), dict) else {}
+        router_parallel_status = self.load_router_parallel_status()
+        router_parallel_config = (
+            router_parallel_status.get("config")
+            if isinstance(router_parallel_status.get("config"), dict)
+            else {}
+        )
 
         return {
             "generated_at": runtime_view.get("generated_at") or _utc_now_iso(),
@@ -1306,6 +1357,13 @@ class RuntimeObservabilityService:
             "active_session_count": int(metrics.get("active_session_count") or 0),
             "validation": validation_report,
             "metrics": metrics,
+            "router_parallel_status": router_parallel_status,
+            "router_parallel_enabled": bool(router_parallel_config.get("parallel_enabled")),
+            "router_parallel_hard_timeout_enabled": bool(router_parallel_config.get("hard_timeout_enabled")),
+            "router_parallel_total_runs": int(router_parallel_status.get("total_parallel_runs") or 0),
+            "router_parallel_timeout_branches": int(router_parallel_status.get("total_timeout_branches") or 0),
+            "router_parallel_partial_fail_runs": int(router_parallel_status.get("total_partial_fail_runs") or 0),
+            "router_parallel_hard_timeout_runs": int(router_parallel_status.get("total_hard_timeout_runs") or 0),
             "session_ids": [
                 _safe_str(session_view.get("session_id"))
                 for session_view in session_views
@@ -1988,8 +2046,34 @@ class DesktopMonitoringSnapshotService:
             )
         validation = observability.get("validation") if isinstance(observability.get("validation"), dict) else {}
         validation_errors = [str(item) for item in (validation.get("errors") or []) if str(item)]
+        router_parallel_status = (
+            observability.get("router_parallel_status")
+            if isinstance(observability.get("router_parallel_status"), dict)
+            else {}
+        )
+        router_parallel_timeout_branches = int(router_parallel_status.get("total_timeout_branches") or 0)
+        router_parallel_partial_fail_runs = int(router_parallel_status.get("total_partial_fail_runs") or 0)
+        router_parallel_total_runs = int(router_parallel_status.get("total_parallel_runs") or 0)
+        router_parallel_hard_timeout_runs = int(router_parallel_status.get("total_hard_timeout_runs") or 0)
+        router_parallel_config = (
+            router_parallel_status.get("config")
+            if isinstance(router_parallel_status.get("config"), dict)
+            else {}
+        )
         if validation_errors:
             alerts.append(f"{len(validation_errors)} runtime contract validation issues projected.")
+        if router_parallel_timeout_branches > 0:
+            alerts.append(
+                f"Router parallel branches reported {router_parallel_timeout_branches} timeout classifications."
+            )
+        if router_parallel_partial_fail_runs > 0:
+            alerts.append(
+                f"Router parallel mode recorded {router_parallel_partial_fail_runs} partial-fail runs."
+            )
+        if router_parallel_hard_timeout_runs > 0:
+            alerts.append(
+                f"Router parallel hard-timeout mode used in {router_parallel_hard_timeout_runs} runs."
+            )
         recent_items = [
             _build_recent_projection_item(
                 timestamp=_safe_str(event_object.get("timestamp")),
@@ -2013,6 +2097,11 @@ class DesktopMonitoringSnapshotService:
             "average_latency_ms": average_latency_ms,
             "active_session_count": int(observability.get("active_session_count") or 0),
             "validation_issue_count": len(validation_errors),
+            "router_parallel_runs": router_parallel_total_runs,
+            "router_parallel_timeout_branches": router_parallel_timeout_branches,
+            "router_parallel_partial_fail_runs": router_parallel_partial_fail_runs,
+            "router_parallel_hard_timeout_runs": router_parallel_hard_timeout_runs,
+            "router_parallel_hard_timeout_enabled": bool(router_parallel_config.get("hard_timeout_enabled")),
         }
 
         return _build_projection_snapshot(
@@ -2028,6 +2117,8 @@ class DesktopMonitoringSnapshotService:
             validation=validation,
             validation_issue_count=len(validation_errors),
             active_session_count=int(observability.get("active_session_count") or 0),
+            router_parallel_status=router_parallel_status,
+            router_parallel_enabled=bool(router_parallel_config.get("parallel_enabled")),
             latest_sessions=latest_session_summaries,
             observability=observability,
             session_count=int(runtime_view.get("session_count") or 0),
