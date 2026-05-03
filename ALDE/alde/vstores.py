@@ -310,7 +310,7 @@ def _resolve_chunking_config(
     }
     strategy = str(chunk_strategy or CHUNK_STRATEGY or "recursive").strip().lower()
     strategy = strategy_aliases.get(strategy, strategy)
-    valid_strategies = {"recursive", "character", "markdown"}
+    valid_strategies = {"recursive", "character", "markdown", "python_ast"}
     if strategy not in valid_strategies:
         raise ValueError(
             f"Unsupported chunk_strategy {chunk_strategy!r}. Expected one of: {sorted(valid_strategies)}"
@@ -330,6 +330,32 @@ def _resolve_chunking_config(
     return strategy, resolved_chunk_size, resolved_overlap
 
 
+class _PythonAstSplitterAdapter:
+    """Adapts :class:`alde.repo_code_splitter.PythonCodeSplitter` to the
+    LangChain ``split_text(text) -> list[str]`` interface so it can be used
+    as a drop-in replacement wherever ``_create_text_splitter`` is called.
+    """
+
+    def __init__(self) -> None:
+        try:
+            from .repo_code_splitter import PythonCodeSplitter  # type: ignore
+        except ImportError:
+            from alde.repo_code_splitter import PythonCodeSplitter  # type: ignore
+        self._inner = PythonCodeSplitter()
+
+    def split_text(self, text: str) -> list[str]:
+        return self._inner.split_text(text)
+
+    def create_documents(self, texts: list[str], metadatas: list[dict] | None = None) -> list:
+        """Minimal LangChain Document-list compat (returns plain dicts)."""
+        metadatas = metadatas or [{}] * len(texts)
+        results = []
+        for text, meta in zip(texts, metadatas):
+            for chunk in self.split_text(text):
+                results.append({"page_content": chunk, "metadata": meta})
+        return results
+
+
 def _create_text_splitter(
     chunk_strategy: str | None = None,
     chunk_size: int | None = None,
@@ -340,6 +366,8 @@ def _create_text_splitter(
         chunk_size=chunk_size,
         overlap=overlap,
     )
+    if strategy == "python_ast":
+        return _PythonAstSplitterAdapter()
     splitter_cls_map = {
         "recursive": RecursiveCharacterTextSplitter,
         "character": CharacterTextSplitter,

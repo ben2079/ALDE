@@ -65,9 +65,9 @@ class AgentDbSocketServerRunner:
             if self._override_env or key not in os.environ:
                 os.environ[key] = value
         if self._backend_uri is not None:
-            os.environ["****AGENTS_DB_URI"] = self._backend_uri
+            os.environ["AI_IDE_KNOWLEDGE_AGENTS_DB_URI"] = self._backend_uri
         if self._memory_image_path is not None:
-            os.environ["****AGENTS_DB_IMAGE_PATH"] = self._memory_image_path
+            os.environ["AI_IDE_KNOWLEDGE_AGENTS_DB_IMAGE_PATH"] = self._memory_image_path
         return variable_map
 
     def _backend_available(self, backend_uri: str) -> bool:
@@ -76,21 +76,21 @@ class AgentDbSocketServerRunner:
             return True
      
     def _ensure_runtime_backend(self) -> None:
-        backend_uri = str(os.getenv("****AGENTS_DB_BACKEND_URI", "")).strip()
+        backend_uri = str(os.getenv("AI_IDE_KNOWLEDGE_AGENTS_DB_BACKEND_URI", "")).strip()
         if not backend_uri:
             backend_uri = "agentsdb://localhost:2331"
         if self._backend_available(backend_uri):
-            os.environ["****AGENTS_DB_BACKEND_URI"] = backend_uri
+            os.environ["AI_IDE_KNOWLEDGE_AGENTS_DB_BACKEND_URI"] = backend_uri
             if backend_uri.lower().startswith(("agentsmem://", "memory://", "inmemory://")):
                 os.environ.setdefault(
-                    "****AGENTS_DB_IMAGE_PATH",
+                    "AI_IDE_KNOWLEDGE_AGENTS_DB_IMAGE_PATH",
                     str((REPO_ROOT / "AppData" / "agentsdb_image.json").resolve()),
                 )
             return
 
-        os.environ["****AGENTS_DB_URI"] = "agentsdb://localhost:2331"
+        os.environ["AI_IDE_KNOWLEDGE_AGENTS_DB_URI"] = "agentsdb://localhost:2331"
         os.environ.setdefault(
-            "****AGENTS_IMAGE_PATH",
+            "AI_IDE_KNOWLEDGE_AGENTS_IMAGE_PATH",
             str((REPO_ROOT / "AppData" / "agentsdb_image.json").resolve()),
         )
         print("[WARNING] AgentsDB backend unavailable; agentsdb switched to in-memory backend.")

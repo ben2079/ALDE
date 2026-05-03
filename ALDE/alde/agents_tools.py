@@ -2305,43 +2305,13 @@ def upsert_object_record_tool(
     )
     return json.dumps(result, ensure_ascii=False)
 
-
-
-def upsert_dispatcher_job_record_tool(
-    job_posting_result: dict[str, Any] | str,
-    correlation_id: str | None = None,
-    dispatcher_db_path: str | None = None,
-    job_postings_db_path: str | None = None,
-    obj_name: str | None = None,
-    processing_state: str | None = None,
-    processed: bool | None = None,
-    failed_reason: str | None = None,
-    source_agent: str | None = None,
-    source_payload: dict[str, Any] | None = None,
-    dispatcher_updates: dict[str, Any] | None = None,
-) -> str:
-    return upsert_object_record_tool(
-        object_result=job_posting_result,
-        correlation_id=correlation_id,
-        dispatcher_db_path=dispatcher_db_path,
-        obj_db_path=job_postings_db_path,
-        obj_name=_normalize_document_obj_name(obj_name, "job_postings"),
-        processing_state=processing_state,
-        processed=processed,
-        failed_reason=failed_reason,
-        source_agent=source_agent,
-        source_payload=source_payload,
-        dispatcher_updates=dispatcher_updates,
-    )
-
-
 def store_profile_result_tool(
     profile_result: dict[str, Any] | str,
     correlation_id: str | None = None,
     db_path: str | None = None,
     source_agent: str | None = None,
     obj_name: str | None = None,
-) -> str:
+    ) -> str:
     return store_object_result_tool(
         object_result=profile_result,
         correlation_id=correlation_id,
@@ -3220,6 +3190,8 @@ AGENTS_DB_STRUCTURE_CONFIGS: dict[str, dict[str, Any]] = {
                     },
                 ],
             },
+
+
             "agents_db.py": {
                 "role": "knowledge_projection",
                 "layers": [
@@ -3370,23 +3342,6 @@ def build_agent_system_configs_tool(
     return json.dumps(config_bundle, ensure_ascii=False)
 
 
-def update_dispatcher_document_status(
-    *,
-    correlation_id: str,
-    processing_state: str,
-    db_path: str | None = None,
-    processed: bool | None = None,
-    failed_reason: str | None = None,
-    extra_updates: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    return DOCUMENT_REPOSITORY.update_dispatcher_status(
-        correlation_id=correlation_id,
-        processing_state=processing_state,
-        db_path=db_path,
-        processed=processed,
-        failed_reason=failed_reason,
-        extra_updates=extra_updates,
-    )
 
 
 class DocumentDispatchService:
@@ -3893,118 +3848,8 @@ class DocumentDispatchService:
 DOCUMENT_DISPATCH_SERVICE = DocumentDispatchService()
 
 
-def dispatch_docs(
-    scan_dir: str,
-    db: dict | None = None,
-    db_path: str | None = None,
-    obj: str | None = None,
-    obj_name: str | None = None,
-    thread_id: str | None = None,
-    dispatcher_message_id: str | None = None,
-    recursive: bool = True,
-    extensions: list | None = None,
-    max_files: int | None = None,
-    agent_name: str = "_xworker",
-    parser_agent_name: str | None = None,
-    parser_job_name: str | None = None,
-    dry_run: bool = False,
-) -> dict:
-    return DOCUMENT_DISPATCH_SERVICE.dispatch_documents(
-        scan_dir=scan_dir,
-        db=db,
-        db_path=db_path,
-        obj=obj,
-        obj_name=obj_name,
-        thread_id=thread_id,
-        dispatcher_message_id=dispatcher_message_id,
-        recursive=recursive,
-        extensions=extensions,
-        max_files=max_files,
-        agent_name=agent_name,
-        parser_agent_name=parser_agent_name,
-        parser_job_name=parser_job_name,
-        dry_run=dry_run,
-    )
 
 
-def batch_generate_new_docs(
-    scan_dir: str,
-    profile_path: str,
-    db_path: str,
-    out_dir: str | None = None,
-    model: str = "gpt-4o-mini",
-    max_files: int | None = None,
-    max_text_chars: int = 20000,
-    dry_run: bool = False,
-    write_pdf: bool = True,
-    rerun_processed: bool = False,
-) -> dict:
-    """Batch-generate new documents for all job-offer PDFs in a directory.
-
-    Thin wrapper around `alde.batch_cover_letters.batch_generate` so it can be used
-    via the unified tool dispatcher (tool calling).
-    """
-    try:
-        from .batch_cover_letters import batch_generate  # type: ignore
-    except Exception:
-        from batch_cover_letters import batch_generate  # type: ignore
-
-    return batch_generate(
-        scan_dir=scan_dir,
-        profile_path=profile_path,
-        dispatcher_db_path=db_path,
-        out_dir=out_dir,
-        model=model,
-        max_files=max_files,
-        max_text_chars=max_text_chars,
-        dry_run=dry_run,
-        write_pdf=write_pdf,
-        rerun_processed=rerun_processed,
-    )
-
-
-def batch_generate_documents_tool(
-    scan_dir: str,
-    profile_path: str,
-    db_path: str,
-    out_dir: str | None = None,
-    workflow_name: str = "cover_letter_batch_generation",
-    model: str = "gpt-4o-mini",
-    max_files: int | None = None,
-    max_text_chars: int = 20000,
-    dry_run: bool = False,
-    write_pdf: bool = True,
-    rerun_processed: bool = False,
-) -> dict[str, Any]:
-    # Legacy compatibility wrapper: route legacy batch requests into
-    # dispatch-driven per-document handoff fan-out.
-    dispatch_result = DOCUMENT_DISPATCH_SERVICE.dispatch_documents(
-        scan_dir=scan_dir,
-        db_path=db_path,
-        max_files=max_files,
-        dry_run=dry_run,
-        parser_job_name="job_posting_parser",
-    )
-    if not isinstance(dispatch_result, dict):
-        return {
-            "ok": False,
-            "error": "dispatch_result_invalid",
-            "result": dispatch_result,
-        }
-
-    result_payload = dict(dispatch_result)
-    result_payload["compat"] = {
-        "legacy_tool": "batch_generate_documents",
-        "strategy": "dispatch_fanout_per_document",
-        "workflow_name": workflow_name,
-        "profile_path": profile_path,
-        "out_dir": out_dir,
-        "model": model,
-        "max_text_chars": int(max_text_chars),
-        "write_pdf": bool(write_pdf),
-        "rerun_processed": bool(rerun_processed),
-    }
-    return result_payload
 
 
 def md_to_pdf(
@@ -5247,6 +5092,11 @@ def vdb_worker(
         force=force,
         remove_store_dir=remove_store_dir,
     )
+
+
+
+
+
 # return data from T with type, key or with type, key where types, keys are (SQL/NoSQL) data structure types
 
 def write_document(
@@ -5728,23 +5578,26 @@ _TOOL_RUNTIME_REFS: dict[str, Any] = {
     "tool_names": get_available_tool_names(),
 }
 
+try:
+    from .repo_code_splitter import repo_knowledge_worker, repo_knowledge_query
+except ImportError:
+    from alde.repo_code_splitter import repo_knowledge_worker, repo_knowledge_query
 
 _TOOL_IMPLEMENTATIONS: dict[str, Callable | None] = {
     "memorydb": memorydb,
     "vectordb": vectordb,
     "vdb_worker": vdb_worker,
+    "repo_knowledge_worker": repo_knowledge_worker,
+    "repo_knowledge_query": repo_knowledge_query,
     "build_agent_system_configs": build_agent_system_configs_tool,
     "execute_action_request": ACTION_REQUEST_SERVICE.execute_request_tool,
     "store_object_result": store_object_result_tool,
     "ingest_object": ingest_object_tool,
     "upsert_object_record": upsert_object_record_tool,
-    "upsert_dispatcher_job_record": upsert_dispatcher_job_record_tool,
     "ingest_profile": ingest_profile_tool,
     "ingest_job_posting": ingest_job_posting_tool,
     "store_job_posting_result": store_job_posting_result_tool,
     "store_profile_result": store_profile_result_tool,
-    "batch_document_generator": batch_generate_documents_tool,
-    "batch_generate_documents": batch_generate_documents_tool,
     "write_document": write_document,
     "read_document": read_document,
     "pypdf_read_document": pypdf_read_document,

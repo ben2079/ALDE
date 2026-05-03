@@ -496,6 +496,114 @@ JOB_PROMPTS: dict[str, dict[str, Any]] = {
             },
         },
     },
+    "repo_knowledge_worker": {
+        "prompt": _text(
+            """
+            === Job: repo_knowledge_worker ===
+            Description: Deterministic repository indexing execution job.
+            Goal: Run the repo_knowledge_worker tool with explicit parameters and return its result unchanged.
+
+            Rules:
+            - Use only the repo_knowledge_worker tool for this job.
+            - Keep operation explicit: scan or build.
+            - Pass root_dir, extensions, workers, and image_path only when provided.
+            - Return the tool result payload unchanged.
+            - Do not invent repository state, indexing metrics, or errors.
+            """
+        ),
+        "task": {
+            "mode": "tool_execution",
+            "tool_name": "repo_knowledge_worker",
+        },
+        "output_schema": {
+            "ok": True,
+            "operation": "scan|build",
+            "files_found": 0,
+            "total_blocks": 0,
+            "total_entities": 0,
+            "total_relations": 0,
+            "total_embedded": 0,
+            "errors": [],
+        },
+    },
+    "repo_knowledge_query": {
+        "prompt": _text(
+            """
+            === Job: repo_knowledge_query ===
+            Description: Deterministic repository retrieval execution job.
+            Goal: Run the repo_knowledge_query tool and return context chunks for downstream reasoning.
+
+            Rules:
+            - Use only the repo_knowledge_query tool for this job.
+            - Require a non-empty query.
+            - Pass owner_types, limit, namespace_id, image_path, and use_vector only when provided.
+            - Return the tool result payload unchanged.
+            - Do not invent matches, scores, or source paths.
+            """
+        ),
+        "task": {
+            "mode": "tool_execution",
+            "tool_name": "repo_knowledge_query",
+        },
+        "output_schema": {
+            "ok": True,
+            "query": "...",
+            "namespace_id": "ns_repo_knowledge",
+            "owner_types": ["block", "entity"],
+            "used_vector_search": True,
+            "total": 0,
+            "chunks": [],
+        },
+    },
+    "router_planner_repo_knowledge_async": {
+        "prompt": _text(
+            """
+            === Job: Xrouter_Xplanner for repo_knowledge_async ===
+            Description: Specialized router planner for asynchronous repo-knowledge fanout to xworker.
+            Goal: Emit deterministic route_to_agent branches for repo_knowledge_worker and repo_knowledge_query execution.
+
+            Rules:
+            - Route only to _xworker.
+            - Use explicit job_name per branch: repo_knowledge_worker or repo_knowledge_query.
+            - Keep branch payloads source-grounded and deterministic.
+            - For asynchronous branch execution, assume parallel worker target 4.
+            - Do not invent tool outputs.
+            """
+        ),
+        "task": {
+            "mode": "parallel_router_planner",
+            "defaults": {
+                "target_agent": "_xworker",
+            },
+            "parallel": {
+                "enabled": True,
+                "workers": 4,
+                "mode": "router_parallel_branches",
+            },
+            "available_jobs": [
+                "repo_knowledge_worker",
+                "repo_knowledge_query",
+            ],
+        },
+        "output_schema": {
+            "branches": [
+                {
+                    "target_agent": "_xworker",
+                    "job_name": "repo_knowledge_worker",
+                    "user_question": "{...tool payload json...}",
+                },
+                {
+                    "target_agent": "_xworker",
+                    "job_name": "repo_knowledge_query",
+                    "user_question": "{...tool payload json...}",
+                },
+            ],
+            "parallel": {
+                "enabled": True,
+                "workers": 4,
+            },
+        },
+    },
    
     "mail_agent_runtime": {
         "prompt": _text(
@@ -538,6 +646,36 @@ JOB_CONFIGS: dict[str, dict[str, Any]] = {
         "skill_profile": "xworker_core",
         "default_object_name": "documents",
         "is_default_for_agent": True,
+    },
+    "repo_knowledge_worker": {
+        "runtime_agent": "_xworker",
+        "skill_profile": "xworker_core",
+        "default_object_name": "repo_knowledge",
+        "workflow_name": "xworker_repo_knowledge_worker_leaf",
+        "default_tool_names": ["repo_knowledge_worker"],
+    },
+    "repo_knowledge_query": {
+        "runtime_agent": "_xworker",
+        "skill_profile": "xworker_core",
+        "default_object_name": "repo_knowledge",
+        "workflow_name": "xworker_repo_knowledge_query_leaf",
+        "default_tool_names": ["repo_knowledge_query"],
+    },
+    "router_planner_repo_knowledge_async": {
+        "runtime_agent": "_xrouter_xplanner",
+        "skill_profile": "xrouter_repo_knowledge_async_planner",
+        "default_object_name": "repo_knowledge",
+        "workflow_name": "xrouter_repo_knowledge_async_router",
+        "route_defaults": {
+            "target_agent": "_xworker",
+            "handoff_metadata": {
+                "workflow_name": "xrouter_repo_knowledge_async_router",
+                "parallel_mode": "router_parallel_branches",
+                "parallel_workers": 4,
+                "parallel_enabled_env": "ALDE_ROUTER_BRANCH_PARALLEL_ENABLED",
+                "parallel_workers_env": "ALDE_ROUTER_BRANCH_PARALLEL_WORKERS",
+            },
+        },
     },
     "document_dispatch": {
         "runtime_agent": "_xworker",
@@ -651,6 +789,8 @@ def _tool_skill_profiles_for_agent(agent_label: str) -> dict[str, str]:
         "store_object_result": "xworker_dispatch",
         "run_mail_agent": "xworker_mail_agent_runtime",
         "vdb_worker": "xworker_core",
+        "repo_knowledge_worker": "xworker_core",
+        "repo_knowledge_query": "xworker_core",
         "dispatch_documents": "xworker_dispatch",
         "read_document": "xworker_core",
         "list_documents": "xworker_core",
@@ -712,6 +852,8 @@ AGENT_RUNTIME: dict[str, dict[str, Any]] = {
             "store_object_result",
             "run_mail_agent",
             "vdb_worker",
+            "repo_knowledge_worker",
+            "repo_knowledge_query",
             "@dispatcher",
             "@doc_ro",
             "@doc_rw",
@@ -1163,6 +1305,12 @@ AGENT_SKILLS: dict[str, dict[str, Any]] = {
         "description": "Planning profile for deterministic dispatch->parse->cover-letter sequence initialization.",
         "job_name": "router_planner_cover_letter_sequence",
     },
+    "xrouter_repo_knowledge_async_planner": {
+        "role": "xplaner_xrouter",
+        "prompt_fragments": ["source_grounding", "router_handoff", "deterministic_workflow"],
+        "description": "Planning profile for async repo-knowledge fanout routing to xworker.",
+        "job_name": "router_planner_repo_knowledge_async",
+    },
   
     "xworker_core": {
         "role": "xworker",
@@ -1315,6 +1463,29 @@ TOOL_CONFIGS: list[dict[str, Any]] = [
             {"name": "overlap", "type": "integer", "description": "Optional chunk overlap for build operations."},
             {"name": "force", "type": "boolean", "description": "Required for wipe operations.", "default": False},
             {"name": "remove_store_dir", "type": "boolean", "description": "If true and operation=wipe: delete the whole store directory. Otherwise remove only index+manifest files.", "default": False},
+        ],
+    },
+    {
+        "name": "repo_knowledge_worker",
+        "description": "Scan or build repository knowledge as AgentsDB document, entity, relation, and embedding objects.",
+        "parameters": [
+            {"name": "operation", "type": "string", "description": "Operation to run: scan|build.", "required": True, "enum": ["scan", "build"]},
+            {"name": "root_dir", "type": "string", "description": "Repository root directory to parse. Default: current ALDE workspace root."},
+            {"name": "image_path", "type": "string", "description": "Optional snapshot path when the runtime falls back to an in-memory AgentsDB backend."},
+            {"name": "workers", "type": "integer", "description": "Number of indexing workers.", "default": 4},
+            {"name": "extensions", "type": "array", "description": "Optional extension filter, default ['.py'].", "items": {"type": "string"}},
+        ],
+    },
+    {
+        "name": "repo_knowledge_query",
+        "description": "Query indexed repository knowledge and return relevant code context chunks (blocks, entities, relations) for the IDE Agent. Uses dense-vector search with text-search fallback.",
+        "parameters": [
+            {"name": "query", "type": "string", "description": "Natural-language search query, e.g. 'how does the AgentsDB pipeline store embeddings'.", "required": True},
+            {"name": "owner_types", "type": "array", "description": "Owner types to query: block | entity | relation | all. Default: [block, entity].", "items": {"type": "string"}},
+            {"name": "limit", "type": "integer", "description": "Max results per owner_type (1–50). Default: 10.", "default": 10},
+            {"name": "namespace_id", "type": "string", "description": "AgentsDB namespace to query. Default: ns_repo_knowledge."},
+            {"name": "image_path", "type": "string", "description": "Optional snapshot path for in-memory fallback backend."},
+            {"name": "use_vector", "type": "boolean", "description": "Attempt dense-vector search before text fallback. Default: true.", "default": True},
         ],
     },
     {
@@ -1703,7 +1874,8 @@ TOOL_GROUPS: dict[str, list[str]] = {
     "web": ["fetch_url", "fetch_data", "call_api"],
     "comms": ["send_mail", "run_mail_agent", "calendar", "call", "accept_call", "reject_call"],
     "code": ["code_tool", "iter_documents"],
-    "dispatcher": ["dispatch_documents", "execute_action_request", "upsert_object_record", "ingest_object", "store_object_result", "vdb_worker"],
+    "dispatcher": ["dispatch_documents", "execute_action_request", "upsert_object_record", "ingest_object", "store_object_result", "vdb_worker", "repo_knowledge_worker"],
+    "repo_knowledge": ["repo_knowledge_worker", "repo_knowledge_query"],
 }
 
 
@@ -1999,6 +2171,125 @@ WORKFLOWS: dict[str, dict[str, Any]] = {
                 },
                 "to": "cover_letter_writer_complete",
             }
+        ],
+    },
+    "xworker_repo_knowledge_worker_leaf": {
+        "description": "Leaf workflow for repo_knowledge_worker tool-execution job.",
+        "entry_state": "repo_knowledge_worker_active",
+        "states": {
+            "repo_knowledge_worker_active": {
+                "actor": {"kind": "agent", "name": "_xworker"},
+                "terminal": False,
+            },
+            "repo_knowledge_worker_complete": {
+                "actor": {"kind": "state", "name": "workflow_complete"},
+                "terminal": True,
+            },
+            "repo_knowledge_worker_failed": {
+                "actor": {"kind": "state", "name": "workflow_failed"},
+                "terminal": True,
+            },
+        },
+        "transitions": [
+            {
+                "from": "repo_knowledge_worker_active",
+                "on": {"kind": "state", "name": ["followup_complete", "tool_complete"]},
+                "to": "repo_knowledge_worker_complete",
+            },
+            {
+                "from": "repo_knowledge_worker_active",
+                "on": {"kind": "state", "name": ["model_failed", "tool_failed"]},
+                "to": "repo_knowledge_worker_failed",
+            },
+        ],
+    },
+    "xworker_repo_knowledge_query_leaf": {
+        "description": "Leaf workflow for repo_knowledge_query tool-execution job.",
+        "entry_state": "repo_knowledge_query_active",
+        "states": {
+            "repo_knowledge_query_active": {
+                "actor": {"kind": "agent", "name": "_xworker"},
+                "terminal": False,
+            },
+            "repo_knowledge_query_complete": {
+                "actor": {"kind": "state", "name": "workflow_complete"},
+                "terminal": True,
+            },
+            "repo_knowledge_query_failed": {
+                "actor": {"kind": "state", "name": "workflow_failed"},
+                "terminal": True,
+            },
+        },
+        "transitions": [
+            {
+                "from": "repo_knowledge_query_active",
+                "on": {"kind": "state", "name": ["followup_complete", "tool_complete"]},
+                "to": "repo_knowledge_query_complete",
+            },
+            {
+                "from": "repo_knowledge_query_active",
+                "on": {"kind": "state", "name": ["model_failed", "tool_failed"]},
+                "to": "repo_knowledge_query_failed",
+            },
+        ],
+    },
+    "xrouter_repo_knowledge_async_router": {
+        "description": "xrouter_xplanner workflow for async repo-knowledge fanout to xworker branches.",
+        "entry_state": "xrouter_repo_knowledge_ready",
+        "parallel": {
+            "mode": "router_parallel_branches",
+            "enabled": True,
+            "workers": 4,
+            "enabled_env": "ALDE_ROUTER_BRANCH_PARALLEL_ENABLED",
+            "workers_env": "ALDE_ROUTER_BRANCH_PARALLEL_WORKERS",
+        },
+        "states": {
+            "xrouter_repo_knowledge_ready": {
+                "actor": {"kind": "agent", "name": "_xrouter_xplanner"},
+                "terminal": False,
+            },
+            "xrouter_repo_knowledge_routed": {
+                "actor": {"kind": "tool", "name": "route_to_agent"},
+                "terminal": False,
+            },
+            "xrouter_repo_knowledge_complete": {
+                "actor": {"kind": "state", "name": "workflow_complete"},
+                "terminal": True,
+            },
+            "xrouter_repo_knowledge_failed": {
+                "actor": {"kind": "state", "name": "workflow_failed"},
+                "terminal": True,
+            },
+        },
+        "transitions": [
+            {
+                "from": "xrouter_repo_knowledge_ready",
+                "on": {
+                    "kind": "tool",
+                    "name": "route_to_agent",
+                    "conditions": {"target_agent": "_xworker"},
+                },
+                "to": "xrouter_repo_knowledge_routed",
+            },
+            {
+                "from": "xrouter_repo_knowledge_routed",
+                "on": {
+                    "kind": "state",
+                    "name": ["followup_complete", "routed_agent_complete"],
+                    "conditions": {
+                        "any": [
+                            {"result": {"exists": True}},
+                            {"target_agent": "_xworker"},
+                        ]
+                    },
+                },
+                "to": "xrouter_repo_knowledge_complete",
+            },
+            {
+                "from": ["xrouter_repo_knowledge_ready", "xrouter_repo_knowledge_routed"],
+                "on": {"kind": "state", "name": ["model_failed", "tool_failed", "routed_agent_failed"]},
+                "to": "xrouter_repo_knowledge_failed",
+            },
         ],
     },
     "xworker_documents_dispatch_chain": {

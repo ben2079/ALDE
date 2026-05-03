@@ -20,17 +20,16 @@ Source system: repo_indexer
 """
 from __future__ import annotations
 
+import argparse
 import ast
 import hashlib
 import os
-import re
 import sys
-import textwrap
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping, Sequence
 
 # ---------------------------------------------------------------------------
 # Path bootstrap (run from project root OR from ALDE/alde/)
@@ -45,11 +44,15 @@ from agents_db import (  # type: ignore
     AgentDbInMemoryRepository,
     BlockObject,
     DocumentObject,
+    EntityObject,
+    EntityRelationObject,
     EntityRelationEmbeddingService,
     KnowledgeObjectService,
     NamespaceObject,
+    ObjectMappingService,
     RuntimeConfigObject,
-    _now_utc,
+    load_agentsdb_pipeline_service,
+    load_agentsdb_runtime_config_from_env,
 )
 
 
@@ -207,6 +210,31 @@ class PythonCodeSplitter:
         offsets.append(pos)  # sentinel
         return offsets
 
+    def split_text(self, text: str, filename: str = "<string>") -> list[str]:
+        """LangChain-compatible interface: split raw *text* and return content strings.
+
+        Writes *text* to a NamedTemporaryFile, runs the AST splitter, and returns
+        the ``content`` of each CodeBlock as a plain string list.  This allows
+        ``PythonCodeSplitter`` to be used wherever a LangChain-style
+        ``split_text(text) -> list[str]`` splitter is expected.
+        """
+        import tempfile
+
+        suffix = Path(filename).suffix or ".py"
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=suffix, encoding="utf-8", delete=False
+        ) as tmp:
+            tmp.write(text)
+            tmp_path = tmp.name
+        try:
+            blocks = self.split_object(tmp_path)
+        finally:
+            try:
+                Path(tmp_path).unlink(missing_ok=True)
+            except OSError:
+                pass
+        return [b.content for b in blocks if b.content.strip()]
+
     def _maybe_subchunk(
         self,
         raw: str,
@@ -224,6 +252,218 @@ class PythonCodeSplitter:
             chunks.append((chunk, base_char_start + pos, base_char_start + pos + len(chunk)))
             pos += self.MAX_BLOCK_CHARS
         return chunks
+
+
+def _build_default_runtime_config() -> RuntimeConfigObject:
+    return RuntimeConfigObject(
+        agents_db_uri="mongodb://unused",
+        database_name="alde_repo_knowledge",
+        tenant_id="tenant_default",
+        namespace_id=RepoDocumentBuilder._NAMESPACE_ID,
+        namespace_slug="repo-knowledge",
+        namespace_name=RepoDocumentBuilder._NAMESPACE_NAME,
+        default_embedding_model="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
+        default_embedding_dimension=384,
+        index_backend="faiss",
+    )
+
+
+class RepoModuleParser:
+    """Build parser-compatible payloads for Python modules.
+
+    The resulting payload mirrors the job parser schema already consumed by
+    ObjectMappingService so repo knowledge flows through the same AgentsDB
+    document/entity/relation pipeline as other parsed artifacts.
+    """
+
+    def __init__(self, splitter: PythonCodeSplitter | None = None) -> None:
+        self._splitter = splitter or PythonCodeSplitter()
+
+    def parse_object(self, source_path: str, *, repo_root: str) -> dict[str, Any]:
+        path = Path(source_path)
+        source = path.read_text(encoding="utf-8", errors="replace")
+        blocks = self._splitter.split_object(source_path)
+        rel_path = str(path.relative_to(repo_root)) if path.is_relative_to(repo_root) else path.name
+        content_sha = hashlib.sha256(source.encode("utf-8", errors="ignore")).hexdigest()
+        correlation_id = f"repo:{content_sha[:16]}"
+        title = rel_path
+
+        section_payloads = [
+            {
+                "section_key": f"block_{block.block_no}",
+                "heading": block.heading,
+                "text": block.content,
+                "block_kind": block.block_kind,
+                "metadata": {
+                    "source_path": rel_path,
+                    "kind": block.block_kind,
+                    "parent": block.parent_heading,
+                    "block_no": block.block_no,
+                    "char_start": block.char_start,
+                    "char_end": block.char_end,
+                },
+            }
+            for block in blocks
+            if block.content.strip()
+        ]
+
+        entity_objects, relation_objects = self._build_entity_relation_payloads(
+            source=source,
+            rel_path=rel_path,
+        )
+
+        return {
+            "agent": "repo_module_parser",
+            "job_name": "repo_module_parser",
+            "correlation_id": correlation_id,
+            "file": {
+                "path": str(path),
+                "name": path.name,
+                "source_path": str(path),
+                "source_uri": f"file://{path}",
+                "content_sha256": content_sha,
+                "mime_type": "text/x-python",
+            },
+            "parse": {
+                "is_repo_module": True,
+                "language": "python",
+                "extraction_quality": "high",
+                "errors": [],
+                "warnings": [],
+            },
+            "document": {
+                "title": title,
+                "summary": f"Python source module {rel_path}",
+                "raw_text": source,
+                "metadata": {
+                    "source_path": rel_path,
+                    "module_name": path.stem,
+                    "content_sha256": content_sha,
+                    "block_count": len(section_payloads),
+                    "parser": "repo_code_splitter",
+                },
+            },
+            "raw_text_document": {
+                "title": title,
+                "language": "python",
+                "raw_text": source,
+                "sections": section_payloads,
+                "metadata": {
+                    "source": rel_path,
+                    "parser": "repo_code_splitter",
+                },
+            },
+            "entity_objects": entity_objects,
+            "relation_objects": relation_objects,
+            "db_updates": {
+                "correlation_id": correlation_id,
+                "content_sha256": content_sha,
+                "processing_state": "processed",
+                "processed": True,
+            },
+        }
+
+    def _build_entity_relation_payloads(self, *, source: str, rel_path: str) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        module_name = Path(rel_path).stem
+        entity_objects: list[dict[str, Any]] = [
+            {
+                "entity_key": "subject",
+                "entity_type": "module",
+                "canonical_name": module_name,
+                "mention_text": module_name,
+                "section_key": "block_1",
+                "summary": f"Python module {rel_path}",
+                "metadata": {"role": "subject", "source_field": "document.title", "source_path": rel_path},
+            }
+        ]
+        relation_objects: list[dict[str, Any]] = []
+
+        try:
+            tree = ast.parse(source)
+        except SyntaxError:
+            return entity_objects, relation_objects
+
+        seen_entity_keys = {"subject"}
+        seen_relations: set[tuple[str, str, str]] = set()
+
+        def add_entity(*, entity_key: str, entity_type: str, canonical_name: str, section_key: str, relation_type: str | None, summary: str, source_field: str) -> None:
+            if entity_key not in seen_entity_keys:
+                entity_objects.append(
+                    {
+                        "entity_key": entity_key,
+                        "entity_type": entity_type,
+                        "canonical_name": canonical_name,
+                        "mention_text": canonical_name,
+                        "section_key": section_key,
+                        "summary": summary,
+                        "metadata": {"source_field": source_field, "source_path": rel_path},
+                    }
+                )
+                seen_entity_keys.add(entity_key)
+            if relation_type:
+                relation_key = ("subject", relation_type, entity_key)
+                if relation_key not in seen_relations:
+                    relation_objects.append(
+                        {
+                            "source_entity_key": "subject",
+                            "target_entity_key": entity_key,
+                            "relation_type": relation_type,
+                            "section_key": section_key,
+                            "metadata": {"source_field": source_field, "source_path": rel_path},
+                        }
+                    )
+                    seen_relations.add(relation_key)
+
+        for node in tree.body:
+            if isinstance(node, ast.ClassDef):
+                add_entity(
+                    entity_key=f"class:{node.name}",
+                    entity_type="class",
+                    canonical_name=node.name,
+                    section_key=f"block_{len(entity_objects) + 1}",
+                    relation_type="defines_class",
+                    summary=f"Class defined in {rel_path}",
+                    source_field="ast.ClassDef.name",
+                )
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                add_entity(
+                    entity_key=f"function:{node.name}",
+                    entity_type="function",
+                    canonical_name=node.name,
+                    section_key=f"block_{len(entity_objects) + 1}",
+                    relation_type="defines_function",
+                    summary=f"Function defined in {rel_path}",
+                    source_field="ast.FunctionDef.name",
+                )
+            elif isinstance(node, ast.Import):
+                for alias in node.names:
+                    import_name = str(alias.name or "").strip()
+                    if not import_name:
+                        continue
+                    add_entity(
+                        entity_key=f"dependency:{import_name}",
+                        entity_type="dependency",
+                        canonical_name=import_name,
+                        section_key="block_1",
+                        relation_type="imports_module",
+                        summary=f"Imported dependency used by {rel_path}",
+                        source_field="ast.Import.name",
+                    )
+            elif isinstance(node, ast.ImportFrom):
+                import_name = str(node.module or "").strip()
+                if not import_name:
+                    continue
+                add_entity(
+                    entity_key=f"dependency:{import_name}",
+                    entity_type="dependency",
+                    canonical_name=import_name,
+                    section_key="block_1",
+                    relation_type="imports_module",
+                    summary=f"Imported dependency used by {rel_path}",
+                    source_field="ast.ImportFrom.module",
+                )
+
+        return entity_objects, relation_objects
 
 
 # ---------------------------------------------------------------------------
@@ -307,11 +547,12 @@ class RepoIndexService:
 
     def __init__(
         self,
-        repo: AgentDbInMemoryRepository,
+        repo: Any,
         knowledge_svc: KnowledgeObjectService,
         emb_svc: EntityRelationEmbeddingService,
         *,
         workers: int = 4,
+        runtime_config: RuntimeConfigObject | None = None,
     ) -> None:
         self._repo = repo
         self._ks = knowledge_svc
@@ -319,6 +560,9 @@ class RepoIndexService:
         self._workers = workers
         self._splitter = PythonCodeSplitter()
         self._builder = RepoDocumentBuilder()
+        self._runtime_config = runtime_config or _build_default_runtime_config()
+        self._module_parser = RepoModuleParser(self._splitter)
+        self._mapping_service = ObjectMappingService(self._ks, self._runtime_config)
 
     def scan_object(self, scan_root: str, *, extensions: tuple[str, ...] = (".py",)) -> list[str]:
         """Return sorted list of source file paths under *scan_root*."""
@@ -332,16 +576,72 @@ class RepoIndexService:
         return sorted(result)
 
     def index_object(self, source_path: str, *, repo_root: str) -> dict[str, Any]:
-        """Split, store, and embed a single source file. Returns per-file report."""
-        blocks = self._splitter.split_object(source_path)
-        if not blocks:
+        """Split, map, store, and embed a single source file. Returns per-file report."""
+        payload = self._module_parser.parse_object(source_path, repo_root=repo_root)
+        document_payload = payload.get("document") if isinstance(payload.get("document"), Mapping) else {}
+        if not document_payload:
             return {"path": source_path, "blocks": 0, "embedded": 0, "skipped": True}
 
-        doc = self._builder.build_object(source_path, blocks, repo_root=repo_root)
-        self._ks.store_document_object(doc)
+        correlation_id = str(payload.get("correlation_id") or "").strip()
+        namespace_object = self._mapping_service.load_namespace_object(
+            handoff_metadata={
+                "tenant_id": RepoDocumentBuilder._TENANT_ID,
+                "knowledge_namespace_id": RepoDocumentBuilder._NAMESPACE_ID,
+                "knowledge_namespace_slug": "repo-knowledge",
+                "knowledge_namespace_name": RepoDocumentBuilder._NAMESPACE_NAME,
+            }
+        )
+        document_object = self._mapping_service.build_document_object(
+            object_name="documents",
+            result_payload=payload,
+            namespace_object=namespace_object,
+            correlation_id=correlation_id,
+            handoff_payload={"source_path": source_path, "platform": "repo_indexer"},
+        )
+        if document_object is None:
+            return {"path": source_path, "blocks": 0, "embedded": 0, "skipped": True}
+
+        object_payload = self._mapping_service.load_object_payload(object_name="documents", result_payload=payload)
+        block_seed_objects = self._mapping_service.build_block_seed_objects(
+            object_name="documents",
+            object_payload=object_payload,
+            correlation_id=correlation_id,
+            result_payload=payload,
+        )
+        entity_candidate_objects = self._mapping_service.build_entity_candidate_objects(
+            object_name="documents",
+            object_payload=object_payload,
+            correlation_id=correlation_id,
+            result_payload=payload,
+        )
+        entity_objects = self._mapping_service.build_entity_objects(
+            object_name="documents",
+            namespace_object=namespace_object,
+            correlation_id=correlation_id,
+            document_id=document_object.id,
+            entity_candidate_objects=entity_candidate_objects,
+            timestamp=document_object.created_at,
+        )
+        relation_objects = self._mapping_service.build_relation_objects(
+            object_name="documents",
+            namespace_object=namespace_object,
+            correlation_id=correlation_id,
+            entity_candidate_objects=entity_candidate_objects,
+            entity_objects=entity_objects,
+            block_seed_objects=block_seed_objects,
+            timestamp=document_object.created_at,
+            result_payload=payload,
+        )
+
+        self._ks.store_namespace_object(namespace_object)
+        self._ks.store_document_object(document_object)
+        for entity_object in entity_objects:
+            self._ks.store_entity_object(entity_object)
+        for relation_object in relation_objects:
+            self._ks.store_relation_object(relation_object)
 
         embedded = 0
-        for blk in doc.blocks:
+        for blk in document_object.blocks:
             blk_dict = {
                 "block_id": blk.block_id,
                 "heading": blk.heading,
@@ -353,24 +653,58 @@ class RepoIndexService:
             if result.get("stored"):
                 embedded += 1
 
+        for entity_object in entity_objects:
+            result = self._emb_svc.process_object(
+                "entity",
+                {
+                    "entity_id": entity_object.id,
+                    "entity_type": entity_object.entity_type,
+                    "canonical_name": entity_object.canonical_name,
+                    "summary": entity_object.summary,
+                    "attributes": entity_object.attributes,
+                },
+                owner_id=entity_object.id,
+            )
+            if result.get("stored"):
+                embedded += 1
+
+        for relation_object in relation_objects:
+            result = self._emb_svc.process_object(
+                "relation",
+                {
+                    "relation_id": relation_object.id,
+                    "source_entity_id": relation_object.source_entity_id,
+                    "target_entity_id": relation_object.target_entity_id,
+                    "relation_type": relation_object.relation_type,
+                    "metadata": relation_object.metadata,
+                },
+                owner_id=relation_object.id,
+            )
+            if result.get("stored"):
+                embedded += 1
+
         return {
             "path": source_path,
-            "doc_id": doc.id,
-            "blocks": len(doc.blocks),
+            "doc_id": document_object.id,
+            "blocks": len(document_object.blocks),
+            "entities": len(entity_objects),
+            "relations": len(relation_objects),
             "embedded": embedded,
             "skipped": False,
         }
 
-    def index_repo_object(self, scan_root: str) -> dict[str, Any]:
+    def index_repo_object(self, scan_root: str, *, extensions: Sequence[str] = (".py",)) -> dict[str, Any]:
         """Full repo index run: scan → split → store → embed. Returns summary report."""
         # Ensure namespace exists
         ns = self._builder.build_namespace_object()
         self._ks.store_namespace_object(ns)
 
-        files = self.scan_object(scan_root)
+        files = self.scan_object(scan_root, extensions=tuple(extensions))
         t0 = time.perf_counter()
 
         total_blocks = 0
+        total_entities = 0
+        total_relations = 0
         total_embedded = 0
         total_skipped = 0
         errors: list[str] = []
@@ -386,6 +720,8 @@ class RepoIndexService:
             for fut in as_completed(futures):
                 r = fut.result()
                 total_blocks += r.get("blocks", 0)
+                total_entities += r.get("entities", 0)
+                total_relations += r.get("relations", 0)
                 total_embedded += r.get("embedded", 0)
                 if r.get("skipped"):
                     total_skipped += 1
@@ -393,15 +729,379 @@ class RepoIndexService:
                     errors.append(f"{r['path']}: {r['error']}")
 
         elapsed = time.perf_counter() - t0
-        self._repo._flush_image()
+        repo_backend = getattr(self._ks, "_repository", self._repo)
+        if hasattr(repo_backend, "_flush_image"):
+            repo_backend._flush_image()
 
         return {
             "scan_root": scan_root,
             "files_found": len(files),
             "files_skipped": total_skipped,
             "total_blocks": total_blocks,
+            "total_entities": total_entities,
+            "total_relations": total_relations,
             "total_embedded": total_embedded,
             "elapsed_s": round(elapsed, 2),
             "rate_files_per_s": round((len(files) - total_skipped) / elapsed, 2) if elapsed > 0 else 0,
             "errors": errors[:10],
         }
+
+
+def create_repo_index_service(
+    *,
+    image_path: str | None = None,
+    workers: int = 4,
+) -> RepoIndexService:
+    resolved_runtime_config = load_agentsdb_runtime_config_from_env()
+    runtime_config = resolved_runtime_config or _build_default_runtime_config()
+    if resolved_runtime_config is not None:
+        pipeline_service = load_agentsdb_pipeline_service(runtime_config)
+        knowledge_service = pipeline_service._knowledge_service
+        repository = knowledge_service._repository
+    else:
+        repository = AgentDbInMemoryRepository(image_path=image_path)
+        repository.ensure_index_objects()
+        knowledge_service = KnowledgeObjectService(repository)
+    embedding_service = EntityRelationEmbeddingService(knowledge_service, runtime_config)
+    return RepoIndexService(
+        repository,
+        knowledge_service,
+        embedding_service,
+        workers=workers,
+        runtime_config=runtime_config,
+    )
+
+def repo_knowledge_worker(
+    operation: str,
+    root_dir: str | None = None,
+    image_path: str | None = None,
+    workers: int = 4,
+    extensions: list[str] | str | None = None,
+) -> dict | str:
+    """Scan or build repository knowledge using the AgentsDB parser schema."""
+    try:
+        try:
+            from .repo_code_splitter import create_repo_index_service  # type: ignore
+        except ImportError:
+            from alde.repo_code_splitter import create_repo_index_service  # type: ignore
+
+        resolved_root = Path(os.path.abspath(os.path.expanduser(root_dir or Path(__file__).resolve().parents[1])) )
+        resolved_extensions = extensions
+        if isinstance(resolved_extensions, str):
+            resolved_extensions = [resolved_extensions]
+        normalized_extensions = tuple(
+            item if str(item).startswith(".") else f".{item}"
+            for item in (resolved_extensions or [".py"])
+            if str(item).strip()
+        )
+
+        service = create_repo_index_service(image_path=image_path, workers=max(1, int(workers)))
+        normalized_operation = str(operation or "build").strip().lower()
+        if normalized_operation == "scan":
+            return {
+                "ok": True,
+                "operation": "scan",
+                "root_dir": str(resolved_root),
+                "extensions": list(normalized_extensions),
+                "files": service.scan_object(str(resolved_root), extensions=normalized_extensions),
+            }
+        if normalized_operation == "build":
+            result = service.index_repo_object(str(resolved_root), extensions=normalized_extensions)
+            result["ok"] = True
+            result["operation"] = "build"
+            return result
+        return {
+            "ok": False,
+            "error": f"Unsupported operation: {operation}",
+            "allowed_operations": ["scan", "build"],
+        }
+    except BaseException as exc:
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+
+
+# ---------------------------------------------------------------------------
+# repo_knowledge_query – retrieve repo knowledge as IDE-Agent context
+# ---------------------------------------------------------------------------
+
+_REPO_KNOWLEDGE_NS = "ns_repo_knowledge"
+
+_OWNER_TYPE_ALL = ("block", "entity", "relation")
+
+
+def _format_repo_knowledge_chunks(candidates: list[dict], owner_type: str) -> list[dict]:
+    """Normalise raw agentsdb hits into lightweight context chunks."""
+    chunks: list[dict] = []
+    for item in candidates:
+        payload = item if not isinstance(item.get("payload"), dict) else item["payload"]
+        chunk: dict = {"owner_type": owner_type}
+
+        # --- block ---
+        if owner_type == "block":
+            heading = payload.get("heading") or payload.get("block_kind") or "block"
+            content = payload.get("content") or payload.get("text") or ""
+            meta = payload.get("metadata") or {}
+            chunk["heading"] = heading
+            chunk["content"] = content[:2000]
+            chunk["source_path"] = meta.get("source_path") or payload.get("source_path", "")
+            chunk["block_kind"] = payload.get("block_kind") or meta.get("kind", "")
+            chunk["score"] = item.get("score")
+
+        # --- entity ---
+        elif owner_type == "entity":
+            chunk["canonical_name"] = payload.get("canonical_name") or payload.get("mention_text", "")
+            chunk["entity_type"] = payload.get("entity_type", "")
+            chunk["summary"] = (payload.get("summary") or "")[:500]
+            meta = payload.get("metadata") or {}
+            chunk["source_path"] = meta.get("source_path") or payload.get("source_path", "")
+            chunk["score"] = item.get("score")
+
+        # --- relation ---
+        elif owner_type == "relation":
+            chunk["relation_type"] = payload.get("relation_type", "")
+            chunk["source_entity_id"] = payload.get("source_entity_id", "")
+            chunk["target_entity_id"] = payload.get("target_entity_id", "")
+            meta = payload.get("metadata") or {}
+            chunk["source_path"] = meta.get("source_path") or payload.get("source_path", "")
+            chunk["score"] = item.get("score")
+
+        else:
+            chunk["raw"] = payload
+
+        chunks.append(chunk)
+    return chunks
+
+
+def repo_knowledge_query(
+    query: str,
+    owner_types: list[str] | str | None = None,
+    limit: int = 10,
+    namespace_id: str | None = None,
+    image_path: str | None = None,
+    use_vector: bool = True,
+) -> dict:
+    """Query indexed repository knowledge and return context chunks for the IDE Agent.
+
+    Parameters
+    ----------
+    query        : Natural-language search query.
+    owner_types  : One or more of "block", "entity", "relation", or "all".
+                   Default: ["block", "entity"].
+    limit        : Max results per owner_type. Default: 10.
+    namespace_id : AgentsDB namespace to query. Default: ns_repo_knowledge.
+    image_path   : Snapshot path for in-memory fallback backend.
+    use_vector   : Attempt dense-vector (embedding) search before text fallback.
+                   Default: True.
+    """
+    try:
+        try:
+            from .repo_code_splitter import create_repo_index_service  # type: ignore
+        except ImportError:
+            from alde.repo_code_splitter import create_repo_index_service  # type: ignore
+
+        try:
+            from .agents_db import (  # type: ignore
+                EntityRelationEmbeddingService,
+                load_agentsdb_runtime_config_from_env,
+                load_agentsdb_pipeline_service,
+                sync_retrieval_run_to_agentsdb_knowledge,
+            )
+        except ImportError:
+            from alde.agents_db import (  # type: ignore
+                EntityRelationEmbeddingService,
+                load_agentsdb_runtime_config_from_env,
+                load_agentsdb_pipeline_service,
+                sync_retrieval_run_to_agentsdb_knowledge,
+            )
+
+        # --- resolve owner_types ---
+        if owner_types is None:
+            resolved_owner_types: list[str] = ["block", "entity"]
+        elif isinstance(owner_types, str):
+            resolved_owner_types = list(_OWNER_TYPE_ALL) if owner_types.strip().lower() == "all" else [owner_types.strip()]
+        else:
+            flat = []
+            for ot in owner_types:
+                if str(ot).strip().lower() == "all":
+                    flat.extend(_OWNER_TYPE_ALL)
+                else:
+                    flat.append(str(ot).strip())
+            resolved_owner_types = list(dict.fromkeys(flat))  # deduplicate, preserve order
+
+        ns = str(namespace_id or _REPO_KNOWLEDGE_NS).strip()
+        safe_limit = max(1, min(int(limit), 50))
+
+        # --- load services ---
+        runtime_config = load_agentsdb_runtime_config_from_env()
+        if runtime_config is None:
+            # fallback: build service from in-memory snapshot (read-only query)
+            service = create_repo_index_service(image_path=image_path)
+            knowledge_service = service._ks
+            runtime_config = service._runtime_config
+        else:
+            pipeline_service = load_agentsdb_pipeline_service(runtime_config)
+            knowledge_service = pipeline_service._knowledge_service
+
+        # --- embed query text (best-effort) ---
+        query_vector: list[float] | None = None
+        if use_vector:
+            try:
+                emb_svc = EntityRelationEmbeddingService(knowledge_service, runtime_config)
+                query_vector = emb_svc.embed_object("query", query)
+            except Exception:
+                query_vector = None
+
+        # --- run retrieval per owner_type ---
+        all_chunks: list[dict] = []
+        used_vector = False
+        for ot in resolved_owner_types:
+            candidates: list[dict] = []
+
+            if query_vector is not None:
+                try:
+                    candidates = knowledge_service.build_vector_candidate_pipeline(
+                        query_vector=query_vector,
+                        namespace_id=ns,
+                        owner_type=ot,
+                        limit=safe_limit,
+                    )
+                    used_vector = True
+                except Exception:
+                    candidates = []
+
+            if not candidates:
+                # text search fallback
+                candidates = knowledge_service.find_objects(
+                    namespace_id=ns,
+                    query_text=query,
+                    limit=safe_limit,
+                )
+
+            all_chunks.extend(_format_repo_knowledge_chunks(candidates, ot))
+
+        result: dict = {
+            "ok": True,
+            "query": query,
+            "namespace_id": ns,
+            "owner_types": resolved_owner_types,
+            "used_vector_search": used_vector,
+            "total": len(all_chunks),
+            "chunks": all_chunks,
+        }
+
+        # --- log retrieval run (best-effort) ---
+        try:
+            sync_retrieval_run_to_agentsdb_knowledge(
+                tool_name="repo_knowledge_query",
+                query_event={"query": query, "namespace_id": ns, "owner_types": resolved_owner_types, "limit": safe_limit},
+                outcome_event={"total": len(all_chunks), "used_vector_search": used_vector},
+                retrieval_result=result,
+            )
+        except Exception:
+            pass
+
+        return result
+
+    except BaseException as exc:
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+
+
+# ---------------------------------------------------------------------------
+# load_repo_context_for_ide_agent – format query results for ChatWindow
+# ---------------------------------------------------------------------------
+
+def load_repo_context_for_ide_agent(
+    query: str,
+    *,
+    limit: int = 5,
+    owner_types: list[str] | str | None = None,
+    namespace_id: str | None = None,
+    image_path: str | None = None,
+    use_vector: bool = True,
+) -> list[dict]:
+    """Query indexed repo knowledge and return context entries ready for
+    ``ChatWindow.attach_runtime_context()``.
+
+    Each returned dict has the keys ``title``, ``language``, ``content``,
+    ``source_path`` — exactly what :py:meth:`attach_runtime_context` expects.
+
+    Parameters
+    ----------
+    query:        Natural-language or symbol query.
+    limit:        Max number of chunks to return (default 5).
+    owner_types:  "block" | "entity" | "relation" or a list thereof.
+    namespace_id: Restrict to a specific AgentsDB namespace.
+    image_path:   Optional in-memory snapshot path.
+    use_vector:   Whether to use vector search (falls back to text if False).
+    """
+    result = repo_knowledge_query(
+        query=query,
+        owner_types=owner_types,
+        limit=limit,
+        namespace_id=namespace_id,
+        image_path=image_path,
+        use_vector=use_vector,
+    )
+
+    entries: list[dict] = []
+    if not result.get("ok"):
+        return entries
+
+    for chunk in result.get("chunks", []):
+        owner_type = chunk.get("owner_type", "block")
+
+        if owner_type == "block":
+            content = chunk.get("content") or ""
+            heading = chunk.get("heading") or "block"
+            block_kind = chunk.get("block_kind") or ""
+            title = f"[{block_kind}] {heading}" if block_kind else heading
+        elif owner_type == "entity":
+            content = chunk.get("summary") or chunk.get("canonical_name") or ""
+            canonical = chunk.get("canonical_name") or "entity"
+            entity_type = chunk.get("entity_type") or ""
+            title = f"[entity:{entity_type}] {canonical}" if entity_type else f"[entity] {canonical}"
+        elif owner_type == "relation":
+            title = (
+                f"[relation:{chunk.get('relation_type', '')}] "
+                f"{chunk.get('source_entity_id', '')} → {chunk.get('target_entity_id', '')}"
+            )
+            content = title
+        else:
+            content = str(chunk)
+            title = "repo_chunk"
+
+        if not str(content).strip():
+            continue
+
+        entries.append({
+            "title": title,
+            "language": "python",
+            "content": str(content).strip(),
+            "source_path": chunk.get("source_path") or "",
+        })
+
+    return entries
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="alde.repo_code_splitter")
+    parser.add_argument("scan_root", nargs="?", default=str(_ROOT), help="Repository root to index. Default: current ALDE workspace root.")
+    parser.add_argument("--workers", type=int, default=4, help="Number of indexing workers.")
+    parser.add_argument("--image-path", type=str, default=None, help="Optional snapshot path for in-memory fallback storage.")
+    parser.add_argument("--extensions", nargs="*", default=[".py"], help="File extensions to scan. Default: .py")
+    parser.add_argument("--pretty", action="store_true", help="Pretty-print the JSON result.")
+    args = parser.parse_args(list(argv) if argv is not None else None)
+
+    service = create_repo_index_service(image_path=args.image_path, workers=max(1, int(args.workers)))
+    result = service.index_repo_object(
+        str(Path(args.scan_root).expanduser().resolve()),
+        extensions=tuple(args.extensions or [".py"]),
+    )
+    result["extensions"] = list(args.extensions or [".py"])
+    import json
+
+    print(json.dumps(result, ensure_ascii=False, indent=2 if args.pretty else None))
+    return 0 if not result.get("errors") else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

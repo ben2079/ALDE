@@ -2155,8 +2155,8 @@ class AIWidget(QWidget):
         footer_action_icon = _icon("automation_25dp_B7B7B7_FILL0_wght500_GRAD0_opsz24.svg")
         if not footer_action_icon.isNull():
             self.btn_footer_actions.setIcon(footer_action_icon)
-        self.btn_footer_actions.setText("Action")
-        self.btn_footer_actions.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self.btn_footer_actions.setText("")
+        self.btn_footer_actions.setToolButtonStyle(Qt.ToolButtonIconOnly)
         self.btn_footer_actions.setPopupMode(QToolButton.InstantPopup)
         self.btn_footer_actions.setCursor(Qt.PointingHandCursor)
         self.btn_footer_actions.setToolTip("Configured actions starten")
@@ -3736,6 +3736,17 @@ class ChatWindow(QWidget):
                 border-radius: 8px;
             }}
             QWidget#chatFooterControls {{
+                background: transparent;
+                border: none;
+            }}
+            QToolButton#chatFooterActionsButton {{
+                background: transparent;
+                border: none;
+                padding: 0px;
+            }}
+            QToolButton#chatFooterActionsButton:hover,
+            QToolButton#chatFooterActionsButton:pressed,
+            QToolButton#chatFooterActionsButton:checked {{
                 background: transparent;
                 border: none;
             }}
