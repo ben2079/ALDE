@@ -512,6 +512,63 @@ class TestAgentRouting(unittest.TestCase):
 
         self.assertIsNone(route)
 
+    def test_resolve_forced_route_parses_python_execute_route_to_agent_snippet(self) -> None:
+        route = agents_configurator.resolve_forced_route(
+            "_xplaner_xrouter",
+            """
+result, route = agents_factory.execute_route_to_agent(
+    {
+        \"job_name\": \"router_planner_cover_letter_sequence\",
+        \"profile_id\": \"44e8fce720b6ef2f385478d7f1123027caa7a148abc37af870c7522f0ccf6040\",
+        \"job_posting\": {\"a1bc3b671dee2a993f42d2ef572573218d4db04ebc381a40b2d10446f1016c30\"},
+        \"options\": {\"language\": \"de\", \"tone\": \"modern\"},
+    },
+    source_agent_label=\"_xrouter_xplanner\",
+)
+""",
+            set(agents_factory.AGENTS_REGISTRY.keys()),
+        )
+
+        self.assertIsInstance(route, dict)
+        self.assertEqual(route.get("job_name"), "router_planner_cover_letter_sequence")
+        self.assertEqual(route.get("profile_id"), "profile:44e8fce720b6ef2f385478d7f1123027caa7a148abc37af870c7522f0ccf6040")
+        self.assertEqual(
+            route.get("job_posting"),
+            {
+                "source": "correlation_id",
+                "value": "a1bc3b671dee2a993f42d2ef572573218d4db04ebc381a40b2d10446f1016c30",
+            },
+        )
+        self.assertEqual(route.get("_origin_agent_label"), "_xrouter_xplanner")
+
+    def test_chatcom_python_execute_route_snippet_uses_forced_route_without_model_call(self) -> None:
+        with patch.object(chat_mod.ChatCompletion, "_get_client") as get_client, patch(
+            "alde.agents_factory.execute_forced_route",
+            return_value="Routing to _xworker",
+        ) as execute_forced_route_mock:
+            chat = chat_mod.ChatCom(
+                _model="gpt-4o-mini",
+                _input_text="""
+result, route = agents_factory.execute_route_to_agent(
+    {
+        \"job_name\": \"router_planner_cover_letter_sequence\",
+        \"profile_id\": \"44e8fce720b6ef2f385478d7f1123027caa7a148abc37af870c7522f0ccf6040\",
+        \"job_posting\": {\"a1bc3b671dee2a993f42d2ef572573218d4db04ebc381a40b2d10446f1016c30\"},
+        \"options\": {\"language\": \"de\", \"tone\": \"modern\"},
+    },
+    source_agent_label=\"_xrouter_xplanner\",
+)
+""",
+                _name="test_python_route_snippet",
+            )
+            result = chat.get_response()
+
+        self.assertIsInstance(chat._forced_route, dict)
+        self.assertEqual(chat._forced_route.get("job_name"), "router_planner_cover_letter_sequence")
+        self.assertEqual(result, "Routing to _xworker")
+        execute_forced_route_mock.assert_called_once()
+        get_client.assert_not_called()
+
     def test_available_job_names_include_runtime_default_jobs(self) -> None:
         job_names = agents_configurator.get_available_job_names()
 
@@ -575,6 +632,55 @@ class TestAgentRouting(unittest.TestCase):
         self.assertEqual(result, "Routing to _xworker")
         self.assertIsInstance(route, dict)
         self.assertEqual(route.get("agent_label"), "_xworker")
+
+    def test_worker_internal_auto_handoff_job_name_target_is_allowed(self) -> None:
+        result, route = agents_factory.execute_tool(
+            "route_to_agent",
+            {
+                "target_agent": "job_posting_parser",
+                "job_name": "job_posting_parser",
+                "handoff_protocol": "agent_handoff_v1",
+                "allow_internal_handoff": True,
+                "handoff_payload": {
+                    "agent_label": "_xworker",
+                    "handoff_to": "job_posting_parser",
+                    "output": {
+                        "type": "file",
+                        "job_name": "job_posting_parser",
+                        "correlation_id": "sha-456",
+                        "link": {"thread_id": "thread-1", "message_id": "msg-1"},
+                        "file": {
+                            "path": "/tmp/job_offer.pdf",
+                            "content_sha256": "sha-456",
+                        },
+                        "db": {"processing_state": "queued"},
+                        "requested_actions": [
+                            "parse",
+                            "extract_text",
+                            "store_object_result",
+                            "mark_processed_on_success",
+                        ],
+                    },
+                },
+                "handoff_metadata": {
+                    "correlation_id": "sha-456",
+                    "dispatcher_message_id": "dispatcher-msg-1",
+                    "dispatcher_db_path": "/tmp/dispatcher_doc_db.json",
+                    "obj_name": "job_postings",
+                    "obj_db_path": "/tmp/job_postings_db.json",
+                    "job_name": "job_posting_parser",
+                },
+            },
+            source_agent_label="_xworker",
+        )
+
+        self.assertEqual(result, "Routing to _xworker")
+        self.assertIsInstance(route, dict)
+        self.assertEqual(route.get("agent_label"), "_xworker")
+        self.assertEqual(
+            agents_factory.AGENT_EXECUTION_SELECTION_SERVICE.load_job_name(route),
+            "job_posting_parser",
+        )
 
     def test_worker_internal_handoff_flag_does_not_allow_cross_agent_route(self) -> None:
         result, route = agents_factory.execute_tool(
@@ -789,11 +895,7 @@ class TestAgentRouting(unittest.TestCase):
         result, route = agents_factory.execute_route_to_agent(
             {
                 "job_name": "router_planner_cover_letter_sequence",
-                "applicant_profile": {
-                    "personal_info": {
-                        "full_name": "Ada Lovelace",
-                    }
-                },
+                "profile_id": "profile:ada-lovelace",
                 "job_posting": {
                     "job_title": "AI Engineer",
                 },
@@ -819,28 +921,13 @@ class TestAgentRouting(unittest.TestCase):
         self.assertEqual(metadata.get("parser_job_name"), "job_posting_parser")
         self.assertEqual(metadata.get("writer_job_name"), "cover_letter_writer")
         self.assertEqual(output.get("action"), "generate_cover_letter")
+        self.assertEqual(output.get("profile_id"), "profile:ada-lovelace")
         self.assertEqual(sequence.get("name"), "dispatch_parse_generate_cover_letter")
         self.assertEqual(
-            ((output.get("applicant_profile") or {}).get("personal_info") or {}).get("full_name"),
-            "Ada Lovelace",
+            output.get("applicant_profile"),
+            {"source": "profile_id", "value": "profile:ada-lovelace"},
         )
         self.assertEqual((output.get("job_posting") or {}).get("job_title"), "AI Engineer")
-
-
-        self.assertEqual(result, "Routing to _xworker")
-        self.assertIsInstance(route, dict)
-        handoff = route.get("handoff") if isinstance(route.get("handoff"), dict) else {}
-        payload = handoff.get("handoff_payload") if isinstance(handoff.get("handoff_payload"), dict) else {}
-        output = payload.get("output") if isinstance(payload.get("output"), dict) else {}
-        self.assertEqual(output.get("action"), "generate_cover_letter")
-        self.assertEqual(
-            ((output.get("applicant_profile") or {}).get("personal_info") or {}).get("full_name"),
-            "Grace Hopper",
-        )
-        self.assertEqual(
-            ((output.get("job_posting_result") or {}).get("job_posting") or {}).get("job_title"),
-            "Compiler Engineer",
-        )
 
     def test_parser_job_config_declares_workflow_name(self) -> None:
         job_config = agents_configurator.get_job_config("job_posting_parser")
@@ -895,6 +982,23 @@ class TestAgentRouting(unittest.TestCase):
         self.assertIn("pypdf_read_document", tool_names)
         self.assertIn("list_documents", tool_names)
         self.assertNotIn("execute_action_request", tool_names)
+
+    def test_route_to_agent_resolves_job_name_target_before_handoff_policy(self) -> None:
+        result, route = agents_factory.execute_route_to_agent(
+            {
+                "target_agent": "applicant_profile_parser",
+                "user_question": "Parse this applicant profile",
+            },
+            source_agent_label="_xrouter_xplanner",
+        )
+
+        self.assertEqual(result, "Routing to _xworker")
+        self.assertIsInstance(route, dict)
+        self.assertEqual(route.get("agent_label"), "_xworker")
+        self.assertEqual(
+            agents_factory.AGENT_EXECUTION_SELECTION_SERVICE.load_job_name(route),
+            "applicant_profile_parser",
+        )
 
     def test_parser_job_default_tools_are_runtime_config_driven(self) -> None:
         self.assertFalse(hasattr(agents_factory.AgentExecutionSelectionService, "_XWORKER_DEFAULT_JOB_TOOLS"))
@@ -1115,6 +1219,136 @@ class TestAgentRouting(unittest.TestCase):
 
         parsed_result = json.loads(result)
         self.assertEqual(parsed_result.get("handoff_results"), ["sha-1", "sha-2"])
+
+    def test_dispatch_documents_cover_letter_flow_chains_parser_to_writer(self) -> None:
+        history = agents_factory.get_history()
+        history._thread_iD = 660
+        history._history_ = [{"role": "user", "content": "generate cover letter from job pdf", "thread-id": history._thread_iD}]
+
+        dispatch_result = {
+            "agent": "xworker",
+            "job_name": "document_dispatch",
+            "scan_dir": "/tmp/jobs",
+            "handoff_messages": [
+                {
+                    "target_agent": "_xworker",
+                    "handoff_protocol": "agent_handoff_v1",
+                    "handoff_payload": {
+                        "agent_label": "_xworker",
+                        "handoff_to": "_xworker",
+                        "output": {
+                            "type": "file",
+                            "job_name": "job_posting_parser",
+                            "action": "generate_cover_letter",
+                            "correlation_id": "sha-cover-1",
+                            "link": {"thread_id": "thread-1", "message_id": "msg-1"},
+                            "file": {"path": "/tmp/jobs/a.pdf", "content_sha256": "sha-cover-1"},
+                            "db": {"processing_state": "queued"},
+                            "requested_actions": ["parse", "extract_text", "store_object_result", "mark_processed_on_success"],
+                            "applicant_profile": {
+                                "source": "text",
+                                "value": {
+                                    "profile_id": "profile:test",
+                                    "preferences": {"language": "de"},
+                                },
+                            },
+                            "options": {"language": "de", "tone": "modern", "max_words": 320},
+                        },
+                    },
+                    "handoff_metadata": {
+                        "correlation_id": "sha-cover-1",
+                        "dispatcher_message_id": "msg-1",
+                        "dispatcher_db_path": "/tmp/dispatcher.json",
+                        "obj_name": "job_postings",
+                        "obj_db_path": "/tmp/job_postings.json",
+                        "job_name": "job_posting_parser",
+                        "sequence_name": "dispatch_parse_generate_cover_letter",
+                        "parser_job_name": "job_posting_parser",
+                        "writer_job_name": "cover_letter_writer",
+                    },
+                }
+            ],
+        }
+
+        original_execute_tool = agents_factory.execute_tool
+
+        class _SequenceChatComE:
+            call_count = 0
+
+            def __init__(self, _model: str, _messages: list, tools: list[dict], tool_choice: str) -> None:
+                self.messages = list(_messages)
+
+            def _response(self):
+                type(self).call_count += 1
+                if type(self).call_count == 1:
+                    content = json.dumps(
+                        {
+                            "agent": "xworker",
+                            "job_name": "job_posting_parser",
+                            "correlation_id": "sha-cover-1",
+                            "parse": {"is_job_posting": True, "language": "de", "errors": [], "warnings": []},
+                            "job_posting": {"job_title": "Platform Engineer", "company_name": "Example Co"},
+                            "db_updates": {"processing_state": "processed", "processed": True},
+                            "file": {"content_sha256": "sha-cover-1"},
+                        },
+                        ensure_ascii=False,
+                    )
+                else:
+                    content = json.dumps(
+                        {
+                            "agent": "xworker",
+                            "job_name": "cover_letter_writer",
+                            "correlation": {
+                                "correlation_id": "sha-cover-1",
+                                "job_posting_correlation_id": "sha-cover-1",
+                                "profile_correlation_id": "profile:test",
+                            },
+                            "cover_letter": {"full_text": "Anschreiben"},
+                            "cv": {"full_text": "Lebenslauf"},
+                            "document": {"full_text": "Anschreiben\n<!-- pagebreak -->\nLebenslauf"},
+                            "pages": [
+                                {"page": 1, "title": "Application", "page_content": "Anschreiben"},
+                                {"page": 2, "title": "CV", "page_content": "Lebenslauf"},
+                            ],
+                        },
+                        ensure_ascii=False,
+                    )
+                return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=content, tool_calls=None))])
+
+        def _execute_tool(name: str, args: dict, tool_call_id: str | None = None, source_agent_label: str | None = None):
+            if name == "dispatch_documents":
+                return dispatch_result, None
+            return original_execute_tool(name, args, tool_call_id, source_agent_label=source_agent_label)
+
+        agent_msg = SimpleNamespace(
+            content="",
+            tool_calls=[
+                _tool_call(
+                    "dispatch_documents",
+                    json.dumps({"scan_dir": "/tmp/jobs", "db_path": "/tmp/dispatcher.json"}, ensure_ascii=False),
+                    call_id="call_dispatcher_cover_letter",
+                )
+            ],
+        )
+
+        with patch("alde.chat_completion.ChatComE", _SequenceChatComE), patch(
+            "alde.agents_factory.execute_tool",
+            side_effect=_execute_tool,
+        ), patch("alde.agents_factory.upsert_object_record_tool", return_value={"ok": True}), patch(
+            "alde.agents_factory.write_document",
+            return_value={"path": "/tmp/cover_letter.md"},
+        ), patch(
+            "alde.agents_factory.md_to_pdf",
+            return_value={"pdf_path": "/tmp/cover_letter.pdf"},
+        ):
+            result = agents_factory._handle_tool_calls(agent_msg, agent_label="_xworker")
+
+        parsed_result = json.loads(result)
+        handoff_results = parsed_result.get("handoff_results") or []
+        self.assertEqual(len(handoff_results), 1)
+        writer_result = json.loads(handoff_results[0])
+        self.assertEqual(writer_result.get("job_name"), "cover_letter_writer")
+        self.assertEqual(writer_result.get("correlation", {}).get("correlation_id"), "sha-cover-1")
 
     def test_router_parallel_branch_mode_merges_results_in_tool_call_order(self) -> None:
         history = agents_factory.get_history()

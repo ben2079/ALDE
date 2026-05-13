@@ -15,6 +15,7 @@ import subprocess
 import shutil
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from threading import Thread
 from urllib.parse import urlparse
 
 # Keep both repository roots on sys.path so local imports work in direct-script
@@ -271,13 +272,13 @@ from PySide6.QtWidgets import (
 
 try:
     if __package__:
-        from .agents_ccomp import ChatCom, ImageDescription, ImageCreate, ChatHistory  # type: ignore
+        from .chat_runtime import ChatCom, ImageDescription, ImageCreate, ChatHistory  # type: ignore
     else:
-        from agents_ccomp import ChatCom, ImageDescription, ImageCreate, ChatHistory  # type: ignore
+        from chat_runtime import ChatCom, ImageDescription, ImageCreate, ChatHistory  # type: ignore
 except ImportError as e:
     msg = str(e)
     if "attempted relative import" in msg or "no known parent package" in msg:
-        from alde.agents_ccomp import ChatCom, ImageDescription, ImageCreate, ChatHistory  # type: ignore  # noqa: E402
+        from alde.chat_runtime import ChatCom, ImageDescription, ImageCreate, ChatHistory  # type: ignore  # noqa: E402
     else:
         raise
 
@@ -2044,6 +2045,7 @@ class AIWidget(QWidget):
     _PROMPT_COMPOSER_H_MARGIN = 12
     _PROMPT_COMPOSER_SPACING = 8
     _PROMPT_SEND_BUTTON_SIZE = 34
+    _async_result_ready = Signal(object)
 
     def __init__(self,
         accent, 
@@ -2060,6 +2062,7 @@ class AIWidget(QWidget):
         self.scheme = _build_scheme(accent, base)                # Farbschema mergen
         self._build_ui()
         self._wire()
+        self._async_result_ready.connect(self._handle_async_result)
 
         if self._api_key_missing:
             try:
@@ -2363,6 +2366,70 @@ class AIWidget(QWidget):
         except Exception:
             pass
 
+    def _run_background_task(self, *, kind: str, worker: Callable[[], dict[str, Any]]) -> None:
+        def _invoke_worker() -> None:
+            try:
+                payload = dict(worker() or {})
+            except Exception as exc:
+                payload = {
+                    "kind": kind,
+                    "reply": f"[ERROR] {type(exc).__name__}: {exc}",
+                    "reset_context": True,
+                }
+            payload.setdefault("kind", kind)
+            self._async_result_ready.emit(payload)
+
+        Thread(target=_invoke_worker, daemon=True).start()
+
+    @Slot(object)
+    def _handle_async_result(self, payload: object) -> None:
+        if not isinstance(payload, dict):
+            return
+
+        kind = str(payload.get("kind") or "").strip().lower()
+        status_message = str(payload.get("status_message") or "").strip()
+        reset_context = bool(payload.get("reset_context", True))
+
+        if kind in {"action", "chat", "image_describe"}:
+            reply = str(payload.get("reply") or "").strip()
+            self._append("AI", reply)
+            if reset_context:
+                self._dropped_files = []
+                self._runtime_context_entries = []
+            if status_message:
+                self._show_footer_status(status_message)
+            return
+
+        if kind == "image_create":
+            error_text = str(payload.get("error") or "").strip()
+            if error_text:
+                self._append("AI", f"[ERROR] {error_text}")
+                if status_message:
+                    self._show_footer_status(status_message)
+                return
+
+            image_path_text = str(payload.get("path") or "").strip()
+            if not image_path_text:
+                self._append("AI", "[ERROR] Image generation returned no path")
+                if status_message:
+                    self._show_footer_status(status_message)
+                return
+
+            image_path = Path(image_path_text)
+            window = self.window()
+            opener = getattr(window, "_open_path_in_focused_tab", None)
+            if callable(opener):
+                opener(image_path, title=image_path.name)
+                self._append("AI", f"[IMAGE] {image_path}")
+            else:
+                self._append("AI", f"[IMAGE SAVED] {image_path}")
+
+            if reset_context:
+                self._dropped_files = []
+                self._runtime_context_entries = []
+            if status_message:
+                self._show_footer_status(status_message)
+
     def _dispatch_action_object(self, *, action_object_name: str, action_request: dict[str, Any]) -> None:
         if getattr(self, "_api_key_missing", False):
             self._append("System", "Chat is disabled because OPENAI_API_KEY is not set.")
@@ -2371,19 +2438,25 @@ class AIWidget(QWidget):
         action_request_text = json.dumps(action_request, ensure_ascii=False)
         self._append("You", action_request_text)
         self.prompt_edit.clear()
-
-        try:
-            action_reply = ChatCom(
-                _model=self._model,
-                _input_text=action_request_text,
-            ).get_response()
-        except Exception as exc:
-            action_reply = f"[ERROR] {exc}"
-
-        self._append("AI", str(action_reply))
-        self._dropped_files = []
-        self._runtime_context_entries = []
         self._show_footer_status(f"Action gestartet: {action_object_name}")
+
+        def _build_action_reply() -> dict[str, Any]:
+            try:
+                action_reply = ChatCom(
+                    _model=self._model,
+                    _input_text=action_request_text,
+                ).get_response()
+            except Exception as exc:
+                action_reply = f"[ERROR] {exc}"
+
+            return {
+                "kind": "action",
+                "reply": str(action_reply),
+                "status_message": f"Action abgeschlossen: {action_object_name}",
+                "reset_context": True,
+            }
+
+        self._run_background_task(kind="action", worker=_build_action_reply)
 
     def _start_action_object(self, action_object: dict[str, Any]) -> None:
         action_object_name = str(action_object.get("display_name") or action_object.get("action_object_name") or "Action").strip()
@@ -2568,19 +2641,26 @@ class AIWidget(QWidget):
 
         self._append("You", prompt_visible)
         self.prompt_edit.clear()
-        
-        try:
-            reply = ChatCom(
-                _model=self._model,
-                _url=image_paths or None,
-                _input_text=prompt_for_model
-            ).get_response()
-        except Exception as exc:
-            reply = f"[ERROR] {exc}"
+        self._show_footer_status("Chat gesendet")
 
-        self._append("AI", str(reply))
-        self._dropped_files = []
-        self._runtime_context_entries = []
+        def _build_chat_reply() -> dict[str, Any]:
+            try:
+                reply = ChatCom(
+                    _model=self._model,
+                    _url=image_paths or None,
+                    _input_text=prompt_for_model,
+                ).get_response()
+            except Exception as exc:
+                reply = f"[ERROR] {exc}"
+
+            return {
+                "kind": "chat",
+                "reply": str(reply),
+                "status_message": "Chat abgeschlossen",
+                "reset_context": True,
+            }
+
+        self._run_background_task(kind="chat", worker=_build_chat_reply)
 
     # ---------------------------------------------------------------------------
     #  CHAT – Bild analysieren
@@ -2612,26 +2692,33 @@ class AIWidget(QWidget):
         self._append("You", prompt_visible)
         self.prompt_edit.clear()
         url = image_paths[0]
+        self._show_footer_status("Bildanalyse gestartet")
 
-        try:
-            resp = ImageDescription(
-                _model="gpt-5",
-                _url=url,
-                _input_text=prompt_for_model
-            ).get_descript()
+        def _build_image_description_reply() -> dict[str, Any]:
+            try:
+                resp = ImageDescription(
+                    _model="gpt-5",
+                    _url=url,
+                    _input_text=prompt_for_model,
+                ).get_descript()
 
-            if hasattr(resp, 'choices') and resp.choices:
-                reply = (resp.choices[0].message.content or "")
-            elif hasattr(resp, 'content'):
-                reply = (resp.content or "")
-            else:
-                reply = str(resp)
-        except Exception as exc:
-            reply = f"[ERROR] {exc}"
+                if hasattr(resp, 'choices') and resp.choices:
+                    reply = (resp.choices[0].message.content or "")
+                elif hasattr(resp, 'content'):
+                    reply = (resp.content or "")
+                else:
+                    reply = str(resp)
+            except Exception as exc:
+                reply = f"[ERROR] {exc}"
 
-        self._append("AI", reply)
-        self._dropped_files = []
-        self._runtime_context_entries = []
+            return {
+                "kind": "image_describe",
+                "reply": str(reply),
+                "status_message": "Bildanalyse abgeschlossen",
+                "reset_context": True,
+            }
+
+        self._run_background_task(kind="image_describe", worker=_build_image_description_reply)
 
     # ---------------------------------------------------------------------------
     #  CHAT – Bild generieren
@@ -2650,31 +2737,32 @@ class AIWidget(QWidget):
             return  
         self._append("You", prompt)
         self.prompt_edit.clear()    
+        self._show_footer_status("Bildgenerierung gestartet")
 
-        try:
-            raw = ImageCreate(
-                _model="gpt-5",
-                _input_text=prompt
-            ).get_img()
-        except Exception as exc:
-            self._append("AI", f"[ERROR] {exc}")
-            return
+        def _build_image_create_result() -> dict[str, Any]:
+            try:
+                raw = ImageCreate(
+                    _model="gpt-5",
+                    _input_text=prompt,
+                ).get_img()
+                img_bytes, mime = decode_image_payload(raw)
+                path = save_generated_image(img_bytes, mime=mime)
+            except Exception as exc:
+                return {
+                    "kind": "image_create",
+                    "error": f"{type(exc).__name__}: {exc}",
+                    "status_message": "Bildgenerierung fehlgeschlagen",
+                    "reset_context": True,
+                }
 
-        try:
-            img_bytes, mime = decode_image_payload(raw)
-            path = save_generated_image(img_bytes, mime=mime)
-        except Exception as exc:
-            self._append("AI", f"[ERROR] Image decode/save failed: {exc}")
-            return
+            return {
+                "kind": "image_create",
+                "path": str(path),
+                "status_message": "Bildgenerierung abgeschlossen",
+                "reset_context": True,
+            }
 
-        # Open in a new tab in the (focused) tab-dock
-        win = self.window()
-        opener = getattr(win, "_open_path_in_focused_tab", None)
-        if callable(opener):
-            opener(path, title=path.name)
-            self._append("AI", f"[IMAGE] {path}")
-        else:
-            self._append("AI", f"[IMAGE SAVED] {path}")
+        self._run_background_task(kind="image_create", worker=_build_image_create_result)
 
     # ---------------------------------------------------------------------------
     #  HILFSFUNKTION – Nachricht an ChatWindow anhängen

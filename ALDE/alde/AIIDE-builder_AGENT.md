@@ -19,7 +19,7 @@ Pipeline
 Runtime Tool
 
 - Tool-Name: `repo_knowledge_worker`
-- Operationen: `scan`, `build`
+- Operationen: `scan`, `build`, `cleanup`, `delete`, `rebuild`, `repair_namespace`, `status`
 - Default-Ziel: Python-Module (`.py`) im aktuellen Repo
 
 Beispiel
@@ -31,6 +31,18 @@ repo_knowledge_worker(
 	extensions=[".py"],
 	workers=4,
 )
+
+# Async rebuild with cleanup in one job
+job = repo_knowledge_worker(
+	operation="repair_namespace",
+	run_async=True,
+	root_dir="/abs/path/to/repo",
+	extensions=[".py"],
+	workers=4,
+)
+
+# Poll status
+repo_knowledge_worker(operation="status", job_id=job.get("job_id"))
 ```
 
 Erwartetes Ergebnis

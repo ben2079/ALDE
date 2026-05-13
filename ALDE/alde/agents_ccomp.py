@@ -58,6 +58,10 @@ except BaseException as e:
 else:
     _VSTORE_IMPORT_ERROR = None
 
+# Prefer importing ChatCom/ChatHistory from `alde.chat_runtime` (or the
+# `chat_completion` compatibility alias). This module remains the legacy
+# implementation surface for callers that still rely on agents_ccomp.
+
 
 # ---------------------------------------------------------------------------
 # Canonical AppData paths
@@ -1783,7 +1787,7 @@ class ChatCom(ChatCompletion,ChatHistory):
             },
         )
     # -------------------------------- API (retrieve the model's response) -
-    # -------------------------------- tool calls handler from the agenszie_factory_framework -
+        # -------------------------------- Tool-call handling via agents_factory -
 
     def get_response(self) -> str:
             import sys

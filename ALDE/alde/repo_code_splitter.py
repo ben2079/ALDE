@@ -23,13 +23,16 @@ from __future__ import annotations
 import argparse
 import ast
 import hashlib
+import json
 import os
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence
+from uuid import uuid4
 
 # ---------------------------------------------------------------------------
 # Path bootstrap (run from project root OR from ALDE/alde/)
@@ -39,6 +42,115 @@ _ROOT = _HERE.parent.parent
 for _p in (_ROOT, _HERE):
     if str(_p) not in sys.path:
         sys.path.insert(0, str(_p))
+
+
+_REPO_WORKER_JOBS_LOCK = threading.RLock()
+_REPO_WORKER_JOBS: dict[str, dict[str, Any]] = {}
+
+
+class RepoWorkerJobStoreService:
+    """Persist repo worker job states so status polling survives process boundaries."""
+
+    _STORAGE_PATH_ENV = "ALDE_REPO_WORKER_JOBS_PATH"
+
+    def __init__(self, *, storage_path: Path | None = None) -> None:
+        self._storage_path = Path(storage_path) if storage_path is not None else None
+        self._lock = threading.RLock()
+
+    def _resolve_storage_path(self) -> Path:
+        configured_path = str(os.getenv(self._STORAGE_PATH_ENV, "") or "").strip()
+        if configured_path:
+            return Path(os.path.abspath(os.path.expanduser(configured_path)))
+        if self._storage_path is not None:
+            return Path(self._storage_path)
+        return _HERE.parent / "AppData" / "repo_worker_jobs.json"
+
+    def _load_job_records(self) -> dict[str, dict[str, Any]]:
+        storage_path = self._resolve_storage_path()
+        if not storage_path.is_file():
+            return {}
+        try:
+            payload = json.loads(storage_path.read_text(encoding="utf-8") or "{}")
+        except Exception:
+            return {}
+        jobs_payload = payload.get("jobs") if isinstance(payload, Mapping) else None
+        if not isinstance(jobs_payload, Mapping):
+            return {}
+        return {
+            str(job_id): dict(job_payload)
+            for job_id, job_payload in jobs_payload.items()
+            if isinstance(job_payload, Mapping)
+        }
+
+    def _store_job_records(self, job_records: Mapping[str, Mapping[str, Any]]) -> None:
+        storage_path = self._resolve_storage_path()
+        storage_path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "schema": "repo_worker_jobs_v1",
+            "updated_at": time.time(),
+            "jobs": {
+                str(job_id): dict(job_payload)
+                for job_id, job_payload in job_records.items()
+                if isinstance(job_payload, Mapping)
+            },
+        }
+        temp_path = storage_path.with_suffix(f"{storage_path.suffix}.tmp")
+        temp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(temp_path, storage_path)
+
+    def load_object_job(self, job_id: str) -> dict[str, Any] | None:
+        normalized_job_id = str(job_id or "").strip()
+        if not normalized_job_id:
+            return None
+        with self._lock:
+            job_records = self._load_job_records()
+            job_payload = job_records.get(normalized_job_id)
+            return dict(job_payload) if isinstance(job_payload, Mapping) else None
+
+    def store_object_job(self, job_id: str, job_payload: Mapping[str, Any]) -> dict[str, Any]:
+        normalized_job_id = str(job_id or "").strip()
+        normalized_job_payload = dict(job_payload or {})
+        normalized_job_payload["job_id"] = normalized_job_id
+        with self._lock:
+            job_records = self._load_job_records()
+            job_records[normalized_job_id] = dict(normalized_job_payload)
+            self._store_job_records(job_records)
+        return dict(normalized_job_payload)
+
+
+_REPO_WORKER_JOB_STORE = RepoWorkerJobStoreService()
+
+
+def _load_repo_worker_job(job_id: str) -> dict[str, Any] | None:
+    normalized_job_id = str(job_id or "").strip()
+    if not normalized_job_id:
+        return None
+    with _REPO_WORKER_JOBS_LOCK:
+        job_state = _REPO_WORKER_JOBS.get(normalized_job_id)
+        if isinstance(job_state, Mapping):
+            return dict(job_state)
+    job_state = _REPO_WORKER_JOB_STORE.load_object_job(normalized_job_id)
+    if isinstance(job_state, Mapping):
+        with _REPO_WORKER_JOBS_LOCK:
+            _REPO_WORKER_JOBS[normalized_job_id] = dict(job_state)
+        return dict(job_state)
+    return None
+
+
+def _store_repo_worker_job(job_id: str, job_payload: Mapping[str, Any]) -> dict[str, Any]:
+    normalized_job_id = str(job_id or "").strip()
+    normalized_job_payload = dict(job_payload or {})
+    normalized_job_payload["job_id"] = normalized_job_id
+    with _REPO_WORKER_JOBS_LOCK:
+        _REPO_WORKER_JOBS[normalized_job_id] = dict(normalized_job_payload)
+    _REPO_WORKER_JOB_STORE.store_object_job(normalized_job_id, normalized_job_payload)
+    return dict(normalized_job_payload)
+
+
+def _update_repo_worker_job(job_id: str, **updates: Any) -> dict[str, Any]:
+    job_state = _load_repo_worker_job(job_id) or {"job_id": str(job_id or "").strip()}
+    job_state.update(updates)
+    return _store_repo_worker_job(str(job_id or "").strip(), job_state)
 
 from agents_db import (  # type: ignore
     AgentDbInMemoryRepository,
@@ -265,6 +377,21 @@ def _build_default_runtime_config() -> RuntimeConfigObject:
         default_embedding_model="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
         default_embedding_dimension=384,
         index_backend="faiss",
+    )
+
+
+def _normalize_repo_runtime_config(runtime_config: RuntimeConfigObject | None) -> RuntimeConfigObject:
+    base = runtime_config or _build_default_runtime_config()
+    return RuntimeConfigObject(
+        agents_db_uri=base.agents_db_uri,
+        database_name=base.database_name,
+        tenant_id=base.tenant_id,
+        namespace_id=RepoDocumentBuilder._NAMESPACE_ID,
+        namespace_slug="repo-knowledge",
+        namespace_name=RepoDocumentBuilder._NAMESPACE_NAME,
+        default_embedding_model=base.default_embedding_model,
+        default_embedding_dimension=base.default_embedding_dimension,
+        index_backend=base.index_backend,
     )
 
 
@@ -715,21 +842,39 @@ class RepoIndexService:
             except Exception as exc:
                 return {"path": fpath, "blocks": 0, "embedded": 0, "skipped": True, "error": str(exc)}
 
-        with ThreadPoolExecutor(max_workers=self._workers) as executor:
-            futures = {executor.submit(_index_one, fp): fp for fp in files}
-            for fut in as_completed(futures):
-                r = fut.result()
-                total_blocks += r.get("blocks", 0)
-                total_entities += r.get("entities", 0)
-                total_relations += r.get("relations", 0)
-                total_embedded += r.get("embedded", 0)
-                if r.get("skipped"):
-                    total_skipped += 1
-                if r.get("error"):
-                    errors.append(f"{r['path']}: {r['error']}")
+        repo_backend = getattr(self._ks, "_repository", self._repo)
+        flush_context = getattr(repo_backend, "deferred_flush", None)
+        if not callable(flush_context):
+            flush_context = getattr(repo_backend, "deferred_write_queue", None)
+        if callable(flush_context):
+            with flush_context():
+                with ThreadPoolExecutor(max_workers=self._workers) as executor:
+                    futures = {executor.submit(_index_one, fp): fp for fp in files}
+                    for fut in as_completed(futures):
+                        r = fut.result()
+                        total_blocks += r.get("blocks", 0)
+                        total_entities += r.get("entities", 0)
+                        total_relations += r.get("relations", 0)
+                        total_embedded += r.get("embedded", 0)
+                        if r.get("skipped"):
+                            total_skipped += 1
+                        if r.get("error"):
+                            errors.append(f"{r['path']}: {r['error']}")
+        else:
+            with ThreadPoolExecutor(max_workers=self._workers) as executor:
+                futures = {executor.submit(_index_one, fp): fp for fp in files}
+                for fut in as_completed(futures):
+                    r = fut.result()
+                    total_blocks += r.get("blocks", 0)
+                    total_entities += r.get("entities", 0)
+                    total_relations += r.get("relations", 0)
+                    total_embedded += r.get("embedded", 0)
+                    if r.get("skipped"):
+                        total_skipped += 1
+                    if r.get("error"):
+                        errors.append(f"{r['path']}: {r['error']}")
 
         elapsed = time.perf_counter() - t0
-        repo_backend = getattr(self._ks, "_repository", self._repo)
         if hasattr(repo_backend, "_flush_image"):
             repo_backend._flush_image()
 
@@ -746,6 +891,145 @@ class RepoIndexService:
             "errors": errors[:10],
         }
 
+    def delete_repo_knowledge_objects(
+        self,
+        *,
+        object_names: Sequence[str],
+        namespace_ids: Sequence[str],
+        owner_prefixes: Sequence[str],
+        async_delete: bool = True,
+        limit: int = 50_000,
+    ) -> dict[str, Any]:
+        """Delete repo-knowledge artifacts via repository.delete_object().
+
+        The method is intentionally conservative: for embeddings it requires an
+        owner prefix match (e.g. ``blk:repo:``) to avoid deleting unrelated data.
+        """
+        repository = getattr(self._ks, "_repository", self._repo)
+        delete_object = getattr(repository, "delete_object", None)
+        load_objects = getattr(repository, "load_objects", None)
+        if not callable(delete_object) or not callable(load_objects):
+            return {
+                "ok": False,
+                "error": "repository_missing_load_or_delete",
+            }
+
+        normalized_names = [str(name or "").strip().lower() for name in object_names if str(name or "").strip()]
+        supported_names = [name for name in normalized_names if name in {"embedding", "relation", "entity", "document"}]
+        if not supported_names:
+            return {
+                "ok": False,
+                "error": "no_supported_object_names",
+                "supported": ["embedding", "relation", "entity", "document"],
+            }
+
+        normalized_namespaces = [str(namespace_id or "").strip() for namespace_id in namespace_ids if str(namespace_id or "").strip()]
+        if not normalized_namespaces:
+            normalized_namespaces = [RepoDocumentBuilder._NAMESPACE_ID]
+
+        normalized_prefixes = [str(prefix or "").strip() for prefix in owner_prefixes if str(prefix or "").strip()]
+        if not normalized_prefixes:
+            normalized_prefixes = ["blk:repo:"]
+
+        def _resolve_record_id(payload: Mapping[str, Any]) -> str:
+            return str(payload.get("_id") or payload.get("id") or "").strip()
+
+        def _is_repo_match(object_name: str, payload: Mapping[str, Any]) -> bool:
+            if object_name == "embedding":
+                owner_id = str(payload.get("owner_id") or "").strip()
+                return any(owner_id.startswith(prefix) for prefix in normalized_prefixes)
+
+            if str(payload.get("source_system") or "").strip() == RepoDocumentBuilder._SOURCE_SYSTEM:
+                return True
+            if str(payload.get("document_type") or "").strip() == RepoDocumentBuilder._DOCUMENT_TYPE:
+                return True
+
+            record_id = _resolve_record_id(payload)
+            if object_name == "document":
+                return record_id.startswith("doc:repo_source:")
+            if object_name == "entity":
+                return record_id.startswith("ent:documents:")
+            if object_name == "relation":
+                return record_id.startswith("rel:documents:")
+            return False
+
+        delete_targets: list[tuple[str, str]] = []
+        per_object_totals: dict[str, int] = {name: 0 for name in supported_names}
+        per_object_matches: dict[str, int] = {name: 0 for name in supported_names}
+        errors: list[str] = []
+
+        for object_name in supported_names:
+            for namespace_id in normalized_namespaces:
+                object_payload_list = load_objects(object_name, object_filter={"namespace_id": namespace_id}, limit=max(1, int(limit)))
+                per_object_totals[object_name] += len(object_payload_list)
+                for object_payload in object_payload_list:
+                    if not isinstance(object_payload, Mapping):
+                        continue
+                    if not _is_repo_match(object_name, object_payload):
+                        continue
+                    object_id = _resolve_record_id(object_payload)
+                    if not object_id:
+                        continue
+                    per_object_matches[object_name] += 1
+                    delete_targets.append((object_name, object_id))
+
+        deleted_count = 0
+
+        def _delete_one(target: tuple[str, str]) -> bool:
+            object_name, object_id = target
+            try:
+                return bool(delete_object(object_name, object_id))
+            except Exception as exc:  # pragma: no cover - defensive guard
+                errors.append(f"{object_name}:{object_id}:{type(exc).__name__}:{exc}")
+                return False
+
+        unique_targets = list(dict.fromkeys(delete_targets))
+        repo_backend = getattr(self._ks, "_repository", self._repo)
+        flush_context = getattr(repo_backend, "deferred_flush", None)
+        if not callable(flush_context):
+            flush_context = getattr(repo_backend, "deferred_write_queue", None)
+        if callable(flush_context):
+            with flush_context():
+                if async_delete and unique_targets:
+                    worker_count = max(1, min(self._workers, 8))
+                    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+                        futures = [executor.submit(_delete_one, target) for target in unique_targets]
+                        for future in as_completed(futures):
+                            if future.result():
+                                deleted_count += 1
+                else:
+                    for target in unique_targets:
+                        if _delete_one(target):
+                            deleted_count += 1
+        else:
+            if async_delete and unique_targets:
+                worker_count = max(1, min(self._workers, 8))
+                with ThreadPoolExecutor(max_workers=worker_count) as executor:
+                    futures = [executor.submit(_delete_one, target) for target in unique_targets]
+                    for future in as_completed(futures):
+                        if future.result():
+                            deleted_count += 1
+            else:
+                for target in unique_targets:
+                    if _delete_one(target):
+                        deleted_count += 1
+
+        if hasattr(repo_backend, "_flush_image"):
+            repo_backend._flush_image()
+
+        return {
+            "ok": True,
+            "deleted": deleted_count,
+            "candidates": len(unique_targets),
+            "namespace_ids": normalized_namespaces,
+            "object_names": supported_names,
+            "owner_prefixes": normalized_prefixes,
+            "per_object_totals": per_object_totals,
+            "per_object_matches": per_object_matches,
+            "errors": errors[:20],
+            "async_delete": bool(async_delete),
+        }
+
 
 def create_repo_index_service(
     *,
@@ -753,7 +1037,7 @@ def create_repo_index_service(
     workers: int = 4,
 ) -> RepoIndexService:
     resolved_runtime_config = load_agentsdb_runtime_config_from_env()
-    runtime_config = resolved_runtime_config or _build_default_runtime_config()
+    runtime_config = _normalize_repo_runtime_config(resolved_runtime_config)
     if resolved_runtime_config is not None:
         pipeline_service = load_agentsdb_pipeline_service(runtime_config)
         knowledge_service = pipeline_service._knowledge_service
@@ -771,50 +1055,218 @@ def create_repo_index_service(
         runtime_config=runtime_config,
     )
 
+
+def _run_repo_knowledge_operation(
+    *,
+    operation: str,
+    root_dir: str | None,
+    image_path: str | None,
+    workers: int,
+    extensions: list[str] | str | None,
+    cleanup_before_build: bool,
+    cleanup_namespace_ids: list[str] | str | None,
+    cleanup_object_names: list[str] | str | None,
+    cleanup_owner_prefixes: list[str] | str | None,
+    delete_async: bool,
+) -> dict[str, Any]:
+    resolved_root = Path(os.path.abspath(os.path.expanduser(root_dir or Path(__file__).resolve().parents[1])))
+    resolved_extensions = extensions
+    if isinstance(resolved_extensions, str):
+        resolved_extensions = [resolved_extensions]
+    normalized_extensions = tuple(
+        item if str(item).startswith(".") else f".{item}"
+        for item in (resolved_extensions or [".py"])
+        if str(item).strip()
+    )
+
+    service = create_repo_index_service(image_path=image_path, workers=max(1, int(workers)))
+    normalized_operation = str(operation or "build").strip().lower()
+    resolved_cleanup_namespaces = cleanup_namespace_ids
+    if isinstance(resolved_cleanup_namespaces, str):
+        resolved_cleanup_namespaces = [resolved_cleanup_namespaces]
+    normalized_cleanup_namespaces = [
+        str(namespace_id or "").strip()
+        for namespace_id in (resolved_cleanup_namespaces or ["ns_alde_default", RepoDocumentBuilder._NAMESPACE_ID])
+        if str(namespace_id or "").strip()
+    ]
+
+    resolved_cleanup_object_names = cleanup_object_names
+    if isinstance(resolved_cleanup_object_names, str):
+        resolved_cleanup_object_names = [resolved_cleanup_object_names]
+    normalized_cleanup_object_names = [
+        str(object_name or "").strip().lower()
+        for object_name in (resolved_cleanup_object_names or ["embedding", "relation", "entity", "document"])
+        if str(object_name or "").strip()
+    ]
+
+    resolved_cleanup_prefixes = cleanup_owner_prefixes
+    if isinstance(resolved_cleanup_prefixes, str):
+        resolved_cleanup_prefixes = [resolved_cleanup_prefixes]
+    normalized_cleanup_prefixes = [
+        str(prefix or "").strip()
+        for prefix in (resolved_cleanup_prefixes or ["blk:repo:"])
+        if str(prefix or "").strip()
+    ]
+
+    if normalized_operation == "repair_namespace":
+        normalized_operation = "rebuild"
+        normalized_cleanup_namespaces = ["ns_alde_default", RepoDocumentBuilder._NAMESPACE_ID]
+        normalized_cleanup_object_names = ["embedding", "relation", "entity", "document"]
+        normalized_cleanup_prefixes = ["blk:repo:"]
+
+    if normalized_operation == "scan":
+        return {
+            "ok": True,
+            "operation": "scan",
+            "root_dir": str(resolved_root),
+            "extensions": list(normalized_extensions),
+            "files": service.scan_object(str(resolved_root), extensions=normalized_extensions),
+        }
+    if normalized_operation == "build":
+        cleanup_report = None
+        if cleanup_before_build:
+            cleanup_report = service.delete_repo_knowledge_objects(
+                object_names=normalized_cleanup_object_names,
+                namespace_ids=normalized_cleanup_namespaces,
+                owner_prefixes=normalized_cleanup_prefixes,
+                async_delete=bool(delete_async),
+            )
+        result = service.index_repo_object(str(resolved_root), extensions=normalized_extensions)
+        result["ok"] = True
+        result["operation"] = "build"
+        if cleanup_report is not None:
+            result["cleanup"] = cleanup_report
+        return result
+    if normalized_operation in {"cleanup", "delete"}:
+        cleanup_report = service.delete_repo_knowledge_objects(
+            object_names=normalized_cleanup_object_names,
+            namespace_ids=normalized_cleanup_namespaces,
+            owner_prefixes=normalized_cleanup_prefixes,
+            async_delete=bool(delete_async),
+        )
+        cleanup_report["operation"] = "cleanup"
+        return cleanup_report
+    if normalized_operation == "rebuild":
+        cleanup_report = service.delete_repo_knowledge_objects(
+            object_names=normalized_cleanup_object_names,
+            namespace_ids=normalized_cleanup_namespaces,
+            owner_prefixes=normalized_cleanup_prefixes,
+            async_delete=bool(delete_async),
+        )
+        result = service.index_repo_object(str(resolved_root), extensions=normalized_extensions)
+        result["ok"] = True
+        result["operation"] = "rebuild"
+        result["cleanup"] = cleanup_report
+        return result
+
+    return {
+        "ok": False,
+        "error": f"Unsupported operation: {operation}",
+        "allowed_operations": ["scan", "build", "cleanup", "delete", "rebuild", "status", "repair_namespace"],
+    }
+
+
+def _run_repo_worker_job(job_id: str, job_payload: Mapping[str, Any]) -> None:
+    _update_repo_worker_job(job_id, status="running", started_at=time.time(), error=None)
+    try:
+        result = _run_repo_knowledge_operation(**dict(job_payload))
+        _update_repo_worker_job(
+            job_id,
+            status="completed",
+            finished_at=time.time(),
+            result=dict(result),
+            error=None,
+        )
+    except BaseException as exc:  # pragma: no cover - defensive guard
+        _update_repo_worker_job(
+            job_id,
+            status="failed",
+            finished_at=time.time(),
+            error=f"{type(exc).__name__}: {exc}",
+        )
+
 def repo_knowledge_worker(
     operation: str,
     root_dir: str | None = None,
     image_path: str | None = None,
     workers: int = 4,
     extensions: list[str] | str | None = None,
+    cleanup_before_build: bool = False,
+    cleanup_namespace_ids: list[str] | str | None = None,
+    cleanup_object_names: list[str] | str | None = None,
+    cleanup_owner_prefixes: list[str] | str | None = None,
+    delete_async: bool = True,
+    run_async: bool = False,
+    job_id: str | None = None,
 ) -> dict | str:
     """Scan or build repository knowledge using the AgentsDB parser schema."""
     try:
-        try:
-            from .repo_code_splitter import create_repo_index_service  # type: ignore
-        except ImportError:
-            from alde.repo_code_splitter import create_repo_index_service  # type: ignore
-
-        resolved_root = Path(os.path.abspath(os.path.expanduser(root_dir or Path(__file__).resolve().parents[1])) )
-        resolved_extensions = extensions
-        if isinstance(resolved_extensions, str):
-            resolved_extensions = [resolved_extensions]
-        normalized_extensions = tuple(
-            item if str(item).startswith(".") else f".{item}"
-            for item in (resolved_extensions or [".py"])
-            if str(item).strip()
-        )
-
-        service = create_repo_index_service(image_path=image_path, workers=max(1, int(workers)))
         normalized_operation = str(operation or "build").strip().lower()
-        if normalized_operation == "scan":
+        if normalized_operation == "status":
+            normalized_job_id = str(job_id or "").strip()
+            if not normalized_job_id:
+                return {"ok": False, "error": "status operation requires job_id"}
+            job_state = _load_repo_worker_job(normalized_job_id)
+            if not isinstance(job_state, dict):
+                return {"ok": False, "error": f"unknown job_id: {normalized_job_id}"}
+            return {"ok": True, "operation": "status", "job": dict(job_state)}
+
+        operation_payload = {
+            "operation": normalized_operation,
+            "root_dir": root_dir,
+            "image_path": image_path,
+            "workers": workers,
+            "extensions": extensions,
+            "cleanup_before_build": cleanup_before_build,
+            "cleanup_namespace_ids": cleanup_namespace_ids,
+            "cleanup_object_names": cleanup_object_names,
+            "cleanup_owner_prefixes": cleanup_owner_prefixes,
+            "delete_async": delete_async,
+        }
+
+        if bool(run_async) and normalized_operation in {"build", "cleanup", "delete", "rebuild", "repair_namespace"}:
+            normalized_job_id = str(job_id or f"repo-job-{uuid4().hex[:12]}").strip()
+            job_state = {
+                "job_id": normalized_job_id,
+                "operation": normalized_operation,
+                "status": "queued",
+                "created_at": time.time(),
+                "params": {
+                    "root_dir": root_dir,
+                    "image_path": image_path,
+                    "workers": workers,
+                    "extensions": extensions,
+                    "cleanup_before_build": cleanup_before_build,
+                    "cleanup_namespace_ids": cleanup_namespace_ids,
+                    "cleanup_object_names": cleanup_object_names,
+                    "cleanup_owner_prefixes": cleanup_owner_prefixes,
+                    "delete_async": delete_async,
+                },
+            }
+            _store_repo_worker_job(normalized_job_id, job_state)
+
+            worker_thread = threading.Thread(
+                target=_run_repo_worker_job,
+                args=(normalized_job_id, operation_payload),
+                name=f"repo-knowledge-worker:{normalized_job_id}",
+                daemon=True,
+            )
+            worker_thread.start()
             return {
                 "ok": True,
-                "operation": "scan",
-                "root_dir": str(resolved_root),
-                "extensions": list(normalized_extensions),
-                "files": service.scan_object(str(resolved_root), extensions=normalized_extensions),
+                "operation": normalized_operation,
+                "async": True,
+                "job_id": normalized_job_id,
+                "status": "queued",
+                "status_call": {
+                    "operation": "status",
+                    "job_id": normalized_job_id,
+                },
             }
-        if normalized_operation == "build":
-            result = service.index_repo_object(str(resolved_root), extensions=normalized_extensions)
-            result["ok"] = True
-            result["operation"] = "build"
-            return result
-        return {
-            "ok": False,
-            "error": f"Unsupported operation: {operation}",
-            "allowed_operations": ["scan", "build"],
-        }
+
+        result = _run_repo_knowledge_operation(**operation_payload)
+        result["async"] = False
+        return result
     except BaseException as exc:
         return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
 

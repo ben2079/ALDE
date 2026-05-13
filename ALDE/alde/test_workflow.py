@@ -5,6 +5,7 @@ import os
 import sys
 import tempfile
 import unittest
+import uuid
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -1012,7 +1013,48 @@ class TestWorkflowIntegration(unittest.TestCase):
             self.assertEqual(len(report["classified"]["known_processed"]), 1)
             self.assertEqual(report["classified"]["known_processed"][0]["content_sha256"], correlation_id)
 
-    def test_dispatch_documents_tool_spec_accepts_current_and_legacy_agent_fields(self) -> None:
+    def test_dispatch_documents_resolve_scan_dir_prefers_default_vsm4_before_db_parent(self) -> None:
+        warnings: list[dict[str, object]] = []
+        with tempfile.TemporaryDirectory() as tmpdir:
+            resolved_scan_dir = tools_mod.DOCUMENT_DISPATCH_SERVICE.resolve_scan_dir(
+                os.path.join(tmpdir, "missing-documents"),
+                resolved_db_path=os.path.join(tmpdir, "dispatcher_doc_db.json"),
+                warnings=warnings,
+            )
+
+        expected_scan_dir = os.path.join(Path(tools_mod.__file__).resolve().parent.parent, "AppData", "VSM_4_Data")
+        self.assertEqual(resolved_scan_dir, expected_scan_dir)
+        self.assertTrue(warnings)
+        self.assertEqual(warnings[-1].get("reason"), "fallback_to_default_vsm4")
+
+    def test_collect_document_paths_skips_virtualenv_and_package_directories(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            kept_pdf = os.path.join(tmpdir, "documents", "keep.pdf")
+            skipped_hidden_venv_pdf = os.path.join(tmpdir, ".venv", "skip-hidden.pdf")
+            skipped_venv_pdf = os.path.join(tmpdir, "venv", "skip-venv.pdf")
+            skipped_site_packages_pdf = os.path.join(tmpdir, "vendor", "site-packages", "skip-package.pdf")
+            skipped_cover_letter_pdf = os.path.join(tmpdir, "cover_letters_generated", "skip-cover-letter.pdf")
+
+            for file_path in (
+                kept_pdf,
+                skipped_hidden_venv_pdf,
+                skipped_venv_pdf,
+                skipped_site_packages_pdf,
+                skipped_cover_letter_pdf,
+            ):
+                os.makedirs(os.path.dirname(file_path), exist_ok=True)
+                with open(file_path, "wb") as handle:
+                    handle.write(b"fake-pdf-content")
+
+            document_paths = tools_mod.DOCUMENT_DISPATCH_SERVICE.collect_document_paths(
+                tmpdir,
+                recursive=True,
+                extensions={".pdf"},
+            )
+
+            self.assertEqual(document_paths, [kept_pdf])
+
+    def test_dispatch_documents_tool_spec_accepts_current_agent_and_job_fields(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             pdf_path = os.path.join(tmpdir, "posting.pdf")
             with open(pdf_path, "wb") as handle:
@@ -1027,17 +1069,17 @@ class TestWorkflowIntegration(unittest.TestCase):
             self.assertIn("parser_job_name", parameter_names)
 
             tool_result = tool_spec.execute({"scan_dir": tmpdir, "dry_run": True})
-            legacy_result = tools_mod.dispatch_docs(
+            direct_result = tools_mod.DOCUMENT_DISPATCH_SERVICE.dispatch_documents(
                 scan_dir=tmpdir,
                 dry_run=True,
-                parser_agent_name="_job_posting_parser",
+                parser_job_name="job_posting_parser",
             )
 
             self.assertIsInstance(tool_result, dict)
             self.assertEqual(tool_result["agent"], "xworker")
             self.assertEqual(tool_result["job_name"], "document_dispatch")
-            self.assertEqual(legacy_result["agent"], "xworker")
-            self.assertEqual(legacy_result["job_name"], "document_dispatch")
+            self.assertEqual(direct_result["agent"], "xworker")
+            self.assertEqual(direct_result["job_name"], "document_dispatch")
 
     def test_read_document_uses_pypdf_extractor_for_pdf_files(self) -> None:
         with tempfile.NamedTemporaryFile("wb", suffix=".pdf", delete=False) as tmp:
@@ -1318,6 +1360,362 @@ class TestWorkflowIntegration(unittest.TestCase):
             self.assertTrue(attachment_messages)
             self.assertIn("profiles", str(attachment_messages[-1].get("content") or ""))
             self.assertIn("job_postings", str(attachment_messages[-1].get("content") or ""))
+
+    def test_real_agentsdb_socket_writer_context_attaches_profile_and_job_posting_documents(self) -> None:
+        agents_db_uri = "agentsdb://127.0.0.1:2331"
+        database_name = "alde_knowledge"
+        probe_id = uuid.uuid4().hex[:8]
+        profile_correlation_id = f"profile:real-socket-attachment:{probe_id}"
+        job_correlation_id = f"job:real-socket-attachment:{probe_id}"
+
+        previous_env = self._apply_env_values(
+            {
+                "AI_IDE_KNOWLEDGE_AGENTS_DB_URI": agents_db_uri,
+                "AI_IDE_KNOWLEDGE_AGENTS_DB_BACKEND_URI": "agentsmem://local",
+                "AI_IDE_KNOWLEDGE_AGENTS_DB_NAME": database_name,
+                "AI_IDE_KNOWLEDGE_AGENTS_DB_NAMESPACE_ID": f"ns_real_socket_attachment_{probe_id}",
+                "AI_IDE_KNOWLEDGE_AGENTS_DB_NAMESPACE_SLUG": f"real-socket-attachment-{probe_id}",
+                "AI_IDE_KNOWLEDGE_AGENTS_DB_NAMESPACE_NAME": f"Real Socket Attachment {probe_id}",
+            }
+        )
+        self._reset_agentsdb_runtime_state()
+
+        socket_repository: agents_db_mod.AgentDbSocketRepository | None = None
+        try:
+            try:
+                socket_repository = agents_db_mod.AgentDbSocketRepository.create_from_uri(
+                    agents_db_uri,
+                    database_name,
+                    timeout_seconds=1.5,
+                )
+                health_payload = socket_repository._request_object("health")
+                self.assertTrue(bool(health_payload.get("ok", True)))
+            except Exception as exc:
+                self.skipTest(
+                    "agentsdb socket endpoint not reachable for real attachment integration test "
+                    f"({agents_db_uri}): {type(exc).__name__}: {exc}"
+                )
+
+            profile_result = {
+                "agent": "_xworker",
+                "correlation_id": profile_correlation_id,
+                "parse": {"language": "de", "errors": [], "warnings": []},
+                "profile": {
+                    "profile_id": profile_correlation_id,
+                    "preferences": {"language": "de"},
+                    "skills": ["python", "rag", "agentsdb"],
+                },
+            }
+            job_posting_result = {
+                "agent": "_xworker",
+                "correlation_id": job_correlation_id,
+                "parse": {"is_job_posting": True, "language": "de", "errors": [], "warnings": []},
+                "raw_text_document": {
+                    "document_type": "job_posting",
+                    "title": "Senior MCP Engineer",
+                    "language": "de",
+                    "raw_text": "Senior MCP Engineer at Example Co with Python, AgentsDB, and distributed systems.",
+                    "sections": [],
+                    "metadata": {},
+                },
+                "job_posting": {
+                    "job_title": "Senior MCP Engineer",
+                    "company_name": "Example Co",
+                    "raw_text": "Senior MCP Engineer at Example Co with Python, AgentsDB, and distributed systems.",
+                },
+            }
+
+            profile_store = json.loads(
+                tools_mod.store_profile_result_tool(
+                    profile_result=profile_result,
+                    correlation_id=profile_correlation_id,
+                    source_agent="_xworker",
+                    obj_name="profiles",
+                )
+            )
+            job_store = json.loads(
+                tools_mod.store_job_posting_result_tool(
+                    job_posting_result=job_posting_result,
+                    correlation_id=job_correlation_id,
+                    source_agent="_xworker",
+                    obj_name="job_postings",
+                )
+            )
+
+            self.assertTrue(profile_store["ok"])
+            self.assertTrue(job_store["ok"])
+
+            dispatch_result, dispatch_request = agents_factory.execute_tool(
+                "route_to_agent",
+                {
+                    "target_agent": "_xworker",
+                    "job_name": "document_dispatch",
+                    "message_text": "Bitte starte den Workflow.",
+                    "handoff_payload": {
+                        "output": {
+                            "action": "generate_cover_letter",
+                            "job_posting_result": job_posting_result,
+                            "profile_result": profile_result,
+                            "applicant_profile": {
+                                "source": "text",
+                                "value": {
+                                    "profile_id": profile_correlation_id,
+                                    "skills": ["python", "rag", "agentsdb"],
+                                },
+                            },
+                            "options": {
+                                "language": "de",
+                                "tone": "modern",
+                            },
+                            "sequence": {
+                                "writer_job_name": "cover_letter_writer",
+                            },
+                        }
+                    },
+                    "handoff_metadata": {"writer_job_name": "cover_letter_writer"},
+                },
+                source_agent_label="_xplaner_xrouter",
+            )
+
+            self.assertEqual(dispatch_result, "Routing to _xworker")
+            self.assertIsNotNone(dispatch_request)
+
+            scope_key = agents_factory.AGENT_MEMORY_SERVICE.load_session_scope_key(
+                thread_id=agents_factory.WORKFLOW_CONTEXT_SERVICE.load_current_thread_id(),
+            )
+            writer_correlation_id = agents_factory.AGENT_MEMORY_SERVICE.build_object_correlation_id(
+                agent_label="_xworker",
+                memory_slot="cover_letter_writer",
+                scope_key=scope_key,
+            )
+            stored_writer_record = tools_mod.DOCUMENT_REPOSITORY.get_document(
+                writer_correlation_id,
+                obj_name="agent_memory",
+            )
+            session_entries = (
+                ((stored_writer_record.get("agent_memory") or {}).get("session_context") or {}).get("entries") or []
+            )
+
+            self.assertTrue(session_entries)
+            context_types = [str(entry.get("context_type") or "") for entry in session_entries if isinstance(entry, dict)]
+            self.assertIn("applicant_profile", context_types)
+            self.assertIn("profile_result", context_types)
+            self.assertIn("job_posting_result", context_types)
+            self.assertIn("options", context_types)
+            self.assertIn("ATTACHMENT", context_types)
+
+            writer_result, writer_request = agents_factory.execute_tool(
+                "route_to_agent",
+                {
+                    "target_agent": "_xworker",
+                    "job_name": "cover_letter_writer",
+                    "message_text": "Bitte erstelle ein Anschreiben.",
+                },
+                source_agent_label="_xplaner_xrouter",
+            )
+
+            self.assertEqual(writer_result, "Routing to _xworker")
+            self.assertIsNotNone(writer_request)
+
+            attachment_documents = ((writer_request.get("runtime") or {}).get("attachment_documents") or [])
+            self.assertTrue(attachment_documents)
+            attachment_obj_names = {
+                str(item.get("obj_name") or "")
+                for item in attachment_documents
+                if isinstance(item, dict)
+            }
+            self.assertIn("profiles", attachment_obj_names)
+            self.assertIn("job_postings", attachment_obj_names)
+
+            session_cache_messages = [
+                message
+                for message in (writer_request.get("messages") or [])
+                if isinstance(message, dict)
+                and str(message.get("role") or "").strip().lower() == "user"
+                and "Session cache context (agentsdb agent_memory)" in str(message.get("content") or "")
+            ]
+            self.assertTrue(session_cache_messages)
+            self.assertIn("profile_result", str(session_cache_messages[-1].get("content") or ""))
+            self.assertIn("job_posting_result", str(session_cache_messages[-1].get("content") or ""))
+
+            attachment_messages = [
+                message
+                for message in (writer_request.get("messages") or [])
+                if isinstance(message, dict)
+                and str(message.get("role") or "").strip().lower() == "user"
+                and "Session attachment documents (agentsdb agent_memory)" in str(message.get("content") or "")
+            ]
+            self.assertTrue(attachment_messages)
+            self.assertIn("profiles", str(attachment_messages[-1].get("content") or ""))
+            self.assertIn("job_postings", str(attachment_messages[-1].get("content") or ""))
+        finally:
+            self._restore_env_values(previous_env)
+            self._reset_agentsdb_runtime_state()
+
+    def test_known_processed_cover_letter_resume_path_persists_cover_letter_artifacts(self) -> None:
+        backend = _InMemoryMongoDocumentBackend()
+        self._reset_agentsdb_runtime_state()
+
+        with tempfile.TemporaryDirectory() as scan_tmpdir, tempfile.TemporaryDirectory() as output_tmpdir:
+            pdf_path = os.path.join(scan_tmpdir, "posting.pdf")
+            with open(pdf_path, "wb") as handle:
+                handle.write(b"fake-pdf-content")
+
+            correlation_id = tools_mod._sha256_file(pdf_path)
+            profile_correlation_id = "profile:resume-e2e"
+            dispatcher_storage_key = tools_mod.DOCUMENT_REPOSITORY._resolve_db_path(db_name="dispatcher_documents")
+
+            profile_result = {
+                "agent": "_xworker",
+                "correlation_id": profile_correlation_id,
+                "parse": {"language": "de", "errors": [], "warnings": []},
+                "profile": {
+                    "profile_id": profile_correlation_id,
+                    "preferences": {"language": "de"},
+                    "skills": ["Python", "AgentsDB"],
+                },
+            }
+            job_posting_result = {
+                "agent": "job_posting_parser",
+                "correlation_id": correlation_id,
+                "parse": {"is_job_posting": True, "language": "de", "errors": [], "warnings": []},
+                "file": {"path": pdf_path, "content_sha256": correlation_id},
+                "job_posting": {
+                    "job_title": "Platform Engineer",
+                    "company_name": "Example Co",
+                    "raw_text": "Platform Engineer mit Python, AgentsDB und Workflow-Orchestrierung.",
+                },
+                "raw_text_document": {
+                    "document_type": "job_posting",
+                    "title": "Platform Engineer",
+                    "language": "de",
+                    "raw_text": "Platform Engineer mit Python, AgentsDB und Workflow-Orchestrierung.",
+                    "sections": [],
+                    "metadata": {},
+                },
+                "db_updates": {
+                    "processing_state": "processed",
+                    "processed": True,
+                },
+            }
+
+            with patch.object(tools_mod.DOCUMENT_REPOSITORY, "_load_agentsdb_backend", return_value=backend):
+                tools_mod.store_profile_result_tool(
+                    profile_result=profile_result,
+                    correlation_id=profile_correlation_id,
+                    source_agent="_xworker",
+                    obj_name="profiles",
+                )
+                tools_mod.store_job_posting_result_tool(
+                    job_posting_result=job_posting_result,
+                    correlation_id=correlation_id,
+                    source_agent="job_posting_parser",
+                    obj_name="job_postings",
+                )
+                backend.upsert_record(
+                    storage_key=dispatcher_storage_key,
+                    record_id=correlation_id,
+                    record_value={
+                        "id": correlation_id,
+                        "content_sha256": correlation_id,
+                        "source_path": pdf_path,
+                        "processing_state": "processed",
+                        "processed": True,
+                        "file_size_bytes": os.path.getsize(pdf_path),
+                        "mtime_epoch": int(os.path.getmtime(pdf_path)),
+                    },
+                    db_name="dispatcher_documents",
+                    obj_name="documents",
+                )
+
+                dispatch_report = tools_mod.DOCUMENT_DISPATCH_SERVICE.dispatch_documents(
+                    scan_dir=scan_tmpdir,
+                    action="generate_cover_letter",
+                    profile_id=profile_correlation_id,
+                    job_posting_result=job_posting_result,
+                    options={
+                        "language": "de",
+                        "tone": "modern",
+                        "max_words": 320,
+                        "output_dir": output_tmpdir,
+                        "write_pdf": False,
+                    },
+                    dry_run=False,
+                )
+
+                route_handoffs = agents_factory._extract_tool_handoff_messages(dispatch_report)
+                self.assertEqual(len(route_handoffs), 1)
+                self.assertEqual(route_handoffs[0]["job_name"], "cover_letter_writer")
+
+                route_result, writer_request = agents_factory.execute_route_to_agent(
+                    route_handoffs[0],
+                    source_agent_label="_xworker",
+                )
+
+                self.assertEqual(route_result, "Routing to _xworker")
+                self.assertEqual(((writer_request.get("runtime") or {}).get("job_name")), "cover_letter_writer")
+                result_postprocess = (((writer_request.get("handoff_context") or {}).get("contract") or {}).get("schema") or {}).get("result_postprocess") or {}
+                self.assertEqual(result_postprocess.get("tool"), "persist_cover_letter_artifacts")
+
+                persist_result = agents_factory.ROUTING_RESULT_POSTPROCESS_SERVICE.apply_object_result(
+                    writer_request,
+                    result_text=json.dumps(
+                        {
+                            "cover_letter": {
+                                "full_text": "Sehr geehrtes Team,\n\nmit meiner Erfahrung in Python und AgentsDB passe ich gut zur Rolle Platform Engineer.\n\nMit freundlichen Gruessen\nBen"
+                            },
+                            "cv": {
+                                "full_text": "Python\nAgentsDB\nWorkflow-Orchestrierung"
+                            },
+                            "quality": {
+                                "language": "de",
+                                "tone_used": "modern",
+                                "matched_requirements": ["Python", "AgentsDB"],
+                                "highlighted_skills": ["Python", "AgentsDB"],
+                                "red_flags": [],
+                            },
+                        },
+                        ensure_ascii=False,
+                    ),
+                    succeeded=True,
+                )
+
+                self.assertIsInstance(persist_result, dict)
+                self.assertTrue(persist_result["ok"])
+                self.assertEqual(((persist_result.get("result") or {}).get("document_pdf_path")), None)
+
+                stored_cover_letter = tools_mod.DOCUMENT_REPOSITORY.get_document(
+                    correlation_id,
+                    obj_name="cover_letters",
+                )
+                self.assertIn("cover_letter", stored_cover_letter)
+                self.assertIn(
+                    "Python und AgentsDB passe ich gut zur Rolle Platform Engineer",
+                    (stored_cover_letter.get("cover_letter") or {}).get("full_text") or "",
+                )
+
+                scope_key = agents_factory.AGENT_MEMORY_SERVICE.load_session_scope_key(
+                    thread_id=agents_factory.WORKFLOW_CONTEXT_SERVICE.load_current_thread_id(),
+                )
+                writer_memory_correlation_id = agents_factory.AGENT_MEMORY_SERVICE.build_object_correlation_id(
+                    agent_label="_xworker",
+                    memory_slot="cover_letter_writer",
+                    scope_key=scope_key,
+                )
+                writer_memory_record = tools_mod.DOCUMENT_REPOSITORY.get_document(
+                    writer_memory_correlation_id,
+                    obj_name="agent_memory",
+                )
+                session_entries = ((((writer_memory_record.get("agent_memory") or {}).get("session_context") or {}).get("entries") or []))
+                context_types = [
+                    str(entry.get("context_type") or "")
+                    for entry in session_entries
+                    if isinstance(entry, dict)
+                ]
+
+                self.assertIn("profile_result", context_types)
+                self.assertIn("job_posting_result", context_types)
+                self.assertIn("ATTACHMENT", context_types)
 
     def test_route_to_agent_caches_generic_handoff_context_for_target_job(self) -> None:
         backend = _InMemoryMongoDocumentBackend()
@@ -1878,6 +2276,88 @@ class TestWorkflowIntegration(unittest.TestCase):
             self.assertEqual(stored["job_posting"]["job_title"], "Runtime Persisted Engineer")
             self.assertEqual(stored["agent"], "_xworker")
         finally:
+            os.unlink(job_postings_db_path)
+
+    def test_primary_route_parser_plain_text_is_normalized_and_forwards_to_cover_letter_writer(self) -> None:
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8") as dispatcher_tmp, tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8") as job_tmp:
+            dispatcher_db_path = dispatcher_tmp.name
+            job_postings_db_path = job_tmp.name
+
+        try:
+            routing_request = {
+                "agent_label": "_xworker",
+                "handoff": {
+                    "handoff_payload": {
+                        "output": {
+                            "type": "job_posting_pdf",
+                            "action": "generate_cover_letter",
+                            "file": {
+                                "path": "/tmp/example-job.pdf",
+                                "name": "example-job.pdf",
+                                "content_sha256": "sha-plain-text-1",
+                            },
+                            "link": {"thread_id": "thread-plain-1", "message_id": "msg-plain-1"},
+                            "db": {"processing_state": "queued"},
+                            "requested_actions": ["parse", "extract_text", "store_object_result", "mark_processed_on_success"],
+                            "job_name": "job_posting_parser",
+                            "applicant_profile": {
+                                "source": "profile_id",
+                                "value": "profile:plain-1",
+                            },
+                        }
+                    },
+                    "metadata": {
+                        "correlation_id": "sha-plain-text-1",
+                        "dispatcher_message_id": "dispatcher-plain-1",
+                        "dispatcher_db_path": dispatcher_db_path,
+                        "obj_name": "job_postings",
+                        "obj_db_path": job_postings_db_path,
+                    },
+                },
+                "handoff_context": {
+                    "contract": {
+                        "schema": {
+                            "result_postprocess": {
+                                "tool": "upsert_object_record",
+                                "source_agent": "target_agent",
+                            }
+                        }
+                    }
+                },
+            }
+
+            result_text = "Support Engineer at Example Co with Python and SQL."
+            postprocess_result = agents_factory.ROUTING_RESULT_POSTPROCESS_SERVICE.apply_object_result(
+                routing_request,
+                result_text=result_text,
+                succeeded=True,
+            )
+
+            stored = tools_mod.DOCUMENT_REPOSITORY.get_document(
+                "sha-plain-text-1",
+                db_path=job_postings_db_path,
+                obj_name="job_postings",
+            )
+
+            self.assertIsInstance(postprocess_result, dict)
+            self.assertTrue(postprocess_result["ok"])
+            self.assertEqual(postprocess_result["result"]["correlation_id"], "sha-plain-text-1")
+            self.assertEqual(postprocess_result["result"]["raw_text_document"]["raw_text"], result_text)
+            self.assertIn("parser_result_synthesized_from_plain_text", postprocess_result["result"]["parse"]["warnings"])
+            self.assertEqual(stored["raw_text_document"]["raw_text"], result_text)
+            self.assertEqual(stored["job_posting"]["raw_text"], result_text)
+            self.assertTrue(stored["parse"]["is_job_posting"])
+            self.assertEqual(postprocess_result["handoff_messages"][0]["job_name"], "cover_letter_writer")
+            self.assertEqual(
+                postprocess_result["handoff_messages"][0]["handoff_payload"]["output"]["job_posting_result"]["raw_text_document"]["raw_text"],
+                result_text,
+            )
+            self.assertEqual(
+                postprocess_result["handoff_messages"][0]["handoff_payload"]["output"]["profile_result"]["profile"]["profile_id"],
+                "profile:plain-1",
+            )
+        finally:
+            os.unlink(dispatcher_db_path)
             os.unlink(job_postings_db_path)
 
     def test_deterministic_action_is_logged_as_real_assistant_result(self) -> None:

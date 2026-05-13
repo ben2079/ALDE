@@ -101,6 +101,14 @@ JOB_PROMPTS: dict[str, dict[str, Any]] = {
                     "recursive",
                     "extensions",
                     "max_files",
+                    "action",
+                    "applicant_profile",
+                    "profile_result",
+                    "job_posting",
+                    "job_posting_result",
+                    "options",
+                    "cover_letter_context",
+                    "source_document",
                     "agent_name",
                     "parser_agent_name",
                     "parser_job_name",
@@ -113,7 +121,9 @@ JOB_PROMPTS: dict[str, dict[str, Any]] = {
                 "List files in scan_dir and filter to PDFs.",
                 "Check readability and compute content_sha256, file_size_bytes, and mtime_epoch.",
                 "Look up each document in the dispatcher DB and classify it as new, known_unprocessed, known_processing, known_processed, or error.",
-                "Forward only new or known_unprocessed items to the job_posting_parser job when parsing work is still required.",
+                "Use parser_job_name for job specializations such as job_posting_parser; keep agent_name and parser_agent_name reserved for runtime agent labels such as _xworker or _xrouter_xplanner.",
+                "Forward new or known_unprocessed items to the job_posting_parser job when parsing work is still required.",
+                "When a generate_cover_letter-style request lands on an already processed document, resume from the stored job_posting result and route directly to cover_letter_writer when the profile input is already available.",
                 "Emit one handoff message per forwarded item so runtime can fire one route_to_agent tool call per document.",
                 "When parsed job data is already available and dispatcher/job-posting stores must be updated together, prefer upsert_object_record over separate store/status writes.",
                 "Return a structured report with summary, forwarded items, and errors.",
@@ -458,15 +468,24 @@ JOB_PROMPTS: dict[str, dict[str, Any]] = {
         "prompt": _text(
             """
             === Job: Xrouter_Xplanner for cover_letter_generation_sequence ===
-            Description: Specialized router planner for dispatch -> parse -> cover-letter execution.
-            Goal: Initialize the deterministic sequence for cover-letter generation from applicant profile and job-offer inputs.
+            Description: Specialized router planner for the deterministic dispatch -> parse -> cover-letter writer pipeline.
+            Goal: Build exactly one initialization payload that starts the cover-letter sequence from applicant-profile or profile_id plus job-posting inputs.
 
-            Rules:
-            - Build one deterministic route initialization payload for document_dispatch.
-            - Preserve all given applicant_profile, job_posting, job_posting_result, and options fields unchanged.
-            - Set action to generate_cover_letter when missing.
-            - Keep sequence metadata explicit: sequence_name, parser_job_name, writer_job_name.
-            - Do not invent filesystem or DB state.
+            Required behavior:
+            - Produce one deterministic handoff for job_name=document_dispatch and target_agent=_xworker.
+            - Treat the request as sequence initialization only, not as direct writing or parsing execution.
+            - Accept the minimal initialization call with profile_id plus job_posting.
+            - When only profile_id is present, emit applicant_profile={source: profile_id, value: <profile_id>} inside the sequence payload.
+            - Preserve applicant_profile, job_posting, job_posting_result, cover_letter_context, source_document, and options unchanged when they are present.
+            - Set action=generate_cover_letter only when action is missing or empty.
+            - Keep sequence metadata explicit and consistent: sequence_name, parser_job_name, writer_job_name.
+            - Use the canonical sequence identity dispatch_parse_generate_cover_letter.
+
+            Constraints:
+            - Do not invent applicant facts, job requirements, attachments, filesystem paths, database state, or execution results.
+            - Do not rename payload fields unless required by the documented output schema.
+            - Do not emit multiple routes, alternatives, commentary, or free-text explanation.
+            - Return only the structured route initialization payload for the sequence.
             """
         ),
 
@@ -482,12 +501,31 @@ JOB_PROMPTS: dict[str, dict[str, Any]] = {
                 "job_posting_parser",
                 "cover_letter_writer",
             ],
+        
+        
+        'sequence':
+        [ 
+              '-> xrouter_planner ->'
+              '-> document_dispatch ->'
+              '-> job_posting_parser ->'
+              '-> agent_memory ->' 
+                '<-'
+              '-> xrouter_planner ->'
+              '-> document_dispatch ->'
+              '-> applicant_profile_parser ->'
+              '-> agent_memory ->' 
+                '<-'
+              '-> xrouter_planner ->'
+              '-> cover_letter_writer ->|'
+              ]
+        
+             
         },
 
         "output_schema": {
             "target_agent": "_xworker",
             "job_name": "document_dispatch",
-            "user_question": "{...sequence payload json...}",
+            "user_question": "{\"action\": \"generate_cover_letter\", \"profile_id\": \"profile:123\", \"job_posting\": {\"job_title\": \"AI Engineer\"}}",
 
             "handoff_metadata": {
                 "sequence_name": "dispatch_parse_generate_cover_letter",
@@ -505,8 +543,11 @@ JOB_PROMPTS: dict[str, dict[str, Any]] = {
 
             Rules:
             - Use only the repo_knowledge_worker tool for this job.
-            - Keep operation explicit: scan or build.
-            - Pass root_dir, extensions, workers, and image_path only when provided.
+                        - Keep operation explicit: scan, build, cleanup, delete, rebuild, status, or repair_namespace.
+                        - Use repair_namespace to cleanup wrong namespace writes and rebuild in one deterministic run.
+                        - For long runs prefer run_async=true and poll with operation=status + job_id.
+                        - Pass root_dir, extensions, workers, image_path, cleanup_namespace_ids, cleanup_object_names,
+                            cleanup_owner_prefixes, cleanup_before_build, delete_async, run_async, and job_id only when provided.
             - Return the tool result payload unchanged.
             - Do not invent repository state, indexing metrics, or errors.
             """
@@ -517,12 +558,22 @@ JOB_PROMPTS: dict[str, dict[str, Any]] = {
         },
         "output_schema": {
             "ok": True,
-            "operation": "scan|build",
+            "operation": "scan|build|cleanup|delete|rebuild|status|repair_namespace",
+            "async": False,
+            "job_id": None,
+            "status": "queued|running|completed|failed",
             "files_found": 0,
             "total_blocks": 0,
             "total_entities": 0,
             "total_relations": 0,
             "total_embedded": 0,
+            "cleanup": {
+                "deleted": 0,
+                "candidates": 0,
+                "namespace_ids": [],
+                "object_names": [],
+                "async_delete": True,
+            },
             "errors": [],
         },
     },
@@ -1057,6 +1108,25 @@ HANDOFF_SCHEMA: dict[str, dict[str, Any]] = {
                     "Use metadata.correlation_id to preserve workflow linkage.",
                 ],
             },
+            "cover_letter_writer": {
+                "handoff_id": "cover_letter_writer",
+                "job_name": "cover_letter_writer",
+                "description": "Internal xworker handoff for the cover-letter writer job with deterministic artifact persistence.",
+                "preferred_payload_paths": ["output", "msg"],
+                "target_input_path": "output",
+                "workflow_name": "xworker_cover_letter_writer_leaf",
+                "result_postprocess": {
+                    "tool": "persist_cover_letter_artifacts",
+                    "text_writer_tool": "write_document",
+                    "pdf_writer_tool": "md_to_pdf",
+                    "default_write_pdf": True,
+                },
+                "instructions": [
+                    "Treat output as the authoritative writer brief.",
+                    "Use metadata.correlation_id to preserve workflow linkage.",
+                    "Return the structured cover-letter JSON so runtime persistence can write markdown and PDF artifacts.",
+                ],
+            },
         },
     },
 }
@@ -1467,13 +1537,20 @@ TOOL_CONFIGS: list[dict[str, Any]] = [
     },
     {
         "name": "repo_knowledge_worker",
-        "description": "Scan or build repository knowledge as AgentsDB document, entity, relation, and embedding objects.",
+        "description": "Scan, cleanup, rebuild, and async-run repository knowledge as AgentsDB document, entity, relation, and embedding objects.",
         "parameters": [
-            {"name": "operation", "type": "string", "description": "Operation to run: scan|build.", "required": True, "enum": ["scan", "build"]},
+            {"name": "operation", "type": "string", "description": "Operation to run: scan|build|cleanup|delete|rebuild|status|repair_namespace.", "required": True, "enum": ["scan", "build", "cleanup", "delete", "rebuild", "status", "repair_namespace"]},
             {"name": "root_dir", "type": "string", "description": "Repository root directory to parse. Default: current ALDE workspace root."},
             {"name": "image_path", "type": "string", "description": "Optional snapshot path when the runtime falls back to an in-memory AgentsDB backend."},
             {"name": "workers", "type": "integer", "description": "Number of indexing workers.", "default": 4},
             {"name": "extensions", "type": "array", "description": "Optional extension filter, default ['.py'].", "items": {"type": "string"}},
+            {"name": "cleanup_before_build", "type": "boolean", "description": "When operation=build, run cleanup first via delete_object calls.", "required": False, "default": False},
+            {"name": "cleanup_namespace_ids", "type": "array", "description": "Namespaces to clean during cleanup/rebuild. Default: ['ns_alde_default', 'ns_repo_knowledge'].", "required": False, "items": {"type": "string"}},
+            {"name": "cleanup_object_names", "type": "array", "description": "Object types to clean: embedding|relation|entity|document.", "required": False, "items": {"type": "string"}},
+            {"name": "cleanup_owner_prefixes", "type": "array", "description": "Owner-id prefixes used for safe embedding cleanup. Default: ['blk:repo:'].", "required": False, "items": {"type": "string"}},
+            {"name": "delete_async", "type": "boolean", "description": "Perform delete phase concurrently (ThreadPool) for cleanup/rebuild operations.", "required": False, "default": True},
+            {"name": "run_async", "type": "boolean", "description": "Run build/cleanup/rebuild/repair in background and return job_id immediately.", "required": False, "default": False},
+            {"name": "job_id", "type": "string", "description": "Job id for operation=status polling. Optional custom id when run_async=true.", "required": False},
         ],
     },
     {
@@ -1617,9 +1694,18 @@ TOOL_CONFIGS: list[dict[str, Any]] = [
             {"name": "recursive", "type": "boolean", "description": "Recurse into subdirectories.", "required": False, "default": True},
             {"name": "extensions", "type": "array", "description": "File extensions to include (default: ['.pdf', '.PDF']).", "required": False, "items": {"type": "string"}},
             {"name": "max_files", "type": "integer", "description": "Optional max number of PDFs to scan.", "required": False},
-            {"name": "agent_name", "type": "string", "description": "Target agent name for handoff messages.", "required": False, "default": "_xworker"},
-            {"name": "parser_agent_name", "type": "string", "description": "Optional parser agent override for emitted handoff messages.", "required": False},
-            {"name": "parser_job_name", "type": "string", "description": "Parser job name for each emitted handoff payload.", "required": False, "default": "job_posting_parser"},
+            {"name": "action", "type": "string", "description": "Optional higher-level action context, e.g. generate_cover_letter, preserved across dispatch handoffs.", "required": False},
+            {"name": "profile_id", "type": "string", "description": "Optional profile identifier for cover-letter sequences. When applicant_profile is missing, dispatch preserves profile_id and derives applicant_profile={source: profile_id, value: <profile_id>} for downstream handoffs.", "required": False},
+            {"name": "applicant_profile", "type": "object", "description": "Optional applicant-profile request envelope preserved for cover-letter sequences.", "required": False},
+            {"name": "profile_result", "type": "object", "description": "Optional resolved profile_result payload preserved for cover-letter sequences.", "required": False},
+            {"name": "job_posting", "type": "object", "description": "Optional job-posting request envelope preserved for downstream parser/writer handoffs.", "required": False},
+            {"name": "job_posting_result", "type": "object", "description": "Optional resolved job_posting_result payload preserved for downstream handoffs.", "required": False},
+            {"name": "options", "type": "object", "description": "Optional cover-letter writing options preserved across dispatch handoffs.", "required": False},
+            {"name": "cover_letter_context", "type": "object", "description": "Optional additional cover-letter context preserved across dispatch handoffs.", "required": False},
+            {"name": "source_document", "type": "object", "description": "Optional source-document metadata preserved across dispatch handoffs.", "required": False},
+            {"name": "agent_name", "type": "string", "description": "Runtime target agent for emitted handoff messages. Use only agent labels such as _xworker or _xrouter_xplanner, not job names.", "required": False, "default": "_xworker"},
+            {"name": "parser_agent_name", "type": "string", "description": "Optional legacy runtime target-agent override for emitted handoff messages. Use only agent labels here; parser jobs belong in parser_job_name.", "required": False},
+            {"name": "parser_job_name", "type": "string", "description": "Parser job_name for each emitted handoff payload, for example job_posting_parser.", "required": False, "default": "job_posting_parser"},
             {"name": "dry_run", "type": "boolean", "description": "If true: do not update DB and do not create handoff messages.", "required": False, "default": False},
         ],
     },

@@ -47,6 +47,7 @@ try:
         get_tool_configs,
         get_tool_group_configs,
         normalize_action_request_name,
+        normalize_agent_label,
         normalize_tool_name,
         validate_action_request,
     )
@@ -65,6 +66,7 @@ except ImportError as e:
             get_tool_configs,
             get_tool_group_configs,
             normalize_action_request_name,
+            normalize_agent_label,
             normalize_tool_name,
             validate_action_request,
         )
@@ -799,6 +801,9 @@ class AgentsDbDocumentBackend:
         }
         _atomic_write_json(storage_path, payload)
 
+    def _can_use_local_file_fallback(self, storage_key: str) -> bool:
+        return not _is_agentsdb_storage_key(storage_key)
+
     @classmethod
     def load_from_env(cls) -> "AgentsDbDocumentBackend | None":
         agents_db_uri = str(os.getenv("AI_IDE_KNOWLEDGE_AGENTS_DB_URI", "") or "agentsdb://localhost:2331").strip() or "agentsdb://localhost:2331"
@@ -866,12 +871,16 @@ class AgentsDbDocumentBackend:
         root_key: str,
     ) -> dict[str, Any]:
         collection_name = self._collection_name(db_name=db_name, obj_name=obj_name)
+        if self._load_repository() is None:
+            raise RuntimeError("agentsdb_repository_unavailable")
         repository_record_map = self._storage_records_from_repository(
             collection_name=collection_name,
             storage_key=storage_key,
         )
         if repository_record_map is None:
-            raise RuntimeError("agentsdb_repository_unavailable")
+            if not self._can_use_local_file_fallback(storage_key):
+                raise RuntimeError("agentsdb_repository_unavailable")
+            _, repository_record_map = self._load_record_map(storage_key)
 
         db = deepcopy(empty_db)
         db[root_key] = {}
@@ -894,12 +903,24 @@ class AgentsDbDocumentBackend:
         root_payload = db.get(root_key) if isinstance(db, dict) else None
         records = root_payload if isinstance(root_payload, dict) else {}
 
+        if self._load_repository() is None:
+            raise RuntimeError("agentsdb_repository_unavailable")
+
         repository_record_map = self._storage_records_from_repository(
             collection_name=collection_name,
             storage_key=storage_key,
         )
         if repository_record_map is None:
-            raise RuntimeError("agentsdb_repository_unavailable")
+            if not self._can_use_local_file_fallback(storage_key):
+                raise RuntimeError("agentsdb_repository_unavailable")
+            resolved_storage_path, _ = self._load_record_map(storage_key)
+            next_record_map = {
+                str(record_id): deepcopy(record_value)
+                for record_id, record_value in records.items()
+                if isinstance(record_value, dict)
+            }
+            self._store_record_map(resolved_storage_path, next_record_map)
+            return
 
         for record_id, record_value in records.items():
             if not isinstance(record_value, dict):
@@ -939,6 +960,11 @@ class AgentsDbDocumentBackend:
         )
         if isinstance(repository_record, dict):
             return self._deserialize_record(repository_record)
+        if self._can_use_local_file_fallback(storage_key):
+            _, record_map = self._load_record_map(storage_key)
+            local_record = record_map.get(str(record_id))
+            if isinstance(local_record, dict):
+                return deepcopy(local_record)
         return None
 
     def upsert_record(
@@ -957,7 +983,11 @@ class AgentsDbDocumentBackend:
             record_id=str(record_id),
             record_value=record_value,
         ):
-            raise RuntimeError("agentsdb_repository_unavailable")
+            if not self._can_use_local_file_fallback(storage_key):
+                raise RuntimeError("agentsdb_repository_unavailable")
+            resolved_storage_path, record_map = self._load_record_map(storage_key)
+            record_map[str(record_id)] = deepcopy(record_value)
+            self._store_record_map(resolved_storage_path, record_map)
 
     def delete_record(
         self,
@@ -973,7 +1003,11 @@ class AgentsDbDocumentBackend:
             storage_key=storage_key,
             record_id=str(record_id),
         ):
-            raise RuntimeError("agentsdb_repository_unavailable")
+            if not self._can_use_local_file_fallback(storage_key):
+                raise RuntimeError("agentsdb_repository_unavailable")
+            resolved_storage_path, record_map = self._load_record_map(storage_key)
+            record_map.pop(str(record_id), None)
+            self._store_record_map(resolved_storage_path, record_map)
 
 
 # Backward-compatible aliases for legacy backend naming.
@@ -2993,6 +3027,15 @@ class ActionRequestService:
             recursive=bool(request_payload.get("recursive", True)),
             extensions=request_payload.get("extensions") if isinstance(request_payload.get("extensions"), list) else None,
             max_files=int(request_payload.get("max_files")) if request_payload.get("max_files") is not None else None,
+            action=str(request_payload.get("action") or "").strip() or None,
+            profile_id=str(request_payload.get("profile_id") or "").strip() or None,
+            applicant_profile=deepcopy(request_payload.get("applicant_profile")) if isinstance(request_payload.get("applicant_profile"), dict) else None,
+            profile_result=deepcopy(request_payload.get("profile_result")) if isinstance(request_payload.get("profile_result"), dict) else None,
+            job_posting=deepcopy(request_payload.get("job_posting")) if isinstance(request_payload.get("job_posting"), dict) else None,
+            job_posting_result=deepcopy(request_payload.get("job_posting_result")) if isinstance(request_payload.get("job_posting_result"), dict) else None,
+            options=deepcopy(request_payload.get("options")) if isinstance(request_payload.get("options"), dict) else None,
+            cover_letter_context=deepcopy(request_payload.get("cover_letter_context")) if isinstance(request_payload.get("cover_letter_context"), dict) else None,
+            source_document=deepcopy(request_payload.get("source_document")) if isinstance(request_payload.get("source_document"), dict) else None,
             agent_name=str(request_payload.get("agent_name") or "_xworker").strip() or "_xworker",
             parser_agent_name=str(request_payload.get("parser_agent_name") or "").strip() or None,
             parser_job_name=str(request_payload.get("parser_job_name") or "").strip() or None,
@@ -3345,6 +3388,158 @@ def build_agent_system_configs_tool(
 
 
 class DocumentDispatchService:
+    IGNORED_SCAN_DIR_NAMES = frozenset(
+        {
+            ".git",
+            ".hg",
+            ".micromamba",
+            ".mypy_cache",
+            ".nox",
+            ".pytest_cache",
+            ".ruff_cache",
+            ".svn",
+            ".tox",
+            ".venv",
+            "__pycache__",
+            "node_modules",
+            "site-packages",
+            "venv",
+        }
+    )
+
+    def should_skip_scan_directory(self, directory_name: str) -> bool:
+        normalized_directory_name = str(directory_name or "").strip().lower()
+        if not normalized_directory_name:
+            return False
+        if normalized_directory_name.startswith("cover_letters"):
+            return True
+        return normalized_directory_name in self.IGNORED_SCAN_DIR_NAMES
+
+    def load_dispatch_allowed_agent_labels(
+        self,
+        *,
+        default_target_agent: str,
+    ) -> set[str]:
+        allowed_agent_labels: set[str] = set()
+        for candidate_agent_name in (
+            default_target_agent,
+            "_xworker",
+            "_xrouter_xplanner",
+            "_xplaner_xrouter",
+        ):
+            normalized_agent_name = normalize_agent_label(str(candidate_agent_name or "").strip())
+            if normalized_agent_name:
+                allowed_agent_labels.add(normalized_agent_name)
+        return allowed_agent_labels
+
+    def normalize_dispatch_agent_name(
+        self,
+        agent_name: str | None,
+        *,
+        available_agent_labels: set[str],
+    ) -> str:
+        normalized_agent_name = normalize_agent_label(str(agent_name or "").strip())
+        if normalized_agent_name in available_agent_labels:
+            return normalized_agent_name
+        return ""
+
+    def normalize_dispatch_job_name(
+        self,
+        job_name: str | None,
+        *,
+        available_job_names: set[str],
+    ) -> str:
+        normalized_job_name = str(job_name or "").strip()
+        if not normalized_job_name:
+            return ""
+
+        canonical_aliases = {
+            "dispatch_document": "document_dispatch",
+        }
+        candidate_job_names: list[str] = [normalized_job_name]
+        stripped_job_name = normalized_job_name.lstrip("_")
+        if stripped_job_name and stripped_job_name not in candidate_job_names:
+            candidate_job_names.append(stripped_job_name)
+
+        alias_job_name = str(
+            canonical_aliases.get(normalized_job_name)
+            or canonical_aliases.get(stripped_job_name)
+            or ""
+        ).strip()
+        if alias_job_name and alias_job_name not in candidate_job_names:
+            candidate_job_names.append(alias_job_name)
+
+        for candidate_job_name in candidate_job_names:
+            if candidate_job_name in available_job_names:
+                return candidate_job_name
+        return ""
+
+    def resolve_dispatch_target_config(
+        self,
+        *,
+        dispatch_policy: dict[str, Any],
+        agent_name: str | None,
+        target_agent_name: str | None,
+        parser_agent_name: str | None,
+        parser_job_name: str | None,
+    ) -> tuple[str, str]:
+        runtime_agent_labels = {
+            normalize_agent_label(str(agent_label).strip())
+            for agent_label in get_available_agent_labels()
+            if str(agent_label).strip()
+        }
+        available_job_names = {
+            str(job_name).strip()
+            for job_name in get_available_job_names()
+            if str(job_name).strip()
+        }
+
+        default_target_agent = self.normalize_dispatch_agent_name(
+            dispatch_policy.get("default_target_agent") or "_xworker",
+            available_agent_labels=runtime_agent_labels,
+        ) or "_xworker"
+        available_agent_labels = self.load_dispatch_allowed_agent_labels(
+            default_target_agent=default_target_agent,
+        )
+        available_agent_labels.intersection_update(runtime_agent_labels)
+        default_parser_job_name = self.normalize_dispatch_job_name(
+            dispatch_policy.get("parser_job_name") or "job_posting_parser",
+            available_job_names=available_job_names,
+        ) or "job_posting_parser"
+
+        resolved_parser_job_name = self.normalize_dispatch_job_name(
+            parser_job_name,
+            available_job_names=available_job_names,
+        )
+
+        explicit_agent_name = self.normalize_dispatch_agent_name(
+            agent_name,
+            available_agent_labels=available_agent_labels,
+        )
+        parser_target_candidate = str(parser_agent_name or target_agent_name or "").strip() or None
+        explicit_parser_agent_name = self.normalize_dispatch_agent_name(
+            parser_target_candidate,
+            available_agent_labels=available_agent_labels,
+        )
+
+        legacy_job_name = self.normalize_dispatch_job_name(
+            agent_name,
+            available_job_names=available_job_names,
+        )
+        if legacy_job_name and not resolved_parser_job_name:
+            resolved_parser_job_name = legacy_job_name
+
+        legacy_parser_job_name = self.normalize_dispatch_job_name(
+            parser_target_candidate,
+            available_job_names=available_job_names,
+        )
+        if legacy_parser_job_name and not resolved_parser_job_name:
+            resolved_parser_job_name = legacy_parser_job_name
+
+        resolved_agent_name = explicit_agent_name or explicit_parser_agent_name or default_target_agent
+        resolved_parser_job_name = resolved_parser_job_name or default_parser_job_name
+        return resolved_agent_name, resolved_parser_job_name
+
     def classify_record(self, record: dict[str, Any] | None) -> str:
         if not record:
             return "new"
@@ -3362,15 +3557,15 @@ class DocumentDispatchService:
 
         fallback_candidates: list[tuple[str, str]] = []
         try:
-            db_parent = os.path.dirname(resolved_db_path)
-            if db_parent:
-                fallback_candidates.append((db_parent, "fallback_to_db_parent"))
-        except Exception:
-            pass
-        try:
             base = GetPath()._parent(parg=f"{__file__}")
             vsm4 = os.path.join(base, "AppData", "VSM_4_Data")
             fallback_candidates.append((vsm4, "fallback_to_default_vsm4"))
+        except Exception:
+            pass
+        try:
+            db_parent = os.path.dirname(resolved_db_path)
+            if db_parent:
+                fallback_candidates.append((db_parent, "fallback_to_db_parent"))
         except Exception:
             pass
 
@@ -3396,7 +3591,7 @@ class DocumentDispatchService:
                 dirs[:] = [
                     directory
                     for directory in dirs
-                    if not str(directory).strip().lower().startswith("cover_letters")
+                    if not self.should_skip_scan_directory(directory)
                 ]
                 for file_name in files:
                     if file_name == "Muster_Anschreiben.pdf":
@@ -3544,6 +3739,137 @@ class DocumentDispatchService:
             return os.path.abspath(os.path.expanduser(str(obj_db_default.get("value"))))
         return None
 
+    def build_passthrough_context(
+        self,
+        *,
+        action: str | None = None,
+        profile_id: str | None = None,
+        applicant_profile: dict[str, Any] | None = None,
+        profile_result: dict[str, Any] | None = None,
+        job_posting: dict[str, Any] | None = None,
+        job_posting_result: dict[str, Any] | None = None,
+        options: dict[str, Any] | None = None,
+        cover_letter_context: dict[str, Any] | None = None,
+        source_document: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        passthrough_context: dict[str, Any] = {}
+        normalized_action = normalize_action_request_name(str(action or ""))
+        resolved_profile_id = str(profile_id or "").strip()
+        if normalized_action in {"dispatch_documents", "document_dispatch"} and (
+            bool(resolved_profile_id)
+            or isinstance(applicant_profile, dict)
+            or isinstance(profile_result, dict)
+            or isinstance(job_posting_result, dict)
+            or isinstance(options, dict)
+        ):
+            normalized_action = "generate_cover_letter"
+        if normalized_action:
+            passthrough_context["action"] = normalized_action
+        if resolved_profile_id:
+            passthrough_context["profile_id"] = resolved_profile_id
+        if (
+            resolved_profile_id
+            and normalized_action == "generate_cover_letter"
+            and not isinstance(applicant_profile, dict)
+            and not isinstance(profile_result, dict)
+        ):
+            passthrough_context["applicant_profile"] = {
+                "source": "profile_id",
+                "value": resolved_profile_id,
+            }
+
+        for key, value in (
+            ("applicant_profile", applicant_profile),
+            ("profile_result", profile_result),
+            ("job_posting", job_posting),
+            ("job_posting_result", job_posting_result),
+            ("options", options),
+            ("cover_letter_context", cover_letter_context),
+            ("source_document", source_document),
+        ):
+            if value is not None:
+                passthrough_context[key] = deepcopy(value)
+        return passthrough_context
+
+    def resolve_profile_result(
+        self,
+        *,
+        passthrough_context: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        profile_result = passthrough_context.get("profile_result")
+        if isinstance(profile_result, dict) and profile_result:
+            return deepcopy(profile_result)
+
+        applicant_profile = passthrough_context.get("applicant_profile")
+        if not isinstance(applicant_profile, dict) or not applicant_profile:
+            return None
+
+        request_payload = deepcopy(applicant_profile)
+        if "source" not in request_payload and "value" not in request_payload:
+            request_payload = {"source": "text", "value": request_payload}
+
+        resolved_profile_result = REQUEST_OBJECT_RESOLUTION_SERVICE.build_result_from_request(
+            request_payload,
+            obj_name="profiles",
+        )
+        return deepcopy(resolved_profile_result) if isinstance(resolved_profile_result, dict) else None
+
+    def resolve_job_posting_result(
+        self,
+        *,
+        correlation_id: str,
+        resolved_obj_name: str,
+        obj_db_path: str | None,
+        passthrough_context: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        request_result = passthrough_context.get("job_posting_result")
+        if isinstance(request_result, dict) and request_result:
+            request_correlation_id = str(
+                request_result.get("correlation_id")
+                or ((request_result.get("file") or {}).get("content_sha256") if isinstance(request_result.get("file"), dict) else "")
+                or ""
+            ).strip()
+            if not request_correlation_id or request_correlation_id == correlation_id:
+                return deepcopy(request_result)
+
+        if not obj_db_path:
+            return None
+
+        stored_result = REQUEST_OBJECT_RESOLUTION_SERVICE.load_result_from_store(
+            correlation_id=correlation_id,
+            obj_name=resolved_obj_name,
+            db_path=obj_db_path,
+        )
+        return deepcopy(stored_result) if isinstance(stored_result, dict) else None
+
+    def build_cover_letter_resume_payload(
+        self,
+        *,
+        correlation_id: str,
+        job_posting_result: dict[str, Any],
+        profile_result: dict[str, Any],
+        passthrough_context: dict[str, Any],
+    ) -> dict[str, Any]:
+        resolved_action = normalize_action_request_name(str(passthrough_context.get("action") or ""))
+        if resolved_action != "generate_cover_letter":
+            resolved_action = "generate_cover_letter"
+
+        resolved_job_posting_result = deepcopy(job_posting_result)
+        resolved_job_posting_result.setdefault("correlation_id", correlation_id)
+
+        payload: dict[str, Any] = {
+            "action": resolved_action,
+            "correlation_id": correlation_id,
+            "job_posting_result": resolved_job_posting_result,
+            "profile_result": deepcopy(profile_result),
+            "options": deepcopy(passthrough_context.get("options") or {}),
+        }
+        for key in ("applicant_profile", "cover_letter_context", "source_document"):
+            value = passthrough_context.get(key)
+            if value is not None:
+                payload[key] = deepcopy(value)
+        return payload
+
     def build_dispatch_payload(
         self,
         *,
@@ -3554,8 +3880,9 @@ class DocumentDispatchService:
         item: dict[str, Any],
         record: dict[str, Any] | None,
         dry_run: bool,
+        passthrough_context: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        return {
+        payload: dict[str, Any] = {
             "type": str(dispatch_policy.get("document_type") or "file"),
             "job_name": parser_job_name,
             "correlation_id": item["content_sha256"],
@@ -3574,6 +3901,11 @@ class DocumentDispatchService:
             },
             "requested_actions": list(dispatch_policy.get("requested_actions") or ["parse", "extract_text", "store_object_result", "mark_processed_on_success"]),
         }
+        if isinstance(passthrough_context, dict):
+            for key, value in passthrough_context.items():
+                if value is not None and key not in payload:
+                    payload[key] = deepcopy(value)
+        return payload
 
     def build_handoff_message(
         self,
@@ -3630,6 +3962,7 @@ class DocumentDispatchService:
         resolved_obj_db_path_field: str,
         dry_run: bool,
         errors: list[dict[str, Any]],
+        passthrough_context: dict[str, Any] | None = None,
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         forwarded: list[dict[str, Any]] = []
         handoff_messages: list[dict[str, Any]] = []
@@ -3665,6 +3998,7 @@ class DocumentDispatchService:
                 item=item,
                 record=record if isinstance(record, dict) else None,
                 dry_run=dry_run,
+                passthrough_context=passthrough_context,
             )
             if dry_run:
                 continue
@@ -3680,6 +4014,90 @@ class DocumentDispatchService:
                     dispatch_policy=dispatch_policy,
                     target_agent=agent_name,
                     parser_job_name=parser_job_name,
+                    payload=payload,
+                    correlation_id=correlation_id,
+                    dispatcher_message_id=dispatcher_message_id,
+                    resolved_db_path=resolved_db_path,
+                    resolved_obj_name=resolved_obj_name,
+                    resolved_obj_db_path_field=resolved_obj_db_path_field,
+                    obj_db_path=obj_db_path,
+                )
+            )
+
+        return forwarded, handoff_messages
+
+    def forward_known_processed_documents(
+        self,
+        *,
+        items: list[dict[str, Any]],
+        resolved_db_path: str,
+        dispatch_policy: dict[str, Any],
+        thread_id: str,
+        dispatcher_message_id: str,
+        agent_name: str,
+        parser_job_name: str,
+        resolved_obj_name: str,
+        resolved_obj_db_path_field: str,
+        dry_run: bool,
+        passthrough_context: dict[str, Any],
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        forwarded: list[dict[str, Any]] = []
+        handoff_messages: list[dict[str, Any]] = []
+        if dry_run:
+            return forwarded, handoff_messages
+
+        resolved_profile_result = self.resolve_profile_result(passthrough_context=passthrough_context)
+
+        for item in items:
+            correlation_id = str(item.get("content_sha256") or "").strip()
+            if not correlation_id:
+                continue
+            record = item.get("db_record") if isinstance(item.get("db_record"), dict) else None
+            obj_db_path = self.resolve_object_db_path(
+                dispatch_policy=dispatch_policy,
+                resolved_obj_db_path_field=resolved_obj_db_path_field,
+                resolved_obj_name=resolved_obj_name,
+            )
+            resolved_job_posting_result = self.resolve_job_posting_result(
+                correlation_id=correlation_id,
+                resolved_obj_name=resolved_obj_name,
+                obj_db_path=obj_db_path,
+                passthrough_context=passthrough_context,
+            )
+
+            next_job_name = parser_job_name
+            if isinstance(resolved_job_posting_result, dict) and isinstance(resolved_profile_result, dict):
+                payload = self.build_cover_letter_resume_payload(
+                    correlation_id=correlation_id,
+                    job_posting_result=resolved_job_posting_result,
+                    profile_result=resolved_profile_result,
+                    passthrough_context=passthrough_context,
+                )
+                next_job_name = "cover_letter_writer"
+            else:
+                payload = self.build_dispatch_payload(
+                    dispatch_policy=dispatch_policy,
+                    thread_id=thread_id,
+                    parser_job_name=parser_job_name,
+                    resolved_obj_name=resolved_obj_name,
+                    item=item,
+                    record=record if isinstance(record, dict) else None,
+                    dry_run=dry_run,
+                    passthrough_context=passthrough_context,
+                )
+
+            forwarded.append(
+                {
+                    "path": item.get("path"),
+                    "content_sha256": correlation_id,
+                    "link": {"thread_id": thread_id, "message_id": "PENDING"},
+                }
+            )
+            handoff_messages.append(
+                self.build_handoff_message(
+                    dispatch_policy=dispatch_policy,
+                    target_agent=agent_name,
+                    parser_job_name=next_job_name,
                     payload=payload,
                     correlation_id=correlation_id,
                     dispatcher_message_id=dispatcher_message_id,
@@ -3746,6 +4164,15 @@ class DocumentDispatchService:
         recursive: bool = True,
         extensions: list | None = None,
         max_files: int | None = None,
+        action: str | None = None,
+        profile_id: str | None = None,
+        applicant_profile: dict[str, Any] | None = None,
+        profile_result: dict[str, Any] | None = None,
+        job_posting: dict[str, Any] | None = None,
+        job_posting_result: dict[str, Any] | None = None,
+        options: dict[str, Any] | None = None,
+        cover_letter_context: dict[str, Any] | None = None,
+        source_document: dict[str, Any] | None = None,
         agent_name: str = "_xworker",
         target_agent_name: str | None = "0::jobposting_parser",
         parser_agent_name: str | None = None,
@@ -3757,15 +4184,26 @@ class DocumentDispatchService:
         scan_dir_original = str(scan_dir or "")
         thread_id = thread_id or "UNKNOWN"
         dispatcher_message_id = dispatcher_message_id or "UNKNOWN"
-        resolved_target_agent_name = str(parser_agent_name or target_agent_name or "").strip() or None
-        agent_name = str(
-            agent_name or resolved_target_agent_name or dispatch_policy.get("default_target_agent") or "_xworker"
-        ).strip() or "_xworker"
-        resolved_parser_job_name = str(
-            parser_job_name or dispatch_policy.get("parser_job_name") or "job_posting_parser"
-        ).strip() or "job_posting_parser"
+        agent_name, resolved_parser_job_name = self.resolve_dispatch_target_config(
+            dispatch_policy=dispatch_policy,
+            agent_name=agent_name,
+            target_agent_name=target_agent_name,
+            parser_agent_name=parser_agent_name,
+            parser_job_name=parser_job_name,
+        )
         resolved_obj_name = str(obj_name or obj or dispatch_policy.get("obj_name") or "job_postings").strip() or "job_postings"
         resolved_obj_db_path_field = str(dispatch_policy.get("obj_db_path_field") or f"{resolved_obj_name}_db_path").strip() or f"{resolved_obj_name}_db_path"
+        passthrough_context = self.build_passthrough_context(
+            action=action,
+            profile_id=profile_id,
+            applicant_profile=applicant_profile,
+            profile_result=profile_result,
+            job_posting=job_posting,
+            job_posting_result=job_posting_result,
+            options=options,
+            cover_letter_context=cover_letter_context,
+            source_document=source_document,
+        )
 
         if extensions is None:
             extensions = [".pdf", ".PDF"]
@@ -3830,7 +4268,28 @@ class DocumentDispatchService:
             resolved_obj_db_path_field=resolved_obj_db_path_field,
             dry_run=dry_run,
             errors=errors,
+            passthrough_context=passthrough_context,
         )
+        if (
+            not forwarded
+            and classified["known_processed"]
+            and normalize_action_request_name(str(passthrough_context.get("action") or "")) == "generate_cover_letter"
+        ):
+            known_forwarded, known_handoff_messages = self.forward_known_processed_documents(
+                items=classified["known_processed"],
+                resolved_db_path=resolved_db_path,
+                dispatch_policy=dispatch_policy,
+                thread_id=thread_id,
+                dispatcher_message_id=dispatcher_message_id,
+                agent_name=agent_name,
+                parser_job_name=resolved_parser_job_name,
+                resolved_obj_name=resolved_obj_name,
+                resolved_obj_db_path_field=resolved_obj_db_path_field,
+                dry_run=dry_run,
+                passthrough_context=passthrough_context,
+            )
+            forwarded.extend(known_forwarded)
+            handoff_messages.extend(known_handoff_messages)
         return self.build_report(
             scan_dir=scan_dir,
             timestamp=ts,

@@ -11,6 +11,7 @@ import socket
 import socketserver
 import threading
 import time
+from contextlib import contextmanager, nullcontext
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -852,13 +853,14 @@ class KnowledgeRepository():
         directory = os.path.dirname(path)
         if directory:
             os.makedirs(directory, exist_ok=True)
-        payload = {
-            "schema": "agentsdb_repository_image_v1",
-            "updated_at": _now_utc().isoformat(),
-            "collections": _json_safe_object(self._collections),
-            "index_objects": _json_safe_object(self._index_objects),
-        }
-        temp_path = f"{path}.tmp"
+        with self._lock:
+            payload = {
+                "schema": "agentsdb_repository_image_v1",
+                "updated_at": _now_utc().isoformat(),
+                "collections": _json_safe_object(self._collections),
+                "index_objects": _json_safe_object(self._index_objects),
+            }
+        temp_path = f"{path}.{threading.get_ident()}.{time.time_ns()}.tmp"
         with open(temp_path, "w", encoding="utf-8") as image_file:
             json.dump(payload, image_file, ensure_ascii=False, indent=2)
         os.replace(temp_path, path)
@@ -1069,6 +1071,7 @@ class AgentDbSocketRepository:
     """Knowledge repository backed by a custom agentsdb socket endpoint."""
 
     _OBJECT_COLLECTION_MAP = KnowledgeRepository._OBJECT_COLLECTION_MAP
+    _DEFAULT_APPLY_OPERATIONS_BATCH_SIZE = 64
 
     def __init__(self, agents_db_uri: str, database_name: str = "alde_knowledge", timeout_seconds: float = 5.0) -> None:
         self._agents_db_uri = str(agents_db_uri or "").strip()
@@ -1077,6 +1080,25 @@ class AgentDbSocketRepository:
         parsed_uri = urlparse(self._agents_db_uri)
         self._host = str(parsed_uri.hostname or "localhost")
         self._port = int(parsed_uri.port or 2331)
+        self._write_lock = threading.RLock()
+        self._deferred_write_depth = 0
+        self._pending_write_operations: list[dict[str, Any]] = []
+        self._apply_operations_batch_size = self._load_apply_operations_batch_size()
+
+    @classmethod
+    def _load_apply_operations_batch_size(cls) -> int:
+        raw_value = str(
+            os.getenv(
+                "AI_IDE_KNOWLEDGE_AGENTS_DB_SOCKET_APPLY_BATCH_SIZE",
+                str(cls._DEFAULT_APPLY_OPERATIONS_BATCH_SIZE),
+            )
+            or str(cls._DEFAULT_APPLY_OPERATIONS_BATCH_SIZE)
+        ).strip()
+        try:
+            resolved_value = int(raw_value)
+        except Exception:
+            resolved_value = cls._DEFAULT_APPLY_OPERATIONS_BATCH_SIZE
+        return max(1, resolved_value)
 
     @classmethod
     def create_from_uri(
@@ -1114,7 +1136,11 @@ class AgentDbSocketRepository:
         if not isinstance(response_payload, Mapping):
             raise RuntimeError("agentsdb socket returned non-object response")
         if not bool(response_payload.get("ok", True)):
-            raise RuntimeError(str(response_payload.get("error") or "agentsdb socket request failed"))
+            error_text = str(response_payload.get("error") or "agentsdb socket request failed").strip()
+            detail_text = str(response_payload.get("detail") or "").strip()
+            if detail_text:
+                raise RuntimeError(f"{error_text}: {detail_text}")
+            raise RuntimeError(error_text)
         return dict(response_payload)
 
     def _send_request_bytes(self, request_payload: Mapping[str, Any]) -> bytes:
@@ -1129,6 +1155,58 @@ class AgentDbSocketRepository:
                 response_bytes += chunk
         return response_bytes
 
+    @contextmanager
+    def deferred_write_queue(self) -> Iterable[None]:
+        with self._write_lock:
+            self._deferred_write_depth += 1
+        try:
+            yield
+        finally:
+            pending: list[dict[str, Any]] = []
+            with self._write_lock:
+                self._deferred_write_depth = max(0, self._deferred_write_depth - 1)
+                if self._deferred_write_depth == 0 and self._pending_write_operations:
+                    pending = list(self._pending_write_operations)
+                    self._pending_write_operations = []
+            if pending:
+                self._apply_operations(pending)
+
+    def _apply_operations(self, operations: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+        normalized_operations = [
+            _deepcopy_object(dict(operation))
+            for operation in operations
+            if isinstance(operation, Mapping)
+        ]
+        if not normalized_operations:
+            return {"ok": True, "applied": 0, "deleted": 0, "results": [], "batch_count": 0}
+
+        batch_size = max(int(self._apply_operations_batch_size or 1), 1)
+        aggregated_results: list[dict[str, Any]] = []
+        aggregated_applied = 0
+        aggregated_deleted = 0
+        batch_count = 0
+        last_response_payload: dict[str, Any] = {"ok": True}
+
+        for batch_start in range(0, len(normalized_operations), batch_size):
+            batch_operations = normalized_operations[batch_start: batch_start + batch_size]
+            response_payload = self._request_object(
+                "apply_operations",
+                {"operations": batch_operations},
+            )
+            last_response_payload = dict(response_payload)
+            aggregated_applied += int(response_payload.get("applied") or len(batch_operations))
+            aggregated_deleted += int(response_payload.get("deleted") or 0)
+            batch_results = response_payload.get("results")
+            if isinstance(batch_results, list):
+                aggregated_results.extend(dict(item) for item in batch_results if isinstance(item, Mapping))
+            batch_count += 1
+
+        last_response_payload["applied"] = aggregated_applied
+        last_response_payload["deleted"] = aggregated_deleted
+        last_response_payload["results"] = aggregated_results
+        last_response_payload["batch_count"] = batch_count
+        return last_response_payload
+
     def load_collection(self, object_name: str) -> str:
         return str(self._OBJECT_COLLECTION_MAP[str(object_name).strip().lower()])
 
@@ -1141,6 +1219,17 @@ class AgentDbSocketRepository:
             payload["updated_at"] = _now_utc().isoformat()
         if "created_at" not in payload:
             payload["created_at"] = payload["updated_at"]
+        with self._write_lock:
+            if self._deferred_write_depth > 0:
+                self._pending_write_operations.append(
+                    {
+                        "action": "upsert",
+                        "object_name": str(object_name),
+                        "object_id": str(object_id),
+                        "object_payload": payload,
+                    }
+                )
+                return dict(payload)
         response_payload = self._request_object(
             "upsert_object",
             {
@@ -1152,6 +1241,16 @@ class AgentDbSocketRepository:
         return dict(response_payload.get("object_payload") or payload)
 
     def delete_object(self, object_name: str, object_id: str) -> bool:
+        with self._write_lock:
+            if self._deferred_write_depth > 0:
+                self._pending_write_operations.append(
+                    {
+                        "action": "delete",
+                        "object_name": str(object_name),
+                        "object_id": str(object_id),
+                    }
+                )
+                return True
         response_payload = self._request_object(
             "delete_object",
             {
@@ -1243,11 +1342,35 @@ class AgentDbInMemoryRepository:
     def __init__(self, image_path: str | None = None) -> None:
         self._lock = threading.RLock()
         self._image_path = str(image_path or "").strip() or None
+        self._deferred_flush_depth = 0
+        self._flush_pending = False
         self._collections: dict[str, dict[str, dict[str, Any]]] = {
             collection_name: {}
             for collection_name in self._OBJECT_COLLECTION_MAP.values()
         }
         self._load_image()
+
+    @contextmanager
+    def deferred_flush(self) -> Iterable[None]:
+        with self._lock:
+            self._deferred_flush_depth += 1
+        try:
+            yield
+        finally:
+            should_flush = False
+            with self._lock:
+                self._deferred_flush_depth = max(0, self._deferred_flush_depth - 1)
+                should_flush = self._deferred_flush_depth == 0 and self._flush_pending
+                if should_flush:
+                    self._flush_pending = False
+            if should_flush:
+                self._flush_image()
+
+    def _mark_flush_needed(self) -> None:
+        if self._deferred_flush_depth > 0:
+            self._flush_pending = True
+            return
+        self._flush_image()
 
     def _load_image(self) -> None:
         if not self._image_path:
@@ -1281,12 +1404,13 @@ class AgentDbInMemoryRepository:
             return
         path = os.path.abspath(os.path.expanduser(self._image_path))
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        image_payload = {
-            "schema": "agentsdb_inmemory_image_v1",
-            "updated_at": _now_utc().isoformat(),
-            "collections": _json_safe_object(self._collections),
-        }
-        temp_path = f"{path}.tmp"
+        with self._lock:
+            image_payload = {
+                "schema": "agentsdb_inmemory_image_v1",
+                "updated_at": _now_utc().isoformat(),
+                "collections": _json_safe_object(self._collections),
+            }
+        temp_path = f"{path}.{threading.get_ident()}.{time.time_ns()}.tmp"
         with open(temp_path, "w", encoding="utf-8") as image_file:
             json.dump(image_payload, image_file, ensure_ascii=False, indent=2)
         os.replace(temp_path, path)
@@ -1308,7 +1432,7 @@ class AgentDbInMemoryRepository:
             payload["updated_at"] = payload.get("updated_at") or _now_utc().isoformat()
             payload["created_at"] = payload.get("created_at") or existing_payload.get("created_at") or payload["updated_at"]
             collection[object_id] = dict(payload)
-            self._flush_image()
+            self._mark_flush_needed()
             return dict(payload)
 
     def delete_object(self, object_name: str, object_id: str) -> bool:
@@ -1318,7 +1442,7 @@ class AgentDbInMemoryRepository:
             deleted = normalized_object_id in collection
             if deleted:
                 collection.pop(normalized_object_id, None)
-                self._flush_image()
+                self._mark_flush_needed()
             return deleted
 
     def load_object(self, object_name: str, object_id: str) -> dict[str, Any] | None:
@@ -1398,7 +1522,12 @@ class AgentDbInMemoryRepository:
 
 def _is_memory_backend_uri(uri: str | None) -> bool:
     normalized_uri = str(uri or "").strip().lower()
-    return normalized_uri.startswith("agentsdb://") or normalized_uri.startswith("memodb://") or normalized_uri.startswith("inmemdb://")
+    return (
+        normalized_uri.startswith("agentsmem://")
+        or normalized_uri.startswith("agentsdb://")
+        or normalized_uri.startswith("memodb://")
+        or normalized_uri.startswith("inmemdb://")
+    )
 
 
 class AgentDbSocketServerService:
@@ -1527,6 +1656,40 @@ class AgentDbSocketServerService:
                 max_depth=max(0, int(max_depth)),
             )
             return {"ok": True, "object_payload_list": _json_safe_object(object_payload_list)}
+        if normalized_cmd == "apply_operations":
+            operations = payload.get("operations")
+            if not isinstance(operations, Sequence):
+                raise ValueError("apply_operations requires operations list")
+            applied = 0
+            deleted = 0
+            results: list[dict[str, Any]] = []
+            flush_context = getattr(repository, "deferred_flush", None)
+            if not callable(flush_context):
+                flush_context = getattr(repository, "deferred_write_queue", None)
+            with (flush_context() if callable(flush_context) else nullcontext()):
+                for operation in operations:
+                    if not isinstance(operation, Mapping):
+                        continue
+                    action_name = str(operation.get("action") or "").strip().lower()
+                    object_name = str(operation.get("object_name") or "").strip()
+                    object_id = str(operation.get("object_id") or "").strip()
+                    if action_name == "upsert":
+                        object_payload = operation.get("object_payload")
+                        if not object_name or not object_id or not isinstance(object_payload, Mapping):
+                            continue
+                        repository.upsert_object(object_name, object_id, dict(object_payload))
+                        applied += 1
+                        results.append({"action": "upsert", "object_name": object_name, "object_id": object_id, "ok": True})
+                        continue
+                    if action_name == "delete":
+                        if not object_name or not object_id:
+                            continue
+                        deleted_flag = bool(repository.delete_object(object_name, object_id))
+                        applied += 1
+                        if deleted_flag:
+                            deleted += 1
+                        results.append({"action": "delete", "object_name": object_name, "object_id": object_id, "deleted": deleted_flag, "ok": True})
+            return {"ok": True, "applied": applied, "deleted": deleted, "results": results}
         raise ValueError(f"unknown cmd: {normalized_cmd or '<empty>'}")
 
 
@@ -1717,6 +1880,7 @@ class EntityRelationEmbeddingService:
         self._knowledge_service = knowledge_service
         self._runtime_config = runtime_config
         self._encoder: Any = None
+        self._encoder_lock = threading.RLock()
 
     # ------------------------------------------------------------------
     # Encoder lifecycle
@@ -1744,20 +1908,23 @@ class EntityRelationEmbeddingService:
         """Lazy-load HuggingFaceEmbeddings on first use."""
         if self._encoder is not None:
             return self._encoder
-        try:
-            from langchain_huggingface import HuggingFaceEmbeddings  # type: ignore
-        except ImportError:
-            from langchain_community.embeddings import HuggingFaceEmbeddings  # type: ignore
-        device = self._select_device()
-        model_name = self._model_name()
-        try:
-            self._encoder = HuggingFaceEmbeddings(
-                model_name=model_name,
-                model_kwargs={"device": device},
-            )
-        except TypeError:
-            self._encoder = HuggingFaceEmbeddings(model_name=model_name)
-        return self._encoder
+        with self._encoder_lock:
+            if self._encoder is not None:
+                return self._encoder
+            try:
+                from langchain_huggingface import HuggingFaceEmbeddings  # type: ignore
+            except ImportError:
+                from langchain_community.embeddings import HuggingFaceEmbeddings  # type: ignore
+            device = self._select_device()
+            model_name = self._model_name()
+            try:
+                self._encoder = HuggingFaceEmbeddings(
+                    model_name=model_name,
+                    model_kwargs={"device": device},
+                )
+            except TypeError:
+                self._encoder = HuggingFaceEmbeddings(model_name=model_name)
+            return self._encoder
 
     # ------------------------------------------------------------------
     # Domain: build canonical text representation

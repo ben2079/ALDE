@@ -69,7 +69,7 @@ def main() -> None:
     # --- Setup services ---
     _print_section("1 / Setup")
     repo = AgentDbInMemoryRepository(_DB_PATH)
-    config = RuntimeConfigObject(agents_db_uri="agentsmem://local")
+    config = RuntimeConfigObject(agents_db_uri="agentsmem://local", namespace_id="ns_repo_knowledge")
     ks = KnowledgeObjectService(repo)  # type: ignore[arg-type]
     emb_svc = EntityRelationEmbeddingService(ks, config)
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 from copy import deepcopy
 import json
 from pprint import pformat
@@ -45,7 +46,55 @@ PROMPT_FRAGMENT_CONFIGS = PROMPT_FRAGMENTS
 TOOL_GROUP_CONFIGS = TOOL_GROUPS
 TOOL_NAME_ALIASES = TOOL_NAMES
 WORKFLOW_CONFIGS = WORKFLOWS
-BATCH_WORKFLOW_CONFIGS: dict[str, dict[str, Any]] = {}
+BATCH_WORKFLOW_CONFIGS: dict[str, dict[str, Any]] = {
+    "cover_letter_batch_generation": {
+        "name": "cover_letter_batch_generation",
+        "description": "Deterministic batch workflow for dispatch, job-posting parsing, and cover-letter generation.",
+        "dispatcher": {
+            "tool_name": "dispatch_documents",
+            "job_name": "document_dispatch",
+        },
+        "filters": {
+            "skip_basenames": [],
+        },
+        "profile_result": {
+            "result_field": "profile_result",
+        },
+        "job_payload": {
+            "result_payload_field": "job_posting_result",
+        },
+        "stages": [
+            {
+                "name": "job_posting_parse",
+                "prompt": {"agent_type": "parser", "task_name": "job_posting"},
+                "input_template": {
+                    "job_name": "job_posting_parser",
+                    "source": "dispatcher_handoff",
+                },
+                "response_format": "json",
+            },
+            {
+                "name": "cover_letter_generate",
+                "prompt": {"agent_type": "writer", "task_name": "cover_letter"},
+                "input_template": {
+                    "job_name": "cover_letter_writer",
+                    "job_posting_result": "{{ stages.job_posting_parse.result }}",
+                    "profile_result": "{{ profile_result }}",
+                    "options": "{{ options }}",
+                },
+                "response_format": "json",
+            },
+        ],
+        "document_output": {
+            "text_writer_tool": "write_document",
+            "pdf_writer": "internal_text_pdf",
+        },
+        "dispatcher_record": {
+            "success_updates": {"processing_state": "processed", "processed": True},
+            "failure_updates": {"processing_state": "failed", "processed": False},
+        },
+    },
+}
 
 
 PromptConfig = dict[str, Any]
@@ -494,7 +543,7 @@ def get_available_job_names() -> list[str]:
 def get_default_job_name(agent_name: str) -> str:
     agent_label = normalize_agent_label(agent_name)
     defaults = dict((AGENT_RUNTIME.get(agent_label) or {}).get("defaults") or {})
-    return str(defaults.get("default_job_name") or "").strip()
+    return str(defaults.get("default_job_name") or defaults.get("job_name") or "").strip()
 
 
 def get_agent_manifest(agent_name: str) -> dict[str, Any]:
@@ -609,6 +658,17 @@ def resolve_forced_route(agent_name: str, input_text: Any, available_agents: set
     available = {str(agent) for agent in available_agents}
     text = input_text if isinstance(input_text, str) else json.dumps(input_text, ensure_ascii=False)
 
+    python_route = _parse_python_execute_route_to_agent_call(text)
+    if isinstance(python_route, dict):
+        resolved_target = normalize_agent_label(str(python_route.get("target_agent") or ""))
+        if resolved_target:
+            if resolved_target not in available:
+                python_route = None
+            else:
+                python_route["target_agent"] = resolved_target
+        if isinstance(python_route, dict):
+            return python_route
+
     for route_config in route_configs:
         trigger = route_config.get("trigger") or {}
         trigger_type = str(trigger.get("type") or "")
@@ -687,6 +747,117 @@ def resolve_forced_route(agent_name: str, input_text: Any, available_agents: set
             return resolved_route
 
     return None
+
+
+def _parse_python_execute_route_to_agent_call(text: str) -> dict[str, Any] | None:
+    if not isinstance(text, str) or "execute_route_to_agent" not in text:
+        return None
+
+    try:
+        module = ast.parse(text, mode="exec")
+    except Exception:
+        return None
+
+    if len(module.body) != 1:
+        return None
+
+    statement = module.body[0]
+    if isinstance(statement, ast.Expr):
+        call = statement.value
+    elif isinstance(statement, ast.Assign):
+        call = statement.value
+    else:
+        return None
+
+    if not isinstance(call, ast.Call):
+        return None
+
+    func = call.func
+    func_name = ""
+    if isinstance(func, ast.Name):
+        func_name = str(func.id or "")
+    elif isinstance(func, ast.Attribute):
+        func_name = str(func.attr or "")
+    if func_name != "execute_route_to_agent":
+        return None
+
+    if not call.args:
+        return None
+
+    try:
+        route_args = ast.literal_eval(call.args[0])
+    except Exception:
+        return None
+    if not isinstance(route_args, dict):
+        return None
+
+    normalized_route_args = _normalize_python_route_payload(route_args)
+    for keyword in call.keywords:
+        if str(keyword.arg or "") != "source_agent_label":
+            continue
+        try:
+            source_agent_label = ast.literal_eval(keyword.value)
+        except Exception:
+            source_agent_label = None
+        normalized_source_agent = normalize_agent_label(str(source_agent_label or ""))
+        if normalized_source_agent:
+            normalized_route_args.setdefault("_origin_agent_label", normalized_source_agent)
+    return normalized_route_args
+
+
+def _normalize_python_route_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    normalized_payload: dict[str, Any] = {}
+    for key, value in payload.items():
+        normalized_key = str(key or "")
+        normalized_payload[normalized_key] = _normalize_python_route_value(value, field_name=normalized_key)
+    return normalized_payload
+
+
+def _normalize_python_route_value(value: Any, *, field_name: str | None = None) -> Any:
+    if isinstance(value, dict):
+        return {
+            str(key or ""): _normalize_python_route_value(item, field_name=str(key or ""))
+            for key, item in value.items()
+        }
+
+    if isinstance(value, set):
+        normalized_items = [
+            _normalize_python_route_value(item, field_name=field_name)
+            for item in sorted(value, key=lambda item: str(item))
+        ]
+        if len(normalized_items) == 1:
+            value = normalized_items[0]
+        else:
+            value = normalized_items
+    elif isinstance(value, tuple):
+        value = [
+            _normalize_python_route_value(item, field_name=field_name)
+            for item in value
+        ]
+    elif isinstance(value, list):
+        value = [
+            _normalize_python_route_value(item, field_name=field_name)
+            for item in value
+        ]
+
+    if field_name == "profile_id" and isinstance(value, str):
+        normalized_profile_id = str(value or "").strip()
+        if normalized_profile_id and not normalized_profile_id.startswith("profile:"):
+            if all(character in "0123456789abcdefABCDEF" for character in normalized_profile_id):
+                return f"profile:{normalized_profile_id}"
+        return normalized_profile_id
+
+    if field_name == "job_posting":
+        if isinstance(value, str):
+            normalized_correlation_id = str(value or "").strip()
+            if normalized_correlation_id:
+                return {"source": "correlation_id", "value": normalized_correlation_id}
+        if isinstance(value, list) and len(value) == 1 and isinstance(value[0], str):
+            normalized_correlation_id = str(value[0] or "").strip()
+            if normalized_correlation_id:
+                return {"source": "correlation_id", "value": normalized_correlation_id}
+
+    return value
 
 
 class ActionRequestSchemaService:
@@ -1822,7 +1993,10 @@ class BatchWorkflowValidationObject:
         workflow_config: dict[str, Any] | None = None,
     ) -> None:
         self.workflow_name = workflow_name
-        self.config = deepcopy(workflow_config if workflow_config is not None else None)
+        self.config = deepcopy(
+            workflow_config if workflow_config is not None else BATCH_WORKFLOW_CONFIGS.get(workflow_name, {})
+        )
+        self.errors: list[str] = []
         self.warnings: list[str] = []
 
     def load_missing_report(self) -> dict[str, Any]:
@@ -3004,6 +3178,7 @@ def validate_job_config(job_name: str, job_config: dict[str, Any] | None = None)
         errors.append("runtime_agent is required")
     elif runtime_agent not in AGENT_RUNTIME:
         errors.append(f"runtime_agent '{runtime_agent}' is not defined in AGENT_RUNTIME")
+    default_runtime_job_name = str(get_default_job_name(runtime_agent) or "").strip() if runtime_agent in AGENT_RUNTIME else ""
 
     skill_profile_name = str(config.get("skill_profile") or "").strip()
     if not skill_profile_name:
@@ -3014,9 +3189,14 @@ def validate_job_config(job_name: str, job_config: dict[str, Any] | None = None)
         skill_profile = AGENT_SKILL_PROFILES.get(skill_profile_name) or {}
         profile_job_name = str(skill_profile.get("job_name") or "").strip()
         if profile_job_name and profile_job_name != normalized_job_name:
-            errors.append(
-                f"skill_profile '{skill_profile_name}' declares job_name '{profile_job_name}' instead of '{normalized_job_name}'"
-            )
+            if default_runtime_job_name and profile_job_name == default_runtime_job_name:
+                warnings.append(
+                    f"skill_profile '{skill_profile_name}' is reused from default job '{profile_job_name}' for '{normalized_job_name}'"
+                )
+            else:
+                errors.append(
+                    f"skill_profile '{skill_profile_name}' declares job_name '{profile_job_name}' instead of '{normalized_job_name}'"
+                )
 
     default_object_name = str(config.get("default_object_name") or "").strip()
     if not default_object_name:
@@ -3031,8 +3211,7 @@ def validate_job_config(job_name: str, job_config: dict[str, Any] | None = None)
                 f"runtime_agent '{runtime_agent}' maps job_name '{normalized_job_name}' to skill_profile '{runtime_skill_profile_name}'"
             )
 
-        default_job_name = str(get_default_job_name(runtime_agent) or "").strip()
-        if default_job_name == normalized_job_name and runtime_agent != "_xworker":
+        if default_runtime_job_name == normalized_job_name and runtime_agent != "_xworker":
             warnings.append(
                 f"runtime_agent '{runtime_agent}' uses '{normalized_job_name}' as default_job_name; verify this specialization should be the default"
             )

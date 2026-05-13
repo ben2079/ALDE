@@ -36,6 +36,7 @@ try:
         get_job_config,
         get_specialized_system_prompt,
         get_workflow_config,
+        normalize_action_request_name,
         normalize_agent_label,
         normalize_tool_name,
         prepare_incoming_handoff,
@@ -53,6 +54,7 @@ except ImportError as e:
             get_job_config,
             get_specialized_system_prompt,
             get_workflow_config,
+            normalize_action_request_name,
             normalize_agent_label,
             normalize_tool_name,
             prepare_incoming_handoff,
@@ -62,7 +64,7 @@ except ImportError as e:
         raise
 
 try:
-    from .agents_ccomp import ChatComE, ChatCompletion
+    from .chat_runtime import ChatCom, ChatCompletion
 except ImportError as e:
     msg = str(e)
     if "no known parent package" in msg or "attempted relative import" in msg:
@@ -72,12 +74,13 @@ except ImportError as e:
         _pkg_parent = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         if _pkg_parent not in sys.path:
             sys.path.insert(0, _pkg_parent)
-        from alde.agents_ccomp import ChatComE, ChatCompletion
+        from alde.chat_runtime import ChatCom, ChatCompletion
     else:
         raise
 try:
     from .agents_tools import (  # type: ignore
         DOCUMENT_REPOSITORY,
+        REQUEST_OBJECT_RESOLUTION_SERVICE,
         UNIFIED_TOOLS,
         function_dispatcher,
         get_agent_tools,
@@ -94,6 +97,7 @@ except ImportError as e:
     if "no known parent package" in msg or "attempted relative import" in msg:
         from alde.agents_tools import (  # type: ignore
             DOCUMENT_REPOSITORY,
+            REQUEST_OBJECT_RESOLUTION_SERVICE,
             UNIFIED_TOOLS,
             function_dispatcher,
             get_agent_tools,
@@ -2026,6 +2030,30 @@ class AgentRoutingDispatcher:
                 return candidate_job_name
         return normalized_job_name
 
+    def _load_target_job_context(
+        self,
+        raw_target: str | None,
+        job_name: str | None,
+    ) -> tuple[str | None, str | None, bool]:
+        normalized_target = normalize_agent_label(str(raw_target or "").strip())
+        if not normalized_target or normalized_target in AGENTS_REGISTRY:
+            return None, None, False
+
+        target_job_name = self._load_canonical_job_name(normalized_target)
+        if not target_job_name:
+            return None, None, False
+
+        target_job_config = get_job_config(target_job_name)
+        target_runtime_agent = normalize_agent_label(str(target_job_config.get("runtime_agent") or ""))
+        if not target_runtime_agent or target_runtime_agent not in AGENTS_REGISTRY:
+            return None, None, False
+
+        normalized_job_name = str(job_name or "").strip()
+        if normalized_job_name and normalized_job_name != target_job_name:
+            return None, None, False
+
+        return target_runtime_agent, target_job_name, True
+
     def _load_route_defaults(self, job_name: str | None) -> dict[str, Any]:
         normalized_job_name = str(job_name or "").strip()
         if not normalized_job_name:
@@ -2048,6 +2076,7 @@ class AgentRoutingDispatcher:
         output_payload = deepcopy(sequence_payload)
         passthrough_keys = (
             "action",
+            "profile_id",
             "applicant_profile",
             "job_posting",
             "job_posting_result",
@@ -2057,6 +2086,16 @@ class AgentRoutingDispatcher:
         for key in passthrough_keys:
             if key in args and args.get(key) is not None:
                 output_payload[key] = deepcopy(args.get(key))
+        profile_id = str(output_payload.get("profile_id") or "").strip()
+        if (
+            profile_id
+            and not isinstance(output_payload.get("applicant_profile"), dict)
+            and not isinstance(output_payload.get("profile_result"), dict)
+        ):
+            output_payload["applicant_profile"] = {
+                "source": "profile_id",
+                "value": profile_id,
+            }
         if not str(output_payload.get("action") or "").strip():
             output_payload["action"] = "generate_cover_letter"
 
@@ -2139,10 +2178,21 @@ class AgentRoutingDispatcher:
         ) if str(args.get('tool_name') or nested_tool_name or (explicit_tools[0] if len(explicit_tools) == 1 else '')).strip() else None
         handoff_id = str(args.get('handoff_id') or '').strip() or None
 
+        raw_target_value = str(args.get('target_agent') or object_name or '').strip()
+        resolved_target_agent, resolved_target_job_name, target_was_job_name = self._load_target_job_context(
+            raw_target_value,
+            job_name,
+        )
+        if resolved_target_job_name and not job_name:
+            job_name = resolved_target_job_name
+            args['job_name'] = resolved_target_job_name
+
         route_defaults = self._load_route_defaults(job_name)
         default_target_agent = normalize_agent_label(str(route_defaults.get("target_agent") or "").strip()) if route_defaults else ""
-        if not str(args.get("target_agent") or "").strip() and default_target_agent:
+        if (not str(args.get("target_agent") or "").strip() or target_was_job_name) and default_target_agent:
             args["target_agent"] = default_target_agent
+        elif target_was_job_name and resolved_target_agent:
+            args["target_agent"] = resolved_target_agent
 
         default_handoff_metadata = route_defaults.get("handoff_metadata") if isinstance(route_defaults.get("handoff_metadata"), dict) else {}
         if default_handoff_metadata:
@@ -2729,15 +2779,20 @@ def execute_route_to_agent(
     )
 
 
-
-
-
-
 def execute_forced_route(args: dict, *, ChatCom=None, origin_agent_label: str = "_xplaner_xrouter") -> str:
+    resolved_args = dict(args or {})
+    requested_origin_agent = normalize_agent_label(
+        str(
+            resolved_args.pop("_origin_agent_label", "")
+            or resolved_args.pop("source_agent_label", "")
+            or origin_agent_label
+            or "_xplaner_xrouter"
+        )
+    ) or "_xplaner_xrouter"
     return FORCED_ROUTE_DISPATCHER.dispatch_object(
-        args or {},
+        resolved_args,
         ChatCom=ChatCom,
-        origin_agent_label=origin_agent_label,
+        origin_agent_label=requested_origin_agent,
     )
 
 
@@ -2783,14 +2838,19 @@ class ToolExecutionDispatcher:
             return execute_vectordb(args, tool_call_id)
         if object_name == 'route_to_agent':
             source_label = normalize_agent_label(source_agent_label or "") if source_agent_label else ""
-            route_target = normalize_agent_label(
-                str(
-                    args.get("target_agent")
-                    or ((args.get("agent_response") or {}).get("handoff_to") if isinstance(args.get("agent_response"), dict) else "")
-                    or ((args.get("handoff_payload") or {}).get("handoff_to") if isinstance(args.get("handoff_payload"), dict) else "")
-                    or ""
-                )
+            raw_route_target = str(
+                args.get("target_agent")
+                or ((args.get("agent_response") or {}).get("handoff_to") if isinstance(args.get("agent_response"), dict) else "")
+                or ((args.get("handoff_payload") or {}).get("handoff_to") if isinstance(args.get("handoff_payload"), dict) else "")
+                or ""
             )
+            route_target = normalize_agent_label(raw_route_target)
+            resolved_route_target, _, target_was_job_name = AGENT_ROUTING_DISPATCHER._load_target_job_context(
+                raw_route_target,
+                args.get("job_name"),
+            )
+            if target_was_job_name and resolved_route_target:
+                route_target = resolved_route_target
             allow_internal_handoff = bool(args.get("allow_internal_handoff"))
             internal_self_route = bool(allow_internal_handoff and source_label and route_target == source_label)
             if source_agent_label and not _is_tool_allowed_for_agent(source_agent_label, object_name) and not internal_self_route:
@@ -3730,12 +3790,191 @@ class RoutingResultObject:
         self.object_name = normalize_tool_name(str(self.result_postprocess.get("tool") or ""))
         self.handoff_payload = ROUTING_HANDOFF_VIEW_SERVICE.load_payload(self.request)
         self.metadata = ROUTING_HANDOFF_VIEW_SERVICE.load_metadata(self.request)
-        self.parsed_result = _parse_json_object(result_text)
         self.target_agent_label = ROUTING_HANDOFF_VIEW_SERVICE.load_target_agent(self.request)
         self.source_agent_label = ROUTING_HANDOFF_VIEW_SERVICE.load_source_agent(self.request)
         self.correlation_id = ROUTING_HANDOFF_VIEW_SERVICE.load_correlation_id(self.request)
         self.obj_name = ROUTING_HANDOFF_VIEW_SERVICE.load_object_name(self.request)
         self.dispatcher_db_path, self.obj_db_path = ROUTING_HANDOFF_VIEW_SERVICE.load_dispatcher_paths(self.request)
+        self.parsed_result = self.load_parsed_result(result_text)
+
+    def load_output_payload(self) -> dict[str, Any]:
+        output_payload = self.handoff_payload.get("output")
+        return output_payload if isinstance(output_payload, dict) else {}
+
+    def load_output_action(self) -> str:
+        output_payload = self.load_output_payload()
+        return normalize_action_request_name(str(output_payload.get("action") or ""))
+
+    def load_job_name(self) -> str:
+        return ROUTING_HANDOFF_VIEW_SERVICE.load_job_name(self.request)
+
+    def load_plain_text_fallback_result(self, result_text: Any) -> dict[str, Any]:
+        if not isinstance(result_text, str):
+            return {}
+
+        raw_text = result_text.strip()
+        if not raw_text or self.load_job_name() != "job_posting_parser":
+            return {}
+
+        output_payload = self.load_output_payload()
+        file_payload = output_payload.get("file") if isinstance(output_payload.get("file"), dict) else {}
+        fallback_result = REQUEST_OBJECT_RESOLUTION_SERVICE.build_inline_result(
+            raw_text,
+            obj_name=self.obj_name,
+            source_path=str(file_payload.get("path") or "").strip() or None,
+        )
+        if not isinstance(fallback_result, dict) or not fallback_result:
+            return {}
+
+        if self.correlation_id:
+            fallback_result["correlation_id"] = self.correlation_id
+        if self.target_agent_label:
+            fallback_result["agent"] = self.target_agent_label
+
+        for key in ("file", "link"):
+            value = output_payload.get(key)
+            if isinstance(value, dict) and value:
+                fallback_result.setdefault(key, deepcopy(value))
+
+        job_name = self.load_job_name()
+        if job_name:
+            fallback_result.setdefault("job_name", job_name)
+
+        parse_payload = fallback_result.get("parse")
+        if isinstance(parse_payload, dict):
+            warnings = parse_payload.get("warnings")
+            if not isinstance(warnings, list):
+                warnings = []
+                parse_payload["warnings"] = warnings
+            if "parser_result_synthesized_from_plain_text" not in warnings:
+                warnings.append("parser_result_synthesized_from_plain_text")
+
+        return fallback_result
+
+    def load_parsed_result(self, result_text: Any) -> dict[str, Any]:
+        parsed_result = _parse_json_object(result_text)
+        if parsed_result:
+            return parsed_result
+        return self.load_plain_text_fallback_result(result_text)
+
+    def load_cover_letter_profile_result(self) -> dict[str, Any]:
+        output_payload = self.load_output_payload()
+        profile_result = output_payload.get("profile_result")
+        if isinstance(profile_result, dict) and profile_result:
+            return deepcopy(profile_result)
+
+        applicant_profile = output_payload.get("applicant_profile")
+        if not isinstance(applicant_profile, dict) or not applicant_profile:
+            return {}
+
+        profile_payload: dict[str, Any] = {}
+        source_value = applicant_profile.get("value")
+        if isinstance(source_value, dict) and source_value:
+            profile_payload = deepcopy(source_value)
+        elif "source" not in applicant_profile and "value" not in applicant_profile:
+            profile_payload = deepcopy(applicant_profile)
+
+        correlation_id = ""
+        if profile_payload:
+            correlation_id = str(
+                profile_payload.get("profile_id")
+                or profile_payload.get("id")
+                or output_payload.get("correlation_id")
+                or self.correlation_id
+                or ""
+            ).strip()
+        else:
+            source_name = str(applicant_profile.get("source") or "").strip().lower()
+            if source_name == "profile_id":
+                correlation_id = str(applicant_profile.get("value") or "").strip()
+                if correlation_id:
+                    profile_payload = {"profile_id": correlation_id}
+
+        if not profile_payload:
+            return {}
+
+        options = output_payload.get("options") if isinstance(output_payload.get("options"), dict) else {}
+        preferences = profile_payload.get("preferences") if isinstance(profile_payload.get("preferences"), dict) else {}
+        language = str(options.get("language") or preferences.get("language") or "de").strip() or "de"
+
+        result: dict[str, Any] = {
+            "agent": "xworker",
+            "parse": {"language": language, "errors": [], "warnings": []},
+            "profile": profile_payload,
+        }
+        if correlation_id:
+            result["correlation_id"] = correlation_id
+        return result
+
+    def load_writer_job_name(self) -> str:
+        return str(self.metadata.get("writer_job_name") or "cover_letter_writer").strip() or "cover_letter_writer"
+
+    def build_cover_letter_handoff_args(self) -> dict[str, Any] | None:
+        if self.load_output_action() != "generate_cover_letter":
+            return None
+        if not self.succeeded or not self.load_processed() or not self.parsed_result:
+            return None
+
+        profile_result = self.load_cover_letter_profile_result()
+        if not profile_result:
+            return None
+
+        writer_job_name = self.load_writer_job_name()
+        correlation_id = str(
+            self.parsed_result.get("correlation_id")
+            or self.correlation_id
+            or ((self.parsed_result.get("file") or {}).get("content_sha256") if isinstance(self.parsed_result.get("file"), dict) else "")
+            or ""
+        ).strip()
+        if not correlation_id:
+            return None
+
+        output_payload = self.load_output_payload()
+        writer_payload: dict[str, Any] = {
+            "type": "cover_letter_request",
+            "action": "generate_cover_letter",
+            "job_name": writer_job_name,
+            "correlation_id": correlation_id,
+            "job_posting_result": deepcopy(self.parsed_result),
+            "profile_result": profile_result,
+            "options": deepcopy(output_payload.get("options") or {}),
+        }
+        writer_payload["job_posting_result"].setdefault("correlation_id", correlation_id)
+
+        for key in ("applicant_profile", "cover_letter_context", "source_document"):
+            value = output_payload.get(key)
+            if value is not None:
+                writer_payload[key] = deepcopy(value)
+
+        handoff_metadata: dict[str, Any] = {
+            "correlation_id": correlation_id,
+            "job_name": writer_job_name,
+        }
+        for key in (
+            "sequence_name",
+            "parser_job_name",
+            "writer_job_name",
+            "dispatcher_message_id",
+            "dispatcher_db_path",
+            "obj_name",
+            "obj_db_path",
+        ):
+            value = self.metadata.get(key)
+            if value not in (None, "", [], {}):
+                handoff_metadata[key] = deepcopy(value)
+
+        return {
+            "target_agent": self.target_agent_label or "_xworker",
+            "job_name": writer_job_name,
+            "handoff_protocol": "agent_handoff_v1",
+            "allow_internal_handoff": True,
+            "handoff_payload": {
+                "agent_label": self.target_agent_label or "_xworker",
+                "handoff_to": self.target_agent_label or "_xworker",
+                "output": writer_payload,
+            },
+            "handoff_metadata": handoff_metadata,
+        }
 
     def load_valid_request(self) -> bool:
         return bool(self.request)
@@ -3915,11 +4154,17 @@ class RoutingResultPostprocessService:
         if isinstance(result, dict):
             result["result"] = result_object.parsed_result
             result["result_text"] = _result_text_from_payload(result_object.parsed_result, result_text)
+            cover_letter_handoff = result_object.build_cover_letter_handoff_args()
+            if cover_letter_handoff:
+                result["handoff_messages"] = [cover_letter_handoff]
             return result
         parsed_upsert = _parse_json_object(result)
         if parsed_upsert:
             parsed_upsert.setdefault("result", result_object.parsed_result)
             parsed_upsert.setdefault("result_text", _result_text_from_payload(result_object.parsed_result, result_text))
+            cover_letter_handoff = result_object.build_cover_letter_handoff_args()
+            if cover_letter_handoff:
+                parsed_upsert["handoff_messages"] = [cover_letter_handoff]
             return parsed_upsert
         return {"ok": False, "raw_result": str(result)}
 
@@ -5080,6 +5325,36 @@ class AssistantResponseService:
             return text
         return latest_failure
 
+    def _apply_postprocess_handoffs(
+        self,
+        *,
+        postprocess_result: dict[str, Any] | None,
+        depth: int,
+        ChatCom,
+        response_agent_label: str,
+    ) -> str | None:
+        if not isinstance(postprocess_result, dict):
+            return None
+
+        handoff_messages = postprocess_result.get("handoff_messages") or []
+        if not isinstance(handoff_messages, list) or not handoff_messages:
+            return None
+
+        handoff_results = TOOL_CALL_EXECUTION_SERVICE.execute_handoff_object_messages(
+            parent_tool_call_id=f"postprocess_{normalize_agent_label(response_agent_label or '') or 'agent'}",
+            handoff_messages=[dict(item or {}) for item in handoff_messages if isinstance(item, dict)],
+            depth=depth,
+            ChatCom=ChatCom,
+            agent_label=response_agent_label,
+        )
+        postprocess_result["handoff_results"] = handoff_results
+
+        for handoff_result in reversed(handoff_results):
+            text_value = str(handoff_result or "").strip()
+            if text_value:
+                return text_value
+        return None
+
     def _handle_nested_object_calls(
         self,
         *,
@@ -5118,6 +5393,14 @@ class AssistantResponseService:
         )
         if isinstance(postprocess_result, dict) and isinstance(postprocess_result.get('result_text'), str):
             rec = postprocess_result.get('result_text')
+        chained_result = self._apply_postprocess_handoffs(
+            postprocess_result=postprocess_result if isinstance(postprocess_result, dict) else None,
+            depth=depth,
+            ChatCom=ChatCom,
+            response_agent_label=response_agent_label,
+        )
+        if isinstance(chained_result, str) and chained_result.strip():
+            rec = chained_result
         _advance_workflow_session(
             workflow_session,
             event_kind='state',
@@ -5154,6 +5437,14 @@ class AssistantResponseService:
             )
             if isinstance(postprocess_result, dict) and isinstance(postprocess_result.get('result_text'), str):
                 text = postprocess_result.get('result_text')
+            chained_result = self._apply_postprocess_handoffs(
+                postprocess_result=postprocess_result if isinstance(postprocess_result, dict) else None,
+                depth=0,
+                ChatCom=None,
+                response_agent_label=response_agent_label,
+            )
+            if isinstance(chained_result, str) and chained_result.strip():
+                text = chained_result
             completion_payload = {
                 'target_agent': response_agent_label,
                 'result': text,

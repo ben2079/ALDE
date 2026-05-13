@@ -10,13 +10,44 @@ MessageObject = TypeVar("MessageObject")
 
 class AgentRuntimeCoreService:
     def load_chat_components(self) -> tuple[Any, Any, Any]:
-        from alde.agents_ccomp import ChatCom, ImageCreate, ImageDescription  # type: ignore
+        try:
+            from .chat_runtime import ChatCom, ImageCreate, ImageDescription  # type: ignore
+        except ImportError as e:
+            msg = str(e)
+            if "attempted relative import" in msg or "no known parent package" in msg:
+                try:
+                    from ALDE.alde.chat_runtime import ChatCom, ImageCreate, ImageDescription  # type: ignore
+                except ImportError:
+                    from alde.chat_runtime import ChatCom, ImageCreate, ImageDescription  # type: ignore
+            else:
+                raise
 
         return ChatCom, ImageDescription, ImageCreate
 
     def load_runtime_components(self) -> tuple[Any, Any, Any]:
-        from alde.agents_config import get_agent_config, normalize_agent_label  # type: ignore
-        from alde.agents_factory import execute_forced_route  # type: ignore
+        try:
+            from .agents_config import get_agent_config, normalize_agent_label  # type: ignore
+        except ImportError as e:
+            msg = str(e)
+            if "attempted relative import" in msg or "no known parent package" in msg:
+                try:
+                    from ALDE.alde.agents_config import get_agent_config, normalize_agent_label  # type: ignore
+                except ImportError:
+                    from alde.agents_config import get_agent_config, normalize_agent_label  # type: ignore
+            else:
+                raise
+
+        try:
+            from .agents_factory import execute_forced_route  # type: ignore
+        except ImportError as e:
+            msg = str(e)
+            if "attempted relative import" in msg or "no known parent package" in msg:
+                try:
+                    from ALDE.alde.agents_factory import execute_forced_route  # type: ignore
+                except ImportError:
+                    from alde.agents_factory import execute_forced_route  # type: ignore
+            else:
+                raise
 
         return get_agent_config, normalize_agent_label, execute_forced_route
 
@@ -28,11 +59,14 @@ class AgentRuntimeCoreService:
 
     def load_object_job_name(self, normalized_target: str) -> str:
         try:
-            from alde.agents_config import get_default_job_name  # type: ignore
+            from .agents_config import get_default_job_name  # type: ignore
         except ImportError as e:
             msg = str(e)
             if "attempted relative import" in msg or "no known parent package" in msg:
-                from alde.agents_config import get_default_job_name  # type: ignore
+                try:
+                    from ALDE.alde.agents_config import get_default_job_name  # type: ignore
+                except ImportError:
+                    from alde.agents_config import get_default_job_name  # type: ignore
             else:
                 raise
         return str(get_default_job_name(normalized_target) or "").strip()
