@@ -98,6 +98,55 @@ _MANIFEST_CANON = _VSM3_CANON / "manifest.json"
 _MANIFEST_LEGACY = _VSM3_LEGACY / "manifest.json"
 
 
+def _verbose_terminal_logs_enabled() -> bool:
+    return str(os.getenv("AI_IDE_VERBOSE_TERMINAL_LOGS", "0")).strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _compact_preview(value: Any, limit: int = 220) -> str:
+    text = str(value or "")
+    compact = " ".join(text.split())
+    if len(compact) <= limit:
+        return compact
+    return f"{compact[: max(0, limit - 3)]}..."
+
+
+def _extract_tool_names(tools: Any) -> list[str]:
+    names: list[str] = []
+    if not isinstance(tools, list):
+        return names
+    for entry in tools:
+        name = ""
+        if isinstance(entry, dict):
+            function_payload = entry.get("function") if isinstance(entry.get("function"), dict) else {}
+            name = str(function_payload.get("name") or entry.get("name") or "").strip()
+        else:
+            function_payload = getattr(entry, "function", None)
+            name = str(getattr(function_payload, "name", "") or getattr(entry, "name", "")).strip()
+        if name:
+            names.append(name)
+    return names
+
+
+def _extract_tool_call_names(tool_calls: Any) -> list[str]:
+    if not isinstance(tool_calls, list):
+        return []
+    names: list[str] = []
+    for call in tool_calls:
+        function_payload = getattr(call, "function", None)
+        call_name = str(getattr(function_payload, "name", "") or "").strip()
+        if not call_name and isinstance(call, dict):
+            function_payload = call.get("function") if isinstance(call.get("function"), dict) else {}
+            call_name = str(function_payload.get("name") or "").strip()
+        if call_name:
+            names.append(call_name)
+    return names
+
+
 
 """
     '''
@@ -1488,7 +1537,16 @@ class ChatCom(ChatCompletion,ChatHistory):
             "routing_policy": dict(_agent_cfg.get("routing_policy") or {}),
         }
         self._instance_policy = self._agent_runtime.get("instance_policy") or "ephemeral"
-        print(f"Using agent config: {_agent_cfg}")
+        if _verbose_terminal_logs_enabled():
+            print(f"Using agent config: {_agent_cfg}")
+        else:
+            cfg_tools = _extract_tool_names(_agent_cfg.get("tools"))
+            print(
+                "Using agent config: "
+                f"agent_label={self._agent_label} "
+                f"model={_agent_cfg.get('model')} "
+                f"tool_count={len(cfg_tools)}"
+            )
 
 
         def _normalize_user_text(val: Any) -> str:
@@ -1571,8 +1629,11 @@ class ChatCom(ChatCompletion,ChatHistory):
 
         self._input_text = normalized_workflow_input
         msg_user_text: str = _normalize_user_text(self._input_text)
-        print(f"""USER INPUT:
+        if _verbose_terminal_logs_enabled():
+            print(f"""USER INPUT:
               { msg_user_text}""")
+        else:
+            print(f"USER INPUT: chars={len(msg_user_text)} preview={_compact_preview(msg_user_text)}")
 
         # ------------------------------------------------------------------
         # Deterministic routing shortcuts from declarative config.
@@ -1640,8 +1701,11 @@ class ChatCom(ChatCompletion,ChatHistory):
         # to avoid duplicated system instructions.
 
         msg_sys_content_txt = str(_agent_cfg.get("system") or "")
-        print(f"""SYSTEM INSTRUCTION\\:
+        if _verbose_terminal_logs_enabled():
+            print(f"""SYSTEM INSTRUCTION\\:
         {msg_sys_content_txt}""")
+        else:
+            print(f"SYSTEM INSTRUCTION: chars={len(msg_sys_content_txt)} preview={_compact_preview(msg_sys_content_txt)}")
         
         inserted = _chat._insert(tool=True, f_depth=0, f_role="system")
         _input: list[dict[str, Any]] = [{"role": "system", "content": msg_sys_content_txt}]
@@ -1683,7 +1747,11 @@ class ChatCom(ChatCompletion,ChatHistory):
 
             try:
                 tools = get_agent_runtime_tools(self._agent_label)
-                print(f"Using tools: {tools}")
+                if _verbose_terminal_logs_enabled():
+                    print(f"Using tools: {tools}")
+                else:
+                    tool_names = _extract_tool_names(tools)
+                    print(f"Using tools: count={len(tool_names)} names={tool_names[:12]}")
 
             except Exception:
                 try:
@@ -1824,7 +1892,11 @@ class ChatCom(ChatCompletion,ChatHistory):
             tool_calls = getattr(self.assistant_msg, 'tool_calls', None)
             if tool_calls:
                 # Note: tool-call responses often have no direct text content.
-                print(f'Tool calls: {tool_calls}')
+                if _verbose_terminal_logs_enabled():
+                    print(f'Tool calls: {tool_calls}')
+                else:
+                    tool_call_names = _extract_tool_call_names(tool_calls)
+                    print(f"Tool calls: count={len(tool_call_names)} names={tool_call_names[:12]}")
                 try:
                     from .  import agents_factory  as _agents_factory  # type: ignore
                 except ImportError as e:
@@ -1841,7 +1913,10 @@ class ChatCom(ChatCompletion,ChatHistory):
                     agent_label=getattr(self, "_agent_label", "_xplaner_xrouter"),
                 )
 
-                print(f'FINAL_RESULT: {final_result}')
+                if _verbose_terminal_logs_enabled():
+                    print(f'FINAL_RESULT: {final_result}')
+                else:
+                    print(f"FINAL_RESULT: preview={_compact_preview(final_result, limit=280)}")
                 if final_result is None:
                     return ""
                 if isinstance(final_result, str):

@@ -22,7 +22,9 @@ SYSTEM_PROMPT: dict[str, dict[str, Any]] = {
             - Build a minimal explicit execution plan before delegating: goal, selected target_agent, selected job_name or tool_name, required inputs, and expected result.
             - Use direct tools only when the work is trivial, deterministic, and does not need a worker specialization.
             - If the user provides a concrete filesystem path and asks to read, open, or load it, call read_document directly instead of routing or querying memorydb or vectordb.
-            - Route execution, parsing, writing, dispatching to xworker.
+            - Keep xrouter_xplanner as the main orchestration agent and delegate execution to suitable sub-agents.
+            - Route explicit AgentDB CRUD, lookup, relation-graph, and batch-operation requests to a suitable sub-agent (default: _xworker) with explicit job_name or tool_name.
+            - Support multi-hop delegation when complex async or parallel task trees require sub-agent fanout.
             - Every route_to_agent call must include an explicit job_name or tool_name that matches the intended worker execution path.
             - Prefer structured handoff payloads when downstream execution depends on schema-bound input.
             - Do not delegate until the brief is specific enough for deterministic execution.
@@ -46,13 +48,13 @@ SYSTEM_PROMPT: dict[str, dict[str, Any]] = {
             Goal: Execute the routed job or tool-focused task with the selected skill profile and return deterministic, source-grounded output.
 
             Rules:
-            - Execute only the job handed off by xrouter_xplanner or by an internal xworker handoff.
+            - Execute delegated jobs from planner or worker handoffs with deterministic boundaries.
             - Resolve the skill profile from tool_name first when configured, then fall back to job_name.
             - Respect explicit routed tool constraints when tools are provided as task options.
             - When the request names a concrete filesystem path to read, open, or load, use read_document; memorydb and vectordb are retrieval tools, not direct file loaders.
             - Keep outputs stable, explicit, and task-bounded.
             - Do not invent unsupported claims or runtime results.
-            - Route further only when the workflow explicitly requires an internal xworker handoff.
+            - Delegate further to sub-agents when async or parallel execution branches are explicitly required.
             """
         ),
         "task": {
@@ -219,6 +221,7 @@ JOB_PROMPTS: dict[str, dict[str, Any]] = {
             - Keep salaries in the original currency and preserve source formatting when normalization is ambiguous.
             - Preserve the original extracted source in raw_text_document.raw_text whenever available.
             - Emit entity_objects and relation_objects only when the source provides evidence.
+            - You may encode an evidence-backed relation either in relation_objects or directly on the target entity via is_target, source_entity, is_relational, and explicit_description.
             - Keep job_posting as a flattened compatibility projection for existing storage and downstream consumers.
             - If parse.is_job_posting is false, set db_updates.processing_state to failed and db_updates.processed to false.
             - Return JSON only.
@@ -251,7 +254,8 @@ JOB_PROMPTS: dict[str, dict[str, Any]] = {
                 "Deduplicate ordered lists with most important items first.",
                 "Put the full extracted text into raw_text_document.raw_text and mirror it into job_posting.raw_text when available.",
                 "Represent the posting as a primary subject entity in entity_objects, usually with entity_key 'subject'.",
-                "Use stable, reusable entity keys so relation_objects can reference them deterministically.",
+                "Use stable, reusable entity keys so relation_objects or target-annotated entity_objects can reference them deterministically.",
+                "If you already know the target entity, you may encode the relation on that entity with is_target=true, source_entity='<seed_key>', is_relational='<relation_type>', and explicit_description when a human-readable explanation helps.",
                 "Emit only evidence-backed relation types such as offered_by, located_in, requires_skill, requires_language, or application_contact.",
                 "For latest batch mode, keep only the newest postings after deterministic deduplication and sorting.",
                 "For latest batch mode, include dropped duplicates and non-job-posting items in warnings or dropped_items metadata.",
@@ -304,6 +308,21 @@ JOB_PROMPTS: dict[str, dict[str, Any]] = {
                     "aliases": [],
                     "attributes": {},
                     "metadata": {"role": "subject", "source_field": "job_posting.job_title"},
+                },
+                {
+                    "entity_key": "organization:example_gmbh",
+                    "entity_type": "organization",
+                    "canonical_name": None,
+                    "mention_text": None,
+                    "summary": None,
+                    "confidence": 0.95,
+                    "aliases": [],
+                    "attributes": {},
+                    "is_target": True,
+                    "source_entity": "subject",
+                    "is_relational": "offered_by",
+                    "explicit_description": "Employer named in the posting header.",
+                    "metadata": {"source_field": "job_posting.company_name"},
                 }
             ],
             "relation_objects": [
@@ -502,24 +521,9 @@ JOB_PROMPTS: dict[str, dict[str, Any]] = {
                 "cover_letter_writer",
             ],
         
-        
-        'sequence':
-        [ 
-              '-> xrouter_planner ->'
-              '-> document_dispatch ->'
-              '-> job_posting_parser ->'
-              '-> agent_memory ->' 
-                '<-'
-              '-> xrouter_planner ->'
-              '-> document_dispatch ->'
-              '-> applicant_profile_parser ->'
-              '-> agent_memory ->' 
-                '<-'
-              '-> xrouter_planner ->'
-              '-> cover_letter_writer ->|'
-              ]
-        
-             
+ 
+              
+              
         },
 
         "output_schema": {
@@ -534,10 +538,45 @@ JOB_PROMPTS: dict[str, dict[str, Any]] = {
             },
         },
     },
-    "repo_knowledge_worker": {
+    "adb_operation": {
         "prompt": _text(
             """
-            === Job: repo_knowledge_worker ===
+            === Job: adb_operation ===
+            Description: Deterministic generic AgentDB execution job.
+            Goal: Execute one explicit AgentDB repository operation and return the structured result unchanged.
+
+            Rules:
+            - Use only the adb_operation tool for this job.
+            - Keep the operation explicit: health, ensure_index_objects, upsert_object, delete_object, load_object, load_objects, find_objects, load_relation_graph, or apply_operations.
+            - Pass only the fields required by the selected operation.
+            - Use object_name and object_id exactly as provided; do not invent identifiers or payload fields.
+            - Preserve batch operation ordering when apply_operations is requested.
+            - Return the tool result payload unchanged.
+            - Do not invent repository state, object payloads, or graph edges.
+            """
+        ),
+        "task": {
+            "mode": "tool_execution",
+            "tool_name": "adb_operation",
+        },
+        "output_schema": {
+            "ok": True,
+            "operation": "health|ensure_index_objects|upsert_object|delete_object|load_object|load_objects|find_objects|load_relation_graph|apply_operations",
+            "repository": {
+                "repository_type": "AgentDbInMemoryRepository|AgentDbSocketRepository|KnowledgeRepository",
+                "database_name": "alde_knowledge",
+            },
+            "object_payload": {},
+            "object_payload_list": [],
+            "deleted": False,
+            "applied": 0,
+            "results": [],
+        },
+    },
+    "adb_worker": {
+        "prompt": _text(
+            """
+            === Job: adb_worker ===
             Description: Deterministic repository indexing execution job.
             Goal: Run the repo_knowledge_worker tool with explicit parameters and return its result unchanged.
 
@@ -577,10 +616,10 @@ JOB_PROMPTS: dict[str, dict[str, Any]] = {
             "errors": [],
         },
     },
-    "repo_knowledge_query": {
+    "adb_query": {
         "prompt": _text(
             """
-            === Job: repo_knowledge_query ===
+            === Job: adb_query ===
             Description: Deterministic repository retrieval execution job.
             Goal: Run the repo_knowledge_query tool and return context chunks for downstream reasoning.
 
@@ -611,11 +650,11 @@ JOB_PROMPTS: dict[str, dict[str, Any]] = {
             """
             === Job: Xrouter_Xplanner for repo_knowledge_async ===
             Description: Specialized router planner for asynchronous repo-knowledge fanout to xworker.
-            Goal: Emit deterministic route_to_agent branches for repo_knowledge_worker and repo_knowledge_query execution.
+            Goal: Emit deterministic route_to_agent branches for adb_worker and adb_query execution.
 
             Rules:
             - Route only to _xworker.
-            - Use explicit job_name per branch: repo_knowledge_worker or repo_knowledge_query.
+            - Use explicit job_name per branch: adb_worker or adb_query.
             - Keep branch payloads source-grounded and deterministic.
             - For asynchronous branch execution, assume parallel worker target 4.
             - Do not invent tool outputs.
@@ -632,20 +671,20 @@ JOB_PROMPTS: dict[str, dict[str, Any]] = {
                 "mode": "router_parallel_branches",
             },
             "available_jobs": [
-                "repo_knowledge_worker",
-                "repo_knowledge_query",
+                "adb_worker",
+                "adb_query",
             ],
         },
         "output_schema": {
             "branches": [
                 {
                     "target_agent": "_xworker",
-                    "job_name": "repo_knowledge_worker",
+                    "job_name": "adb_worker",
                     "user_question": "{...tool payload json...}",
                 },
                 {
                     "target_agent": "_xworker",
-                    "job_name": "repo_knowledge_query",
+                    "job_name": "adb_query",
                     "user_question": "{...tool payload json...}",
                 },
             ],
@@ -698,18 +737,31 @@ JOB_CONFIGS: dict[str, dict[str, Any]] = {
         "default_object_name": "documents",
         "is_default_for_agent": True,
     },
-    "repo_knowledge_worker": {
+    "adb_operation": {
+        "runtime_agent": "_xworker",
+        "skill_profile": "xworker_core",
+        "default_object_name": "agents_db",
+        "workflow_name": "xworker_adb_operation_leaf",
+        "default_tool_names": ["adb_operation"],
+    },
+    "agent_relation_graph_analysis": {
+        "runtime_agent": "_xworker",
+        "skill_profile": "xworker_core",
+        "default_object_name": "agents_db_graph",
+        "default_tool_names": ["agent_relation_graph"],
+    },
+    "adb_worker": {
         "runtime_agent": "_xworker",
         "skill_profile": "xworker_core",
         "default_object_name": "repo_knowledge",
-        "workflow_name": "xworker_repo_knowledge_worker_leaf",
+        "workflow_name": "xworker_adb_worker_leaf",
         "default_tool_names": ["repo_knowledge_worker"],
     },
-    "repo_knowledge_query": {
+    "adb_query": {
         "runtime_agent": "_xworker",
         "skill_profile": "xworker_core",
         "default_object_name": "repo_knowledge",
-        "workflow_name": "xworker_repo_knowledge_query_leaf",
+        "workflow_name": "xworker_adb_query_leaf",
         "default_tool_names": ["repo_knowledge_query"],
     },
     "router_planner_repo_knowledge_async": {
@@ -838,6 +890,8 @@ def _tool_skill_profiles_for_agent(agent_label: str) -> dict[str, str]:
         "upsert_object_record": "xworker_dispatch",
         "ingest_object": "xworker_dispatch",
         "store_object_result": "xworker_dispatch",
+        "adb_operation": "xworker_core",
+        "agent_relation_graph": "xworker_core",
         "run_mail_agent": "xworker_mail_agent_runtime",
         "vdb_worker": "xworker_core",
         "repo_knowledge_worker": "xworker_core",
@@ -897,10 +951,13 @@ AGENT_RUNTIME: dict[str, dict[str, Any]] = {
         "canonical_name": "xworker",
         "model": "gpt-4o-mini",
         "tools": [
+            "route_to_agent",
             "execute_action_request",
             "upsert_object_record",
             "ingest_object",
             "store_object_result",
+            "adb_operation",
+            "agent_relation_graph",
             "run_mail_agent",
             "vdb_worker",
             "repo_knowledge_worker",
@@ -941,8 +998,8 @@ AGENT_ROLE: dict[str, dict[str, Any]] = {
         },
     },
     "xworker": {
-        "description": "Single execution role for all routed worker jobs.",
-        "can_route": False,
+        "description": "Execution role for routed worker jobs with optional sub-agent delegation.",
+        "can_route": True,
         "default_instance_policy": "ephemeral",
         "default_tool_policy": "xworker",
         "default_handoff_policy": {
@@ -1455,7 +1512,7 @@ AGENT_MANIFEST: dict[str, dict[str, Any]] = {
         },
         "job_skill_profiles": _job_skill_profiles_for_agent("_xrouter_xplanner"),
         "handoff_policy": {
-            "allowed_targets": ["_xworker"],
+            "allowed_targets": [],
             "target_policies": {
                 "_xworker": {
                     "default_protocol": "agent_handoff_v1",
@@ -1476,7 +1533,7 @@ AGENT_MANIFEST: dict[str, dict[str, Any]] = {
         },
         "job_skill_profiles": _job_skill_profiles_for_agent("_xrouter_xplanner"),
         "handoff_policy": {
-            "allowed_targets": ["_xworker"],
+            "allowed_targets": [],
             "target_policies": {
                 "_xworker": {
                     "default_protocol": "agent_handoff_v1",
@@ -1489,6 +1546,7 @@ AGENT_MANIFEST: dict[str, dict[str, Any]] = {
     "_xworker": {
         "role": "xworker",
         "skill_profile": "xworker_core",
+        "routing_policy": {"mode": "xworker", "can_route": True},
         "skill_profile_loading": {
             "mode": "tool_name",
             "fallback_selection_mode": "job_name",
@@ -1498,7 +1556,7 @@ AGENT_MANIFEST: dict[str, dict[str, Any]] = {
         "tool_skill_profiles": _tool_skill_profiles_for_agent("_xworker"),
         "handoff_policy": {
             "allowed_sources": ["_xrouter_xplanner", "_xplaner_xrouter", "_xworker"],
-            "allowed_targets": ["_xworker"],
+            "allowed_targets": [],
             "source_policies": {
                 "_xrouter_xplanner": {
                     "accepted_protocols": ["message_text", "agent_handoff_v1"],
@@ -1533,6 +1591,41 @@ TOOL_CONFIGS: list[dict[str, Any]] = [
             {"name": "overlap", "type": "integer", "description": "Optional chunk overlap for build operations."},
             {"name": "force", "type": "boolean", "description": "Required for wipe operations.", "default": False},
             {"name": "remove_store_dir", "type": "boolean", "description": "If true and operation=wipe: delete the whole store directory. Otherwise remove only index+manifest files.", "default": False},
+        ],
+    },
+    {
+        "name": "adb_operation",
+        "description": "Execute a generic AgentDB repository operation such as health, index setup, object upsert/load/delete, text search, relation-graph load, or batch apply_operations.",
+        "parameters": [
+            {"name": "operation", "type": "string", "description": "Operation to run: health|ensure_index_objects|upsert_object|delete_object|load_object|load_objects|find_objects|load_relation_graph|apply_operations.", "required": True, "enum": ["health", "ensure_index_objects", "upsert_object", "delete_object", "load_object", "load_objects", "find_objects", "load_relation_graph", "apply_operations"]},
+            {"name": "object_name", "type": "string", "description": "Logical AgentDB object name such as document, entity, relation, or embedding.", "required": False},
+            {"name": "object_id", "type": "string", "description": "Object id used by upsert_object, load_object, or delete_object.", "required": False},
+            {"name": "object_payload", "type": "object", "description": "Object payload used by upsert_object.", "required": False},
+            {"name": "object_filter", "type": "object", "description": "Optional filter object for load_objects.", "required": False},
+            {"name": "limit", "type": "integer", "description": "Result limit for load_objects or find_objects.", "required": False, "default": 50},
+            {"name": "namespace_id", "type": "string", "description": "Namespace id used by find_objects or load_relation_graph.", "required": False},
+            {"name": "query_text", "type": "string", "description": "Query text used by find_objects.", "required": False},
+            {"name": "source_entity_id", "type": "string", "description": "Source entity id used by load_relation_graph.", "required": False},
+            {"name": "max_depth", "type": "integer", "description": "Maximum traversal depth for load_relation_graph.", "required": False, "default": 2},
+            {"name": "operations", "type": "array", "description": "Batch operation list for apply_operations. Each item may contain action, object_name, object_id, and object_payload.", "required": False, "items": {"type": "object"}},
+            {"name": "agents_db_uri", "type": "string", "description": "Optional AgentsDB socket uri such as agentsdb://localhost:2331.", "required": False},
+            {"name": "backend_uri", "type": "string", "description": "Optional backend repository uri such as agentsmem://local.", "required": False},
+            {"name": "database_name", "type": "string", "description": "Optional logical database name.", "required": False},
+            {"name": "memory_image_path", "type": "string", "description": "Optional image path for the in-memory backend.", "required": False},
+        ],
+    },
+    {
+        "name": "agent_relation_graph",
+        "description": "Load and analyze the AgentsDB relation graph for visualization and AI/ML data-model exploration.",
+        "implementation_name": "agent_relation_graph",
+        "parameters": [
+            {"name": "source_uri", "type": "string", "description": "Optional AgentsDB tool endpoint URI. Example: agentsdb://127.0.0.1:2331/tools:agent_relation_graph.", "required": False},
+            {"name": "tool_id", "type": "string", "description": "Graphic tool id to resolve. Default: agent_relation_graph.", "required": False, "enum": ["agent_relation_graph", "workflow_diagram", "sequence_diagram"], "default": "agent_relation_graph"},
+            {"name": "include_view_state", "type": "boolean", "description": "When true, include render-oriented node/edge draw objects.", "required": False, "default": True},
+            {"name": "layout_spread", "type": "number", "description": "Optional graph layout spread factor used for view_state generation.", "required": False, "default": 1.0},
+            {"name": "selected_kind", "type": "string", "description": "Optional focus selector kind for the graph view state.", "required": False, "enum": ["", "node", "edge"], "default": ""},
+            {"name": "selected_object_id", "type": "string", "description": "Optional focused node_id or edge_id used with selected_kind.", "required": False},
+            {"name": "include_connection_preview", "type": "boolean", "description": "When true, include connection/tool preview metadata from the graph control plane.", "required": False, "default": False},
         ],
     },
     {
@@ -1577,8 +1670,8 @@ TOOL_CONFIGS: list[dict[str, Any]] = [
     {
         "name": "read_document",
         "description": "Read the content of a known file from disk. Use this when the request provides a concrete file path to open, read, or load.",
-        "final_result": True,
-        "tool_response_required": False,
+        "final_result": False,
+        "tool_response_required": True,
         "parameters": [
             {"name": "file_path", "type": "string", "description": "The absolute path to the file to read.", "required": True},
         ],
@@ -1586,8 +1679,8 @@ TOOL_CONFIGS: list[dict[str, Any]] = [
     {
         "name": "pypdf_read_document",
         "description": "Read a concrete PDF file from disk using pypdf extraction only.",
-        "final_result": True,
-        "tool_response_required": False,
+        "final_result": False,
+        "tool_response_required": True,
         "parameters": [
             {"name": "file_path", "type": "string", "description": "The absolute path to the PDF file to read.", "required": True},
         ],
@@ -1746,29 +1839,6 @@ TOOL_CONFIGS: list[dict[str, Any]] = [
         ],
     },
     {
-        "name": "upsert_dispatcher_job_record",
-        "description": "Atomically update the job postings store and dispatcher DB for the same job record, with rollback if the second write fails.",
-        "implementation_name": "upsert_object_record",
-        "snapshot_view": {
-            "kind": "dispatcher_action",
-            "title": "Dispatcher job record upserted",
-            "summary_fields": ["action", "correlation_id"],
-        },
-        "parameters": [
-            {"name": "job_posting_result", "type": "object", "description": "Parser-style or normalized job posting result payload to persist.", "required": True},
-            {"name": "correlation_id", "type": "string", "description": "Optional explicit correlation id for both stores.", "required": False},
-            {"name": "dispatcher_db_path", "type": "string", "description": "Path to dispatcher_doc_db.json.", "required": False},
-            {"name": "job_postings_db_path", "type": "string", "description": "Path to job_postings_db.json.", "required": False},
-            {"name": "obj_name", "type": "string", "description": "Logical object/store name to upsert in the document DB. Defaults to 'job_postings'.", "required": False, "default": "job_postings"},
-            {"name": "processing_state", "type": "string", "description": "Optional dispatcher processing state override.", "required": False},
-            {"name": "processed", "type": "boolean", "description": "Optional processed flag override.", "required": False},
-            {"name": "failed_reason", "type": "string", "description": "Optional dispatcher failure reason.", "required": False},
-            {"name": "source_agent", "type": "string", "description": "Optional logical source label.", "required": False},
-            {"name": "source_payload", "type": "object", "description": "Optional source envelope for traceability.", "required": False},
-            {"name": "dispatcher_updates", "type": "object", "description": "Optional extra dispatcher record fields to upsert.", "required": False},
-        ],
-    },
-    {
         "name": "store_object_result",
         "description": "Persist a normalized or parser-style object result directly into the selected object store.",
         "parameters": [
@@ -1778,31 +1848,6 @@ TOOL_CONFIGS: list[dict[str, Any]] = [
             {"name": "obj_name", "type": "string", "description": "Logical object/store name to persist into.", "required": False, "default": "documents"},
             {"name": "source_agent", "type": "string", "description": "Optional logical source label.", "required": False},
             {"name": "source_payload", "type": "object", "description": "Optional source envelope or original payload for traceability.", "required": False},
-        ],
-    },
-    {
-        "name": "store_job_posting_result",
-        "description": "Persist a parsed job-posting result directly into the job postings store, independent of the PDF dispatcher workflow.",
-        "implementation_name": "store_object_result",
-        "parameters": [
-            {"name": "job_posting_result", "type": "object", "description": "Parsed job-posting result payload to store.", "required": True},
-            {"name": "correlation_id", "type": "string", "description": "Optional explicit correlation id. Falls back to job_posting_result.correlation_id or file.content_sha256.", "required": False},
-            {"name": "db_path", "type": "string", "description": "Optional path to job_postings_db.json.", "required": False},
-            {"name": "obj_name", "type": "string", "description": "Logical object/store name to persist into. Defaults to 'job_postings'.", "required": False, "default": "job_postings"},
-            {"name": "source_agent", "type": "string", "description": "Optional logical source label, e.g. job_platform_ingest.", "required": False},
-            {"name": "source_payload", "type": "object", "description": "Optional source envelope or original platform payload for traceability.", "required": False},
-        ],
-    },
-    {
-        "name": "store_profile_result",
-        "description": "Persist a parsed applicant-profile result directly into the profiles store.",
-        "implementation_name": "store_object_result",
-        "parameters": [
-            {"name": "profile_result", "type": "object", "description": "Parsed profile result payload to store.", "required": True},
-            {"name": "correlation_id", "type": "string", "description": "Optional explicit correlation id. Falls back to profile_result.correlation_id or profile.profile_id.", "required": False},
-            {"name": "db_path", "type": "string", "description": "Optional path to profiles_db.json.", "required": False},
-            {"name": "obj_name", "type": "string", "description": "Logical object/store name to persist into. Defaults to 'profiles'.", "required": False, "default": "profiles"},
-            {"name": "source_agent", "type": "string", "description": "Optional logical source label, e.g. profile_platform_ingest.", "required": False},
         ],
     },
     {
@@ -1818,36 +1863,6 @@ TOOL_CONFIGS: list[dict[str, Any]] = [
             {"name": "source_agent", "type": "string", "description": "Optional logical source label.", "required": False},
             {"name": "source_payload", "type": "object", "description": "Optional source envelope or original payload for traceability.", "required": False},
             {"name": "parse", "type": "object", "description": "Optional parse metadata used when only object_payload is supplied.", "required": False},
-        ],
-    },
-    {
-        "name": "ingest_profile",
-        "description": "Ingest an applicant profile from a platform/API payload or a parser-style result directly into the profiles store.",
-        "implementation_name": "ingest_object",
-        "parameters": [
-            {"name": "profile", "type": "object", "description": "Normalized profile payload to persist when no parser-style result object is supplied.", "required": False},
-            {"name": "applicant_profile", "type": "object", "description": "Optional request-style applicant_profile envelope using source/value fields.", "required": False},
-            {"name": "profile_result", "type": "object", "description": "Optional parser-style profile result payload to persist directly.", "required": False},
-            {"name": "correlation_id", "type": "string", "description": "Optional explicit correlation id. Falls back to profile_result.correlation_id or profile.profile_id.", "required": False},
-            {"name": "db_path", "type": "string", "description": "Optional path to profiles_db.json.", "required": False},
-            {"name": "obj_name", "type": "string", "description": "Logical object/store name to persist into. Defaults to 'profiles'.", "required": False, "default": "profiles"},
-            {"name": "source_agent", "type": "string", "description": "Optional logical source label, e.g. profile_platform_ingest.", "required": False},
-            {"name": "source_payload", "type": "object", "description": "Optional source envelope or original platform payload for traceability.", "required": False},
-        ],
-    },
-    {
-        "name": "ingest_job_posting",
-        "description": "Ingest a platform/API job-posting payload directly into the job postings store, with or without an existing parser-style result envelope.",
-        "implementation_name": "ingest_object",
-        "parameters": [
-            {"name": "job_posting", "type": "object", "description": "Normalized job posting payload to persist when no parser-style result object is supplied.", "required": False},
-            {"name": "job_posting_result", "type": "object", "description": "Optional parser-style job-posting result payload to persist directly.", "required": False},
-            {"name": "correlation_id", "type": "string", "description": "Optional explicit correlation id. Falls back to payload ids or source metadata.", "required": False},
-            {"name": "db_path", "type": "string", "description": "Optional path to job_postings_db.json.", "required": False},
-            {"name": "obj_name", "type": "string", "description": "Logical object/store name to persist into. Defaults to 'job_postings'.", "required": False, "default": "job_postings"},
-            {"name": "source_agent", "type": "string", "description": "Optional logical source label, e.g. job_platform_ingest.", "required": False},
-            {"name": "source_payload", "type": "object", "description": "Optional source envelope or original platform payload for traceability.", "required": False},
-            {"name": "parse", "type": "object", "description": "Optional parse metadata used when only job_posting is supplied.", "required": False},
         ],
     },
  
@@ -1882,29 +1897,39 @@ TOOL_CONFIGS: list[dict[str, Any]] = [
 
 
 TOOL_NAMES: dict[str, str] = {
+    "adb_operation": "adb_operation",
+    "agentdb_operation": "adb_operation",
+    "agentsdb_operation": "adb_operation",
+    "agent_relation_graph": "agent_relation_graph",
+    "agentdb_relation_graph": "agent_relation_graph",
+    "agentsdb_relation_graph": "agent_relation_graph",
+    "agentsdb://127.0.0.1:2331/tools:agent_relation_graph": "agent_relation_graph",
     "dispatch_docs": "dispatch_documents",
     "dispatch_documents": "dispatch_documents",
     "data_dispatcher/dispatch_documents": "dispatch_documents",
     "data_dispatcher.dispatch_documents": "dispatch_documents",
     "dispatch_job_posting_pdfs": "dispatch_documents",
     "ingest_object": "ingest_object",
-    "ingest_profile": "ingest_profile",
-    "ingest_job_posting": "ingest_job_posting",
+    "ingest_profile": "ingest_object",
+    "ingest_job_posting": "ingest_object",
     "ingest_document": "ingest_object",
     "persist_cover_letter_artifacts": "persist_document_artifacts",
     "persist_document_artifacts": "persist_document_artifacts",
     "store_object_result": "store_object_result",
+    "store_job_posting_result": "store_object_result",
+    "store_profile_result": "store_object_result",
     "store_document_result": "store_object_result",
     "upsert_object_record": "upsert_object_record",
-    "upsert_job_record": "upsert_dispatcher_job_record",
+    "upsert_dispatcher_job_record": "upsert_object_record",
+    "upsert_job_record": "upsert_object_record",
     "batch_document_generator": "dispatch_documents",
     "batch_generate_documents": "dispatch_documents",
     "batch_generate_cover_letters": "dispatch_documents",
     "pypdf_read_document": "pypdf_read_document",
     "pypdf_read": "pypdf_read_document",
     "read_pdf_with_pypdf": "pypdf_read_document",
-    "store_profile": "store_profile_result",
-    "persist_profile": "store_profile_result",
+    "store_profile": "store_object_result",
+    "persist_profile": "store_object_result",
 }
 
 
@@ -1961,7 +1986,8 @@ TOOL_GROUPS: dict[str, list[str]] = {
     "comms": ["send_mail", "run_mail_agent", "calendar", "call", "accept_call", "reject_call"],
     "code": ["code_tool", "iter_documents"],
     "dispatcher": ["dispatch_documents", "execute_action_request", "upsert_object_record", "ingest_object", "store_object_result", "vdb_worker", "repo_knowledge_worker"],
-    "repo_knowledge": ["repo_knowledge_worker", "repo_knowledge_query"],
+    "agentdb": ["adb_operation", "agent_relation_graph", "repo_knowledge_worker", "repo_knowledge_query"],
+    "repo_knowledge": ["adb_operation", "agent_relation_graph", "repo_knowledge_worker", "repo_knowledge_query"],
 }
 
 
@@ -2259,63 +2285,93 @@ WORKFLOWS: dict[str, dict[str, Any]] = {
             }
         ],
     },
-    "xworker_repo_knowledge_worker_leaf": {
-        "description": "Leaf workflow for repo_knowledge_worker tool-execution job.",
-        "entry_state": "repo_knowledge_worker_active",
+    "xworker_adb_operation_leaf": {
+        "description": "Leaf workflow for the adb_operation tool-execution job.",
+        "entry_state": "adb_operation_active",
         "states": {
-            "repo_knowledge_worker_active": {
+            "adb_operation_active": {
                 "actor": {"kind": "agent", "name": "_xworker"},
                 "terminal": False,
             },
-            "repo_knowledge_worker_complete": {
+            "adb_operation_complete": {
                 "actor": {"kind": "state", "name": "workflow_complete"},
                 "terminal": True,
             },
-            "repo_knowledge_worker_failed": {
+            "adb_operation_failed": {
                 "actor": {"kind": "state", "name": "workflow_failed"},
                 "terminal": True,
             },
         },
         "transitions": [
             {
-                "from": "repo_knowledge_worker_active",
+                "from": "adb_operation_active",
                 "on": {"kind": "state", "name": ["followup_complete", "tool_complete"]},
-                "to": "repo_knowledge_worker_complete",
+                "to": "adb_operation_complete",
             },
             {
-                "from": "repo_knowledge_worker_active",
+                "from": "adb_operation_active",
                 "on": {"kind": "state", "name": ["model_failed", "tool_failed"]},
-                "to": "repo_knowledge_worker_failed",
+                "to": "adb_operation_failed",
             },
         ],
     },
-    "xworker_repo_knowledge_query_leaf": {
-        "description": "Leaf workflow for repo_knowledge_query tool-execution job.",
-        "entry_state": "repo_knowledge_query_active",
+    "xworker_adb_worker_leaf": {
+        "description": "Leaf workflow for adb_worker tool-execution job.",
+        "entry_state": "adb_worker_active",
         "states": {
-            "repo_knowledge_query_active": {
+            "adb_worker_active": {
                 "actor": {"kind": "agent", "name": "_xworker"},
                 "terminal": False,
             },
-            "repo_knowledge_query_complete": {
+            "adb_worker_complete": {
                 "actor": {"kind": "state", "name": "workflow_complete"},
                 "terminal": True,
             },
-            "repo_knowledge_query_failed": {
+            "adb_worker_failed": {
                 "actor": {"kind": "state", "name": "workflow_failed"},
                 "terminal": True,
             },
         },
         "transitions": [
             {
-                "from": "repo_knowledge_query_active",
+                "from": "adb_worker_active",
                 "on": {"kind": "state", "name": ["followup_complete", "tool_complete"]},
-                "to": "repo_knowledge_query_complete",
+                "to": "adb_worker_complete",
             },
             {
-                "from": "repo_knowledge_query_active",
+                "from": "adb_worker_active",
                 "on": {"kind": "state", "name": ["model_failed", "tool_failed"]},
-                "to": "repo_knowledge_query_failed",
+                "to": "adb_worker_failed",
+            },
+        ],
+    },
+    "xworker_adb_query_leaf": {
+        "description": "Leaf workflow for adb_query tool-execution job.",
+        "entry_state": "adb_query_active",
+        "states": {
+            "adb_query_active": {
+                "actor": {"kind": "agent", "name": "_xworker"},
+                "terminal": False,
+            },
+            "adb_query_complete": {
+                "actor": {"kind": "state", "name": "workflow_complete"},
+                "terminal": True,
+            },
+            "adb_query_failed": {
+                "actor": {"kind": "state", "name": "workflow_failed"},
+                "terminal": True,
+            },
+        },
+        "transitions": [
+            {
+                "from": "adb_query_active",
+                "on": {"kind": "state", "name": ["followup_complete", "tool_complete"]},
+                "to": "adb_query_complete",
+            },
+            {
+                "from": "adb_query_active",
+                "on": {"kind": "state", "name": ["model_failed", "tool_failed"]},
+                "to": "adb_query_failed",
             },
         ],
     },

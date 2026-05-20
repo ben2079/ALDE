@@ -79,6 +79,7 @@ except ImportError as e:
         raise
 try:
     from .agents_tools import (  # type: ignore
+        DOCUMENT_OBJECT_SERVICE,
         DOCUMENT_REPOSITORY,
         REQUEST_OBJECT_RESOLUTION_SERVICE,
         UNIFIED_TOOLS,
@@ -87,8 +88,6 @@ try:
         get_tool_spec,
         memorydb,
         md_to_pdf,
-        store_object_result_tool,
-        upsert_object_record_tool,
         vectordb,
         write_document,
     )
@@ -96,6 +95,7 @@ except ImportError as e:
     msg = str(e)
     if "no known parent package" in msg or "attempted relative import" in msg:
         from alde.agents_tools import (  # type: ignore
+            DOCUMENT_OBJECT_SERVICE,
             DOCUMENT_REPOSITORY,
             REQUEST_OBJECT_RESOLUTION_SERVICE,
             UNIFIED_TOOLS,
@@ -104,8 +104,6 @@ except ImportError as e:
             get_tool_spec,
             memorydb,
             md_to_pdf,
-            store_object_result_tool,
-            upsert_object_record_tool,
             vectordb,
             write_document,
         )
@@ -2018,7 +2016,11 @@ class AgentRoutingDispatcher:
             return None
 
         canonical_aliases = {
+            "agentdb_operation": "adb_operation",
+            "agentsdb_operation": "adb_operation",
             "dispatch_document": "document_dispatch",
+            "repo_knowledge_worker": "adb_worker",
+            "repo_knowledge_query": "adb_query",
         }
         candidate_job_names: list[str] = [normalized_job_name]
         alias_job_name = str(canonical_aliases.get(normalized_job_name) or "").strip()
@@ -2188,7 +2190,9 @@ class AgentRoutingDispatcher:
             args['job_name'] = resolved_target_job_name
 
         route_defaults = self._load_route_defaults(job_name)
-        default_target_agent = normalize_agent_label(str(route_defaults.get("target_agent") or "").strip()) if route_defaults else ""
+        job_config = get_job_config(str(job_name or "").strip()) if str(job_name or "").strip() else {}
+        job_runtime_agent = normalize_agent_label(str((job_config or {}).get("runtime_agent") or "").strip()) if isinstance(job_config, dict) else ""
+        default_target_agent = normalize_agent_label(str(route_defaults.get("target_agent") or job_runtime_agent or "").strip()) if (route_defaults or job_runtime_agent) else ""
         if (not str(args.get("target_agent") or "").strip() or target_was_job_name) and default_target_agent:
             args["target_agent"] = default_target_agent
         elif target_was_job_name and resolved_target_agent:
@@ -3861,7 +3865,30 @@ class RoutingResultObject:
         output_payload = self.load_output_payload()
         profile_result = output_payload.get("profile_result")
         if isinstance(profile_result, dict) and profile_result:
-            return deepcopy(profile_result)
+            embedded_profile = profile_result.get("profile") if isinstance(profile_result.get("profile"), dict) else {}
+            profile_source_path = next(
+                (
+                    str(candidate).strip()
+                    for candidate in (
+                        profile_result.get("source_path"),
+                        profile_result.get("path"),
+                        ((profile_result.get("file") or {}).get("path") if isinstance(profile_result.get("file"), dict) else None),
+                    )
+                    if isinstance(candidate, str) and candidate.strip()
+                ),
+                None,
+            )
+            return REQUEST_OBJECT_RESOLUTION_SERVICE._augment_canonical_result_payload(
+                deepcopy(profile_result),
+                obj_name="profiles",
+                correlation_id=str(
+                    profile_result.get("correlation_id")
+                    or embedded_profile.get("profile_id")
+                    or embedded_profile.get("id")
+                    or ""
+                ).strip() or None,
+                source_path=profile_source_path,
+            )
 
         applicant_profile = output_payload.get("applicant_profile")
         if not isinstance(applicant_profile, dict) or not applicant_profile:
@@ -3904,7 +3931,39 @@ class RoutingResultObject:
         }
         if correlation_id:
             result["correlation_id"] = correlation_id
-        return result
+        inline_profile_source_path = next(
+            (
+                str(candidate).strip()
+                for candidate in (
+                    profile_payload.get("source_path") if isinstance(profile_payload, dict) else None,
+                    result.get("source_path"),
+                )
+                if isinstance(candidate, str) and candidate.strip()
+            ),
+            None,
+        )
+        return REQUEST_OBJECT_RESOLUTION_SERVICE._augment_canonical_result_payload(
+            result,
+            obj_name="profiles",
+            correlation_id=correlation_id or None,
+            source_path=inline_profile_source_path,
+        )
+
+    def load_cover_letter_job_posting_result(self) -> dict[str, Any]:
+        if not isinstance(self.parsed_result, dict) or not self.parsed_result:
+            return {}
+        correlation_id = str(
+            self.parsed_result.get("correlation_id")
+            or self.correlation_id
+            or ((self.parsed_result.get("file") or {}).get("content_sha256") if isinstance(self.parsed_result.get("file"), dict) else "")
+            or ""
+        ).strip()
+        return REQUEST_OBJECT_RESOLUTION_SERVICE._augment_canonical_result_payload(
+            deepcopy(self.parsed_result),
+            obj_name=str(self.parsed_result.get("object_name") or self.obj_name or "job_postings"),
+            correlation_id=correlation_id or None,
+            source_path=self.load_source_path(),
+        )
 
     def load_writer_job_name(self) -> str:
         return str(self.metadata.get("writer_job_name") or "cover_letter_writer").strip() or "cover_letter_writer"
@@ -3915,15 +3974,18 @@ class RoutingResultObject:
         if not self.succeeded or not self.load_processed() or not self.parsed_result:
             return None
 
+        job_posting_result = self.load_cover_letter_job_posting_result()
+        if not job_posting_result:
+            return None
         profile_result = self.load_cover_letter_profile_result()
         if not profile_result:
             return None
 
         writer_job_name = self.load_writer_job_name()
         correlation_id = str(
-            self.parsed_result.get("correlation_id")
+            job_posting_result.get("correlation_id")
             or self.correlation_id
-            or ((self.parsed_result.get("file") or {}).get("content_sha256") if isinstance(self.parsed_result.get("file"), dict) else "")
+            or ((job_posting_result.get("file") or {}).get("content_sha256") if isinstance(job_posting_result.get("file"), dict) else "")
             or ""
         ).strip()
         if not correlation_id:
@@ -3935,7 +3997,7 @@ class RoutingResultObject:
             "action": "generate_cover_letter",
             "job_name": writer_job_name,
             "correlation_id": correlation_id,
-            "job_posting_result": deepcopy(self.parsed_result),
+            "job_posting_result": deepcopy(job_posting_result),
             "profile_result": profile_result,
             "options": deepcopy(output_payload.get("options") or {}),
         }
@@ -3980,8 +4042,60 @@ class RoutingResultObject:
         return bool(self.request)
 
     def load_db_updates(self) -> dict[str, Any]:
-        db_updates = self.parsed_result.get("db_updates")
-        return db_updates if isinstance(db_updates, dict) else {}
+        parsed_result = self.parsed_result if isinstance(self.parsed_result, dict) else {}
+        file_payload = parsed_result.get("file") if isinstance(parsed_result.get("file"), dict) else {}
+        db_updates = parsed_result.get("db_updates") if isinstance(parsed_result.get("db_updates"), dict) else {}
+        effective_updates = dict(db_updates)
+
+        correlation_id = str(
+            parsed_result.get("correlation_id")
+            or self.correlation_id
+            or effective_updates.get("correlation_id")
+            or ""
+        ).strip()
+        content_sha256 = str(
+            parsed_result.get("content_sha256")
+            or file_payload.get("content_sha256")
+            or effective_updates.get("content_sha256")
+            or correlation_id
+            or ""
+        ).strip()
+        processing_state = str(
+            parsed_result.get("processing_state")
+            or parsed_result.get("status")
+            or effective_updates.get("processing_state")
+            or ("processed" if self.succeeded else "failed")
+        ).strip() or ("processed" if self.succeeded else "failed")
+        processed_value = parsed_result.get("processed")
+        if isinstance(processed_value, bool):
+            processed = processed_value
+        elif isinstance(effective_updates.get("processed"), bool):
+            processed = bool(effective_updates.get("processed"))
+        else:
+            processed = processing_state == "processed"
+        failed_reason = str(
+            parsed_result.get("failed_reason")
+            or parsed_result.get("last_error")
+            or effective_updates.get("failed_reason")
+            or ""
+        ).strip() or None
+
+        if correlation_id:
+            effective_updates["correlation_id"] = correlation_id
+        if content_sha256:
+            effective_updates["content_sha256"] = content_sha256
+        effective_updates["processing_state"] = processing_state
+        effective_updates["processed"] = processed
+        effective_updates["failed_reason"] = failed_reason
+
+        existing_record_id = str(
+            effective_updates.get("existing_record_id")
+            or parsed_result.get("id")
+            or ""
+        ).strip()
+        if existing_record_id:
+            effective_updates["existing_record_id"] = existing_record_id
+        return effective_updates
 
     def load_processing_state(self) -> str:
         db_updates = self.load_db_updates()
@@ -4001,18 +4115,121 @@ class RoutingResultObject:
             return str(self.result_text or "").strip() or "routed_agent_failed"
         return failed_reason
 
-    def load_dispatcher_updates(self) -> dict[str, Any]:
+    def load_canonical_record(self) -> dict[str, Any]:
+        processing_state = self.load_processing_state()
+        processed = self.load_processed()
+        failed_reason = self.load_failed_reason()
         db_updates = self.load_db_updates()
-        dispatcher_updates: dict[str, Any] = {}
+        if self.parsed_result:
+            partial_record: dict[str, Any] = dict(self.parsed_result)
+        else:
+            partial_record = {
+                "correlation_id": self.correlation_id,
+                "db_updates": {
+                    "correlation_id": self.correlation_id,
+                    "processing_state": processing_state,
+                    "processed": processed,
+                    "failed_reason": failed_reason,
+                },
+            }
+
+        output_payload = self.load_output_payload()
+        output_file_payload = output_payload.get("file") if isinstance(output_payload.get("file"), dict) else {}
+        if not isinstance(partial_record.get("file"), dict):
+            partial_record["file"] = {}
+        if isinstance(output_file_payload, dict) and output_file_payload:
+            file_payload = dict(partial_record.get("file") or {})
+            for key, value in output_file_payload.items():
+                file_payload.setdefault(str(key), deepcopy(value))
+            partial_record["file"] = file_payload
+
+        correlation_id = str(
+            partial_record.get("correlation_id")
+            or self.correlation_id
+            or db_updates.get("correlation_id")
+            or ((partial_record.get("file") or {}).get("content_sha256") if isinstance(partial_record.get("file"), dict) else "")
+            or "result"
+        ).strip() or "result"
+        source_agent = str(
+            partial_record.get("source")
+            or partial_record.get("source_agent")
+            or partial_record.get("agent")
+            or self.load_source_agent()
+            or self.target_agent_label
+            or self.source_agent_label
+            or ""
+        ).strip() or None
+        return DOCUMENT_REPOSITORY._normalize_operational_record(
+            record=partial_record,
+            correlation_id=correlation_id,
+            object_name=str(partial_record.get("object_name") or self.obj_name or "documents"),
+            source_agent=source_agent,
+            source_path=self.load_source_path(),
+            title=str(partial_record.get("title") or "").strip() or None,
+            content_sha256=str(
+                partial_record.get("content_sha256")
+                or db_updates.get("content_sha256")
+                or ((partial_record.get("file") or {}).get("content_sha256") if isinstance(partial_record.get("file"), dict) else "")
+                or correlation_id
+            ).strip() or correlation_id,
+            processing_state=processing_state,
+            processed=processed,
+            failed_reason=failed_reason,
+        )
+
+    def load_dispatcher_updates(self) -> dict[str, Any]:
+        normalized_record = self.load_canonical_record()
+        db_updates = self.load_db_updates()
+        dispatcher_updates: dict[str, Any] = {
+            "id": normalized_record.get("id"),
+            "correlation_id": normalized_record.get("correlation_id"),
+            "source": normalized_record.get("source"),
+            "source_agent": normalized_record.get("source_agent"),
+            "source_path": normalized_record.get("source_path"),
+            "path": normalized_record.get("path"),
+            "title": normalized_record.get("title"),
+            "record_kind": normalized_record.get("record_kind"),
+            "kind": normalized_record.get("kind"),
+            "object_name": normalized_record.get("object_name"),
+            "content_sha256": normalized_record.get("content_sha256"),
+            "status": normalized_record.get("status"),
+            "processing_state": normalized_record.get("processing_state"),
+            "processed": normalized_record.get("processed"),
+            "failed_reason": normalized_record.get("failed_reason"),
+        }
+        if isinstance(normalized_record.get("file"), dict) and normalized_record.get("file"):
+            dispatcher_updates["file"] = deepcopy(normalized_record.get("file") or {})
+        if isinstance(normalized_record.get("link"), dict) and normalized_record.get("link"):
+            dispatcher_updates["link"] = deepcopy(normalized_record.get("link") or {})
         if isinstance(db_updates.get("existing_record_id"), str) and db_updates.get("existing_record_id"):
             dispatcher_updates["id"] = db_updates.get("existing_record_id")
         return dispatcher_updates
+
+    def load_source_path(self) -> str | None:
+        parsed_result = self.parsed_result if isinstance(self.parsed_result, dict) else {}
+        file_payload = parsed_result.get("file") if isinstance(parsed_result.get("file"), dict) else {}
+        output_payload = self.load_output_payload()
+        output_file_payload = output_payload.get("file") if isinstance(output_payload.get("file"), dict) else {}
+        for candidate in (
+            parsed_result.get("source_path"),
+            parsed_result.get("path"),
+            file_payload.get("path"),
+            file_payload.get("source_uri"),
+            output_file_payload.get("path"),
+            output_file_payload.get("source_uri"),
+        ):
+            if isinstance(candidate, str) and candidate.strip():
+                return candidate.strip()
+        return None
 
     def load_upsert_payload(self) -> dict[str, Any]:
         processing_state = self.load_processing_state()
         processed = self.load_processed()
         failed_reason = self.load_failed_reason()
-        upsert_payload = self.parsed_result if self.parsed_result else {
+        if self.parsed_result:
+            upsert_payload = dict(self.parsed_result)
+        else:
+            upsert_payload = {
             "correlation_id": self.correlation_id,
             "db_updates": {
                 "correlation_id": self.correlation_id,
@@ -4021,6 +4238,30 @@ class RoutingResultObject:
                 "failed_reason": failed_reason,
             },
         }
+        normalized_record = self.load_canonical_record()
+
+        upsert_payload.update(
+            {
+                "id": normalized_record.get("id"),
+                "correlation_id": normalized_record.get("correlation_id"),
+                "source": normalized_record.get("source"),
+                "source_agent": normalized_record.get("source_agent"),
+                "source_path": normalized_record.get("source_path"),
+                "path": normalized_record.get("path"),
+                "title": normalized_record.get("title"),
+                "record_kind": normalized_record.get("record_kind"),
+                "kind": normalized_record.get("kind"),
+                "object_name": normalized_record.get("object_name"),
+                "content_sha256": normalized_record.get("content_sha256"),
+                "status": normalized_record.get("status"),
+                "processing_state": normalized_record.get("processing_state"),
+                "processed": normalized_record.get("processed"),
+                "failed_reason": normalized_record.get("failed_reason"),
+                "db_updates": DOCUMENT_REPOSITORY._build_legacy_db_updates(record=normalized_record),
+            }
+        )
+        if isinstance(normalized_record.get("file"), dict) and normalized_record.get("file"):
+            upsert_payload["file"] = deepcopy(normalized_record.get("file") or {})
         if failed_reason and not isinstance(upsert_payload.get("error"), str):
             upsert_payload["error"] = failed_reason
         return upsert_payload
@@ -4117,7 +4358,7 @@ class RoutingResultPostprocessService:
             )
 
         if result_object.object_name == "store_object_result":
-            result = store_object_result_tool(
+            result = DOCUMENT_OBJECT_SERVICE.store_result(
                 object_result=result_object.load_upsert_payload(),
                 correlation_id=result_object.correlation_id or None,
                 db_path=result_object.obj_db_path or None,
@@ -4138,7 +4379,7 @@ class RoutingResultPostprocessService:
         if not result_object.correlation_id or not result_object.dispatcher_db_path or not result_object.obj_db_path:
             return None
 
-        result = upsert_object_record_tool(
+        result = DOCUMENT_OBJECT_SERVICE.upsert_object_record(
             object_result=result_object.load_upsert_payload(),
             correlation_id=result_object.correlation_id,
             dispatcher_db_path=result_object.dispatcher_db_path,
@@ -5137,17 +5378,19 @@ def get_router_parallel_runtime_status() -> dict[str, Any]:
 
 
 class ToolCallFollowupService:
+    def _is_routing_status_result(self, tool_results: list[str]) -> bool:
+        if len(tool_results) != 1:
+            return False
+        text = str(tool_results[0] or '').strip().lower()
+        return text.startswith('routing to ')
+
     def ensure_object_followup_messages(
         self,
         *,
         followup_messages: list[dict[str, Any]],
         tool_results: list[str],
     ) -> list[dict[str, Any]]:
-        has_non_system_message = any(
-            isinstance(message, dict) and str(message.get('role') or '').strip().lower() != 'system'
-            for message in followup_messages
-        )
-        if has_non_system_message:
+        if self._is_routing_status_result(tool_results):
             return followup_messages
 
         raw_tool_results = "\n".join(
@@ -5157,6 +5400,18 @@ class ToolCallFollowupService:
         ).strip()
         if not raw_tool_results:
             return followup_messages
+
+        has_tool_message = any(
+            isinstance(message, dict) and str(message.get('role') or '').strip().lower() == 'tool'
+            for message in followup_messages
+        )
+        if has_tool_message:
+            return followup_messages
+
+        if followup_messages:
+            latest_content = str((followup_messages[-1] or {}).get('content') or '')
+            if raw_tool_results and raw_tool_results in latest_content:
+                return followup_messages
 
         return list(followup_messages) + [{"role": "user", "content": raw_tool_results}]
 
@@ -5228,6 +5483,15 @@ class ToolCallFollowupService:
             routing_request=routing_request,
             agent_label=agent_label,
         )
+        followup_tools = list(request.get('tools') or [])
+        selected_job_name = ROUTING_HANDOFF_VIEW_SERVICE.load_job_name(routing_request)
+        if (
+            selected_job_name == 'job_posting_parser'
+            and tool_results
+            and not self._is_routing_status_result(tool_results)
+        ):
+            followup_tools = []
+
         followup_messages = self.ensure_object_followup_messages(
             followup_messages=list(request.get('messages') or []),
             tool_results=tool_results,
@@ -5238,7 +5502,7 @@ class ToolCallFollowupService:
         c = ChatComE(
             _model=request.get('model') or model,
             _messages=followup_messages,
-            tools=request.get('tools') or [],
+            tools=followup_tools,
             tool_choice='auto'
         )
 
@@ -5381,6 +5645,7 @@ class AssistantResponseService:
             ChatCom=ChatCom,
             agent_label=response_agent_label,
             workflow_session=next_workflow_session,
+            routing_request=routing_request,
         )
         if rec is None or not str(rec).strip():
             return None
@@ -5555,7 +5820,8 @@ def _maybe_apply_routing_result_postprocess(
 def _handle_tool_calls(agent_msg, depth: int = 0,
                         ChatCom = None,
                        agent_label: str ="",
-                       workflow_session: dict[str, Any] | None = None) -> Any:
+                       workflow_session: dict[str, Any] | None = None,
+                       routing_request: dict[str, Any] | None = None) -> Any:
     """Execute tool calls and continue the conversation."""
     # Ensure we have a ChatHistory instance available (lazy import)
     history = get_history()
@@ -5576,13 +5842,15 @@ def _handle_tool_calls(agent_msg, depth: int = 0,
         workflow_session=workflow_session,
     )
     workflow_session = execution_result.get('workflow_session')
-    routing_request = execution_result.get('routing_request')
+    next_routing_request = execution_result.get('routing_request')
+    if next_routing_request is None:
+        next_routing_request = routing_request
     tool_results = list(execution_result.get('tool_results') or [])
     terminal_tool_result = execution_result.get('terminal_tool_result')
     terminal_tool_name = execution_result.get('terminal_tool_name')
     agent_label = agent_label or '_xplaner_xrouter'
 
-    if terminal_tool_result is not None:
+    if terminal_tool_result is not None and next_routing_request is None:
         WORKFLOW_HISTORY_LOG_SERVICE.log_assistant_response(
             history,
             text=str(terminal_tool_result),
@@ -5599,7 +5867,7 @@ def _handle_tool_calls(agent_msg, depth: int = 0,
 
     return TOOL_CALL_FOLLOWUP_SERVICE.execute_object_followup(
         history=history,
-        routing_request=routing_request,
+        routing_request=next_routing_request,
         tool_results=tool_results,
         depth=depth,
         ChatCom=ChatCom,

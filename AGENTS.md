@@ -34,13 +34,13 @@
 ```python
 class PromptService:
 	def load_object(self, object_name: str) -> str:
-		return get_system_prompt(object_name)
+		return get_system_prompt(prompt_name)
 
 
-def dispatch_object(object_name: str, prompt_service: PromptService) -> str:
-	return prompt_service.load_object(object_name)
+def dispatch_object(object_name: str, service: PromptService) -> str:
+	return service.load_object(object_name)
 ```
 
 - Domain: prompt handling
 - Object: `PromptService`
-- Function: `load_object(object_name)` and `dispatch_object(object_name, prompt_service)`
+- Function: `load_object(object_name)` and `dispatch_object(object_name, service)`

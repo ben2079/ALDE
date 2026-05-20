@@ -10,13 +10,15 @@ import base64
 import binascii
 import uuid
 import html
+import math
 import re
+import time
 import subprocess
 import shutil
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from threading import Thread
-from urllib.parse import urlparse
+from urllib.parse import quote, unquote, urlparse
 
 # Keep both repository roots on sys.path so local imports work in direct-script
 # mode and when the module is imported through the lowercase package alias.
@@ -41,7 +43,7 @@ os.environ.setdefault('QT_QPA_PLATFORM', 'xcb')
 import warnings
 warnings.filterwarnings('ignore', category=Warning)
 from pathlib import Path
-from typing import Any, Callable, Final, List, Optional
+from typing import Any, Callable, Final, List, Mapping, Optional, Sequence
 from io import BytesIO
 import mimetypes
 
@@ -204,13 +206,19 @@ except Exception:    # pragma: no cover – soft-fail, detailed handling below
     _FVImageWidget = _FVPdfWidget = _FVMarkdownWidget = _FVTextWidget = None  # type: ignore
     _FVChatImageWidget = None  # type: ignore
 
-from dotenv import load_dotenv
+try:
+    from dotenv import load_dotenv  # type: ignore
+except Exception:
+    def load_dotenv(*_args, **_kwargs):
+        return False
+
 from PySide6.QtCore import( Qt, QSize, Signal, Slot, QTimer, QEvent,
                             QSettings, QByteArray )            # >>>  NEU ai_ide_v1.7.5.py
 from PySide6 import QtCore
 
 from PySide6.QtGui import (
     QAction,
+    QBrush,
     QIcon,
     QCursor,
     QDragEnterEvent,
@@ -226,6 +234,7 @@ from PySide6.QtGui import (
     QPen,
     QPalette,
     QKeySequence,
+    QShowEvent,
 )
 
 from PySide6.QtWidgets import (
@@ -236,6 +245,8 @@ from PySide6.QtWidgets import (
     QDialogButtonBox,
     QFileDialog,
     QFormLayout,
+    QGraphicsScene,
+    QGraphicsView,
     QGridLayout,
     QInputDialog,
     QDockWidget,
@@ -253,6 +264,7 @@ from PySide6.QtWidgets import (
     QToolButton,
     QSplitter,
     QScrollArea,
+    QStackedWidget,
     QStatusBar,
     QTabWidget,
     QTextEdit,
@@ -303,6 +315,18 @@ except ImportError as e:
     msg = str(e)
     if "attempted relative import" in msg or "no known parent package" in msg:
         from jstree_widget import JsonTreeWidgetWithToolbar  # type: ignore
+    else:
+        raise
+
+try:
+    if __package__:
+        from .agents_db import AgentRelationGraphService  # type: ignore
+    else:
+        from agents_db import AgentRelationGraphService  # type: ignore
+except ImportError as e:
+    msg = str(e)
+    if "attempted relative import" in msg or "no known parent package" in msg:
+        from alde.agents_db import AgentRelationGraphService  # type: ignore  # noqa: E402
     else:
         raise
 
@@ -696,16 +720,19 @@ def _apply_style(widget, scheme, *, _qapp_apply=True):             # patched
     and apply it to *widget* and – optionally – QApplication.
     """
     import string
-    # Allow disabling stylesheet application for crash bisection
+
+    # Allow disabling stylesheet application for crash bisection.
     if os.getenv("AI_IDE_NO_STYLE", "0") == "1":
         try:
             widget.setStyleSheet("")
             if _qapp_apply and QApplication.instance():
                 QApplication.instance().setStyleSheet("")
-        finally:
-            return
-    template = _STYLE + _MENU_STYLE + _SEP_QSS + _TT_QSS           #  ← NEU
-    fmt      = string.Formatter()
+        except Exception:
+            pass
+        return
+
+    template = _STYLE + _MENU_STYLE + _SEP_QSS + _TT_QSS
+    fmt = string.Formatter()
 
     pieces: list[str] = []
     for txt, key, spec, conv in fmt.parse(template):
@@ -2045,6 +2072,7 @@ class AIWidget(QWidget):
     _PROMPT_COMPOSER_H_MARGIN = 12
     _PROMPT_COMPOSER_SPACING = 8
     _PROMPT_SEND_BUTTON_SIZE = 34
+    _PROMPT_PLACEHOLDER_TEXT = "Prompt"
     _async_result_ready = Signal(object)
 
     def __init__(self,
@@ -2115,7 +2143,7 @@ class AIWidget(QWidget):
 
         # 2)  Prompt-Editor  (Drag-&-Drop + Multiline)
         self.prompt_edit = FileDropTextEdit(               # neu: nur EIN Editor
-            placeholderText="Prompt …",
+            placeholderText=self._PROMPT_PLACEHOLDER_TEXT,
             objectName="aiInput"       )
         self.prompt_edit.setAttribute(Qt.WA_StyledBackground, True)
         self.prompt_edit.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
@@ -2365,6 +2393,36 @@ class AIWidget(QWidget):
                 status_bar.showMessage(str(message), int(timeout_ms))
         except Exception:
             pass
+
+    def _handle_local_prompt_command(self, prompt_text: str) -> bool:
+        command_text = str(prompt_text or "").strip()
+        if not command_text:
+            return False
+
+        command_name, _separator, _rest = command_text.partition(" ")
+        if command_name.casefold() != "/sync":
+            return False
+
+        window = self.window()
+        manual_sync_runner = getattr(window, "trigger_explorer_manual_sync", None) if window is not None else None
+        if not callable(manual_sync_runner):
+            self._append("System", "Explorer /sync unavailable: explorer tree is not ready.")
+            self._show_footer_status("Explorer /sync unavailable", 4000)
+            self.prompt_edit.clear()
+            return True
+
+        sync_ok = bool(manual_sync_runner(source_label="chat_sync_command"))
+        if sync_ok:
+            self._append("System", "Explorer /sync completed.")
+            self._show_footer_status("Explorer /sync completed", 2500)
+        else:
+            self._append("System", "Explorer /sync failed.")
+            self._show_footer_status("Explorer /sync failed", 4500)
+
+        self.prompt_edit.clear()
+        self._dropped_files = []
+        self._runtime_context_entries = []
+        return True
 
     def _run_background_task(self, *, kind: str, worker: Callable[[], dict[str, Any]]) -> None:
         def _invoke_worker() -> None:
@@ -2617,6 +2675,10 @@ class AIWidget(QWidget):
 
     @Slot()
     def _send(self) -> None:
+        prompt_text_raw = self.prompt_edit.toPlainText()
+        if self._handle_local_prompt_command(prompt_text_raw):
+            return
+
         if getattr(self, "_api_key_missing", False):
             try:
                 self._append("System", "Chat is disabled because OPENAI_API_KEY is not set.")
@@ -2624,7 +2686,7 @@ class AIWidget(QWidget):
                 pass
             return
         prompt_visible, image_paths = CHAT_ATTACHMENT_SERVICE.build_prompt_payload(
-            prompt_text=self.prompt_edit.toPlainText(),
+            prompt_text=prompt_text_raw,
             file_paths=self._dropped_files,
         )
         runtime_context_payload = self._build_runtime_user_input_context_payload()
@@ -4228,6 +4290,7 @@ from PySide6.QtCore import (
 
 class ControlPlaneWidget(QWidget):
     snapshotChanged = Signal(dict)
+    _operator_async_result_ready = Signal(object)
     _OPERATOR_FILTER_SETTINGS_PREFIX = "ControlPlane/OperatorFilters"
     _RUNTIME_LAYOUT_SETTINGS_PATH_KEY = "controlPlaneRuntimeLayoutPath"
     _RUNTIME_LAYOUT_DEFAULT_REL_PATH = "AppData/control_plane_runtime_tabs.json"
@@ -4243,6 +4306,7 @@ class ControlPlaneWidget(QWidget):
         self._metric_labels: dict[str, QLabel] = {}
         self._last_snapshot: dict[str, Any] = {}
         self._operator_log_entries: list[dict[str, Any] | str] = []
+        self._active_operator_tasks: set[str] = set()
         self._operator_filter_preferences = self._load_operator_filter_preferences()
         self._agent_rows_by_label: dict[str, dict[str, Any]] = {}
         self._runtime_tab_counter = 0
@@ -4255,6 +4319,7 @@ class ControlPlaneWidget(QWidget):
         self._runtime_state_save_timer.setSingleShot(True)
         self._runtime_state_save_timer.setInterval(900)
         self._runtime_state_save_timer.timeout.connect(self.persist_runtime_tabs_state)
+        self._operator_async_result_ready.connect(self._handle_operator_async_result)
         self._build_ui()
         self.update_scheme(accent, base)
 
@@ -4306,6 +4371,124 @@ class ControlPlaneWidget(QWidget):
         self._operator_filter_preferences = self._current_operator_filter_preferences()
         self._save_operator_filter_preferences()
         self._render_operator_log()
+
+    def _build_operator_log_entry(self, message: str) -> dict[str, Any]:
+        timestamp = datetime.now().astimezone().isoformat(timespec="seconds")
+        lowered_message = message.lower()
+        if any(token in lowered_message for token in ("failed", "error", "missing", "unreachable", "degraded", "locked")):
+            status = "fail"
+        elif any(token in lowered_message for token in ("completed", "passed", "refreshed", "ready", "healthy")):
+            status = "pass"
+        else:
+            status = "info"
+        title = message.split(":", 1)[0].strip() or "operator.action"
+        return {
+            "timestamp": timestamp,
+            "title": title,
+            "summary": message,
+            "source": "desktop_operator",
+            "status": status,
+        }
+
+    def _load_operator_snapshot_with_context(
+        self,
+        *,
+        previous_operations: dict[str, Any] | None = None,
+        recent_action_entries: list[Any] | None = None,
+    ) -> dict[str, Any]:
+        try:
+            if __package__:
+                from .control_plane_runtime import load_operator_status_snapshot  # type: ignore
+            else:
+                from alde.control_plane_runtime import load_operator_status_snapshot  # type: ignore
+        except ImportError as exc:
+            msg = str(exc)
+            if "attempted relative import" in msg or "no known parent package" in msg:
+                from control_plane_runtime import load_operator_status_snapshot  # type: ignore
+            else:
+                raise
+
+        previous_snapshot = dict(previous_operations or {})
+        return load_operator_status_snapshot(
+            mcp_probe=dict(previous_snapshot.get("mcp_probe") or {}),
+            recent_action_entries=list(recent_action_entries or []),
+        )
+
+    def _apply_operator_snapshot(self, snapshot: dict[str, Any], *, render_log: bool = True) -> None:
+        applied_snapshot = dict(snapshot or {})
+        self._last_snapshot["operations"] = applied_snapshot
+        self._populate_operator_filter_selectors(applied_snapshot)
+        self._render_operator_snapshot(applied_snapshot)
+        if render_log:
+            self._render_operator_log()
+
+    def _run_operator_background_task(self, *, kind: str, worker: Callable[[], dict[str, Any]]) -> None:
+        if kind in self._active_operator_tasks:
+            return
+
+        self._active_operator_tasks.add(kind)
+
+        def _invoke_worker() -> None:
+            try:
+                payload = dict(worker() or {})
+            except Exception as exc:
+                payload = {
+                    "kind": kind,
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+            payload.setdefault("kind", kind)
+            self._operator_async_result_ready.emit(payload)
+
+        Thread(target=_invoke_worker, daemon=True).start()
+
+    def _build_operator_failure_message(self, kind: str, error_text: str) -> str:
+        prefixes = {
+            "health_checks": "Health checks failed",
+            "queue_probe": "Queue probe failed",
+            "agentsdb_probe": "AgentsDB probe failed",
+            "dispatcher_probe": "Dispatcher probe failed",
+            "dispatcher_repair": "Dispatcher repair failed",
+            "mcp_probe": "MCP probe failed",
+            "export_snapshot": "Runtime export failed",
+        }
+        return f"{prefixes.get(kind, 'Operator action failed')}: {error_text}"
+
+    @Slot(object)
+    def _handle_operator_async_result(self, payload: object) -> None:
+        if not isinstance(payload, dict):
+            return
+
+        kind = str(payload.get("kind") or "").strip()
+        if kind:
+            self._active_operator_tasks.discard(kind)
+
+        error_text = str(payload.get("error") or "").strip()
+        snapshot = payload.get("snapshot") if isinstance(payload.get("snapshot"), dict) else None
+        message = str(payload.get("message") or "").strip()
+
+        if error_text:
+            failure_message = message or self._build_operator_failure_message(kind, error_text)
+            self._append_operator_log(failure_message, refresh_snapshot=False)
+            if kind == "export_snapshot":
+                QMessageBox.warning(self, "Control-Plane Snapshot", f"Export failed:\n{error_text}")
+            return
+
+        if kind == "export_snapshot":
+            if message:
+                self._append_operator_log(message, refresh_snapshot=False)
+            export_path = str(payload.get("path") or "").strip()
+            if export_path:
+                QMessageBox.information(self, "Control-Plane Snapshot", f"Control-plane snapshot exported to:\n{export_path}")
+            return
+
+        if message:
+            self._append_operator_log(
+                message,
+                operator_snapshot=snapshot,
+                refresh_snapshot=False,
+            )
+        elif snapshot is not None:
+            self._apply_operator_snapshot(snapshot)
 
     def _runtime_layout_root(self) -> Path:
         try:
@@ -4528,6 +4711,9 @@ class ControlPlaneWidget(QWidget):
         )
 
     def _collect_runtime_widget_text(self, panel: QWidget) -> str:
+        graph_widget = panel.findChild(ExtensionsWorkspaceWidget)
+        if isinstance(graph_widget, ExtensionsWorkspaceWidget):
+            return graph_widget.current_widget_uri()
         code_editor = panel.findChild(CodeViewer)
         if isinstance(code_editor, CodeViewer):
             return code_editor.toPlainText()
@@ -4541,6 +4727,8 @@ class ControlPlaneWidget(QWidget):
         title = str(panel.property("runtime_widget_title") or "runtime_widget")
         source_path = str(panel.property("runtime_source_path") or "").strip()
         content = self._collect_runtime_widget_text(panel)
+        if widget_kind.strip().lower() == "agent_relation_graph" and content:
+            source_path = content
 
         payload: dict[str, Any] = {
             "kind": widget_kind,
@@ -4973,6 +5161,69 @@ class ControlPlaneWidget(QWidget):
 
         drilldown_layout.addLayout(trace_filter_form)
 
+        self.tree_stream_panel = QFrame(monitor_tab)
+        self.tree_stream_panel.setObjectName("controlMetricCard")
+        self.tree_stream_panel.setMinimumSize(0, 0)
+        self.tree_stream_panel.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+
+        tree_stream_layout = QVBoxLayout(self.tree_stream_panel)
+        tree_stream_layout.setContentsMargins(12, 10, 12, 10)
+        tree_stream_layout.setSpacing(6)
+
+        tree_stream_title = QLabel("<b>Explorer Tree Stream</b>", self.tree_stream_panel)
+        tree_stream_title.setObjectName("controlMeta")
+        tree_stream_layout.addWidget(tree_stream_title)
+
+        tree_stream_form = QFormLayout()
+        tree_stream_form.setContentsMargins(0, 0, 0, 0)
+        tree_stream_form.setSpacing(6)
+        tree_stream_form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
+
+        tree_stream_transport_label = QLabel("Transport", self.tree_stream_panel)
+        tree_stream_transport_label.setObjectName("controlMeta")
+        self.tree_stream_transport_value = QLabel("n/a", self.tree_stream_panel)
+        self.tree_stream_transport_value.setObjectName("controlMetricLabel")
+        self.tree_stream_transport_value.setWordWrap(True)
+        tree_stream_form.addRow(tree_stream_transport_label, self.tree_stream_transport_value)
+
+        tree_stream_state_label = QLabel("State", self.tree_stream_panel)
+        tree_stream_state_label.setObjectName("controlMeta")
+        self.tree_stream_state_value = QLabel("n/a", self.tree_stream_panel)
+        self.tree_stream_state_value.setObjectName("controlMetricLabel")
+        self.tree_stream_state_value.setWordWrap(True)
+        tree_stream_form.addRow(tree_stream_state_label, self.tree_stream_state_value)
+
+        tree_stream_event_label = QLabel("Cursor", self.tree_stream_panel)
+        tree_stream_event_label.setObjectName("controlMeta")
+        self.tree_stream_event_value = QLabel("n/a", self.tree_stream_panel)
+        self.tree_stream_event_value.setObjectName("controlMetricLabel")
+        self.tree_stream_event_value.setWordWrap(True)
+        tree_stream_form.addRow(tree_stream_event_label, self.tree_stream_event_value)
+
+        tree_stream_retry_label = QLabel("Reconnect", self.tree_stream_panel)
+        tree_stream_retry_label.setObjectName("controlMeta")
+        self.tree_stream_retry_value = QLabel("n/a", self.tree_stream_panel)
+        self.tree_stream_retry_value.setObjectName("controlMetricLabel")
+        self.tree_stream_retry_value.setWordWrap(True)
+        tree_stream_form.addRow(tree_stream_retry_label, self.tree_stream_retry_value)
+
+        tree_stream_updated_label = QLabel("Updated", self.tree_stream_panel)
+        tree_stream_updated_label.setObjectName("controlMeta")
+        self.tree_stream_updated_value = QLabel("n/a", self.tree_stream_panel)
+        self.tree_stream_updated_value.setObjectName("controlMetricLabel")
+        self.tree_stream_updated_value.setWordWrap(True)
+        tree_stream_form.addRow(tree_stream_updated_label, self.tree_stream_updated_value)
+
+        tree_stream_error_label = QLabel("Last Error", self.tree_stream_panel)
+        tree_stream_error_label.setObjectName("controlMeta")
+        self.tree_stream_error_value = QLabel("none", self.tree_stream_panel)
+        self.tree_stream_error_value.setObjectName("controlMetricLabel")
+        self.tree_stream_error_value.setWordWrap(True)
+        tree_stream_form.addRow(tree_stream_error_label, self.tree_stream_error_value)
+
+        tree_stream_layout.addLayout(tree_stream_form)
+        drilldown_layout.addWidget(self.tree_stream_panel)
+
         detail_action_row = QHBoxLayout()
         detail_action_row.setContentsMargins(0, 0, 0, 0)
         detail_action_row.setSpacing(8)
@@ -5120,78 +5371,13 @@ class ControlPlaneWidget(QWidget):
         self.tabs.addTab(monitor_tab, "Monitoring")
         self.tabs.addTab(operations_tab, "Operations")
 
-        # Transitional migration workspace inside Agentic Control Plane.
-        # Legacy tabs stay available until audit goals are fully validated.
-        migration_panel = QFrame(hero)
-        migration_panel.setObjectName("controlMigrationPanel")
-        migration_layout = QVBoxLayout(migration_panel)
-        migration_layout.setContentsMargins(10, 10, 10, 10)
-        migration_layout.setSpacing(8)
-
-        migration_title = QLabel("Agentic Control Plane Workspace (Migration)", migration_panel)
-        migration_title.setObjectName("controlMigrationTitle")
-        migration_layout.addWidget(migration_title, 0)
-
-        migration_note = QLabel(
-            "Configuration, Monitor und Operations werden hier gespiegelt. Legacy-Tabs bleiben fuer Audit und Abgleich aktiv.",
-            migration_panel,
-        )
-        migration_note.setObjectName("controlMeta")
-        migration_note.setWordWrap(True)
-        migration_layout.addWidget(migration_note, 0)
-
-        def _create_migration_section(section_title: str, legacy_tab_index: int) -> tuple[QFrame, QTextBrowser]:
-            section_frame = QFrame(migration_panel)
-            section_frame.setObjectName("controlMetricCard")
-
-            section_layout = QVBoxLayout(section_frame)
-            section_layout.setContentsMargins(8, 8, 8, 8)
-            section_layout.setSpacing(6)
-
-            section_header = QHBoxLayout()
-            section_header.setContentsMargins(0, 0, 0, 0)
-            section_header.setSpacing(8)
-
-            section_label = QLabel(section_title, section_frame)
-            section_label.setObjectName("controlMeta")
-            section_header.addWidget(section_label, 1)
-
-            open_legacy_btn = QPushButton("Legacy Tab", section_frame)
-            open_legacy_btn.setObjectName("controlLegacyTabButton")
-            open_legacy_btn.setCursor(Qt.PointingHandCursor)
-            open_legacy_btn.clicked.connect(lambda _checked=False, idx=legacy_tab_index: self.tabs.setCurrentIndex(idx))
-            section_header.addWidget(open_legacy_btn, 0)
-
-            section_layout.addLayout(section_header)
-
-            section_view = QTextBrowser(section_frame)
-            section_view.setObjectName("controlBrowser")
-            section_view.setOpenExternalLinks(False)
-            section_view.setMinimumHeight(96)
-            section_view.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
-            section_layout.addWidget(section_view, 1)
-            return section_frame, section_view
-
-        config_preview_frame, self.control_plane_config_mirror_view = _create_migration_section("Configuration", 0)
-        monitor_preview_frame, self.control_plane_monitor_mirror_view = _create_migration_section("Monitor", 1)
-        operations_preview_frame, self.control_plane_operations_mirror_view = _create_migration_section("Operations", 2)
-
-        migration_sections = QHBoxLayout()
-        migration_sections.setContentsMargins(0, 0, 0, 0)
-        migration_sections.setSpacing(8)
-        migration_sections.addWidget(config_preview_frame, 1)
-        migration_sections.addWidget(monitor_preview_frame, 1)
-        migration_sections.addWidget(operations_preview_frame, 1)
-        migration_layout.addLayout(migration_sections, 1)
-        hero_layout.addWidget(migration_panel, 1)
-
         # Builder-tab symbol button removed per UX request.
         self._code_tab_new_button = None
         self._code_tab_index = -1
 
         self.primary_splitter.addWidget(self.tabs)
         self.primary_splitter.addWidget(hero)
-        self.primary_splitter.setSizes([500, 320])
+        self.primary_splitter.setSizes([640, 180])
         self.primary_splitter.setStretchFactor(0, 4)
         self.primary_splitter.setStretchFactor(1, 1)
         root.addWidget(self.primary_splitter, 1)
@@ -5200,7 +5386,6 @@ class ControlPlaneWidget(QWidget):
         self._restore_runtime_tabs_state()
         self._ensure_builder_runtime_tab(activate=False, persist=False)
         self._set_config_builder_visible(False)
-        self._sync_control_plane_migration_views()
 
     def _resolve_main_editor_window(self) -> QWidget | None:
         candidate = self.window()
@@ -5467,6 +5652,7 @@ class ControlPlaneWidget(QWidget):
     def _runtime_widget_menu_options(self) -> list[tuple[str, str]]:
         return [
             ("</Build>", "builder_panel"),
+            ("Agent Graph", "agent_relation_graph"),
             ("Python", "code_python"),
             ("JSON", "code_json"),
             ("YAML", "code_yaml"),
@@ -5693,7 +5879,18 @@ class ControlPlaneWidget(QWidget):
         panel.setProperty("runtime_widget_title", str(title))
         panel.setProperty("runtime_source_path", resolved_source_path)
 
-        if kind == "builder_panel":
+        if kind == "agent_relation_graph":
+            graph_source_uri = resolved_source_path or str(content or "").strip()
+            graph_widget = ExtensionsWorkspaceWidget(
+                self._accent,
+                self._base,
+                parent=panel,
+                source_uri=graph_source_uri or None,
+            )
+            graph_widget.setProperty("runtime_source_path", graph_source_uri)
+            graph_widget.widgetStateChanged.connect(self._schedule_runtime_state_save)
+            root.addWidget(graph_widget, 1)
+        elif kind == "builder_panel":
             builder_panel = self._create_agent_system_builder_config_panel(
                 initial_payload=self._build_agent_system_template("agent_system", "/create agents"),
                 build_handler=self._execute_agent_system_builder_payload,
@@ -5782,6 +5979,7 @@ class ControlPlaneWidget(QWidget):
         if not display_title:
             label_by_kind = {
                 "builder_panel": "agent_system_builder.json",
+                "agent_relation_graph": "agent_relation_graph",
                 "code_json": "runtime_config.json",
                 "code_yaml": "runtime_config.yaml",
                 "code_python": "runtime_config.py",
@@ -6284,11 +6482,11 @@ class ControlPlaneWidget(QWidget):
             if __package__:
                 from .agents_tools import build_agent_system_configs_tool  # type: ignore
             else:
-                from ALDE_Projekt.ALDE.alde.agents_tools import build_agent_system_configs_tool  # type: ignore
+                from alde.agents_tools import build_agent_system_configs_tool  # type: ignore
         except ImportError as exc:
             msg = str(exc)
             if "attempted relative import" in msg or "no known parent package" in msg:
-                from ALDE_Projekt.ALDE.alde.agents_tools import build_agent_system_configs_tool  # type: ignore
+                from alde.agents_tools import build_agent_system_configs_tool  # type: ignore
             else:
                 raise
 
@@ -6603,44 +6801,6 @@ class ControlPlaneWidget(QWidget):
             ]
         )
 
-    def _sync_control_plane_migration_views(self) -> None:
-        """Mirror key tab content into the in-control-plane migration workspace."""
-        if not isinstance(getattr(self, "control_plane_config_mirror_view", None), QTextBrowser):
-            return
-        if not isinstance(getattr(self, "control_plane_monitor_mirror_view", None), QTextBrowser):
-            return
-        if not isinstance(getattr(self, "control_plane_operations_mirror_view", None), QTextBrowser):
-            return
-
-        def _merge_text(*parts: str) -> str:
-            cleaned_parts = [str(part).strip() for part in parts if str(part).strip()]
-            return "\n\n".join(cleaned_parts)
-
-        config_snapshot = _merge_text(
-            self.config_summary_view.toPlainText(),
-            self.config_manifest_view.toPlainText(),
-        )
-        monitor_snapshot = _merge_text(
-            self.monitor_summary_view.toPlainText(),
-            self.monitor_detail_view.toPlainText(),
-            self.monitor_timeline_view.toPlainText(),
-            self.monitor_trace_view.toPlainText(),
-        )
-        operations_snapshot = _merge_text(
-            self.operator_summary_view.toPlainText(),
-            self.operator_log_view.toPlainText(),
-        )
-
-        self.control_plane_config_mirror_view.setPlainText(
-            config_snapshot or "Configuration snapshot pending."
-        )
-        self.control_plane_monitor_mirror_view.setPlainText(
-            monitor_snapshot or "Monitor snapshot pending."
-        )
-        self.control_plane_operations_mirror_view.setPlainText(
-            operations_snapshot or "Operations snapshot pending."
-        )
-
     def update_scheme(self, accent: dict[str, str], base: dict[str, str]) -> None:
         self._accent = accent
         self._base = base
@@ -6656,16 +6816,6 @@ class ControlPlaneWidget(QWidget):
             QFrame#controlBuilderContainer {{
                 background: {self.scheme['col7']};
                 border: none;
-            }}
-            QFrame#controlMigrationPanel {{
-                background: {self.scheme['col7']};
-                border: 1px solid {self.scheme['col10']};
-                border-radius: 12px;
-            }}
-            QLabel#controlMigrationTitle {{
-                color: {self.scheme['col6']};
-                font-size: 13px;
-                font-weight: 700;
             }}
             QTabWidget#controlPlaneTabs::pane {{
                 background: transparent;
@@ -6858,7 +7008,6 @@ class ControlPlaneWidget(QWidget):
                 "operations": operator_snapshot,
             }
             self._render_operator_log()
-            self._sync_control_plane_migration_views()
             self._last_refresh_label.setText(
                 f"Updated {datetime.now().strftime('%H:%M:%S')}"
             )
@@ -6894,7 +7043,6 @@ class ControlPlaneWidget(QWidget):
                 "operations": {"queue_backend": "n/a", "queue_healthy": False},
             }
             self._render_operator_log()
-            self._sync_control_plane_migration_views()
             self.snapshotChanged.emit(dict(self._last_snapshot))
 
     @Slot()
@@ -6920,7 +7068,7 @@ class ControlPlaneWidget(QWidget):
                     get_workflow_configs,
                 )
             else:
-                from ALDE_Projekt.ALDE.alde.agents_config import (  # type: ignore
+                from agents_config import (  # type: ignore
                     get_agent_manifests,
                     get_tool_configs,
                     get_tool_group_configs,
@@ -6929,7 +7077,7 @@ class ControlPlaneWidget(QWidget):
         except ImportError as exc:
             msg = str(exc)
             if "attempted relative import" in msg or "no known parent package" in msg:
-                from ALDE_Projekt.ALDE.alde.agents_config import (  # type: ignore
+                from alde.agents_config import (  # type: ignore
                     get_agent_manifests,
                     get_tool_configs,
                     get_tool_group_configs,
@@ -7021,7 +7169,44 @@ class ControlPlaneWidget(QWidget):
             else:
                 raise
 
-        return load_desktop_monitoring_snapshot(event_limit=40, trace_limit=80)
+        snapshot = load_desktop_monitoring_snapshot(event_limit=40, trace_limit=80)
+        if not isinstance(snapshot, dict):
+            snapshot = {}
+        snapshot["tree_stream_diagnostic"] = self._load_tree_stream_diagnostic()
+        return snapshot
+
+    def _load_tree_stream_diagnostic(self) -> dict[str, Any]:
+        diagnostic_payload: dict[str, Any] = {
+            "available": False,
+            "transport": "n/a",
+            "connection_state": "unavailable",
+            "reconnect_attempts": 0,
+            "backoff_seconds": 0.0,
+            "last_event_id": "",
+            "last_event_at": "",
+            "last_update_at": "",
+            "last_error": "",
+        }
+        try:
+            window = self.window()
+            explorer = getattr(window, "explorer", None) if window is not None else None
+            diagnostic_loader = getattr(explorer, "load_live_sync_diagnostic", None) if explorer is not None else None
+            if not callable(diagnostic_loader):
+                tree_widget = getattr(explorer, "tree", None) if explorer is not None else None
+                diagnostic_loader = getattr(tree_widget, "load_live_sync_diagnostic", None) if tree_widget is not None else None
+            if not callable(diagnostic_loader):
+                diagnostic_payload["last_error"] = "explorer tree diagnostic unavailable"
+                return diagnostic_payload
+            loaded_payload = diagnostic_loader()
+            if not isinstance(loaded_payload, dict):
+                diagnostic_payload["last_error"] = "explorer tree diagnostic unavailable"
+                return diagnostic_payload
+            diagnostic_payload.update(loaded_payload)
+            diagnostic_payload["available"] = True
+            return diagnostic_payload
+        except Exception as exc:
+            diagnostic_payload["last_error"] = f"{type(exc).__name__}: {exc}"
+            return diagnostic_payload
 
     def _load_agent_drilldown_snapshot(self, agent_label: str) -> dict[str, Any]:
         try:
@@ -7058,21 +7243,8 @@ class ControlPlaneWidget(QWidget):
         return detail
 
     def _load_operator_snapshot(self) -> dict[str, Any]:
-        try:
-            if __package__:
-                from .control_plane_runtime import load_operator_status_snapshot  # type: ignore
-            else:
-                from alde.control_plane_runtime import load_operator_status_snapshot  # type: ignore
-        except ImportError as exc:
-            msg = str(exc)
-            if "attempted relative import" in msg or "no known parent package" in msg:
-                from control_plane_runtime import load_operator_status_snapshot  # type: ignore
-            else:
-                raise
-
-        previous_operations = dict(self._last_snapshot.get("operations") or {})
-        return load_operator_status_snapshot(
-            mcp_probe=dict(previous_operations.get("mcp_probe") or {}),
+        return self._load_operator_snapshot_with_context(
+            previous_operations=dict(self._last_snapshot.get("operations") or {}),
             recent_action_entries=list(self._operator_log_entries),
         )
 
@@ -7131,6 +7303,7 @@ class ControlPlaneWidget(QWidget):
         latest_session = snapshot.get("latest_session") or {}
         latest_state = (latest_session.get("latest_workflow_state") or {}) if isinstance(latest_session, dict) else {}
         latest_handoff = (latest_session.get("latest_handoff") or {}) if isinstance(latest_session, dict) else {}
+        tree_stream_diagnostic = dict(snapshot.get("tree_stream_diagnostic") or {})
         filtered_trace_entries = self._filtered_trace_entries(snapshot)
         active_trace_filters = [
             selector.currentText().strip()
@@ -7147,6 +7320,7 @@ class ControlPlaneWidget(QWidget):
         alerts_html = "".join(
             f"<li>{html.escape(str(alert))}</li>" for alert in (snapshot.get("alerts") or [])
         )
+        self._render_tree_stream_diagnostic(tree_stream_diagnostic)
         self.monitor_summary_view.setHtml(
             "".join(
                 [
@@ -7154,6 +7328,7 @@ class ControlPlaneWidget(QWidget):
                     f"<p><b>Projected sessions:</b> {snapshot.get('session_count', 0)} | <b>events:</b> {snapshot.get('event_count', 0)}</p>",
                     f"<p><b>Detailed trace entries:</b> {snapshot.get('trace_count', 0)} total | <b>visible:</b> {len(filtered_trace_entries)} | <b>filters:</b> {html.escape(active_filter_text)}</p>",
                     f"<p><b>Control-plane health:</b> {html.escape('ready' if bool(snapshot.get('healthy')) else 'attention required')} | <b>Queue:</b> {html.escape(str(snapshot.get('queue_backend') or 'n/a'))} ({'ok' if bool(snapshot.get('queue_healthy')) else 'degraded'}) | <b>Active sessions:</b> {int(snapshot.get('active_session_count') or 0)} | <b>Validation issues:</b> {int(snapshot.get('validation_issue_count') or 0)}</p>",
+                    f"<p><b>Explorer tree stream:</b> {html.escape(str(tree_stream_diagnostic.get('transport') or 'n/a'))} | <b>state:</b> {html.escape(str(tree_stream_diagnostic.get('connection_state') or 'unavailable'))} | <b>cursor:</b> {html.escape(str(tree_stream_diagnostic.get('last_event_id') or 'n/a'))}</p>",
                     f"<p><b>Success:</b> {snapshot.get('success_count', 0)} | <b>Failures:</b> {snapshot.get('failure_count', 0)} | <b>Avg latency:</b> {snapshot.get('average_latency_ms', 0.0):.0f} ms</p>",
                     f"<p><b>Latest workflow state:</b> {html.escape(str(latest_state.get('summary') or 'n/a'))}</p>",
                     f"<p><b>Latest handoff:</b> {html.escape(str(latest_handoff.get('summary') or 'n/a'))}</p>",
@@ -7190,6 +7365,46 @@ class ControlPlaneWidget(QWidget):
             "<p>Normalized runtime trace across chat messages, tool calls, tool results, handoffs, and workflow payloads.</p>"
             + "".join(trace_rows or ["<p>No trace entries match the active filters.</p>"])
         )
+
+    def _render_tree_stream_diagnostic(self, diagnostic: dict[str, Any]) -> None:
+        transport = str(diagnostic.get("transport") or "n/a").strip() or "n/a"
+        state = str(diagnostic.get("connection_state") or "unavailable").strip() or "unavailable"
+        last_event_id = str(diagnostic.get("last_event_id") or "").strip()
+        last_update_at = str(diagnostic.get("last_update_at") or diagnostic.get("last_event_at") or "").strip()
+        last_error = str(diagnostic.get("last_error") or "").strip()
+        reconnect_attempts = int(diagnostic.get("reconnect_attempts") or 0)
+        backoff_seconds = float(diagnostic.get("backoff_seconds") or 0.0)
+        push_enabled = bool(diagnostic.get("push_enabled"))
+        push_supported = bool(diagnostic.get("push_supported"))
+
+        if state in {"connected", "polling"}:
+            state_chip = self._render_status_chip(state, SIGNAL_GREEN)
+        elif state in {"connecting", "reconnecting", "backoff"}:
+            state_chip = self._render_status_chip(state, SIGNAL_YELLOW)
+        elif state in {"disabled", "stopped"}:
+            state_chip = self._render_status_chip(state, self.scheme["col8"])
+        else:
+            state_chip = self._render_status_chip(state, SIGNAL_RED)
+
+        transport_note = transport
+        if transport == "poll" and push_enabled:
+            transport_note = f"{transport} (fallback)"
+        elif transport == "push" and not push_supported:
+            transport_note = f"{transport} (degraded)"
+        elif transport == "n/a" and push_enabled:
+            transport_note = "n/a (push requested)"
+
+        event_text = last_event_id or "n/a"
+        if len(event_text) > 24:
+            event_text = f"{event_text[:12]}...{event_text[-8:]}"
+        retry_text = f"{reconnect_attempts} / {backoff_seconds:.1f}s"
+
+        self.tree_stream_transport_value.setText(html.escape(transport_note))
+        self.tree_stream_state_value.setText(state_chip)
+        self.tree_stream_event_value.setText(html.escape(event_text))
+        self.tree_stream_retry_value.setText(html.escape(retry_text))
+        self.tree_stream_updated_value.setText(html.escape(last_update_at or "n/a"))
+        self.tree_stream_error_value.setText(html.escape(last_error or "none"))
 
     def _render_operator_snapshot(self, snapshot: dict[str, Any]) -> None:
         service_rows = [row for row in (snapshot.get("service_rows") or []) if isinstance(row, dict)]
@@ -7653,115 +7868,131 @@ class ControlPlaneWidget(QWidget):
         return f"<p><b>Health:</b> {self._render_status_chip('stable', SIGNAL_GREEN)} workflow transitions are present</p>"
 
     def _run_operator_health_checks(self) -> None:
-        try:
-            snapshot = self._load_operator_snapshot()
-            self._last_snapshot["operations"] = snapshot
-            self._render_operator_snapshot(snapshot)
-            self._append_operator_log("Health checks refreshed.")
-        except Exception as exc:
-            self._append_operator_log(f"Health checks failed: {type(exc).__name__}: {exc}")
+        previous_operations = dict(self._last_snapshot.get("operations") or {})
+        recent_action_entries = list(self._operator_log_entries)
+
+        def _worker() -> dict[str, Any]:
+            message = "Health checks refreshed."
+            projected_entries = list(recent_action_entries)
+            projected_entries.append(self._build_operator_log_entry(message))
+            snapshot = self._load_operator_snapshot_with_context(
+                previous_operations=previous_operations,
+                recent_action_entries=projected_entries[-12:],
+            )
+            return {
+                "message": message,
+                "snapshot": snapshot,
+            }
+
+        self._run_operator_background_task(kind="health_checks", worker=_worker)
 
     def _probe_queue_health(self) -> None:
-        try:
-            try:
-                if __package__:
-                    from .control_plane_runtime import get_queue_health  # type: ignore
-                else:
-                    from alde.control_plane_runtime import get_queue_health  # type: ignore
-            except ImportError as exc:
-                msg = str(exc)
-                if "attempted relative import" in msg or "no known parent package" in msg:
-                    from control_plane_runtime import get_queue_health  # type: ignore
-                else:
-                    raise
+        previous_operations = dict(self._last_snapshot.get("operations") or {})
+        recent_action_entries = list(self._operator_log_entries)
 
-            queue_backend, queue_healthy = get_queue_health()
-            self._append_operator_log(
-                f"Queue probe: backend={queue_backend} healthy={queue_healthy}"
+        def _worker() -> dict[str, Any]:
+            initial_snapshot = self._load_operator_snapshot_with_context(
+                previous_operations=previous_operations,
+                recent_action_entries=recent_action_entries,
             )
-            operations = self._load_operator_snapshot()
-            self._last_snapshot["operations"] = operations
-            self._render_operator_snapshot(operations)
-        except Exception as exc:
-            self._append_operator_log(f"Queue probe failed: {type(exc).__name__}: {exc}")
+            message = (
+                f"Queue probe: backend={str(initial_snapshot.get('queue_backend') or 'n/a')} "
+                f"healthy={bool(initial_snapshot.get('queue_healthy'))}"
+            )
+            projected_entries = list(recent_action_entries)
+            projected_entries.append(self._build_operator_log_entry(message))
+            final_snapshot = self._load_operator_snapshot_with_context(
+                previous_operations=previous_operations,
+                recent_action_entries=projected_entries[-12:],
+            )
+            return {
+                "message": message,
+                "snapshot": final_snapshot,
+             }
+
+        self._run_operator_background_task(kind="queue_probe", worker=_worker)
 
     def _probe_agentsdb_health(self) -> None:
-        try:
-            operations = self._load_operator_snapshot()
-            self._last_snapshot["operations"] = operations
-            self._render_operator_snapshot(operations)
-            agentsdb_healthy = operations.get("agentsdb_healthy")
+        previous_operations = dict(self._last_snapshot.get("operations") or {})
+        recent_action_entries = list(self._operator_log_entries)
+
+        def _worker() -> dict[str, Any]:
+            initial_snapshot = self._load_operator_snapshot_with_context(
+                previous_operations=previous_operations,
+                recent_action_entries=recent_action_entries,
+            )
+            agentsdb_healthy = initial_snapshot.get("agentsdb_healthy")
             if agentsdb_healthy is True:
-                self._append_operator_log(
-                    f"AgentsDB probe passed: {str(operations.get('agentsdb_detail') or operations.get('agentsdb_uri') or 'agentsdb')[:220]}"
+                message = (
+                    f"AgentsDB probe passed: "
+                    f"{str(initial_snapshot.get('agentsdb_detail') or initial_snapshot.get('agentsdb_uri') or 'agentsdb')[:220]}"
                 )
             elif agentsdb_healthy is False:
-                self._append_operator_log(
-                    f"AgentsDB probe failed: {str(operations.get('agentsdb_error') or 'unknown error')[:220]}"
-                )
+                message = f"AgentsDB probe failed: {str(initial_snapshot.get('agentsdb_error') or 'unknown error')[:220]}"
             else:
-                self._append_operator_log(
-                    f"AgentsDB probe not-run: {str(operations.get('agentsdb_detail') or 'no agentsdb backend configured')[:220]}"
+                message = (
+                    f"AgentsDB probe not-run: "
+                    f"{str(initial_snapshot.get('agentsdb_detail') or 'no agentsdb backend configured')[:220]}"
                 )
-        except Exception as exc:
-            self._append_operator_log(f"AgentsDB probe failed: {type(exc).__name__}: {exc}")
+            projected_entries = list(recent_action_entries)
+            projected_entries.append(self._build_operator_log_entry(message))
+            final_snapshot = self._load_operator_snapshot_with_context(
+                previous_operations=previous_operations,
+                recent_action_entries=projected_entries[-12:],
+            )
+            return {
+                "message": message,
+                "snapshot": final_snapshot,
+            }
+
+        self._run_operator_background_task(kind="agentsdb_probe", worker=_worker)
 
     def _probe_dispatcher_health(self) -> None:
-        try:
-            try:
-                if __package__:
-                    from .agents_tools import DOCUMENT_DISPATCH_SERVICE, _default_dispatcher_db_path  # type: ignore
-                else:
-                    from ALDE_Projekt.ALDE.alde.agents_tools import DOCUMENT_DISPATCH_SERVICE, _default_dispatcher_db_path  # type: ignore
-            except ImportError as exc:
-                msg = str(exc)
-                if "attempted relative import" in msg or "no known parent package" in msg:
-                    from ALDE_Projekt.ALDE.alde.agents_tools import DOCUMENT_DISPATCH_SERVICE, _default_dispatcher_db_path  # type: ignore
-                else:
-                    raise
+        previous_operations = dict(self._last_snapshot.get("operations") or {})
+        recent_action_entries = list(self._operator_log_entries)
 
-            dispatcher_db_path = _default_dispatcher_db_path()
-            dispatcher_error = DOCUMENT_DISPATCH_SERVICE.check_dispatcher_access(
-                resolved_db_path=dispatcher_db_path
+        def _worker() -> dict[str, Any]:
+            initial_snapshot = self._load_operator_snapshot_with_context(
+                previous_operations=previous_operations,
+                recent_action_entries=recent_action_entries,
             )
-            operations = dict(self._last_snapshot.get("operations") or {})
-            operations.update(
-                {
-                    "dispatcher_db_path": dispatcher_db_path,
-                    "dispatcher_healthy": dispatcher_error is None,
-                    "dispatcher_error": dispatcher_error,
-                }
-            )
-            self._last_snapshot["operations"] = operations
-            refreshed_operations = self._load_operator_snapshot()
-            self._last_snapshot["operations"] = refreshed_operations
-            self._render_operator_snapshot(refreshed_operations)
-            if dispatcher_error is None:
-                self._append_operator_log(f"Dispatcher probe passed: {dispatcher_db_path}")
+            if bool(initial_snapshot.get("dispatcher_healthy")):
+                message = f"Dispatcher probe passed: {str(initial_snapshot.get('dispatcher_db_path') or 'n/a')}"
             else:
-                self._append_operator_log(f"Dispatcher probe failed: {dispatcher_error}")
-        except Exception as exc:
-            self._append_operator_log(f"Dispatcher probe failed: {type(exc).__name__}: {exc}")
+                message = f"Dispatcher probe failed: {str(initial_snapshot.get('dispatcher_error') or 'unknown error')}"
+            projected_entries = list(recent_action_entries)
+            projected_entries.append(self._build_operator_log_entry(message))
+            final_snapshot = self._load_operator_snapshot_with_context(
+                previous_operations=previous_operations,
+                recent_action_entries=projected_entries[-12:],
+            )
+            return {
+                "message": message,
+                "snapshot": final_snapshot,
+            }
+
+        self._run_operator_background_task(kind="dispatcher_probe", worker=_worker)
 
     def _repair_dispatcher_store(self) -> None:
-        try:
+        previous_operations = dict(self._last_snapshot.get("operations") or {})
+        recent_action_entries = list(self._operator_log_entries)
+
+        def _worker() -> dict[str, Any]:
             result = self._repair_dispatcher_store_path()
-            operations = dict(self._last_snapshot.get("operations") or {})
-            operations.update(
-                {
-                    "dispatcher_db_path": result.get("dispatcher_db_path"),
-                    "dispatcher_healthy": bool(result.get("dispatcher_healthy")),
-                    "dispatcher_error": result.get("dispatcher_error"),
-                }
-            )
-            self._last_snapshot["operations"] = operations
-            refreshed_operations = self._load_operator_snapshot()
-            self._last_snapshot["operations"] = refreshed_operations
-            self._render_operator_snapshot(refreshed_operations)
             backup_text = f" backup={result.get('backup_path')}" if result.get("backup_path") else ""
-            self._append_operator_log(f"Dispatcher repair completed:{backup_text}")
-        except Exception as exc:
-            self._append_operator_log(f"Dispatcher repair failed: {type(exc).__name__}: {exc}")
+            message = f"Dispatcher repair completed:{backup_text}"
+            projected_entries = list(recent_action_entries)
+            projected_entries.append(self._build_operator_log_entry(message))
+            final_snapshot = self._load_operator_snapshot_with_context(
+                previous_operations=previous_operations,
+                recent_action_entries=projected_entries[-12:],
+            )
+            return {
+                "message": message,
+                "snapshot": final_snapshot,
+            }
+
+        self._run_operator_background_task(kind="dispatcher_repair", worker=_worker)
 
     def _repair_dispatcher_store_path(self, dispatcher_db_path: str | None = None) -> dict[str, Any]:
         try:
@@ -7802,27 +8033,33 @@ class ControlPlaneWidget(QWidget):
         }
 
     def _probe_mcp_health(self) -> None:
-        try:
+        previous_operations = dict(self._last_snapshot.get("operations") or {})
+        recent_action_entries = list(self._operator_log_entries)
+
+        def _worker() -> dict[str, Any]:
             probe = self._run_mcp_health_probe()
-            operations = dict(self._last_snapshot.get("operations") or {})
-            operations["mcp_probe"] = probe
-            self._last_snapshot["operations"] = operations
-            refreshed_operations = self._load_operator_snapshot()
-            self._last_snapshot["operations"] = refreshed_operations
-            self._render_operator_snapshot(refreshed_operations)
             if probe.get("ok"):
                 active_transport = str(probe.get("active_transport") or "").strip() or "unknown"
                 active_server = str(probe.get("active_server") or "").strip() or "unknown"
                 fallback_note = " (fallback)" if bool(probe.get("fallback_used")) else ""
-                self._append_operator_log(
-                    f"MCP probe passed via {active_transport} @ {active_server}{fallback_note}."
-                )
+                message = f"MCP probe passed via {active_transport} @ {active_server}{fallback_note}."
             else:
-                self._append_operator_log(
-                    f"MCP probe failed: {str(probe.get('stderr') or probe.get('stdout') or 'unknown error')[:180]}"
-                )
-        except Exception as exc:
-            self._append_operator_log(f"MCP probe failed: {type(exc).__name__}: {exc}")
+                message = f"MCP probe failed: {str(probe.get('stderr') or probe.get('stdout') or 'unknown error')[:180]}"
+
+            projected_operations = dict(previous_operations)
+            projected_operations["mcp_probe"] = probe
+            projected_entries = list(recent_action_entries)
+            projected_entries.append(self._build_operator_log_entry(message))
+            final_snapshot = self._load_operator_snapshot_with_context(
+                previous_operations=projected_operations,
+                recent_action_entries=projected_entries[-12:],
+            )
+            return {
+                "message": message,
+                "snapshot": final_snapshot,
+            }
+
+        self._run_operator_background_task(kind="mcp_probe", worker=_worker)
 
     def _run_mcp_health_probe(self) -> dict[str, Any]:
         probe_path = Path(__file__).with_name("mcp_health.py")
@@ -7881,7 +8118,12 @@ class ControlPlaneWidget(QWidget):
 
         return result
 
-    def _export_runtime_snapshot_report(self) -> None:
+    def _export_runtime_snapshot_report_path(
+        self,
+        *,
+        operations_snapshot: dict[str, Any],
+        recent_action_entries: list[Any],
+    ) -> str:
         try:
             if __package__:
                 from .control_plane_runtime import export_control_plane_snapshot  # type: ignore
@@ -7894,45 +8136,44 @@ class ControlPlaneWidget(QWidget):
             else:
                 raise
 
-        try:
-            operations_snapshot = dict(self._last_snapshot.get("operations") or {})
-            export_path = export_control_plane_snapshot(
-                event_limit=80,
-                trace_limit=400,
-                mcp_probe=operations_snapshot.get("mcp_probe") if isinstance(operations_snapshot.get("mcp_probe"), dict) else None,
-                recent_action_entries=list(self._operator_log_entries),
-            )
-            self._append_operator_log(f"Control-plane snapshot exported to {export_path}")
-            QMessageBox.information(self, "Control-Plane Snapshot", f"Control-plane snapshot exported to:\n{export_path}")
-        except Exception as exc:
-            self._append_operator_log(f"Runtime export failed: {type(exc).__name__}: {exc}")
-            QMessageBox.warning(self, "Control-Plane Snapshot", f"Export failed:\n{type(exc).__name__}: {exc}")
-
-    def _append_operator_log(self, message: str) -> None:
-        timestamp = datetime.now().astimezone().isoformat(timespec="seconds")
-        lowered_message = message.lower()
-        if any(token in lowered_message for token in ("failed", "error", "missing", "unreachable", "degraded", "locked")):
-            status = "fail"
-        elif any(token in lowered_message for token in ("completed", "passed", "refreshed", "ready", "healthy")):
-            status = "pass"
-        else:
-            status = "info"
-        title = message.split(":", 1)[0].strip() or "operator.action"
-        self._operator_log_entries.append(
-            {
-                "timestamp": timestamp,
-                "title": title,
-                "summary": message,
-                "source": "desktop_operator",
-                "status": status,
-            }
+        return export_control_plane_snapshot(
+            event_limit=80,
+            trace_limit=400,
+            mcp_probe=operations_snapshot.get("mcp_probe") if isinstance(operations_snapshot.get("mcp_probe"), dict) else None,
+            recent_action_entries=list(recent_action_entries),
         )
+
+    def _export_runtime_snapshot_report(self) -> None:
+        operations_snapshot = dict(self._last_snapshot.get("operations") or {})
+        recent_action_entries = list(self._operator_log_entries)
+
+        def _worker() -> dict[str, Any]:
+            export_path = self._export_runtime_snapshot_report_path(
+                operations_snapshot=operations_snapshot,
+                recent_action_entries=recent_action_entries,
+            )
+            return {
+                "message": f"Control-plane snapshot exported to {export_path}",
+                "path": export_path,
+            }
+
+        self._run_operator_background_task(kind="export_snapshot", worker=_worker)
+
+    def _append_operator_log(
+        self,
+        message: str,
+        *,
+        operator_snapshot: dict[str, Any] | None = None,
+        refresh_snapshot: bool = True,
+    ) -> None:
+        self._operator_log_entries.append(self._build_operator_log_entry(message))
         self._operator_log_entries = self._operator_log_entries[-12:]
         try:
-            operations_snapshot = self._load_operator_snapshot()
-            self._last_snapshot["operations"] = operations_snapshot
-            self._populate_operator_filter_selectors(operations_snapshot)
-            self._render_operator_snapshot(operations_snapshot)
+            if isinstance(operator_snapshot, dict):
+                self._apply_operator_snapshot(operator_snapshot, render_log=False)
+            elif refresh_snapshot:
+                operations_snapshot = self._load_operator_snapshot()
+                self._apply_operator_snapshot(operations_snapshot, render_log=False)
         except Exception:
             pass
         self._render_operator_log()
@@ -8180,6 +8421,911 @@ class EnvConfigDomainService:
         )
         section_objects.append(default_section_object)
         return default_section_object
+
+
+
+
+
+class ExtensionArtifactService:
+    def __init__(self, graph_service: AgentRelationGraphService | None = None) -> None:
+        self._graph_service = graph_service or AgentRelationGraphService()
+
+    def load_connection_preview(self, *, source_uri: str | None = None) -> dict[str, Any]:
+        preview_payload = dict(self._graph_service.load_connection_preview(source_uri=source_uri) or {})
+        tool_rows = [dict(item) for item in (preview_payload.get("tools") or []) if isinstance(item, dict)]
+
+        enriched_rows: list[dict[str, Any]] = []
+        for tool_row in tool_rows:
+            next_tool_row = dict(tool_row)
+            tool_id = str(next_tool_row.get("tool_id") or "").strip()
+            manifest_payload = self._graph_service.load_tool_runtime_manifest(tool_id=tool_id, source_uri=source_uri)
+            next_tool_row["runtime_manifest"] = dict(manifest_payload or {})
+            artifact_payload = manifest_payload.get("runtime_artifact")
+            if isinstance(artifact_payload, dict):
+                next_tool_row["runtime_artifact"] = dict(artifact_payload)
+            if not next_tool_row.get("runtime_classes"):
+                next_tool_row["runtime_classes"] = list(manifest_payload.get("runtime_classes") or [])
+            enriched_rows.append(next_tool_row)
+
+        preview_payload["tools"] = enriched_rows
+        return preview_payload
+
+    def load_object_widget(
+        self,
+        *,
+        object_name: str,
+        source_uri: str,
+        parent: QWidget | None = None,
+        scheme: Mapping[str, str] | None = None,
+    ) -> QWidget:
+        manifest_payload = self._graph_service.load_tool_runtime_manifest(tool_id=object_name, source_uri=source_uri)
+        try:
+            return self._load_widget_from_manifest(
+                object_name=object_name,
+                source_uri=source_uri,
+                manifest_payload=manifest_payload,
+                parent=parent,
+                scheme=scheme,
+            )
+        except Exception as exc:
+            return self._build_error_widget(
+                tool_id=object_name,
+                source_uri=source_uri,
+                manifest_payload=manifest_payload,
+                error=exc,
+                parent=parent,
+            )
+
+    def _load_widget_from_manifest(
+        self,
+        *,
+        object_name: str,
+        source_uri: str,
+        manifest_payload: Mapping[str, Any],
+        parent: QWidget | None = None,
+        scheme: Mapping[str, str] | None = None,
+    ) -> QWidget:
+        runtime_artifact = manifest_payload.get("runtime_artifact") if isinstance(manifest_payload.get("runtime_artifact"), dict) else {}
+        entry_module = str(runtime_artifact.get("entry_module") or "").strip()
+        entry_class = str(runtime_artifact.get("entry_class") or "").strip()
+        build_method = str(runtime_artifact.get("build_method") or "load_object_widget").strip() or "load_object_widget"
+
+        if not entry_module or not entry_class:
+            raise ValueError("runtime artifact is missing entry_module or entry_class")
+
+        artifact_module = importlib.import_module(entry_module)
+        entry_object = getattr(artifact_module, entry_class, None)
+        if entry_object is None:
+            raise ImportError(f"entry class '{entry_class}' not found in '{entry_module}'")
+
+        if isinstance(entry_object, type):
+            try:
+                artifact_instance = entry_object(graph_service=self._graph_service)
+            except TypeError:
+                artifact_instance = entry_object()
+        else:
+            artifact_instance = entry_object
+
+        build_callable = getattr(artifact_instance, build_method, None)
+        if callable(build_callable):
+            widget_payload = build_callable(
+                object_name=object_name,
+                source_uri=source_uri,
+                parent=parent,
+                scheme=scheme,
+            )
+            if isinstance(widget_payload, QWidget):
+                return widget_payload
+
+        if callable(artifact_instance):
+            widget_payload = artifact_instance(
+                object_name=object_name,
+                source_uri=source_uri,
+                parent=parent,
+                scheme=scheme,
+            )
+            if isinstance(widget_payload, QWidget):
+                return widget_payload
+
+        raise TypeError("artifact entry did not return a QWidget instance")
+
+    def _build_error_widget(
+        self,
+        *,
+        tool_id: str,
+        source_uri: str,
+        manifest_payload: Mapping[str, Any],
+        error: Exception,
+        parent: QWidget | None,
+    ) -> QWidget:
+        error_widget = QTextBrowser(parent)
+        error_widget.setOpenExternalLinks(False)
+        error_widget.setOpenLinks(False)
+
+        runtime_artifact = manifest_payload.get("runtime_artifact") if isinstance(manifest_payload.get("runtime_artifact"), dict) else {}
+        artifact_module = html.escape(str(runtime_artifact.get("entry_module") or "n/a"))
+        artifact_class = html.escape(str(runtime_artifact.get("entry_class") or "n/a"))
+        escaped_error = html.escape(f"{type(error).__name__}: {error}")
+        error_widget.setHtml(
+            "".join(
+                [
+                    "<h3>Native QWidget artifact load failed</h3>",
+                    f"<p><b>tool_id:</b> <code>{html.escape(str(tool_id or ''))}</code></p>",
+                    f"<p><b>source_uri:</b> <code>{html.escape(str(source_uri or ''))}</code></p>",
+                    f"<p><b>entry_module:</b> <code>{artifact_module}</code></p>",
+                    f"<p><b>entry_class:</b> <code>{artifact_class}</code></p>",
+                    f"<p><b>error:</b> {escaped_error}</p>",
+                ]
+            )
+        )
+        return error_widget
+
+
+class ExtensionsWorkspaceWidget(QWidget):
+    widgetStateChanged = Signal()
+    _LOCAL_WIDGET_STATE_REL_PATH = "AppData/runtime_extensions_workspace.json"
+
+    def __init__(
+        self,
+        accent: dict[str, str] | None = None,
+        base: dict[str, str] | None = None,
+        parent: QWidget | None = None,
+        source_uri: str | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self._accent = dict(accent or {})
+        self._base = dict(base or {})
+        self.scheme: dict[str, str] = _build_scheme(self._accent, self._base)
+        self._backend_service = ExtensionArtifactService()
+        self._session_counter = 0
+        self._session_state_by_tab: dict[QWidget, dict[str, Any]] = {}
+        self._preview_initialized = False
+        self._initial_source_uri = str(source_uri or "").strip()
+
+        self._build_ui()
+        restored_state = self._load_local_widget_state()
+        initial_source_uri = self._initial_source_uri or str(restored_state.get("uri") or "")
+        self._add_extension_tab(
+            source_uri=initial_source_uri,
+            tool_id=str(restored_state.get("selected_tool") or ""),
+            keep_local=bool(restored_state.get("keep_local")),
+            activate=True,
+        )
+        self.update_scheme(self._accent, self._base)
+
+    def _local_widget_state_path(self) -> Path:
+        try:
+            return Path(__file__).resolve().parents[2] / self._LOCAL_WIDGET_STATE_REL_PATH
+        except Exception:
+            return Path.cwd() / self._LOCAL_WIDGET_STATE_REL_PATH
+
+    def _load_local_widget_state(self) -> dict[str, Any]:
+        state_path = self._local_widget_state_path()
+        default_uri = "agentsdb://127.0.0.1:2331/tools:agentdb_relation_graph"
+        default_state = {
+            "uri": default_uri,
+            "selected_tool": "",
+            "keep_local": True,
+            "last_status": "",
+            "last_widget_summary": {},
+        }
+        if not state_path.exists():
+            return dict(default_state)
+        try:
+            payload = json.loads(state_path.read_text(encoding="utf-8"))
+            if not isinstance(payload, dict):
+                return dict(default_state)
+            return {
+                "uri": str(payload.get("uri") or default_uri),
+                "selected_tool": str(payload.get("selected_tool") or ""),
+                "keep_local": bool(payload.get("keep_local", True)),
+                "last_status": str(payload.get("last_status") or ""),
+                "last_widget_summary": dict(payload.get("last_widget_summary") or {}),
+            }
+        except Exception:
+            return dict(default_state)
+
+    def _loaded_widget_summary(self, session_state: Mapping[str, Any]) -> dict[str, Any]:
+        loaded_widget = session_state.get("loaded_widget")
+        summary_callable = getattr(loaded_widget, "snapshot_summary", None)
+        if callable(summary_callable):
+            try:
+                summary_payload = dict(summary_callable() or {})
+            except Exception:
+                summary_payload = {}
+        else:
+            summary_payload = {}
+        summary_payload.setdefault("tool_id", self._session_tool_id(session_state))
+        return summary_payload
+
+    def _persist_local_widget_state(self, session_state: Mapping[str, Any] | None = None) -> None:
+        state = dict(session_state or self._active_session_state() or {})
+        keep_local_checkbox = state.get("keep_local_checkbox")
+        if not isinstance(keep_local_checkbox, QCheckBox):
+            return
+        if not keep_local_checkbox.isChecked():
+            return
+
+        uri_input = state.get("uri_input")
+        tool_selector = state.get("tool_selector")
+        status_label = state.get("control_status_label")
+
+        selected_tool_id = ""
+        if isinstance(tool_selector, QComboBox):
+            selected_tool_id = str(tool_selector.currentData() or tool_selector.currentText() or selected_tool_id).strip() or selected_tool_id
+
+        payload = {
+            "uri": str(uri_input.text() if isinstance(uri_input, QLineEdit) else "").strip(),
+            "selected_tool": selected_tool_id,
+            "keep_local": True,
+            "last_status": str(status_label.text() if isinstance(status_label, QLabel) else "").strip(),
+            "last_widget_summary": self._loaded_widget_summary(state),
+        }
+
+        state_path = self._local_widget_state_path()
+        try:
+            state_path.parent.mkdir(parents=True, exist_ok=True)
+            state_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+        except Exception:
+            return
+
+    def showEvent(self, event: QShowEvent) -> None:
+        super().showEvent(event)
+        if self._preview_initialized:
+            return
+        active_state = self._active_session_state()
+        if active_state:
+            self._refresh_connection_preview(active_state)
+        self._preview_initialized = True
+
+    def current_widget_uri(self) -> str:
+        active_state = self._active_session_state()
+        if not active_state:
+            return ""
+        uri_input = active_state.get("uri_input")
+        if isinstance(uri_input, QLineEdit):
+            return str(uri_input.text()).strip()
+        return ""
+
+    def current_tool_id(self) -> str:
+        active_state = self._active_session_state()
+        if not active_state:
+            return "agentdb_relation_graph"
+        tool_selector = active_state.get("tool_selector")
+        if isinstance(tool_selector, QComboBox):
+            return str(tool_selector.currentData() or tool_selector.currentText() or "agentdb_relation_graph").strip() or "agentdb_relation_graph"
+        return "agentdb_relation_graph"
+
+    def refresh_graph(self) -> None:
+        active_state = self._active_session_state()
+        if not active_state:
+            return
+        self._load_extension_into_session(active_state, fit_view=True)
+
+    def _build_ui(self) -> None:
+        root_layout = QVBoxLayout(self)
+        root_layout.setContentsMargins(0, 0, 0, 0)
+        root_layout.setSpacing(0)
+
+        self.extensions_tabs = QTabWidget(self)
+        self.extensions_tabs.setObjectName("extensionsTabs")
+        self.extensions_tabs.setDocumentMode(True)
+        self.extensions_tabs.setMovable(True)
+        self.extensions_tabs.setTabsClosable(True)
+        self.extensions_tabs.tabCloseRequested.connect(self._close_extension_tab)
+        self.extensions_tabs.currentChanged.connect(self._handle_active_tab_changed)
+
+        self.add_tab_button = None
+
+        root_layout.addWidget(self.extensions_tabs, 1)
+
+    def open_new_connection_tab(self, *, activate: bool = True) -> None:
+        self._add_extension_tab(activate=activate)
+
+    def _close_extension_tab_for_widget(self, tab_widget: QWidget) -> None:
+        tab_index = self.extensions_tabs.indexOf(tab_widget)
+        if tab_index >= 0:
+            self._close_extension_tab(tab_index)
+
+    def _set_tab_close_button(self, tab_widget: QWidget) -> None:
+        tab_index = self.extensions_tabs.indexOf(tab_widget)
+        if tab_index < 0:
+            return
+
+        tab_bar = self.extensions_tabs.tabBar()
+        existing_button = tab_bar.tabButton(tab_index, QTabBar.RightSide)
+        if isinstance(existing_button, QToolButton) and bool(existing_button.property("extensions_close_button")):
+            return
+
+        close_button = QToolButton(tab_bar)
+        close_button.setObjectName("extensionsTabCloseButton")
+        close_button.setProperty("extensions_close_button", True)
+        close_button.setText("x")
+        close_button.setToolTip("Extension-Verbindung schließen")
+        close_button.setToolButtonStyle(Qt.ToolButtonTextOnly)
+        close_button.setCursor(Qt.PointingHandCursor)
+        close_button.setAutoRaise(True)
+        close_button.setFixedSize(16, 16)
+        close_button.clicked.connect(lambda _checked=False, target=tab_widget: self._close_extension_tab_for_widget(target))
+        tab_bar.setTabButton(tab_index, QTabBar.RightSide, close_button)
+
+    def _sync_tab_close_buttons(self) -> None:
+        for tab_index in range(self.extensions_tabs.count()):
+            tab_widget = self.extensions_tabs.widget(tab_index)
+            if isinstance(tab_widget, QWidget):
+                self._set_tab_close_button(tab_widget)
+
+    def _add_extension_tab(
+        self,
+        *,
+        source_uri: str = "",
+        tool_id: str = "",
+        keep_local: bool = True,
+        activate: bool = True,
+    ) -> None:
+        self._session_counter += 1
+        session_id = self._session_counter
+
+        tab_widget = QWidget(self.extensions_tabs)
+        tab_layout = QVBoxLayout(tab_widget)
+        tab_layout.setContentsMargins(0, 0, 0, 0)
+        tab_layout.setSpacing(0)
+
+        session_stack = QStackedWidget(tab_widget)
+        tab_layout.addWidget(session_stack, 1)
+
+        session_state: dict[str, Any] = {
+            "session_id": session_id,
+            "tab_widget": tab_widget,
+            "stack": session_stack,
+            "loaded": False,
+            "loaded_widget": None,
+        }
+
+        control_page = self._build_session_control_page(
+            session_state,
+            source_uri=str(source_uri or "").strip(),
+            tool_id=str(tool_id or "agent_relation_graph").strip() or "agent_relation_graph",
+            keep_local=bool(keep_local),
+        )
+        host_page = self._build_session_host_page(session_state)
+
+        session_state["control_page"] = control_page
+        session_state["host_page"] = host_page
+
+        session_stack.addWidget(control_page)
+        session_stack.addWidget(host_page)
+        session_stack.setCurrentWidget(control_page)
+
+        self._session_state_by_tab[tab_widget] = session_state
+        tab_index = self.extensions_tabs.addTab(tab_widget, f"Connection {session_id}")
+        self._set_tab_close_button(tab_widget)
+
+        self._refresh_connection_preview(session_state)
+        if activate:
+            self.extensions_tabs.setCurrentIndex(tab_index)
+
+    def _close_extension_tab(self, tab_index: int) -> None:
+        tab_widget = self.extensions_tabs.widget(tab_index)
+        if tab_widget is None:
+            return
+
+        if self.extensions_tabs.count() <= 1:
+            session_state = self._session_state_by_tab.get(tab_widget)
+            if not isinstance(session_state, dict):
+                return
+            stack_widget = session_state.get("stack")
+            control_page = session_state.get("control_page")
+            if isinstance(stack_widget, QStackedWidget) and isinstance(control_page, QWidget):
+                stack_widget.setCurrentWidget(control_page)
+            self._set_session_content_widget(session_state, None)
+            session_state["loaded"] = False
+            session_state["loaded_widget"] = None
+            self._refresh_connection_preview(session_state)
+            self._set_tab_close_button(tab_widget)
+            return
+
+        session_state = self._session_state_by_tab.pop(tab_widget, None)
+        if isinstance(session_state, dict):
+            self._set_session_content_widget(session_state, None)
+            session_state.clear()
+        self.extensions_tabs.removeTab(tab_index)
+        self._sync_tab_close_buttons()
+        tab_widget.deleteLater()
+        self.widgetStateChanged.emit()
+
+    def _active_session_state(self) -> dict[str, Any] | None:
+        current_widget = self.extensions_tabs.currentWidget()
+        if current_widget is None:
+            return None
+        session_state = self._session_state_by_tab.get(current_widget)
+        if isinstance(session_state, dict):
+            return session_state
+        return None
+
+    def _handle_active_tab_changed(self, _tab_index: int) -> None:
+        self.setProperty("runtime_source_path", self.current_widget_uri())
+        self.widgetStateChanged.emit()
+
+    def _build_session_control_page(
+        self,
+        session_state: dict[str, Any],
+        *,
+        source_uri: str,
+        tool_id: str,
+        keep_local: bool,
+    ) -> QWidget:
+        control_page = QWidget(self)
+        control_page.setObjectName("extensionsSessionControlPage")
+        control_layout = QVBoxLayout(control_page)
+        control_layout.setContentsMargins(14, 14, 14, 14)
+        control_layout.setSpacing(10)
+
+        title_label = QLabel("Connection / Control Plane", control_page)
+        title_label.setObjectName("extensionsControlTitle")
+        control_layout.addWidget(title_label)
+
+        description_label = QLabel(
+            "Load tools from established connections. Loaded widgets are provided by backend services.",
+            control_page,
+        )
+        description_label.setWordWrap(True)
+        description_label.setObjectName("extensionsControlDescription")
+        control_layout.addWidget(description_label)
+
+        form_layout = QFormLayout()
+        form_layout.setLabelAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        form_layout.setFormAlignment(Qt.AlignLeft | Qt.AlignTop)
+        form_layout.setHorizontalSpacing(10)
+        form_layout.setVerticalSpacing(8)
+
+        uri_input = QLineEdit(control_page)
+        uri_input.setObjectName("extensionsGraphUriInput")
+        uri_input.setPlaceholderText("agentsdb://127.0.0.1:2331/tools:agent_relation_graph")
+        uri_input.setText(str(source_uri or "agentsdb://127.0.0.1:2331/tools:agent_relation_graph"))
+        form_layout.addRow("Source URI:", uri_input)
+
+        tool_selector = QComboBox(control_page)
+        tool_selector.setObjectName("extensionsGraphToolSelector")
+        session_state["requested_tool_id"] = str(tool_id or "").strip()
+        form_layout.addRow("Tool / Extension:", tool_selector)
+
+        keep_local_checkbox = QCheckBox("Remember source and tool for this workspace", control_page)
+        keep_local_checkbox.setObjectName("extensionsKeepLocalCheckBox")
+        keep_local_checkbox.setChecked(bool(keep_local))
+        form_layout.addRow("", keep_local_checkbox)
+
+        control_layout.addLayout(form_layout)
+
+        control_status_label = QLabel("", control_page)
+        control_status_label.setObjectName("extensionsGraphStatusLabel")
+        control_status_label.setWordWrap(True)
+        control_layout.addWidget(control_status_label)
+
+        preview_browser = QTextBrowser(control_page)
+        preview_browser.setObjectName("extensionsConnectionsPreviewBrowser")
+        preview_browser.setOpenExternalLinks(False)
+        preview_browser.setOpenLinks(False)
+        control_layout.addWidget(preview_browser, 1)
+
+        actions_layout = QHBoxLayout()
+        actions_layout.setContentsMargins(0, 0, 0, 0)
+        actions_layout.setSpacing(8)
+        actions_layout.addStretch(1)
+
+        preview_button = QToolButton(control_page)
+        preview_button.setObjectName("extensionsGraphControlButton")
+        preview_button.setIcon(_icon("reload_.svg"))
+        preview_button.setText("")
+        preview_button.setToolButtonStyle(Qt.ToolButtonIconOnly)
+        preview_button.setToolTip("Vorschau aktualisieren")
+        preview_button.setAutoRaise(True)
+        preview_button.setFixedSize(30, 30)
+        preview_button.setCursor(Qt.PointingHandCursor)
+        actions_layout.addWidget(preview_button)
+
+        load_button = QToolButton(control_page)
+        load_button.setObjectName("extensionsGraphControlButton")
+        load_button.setIcon(_icon("load_content.svg"))
+        load_button.setText("")
+        load_button.setToolButtonStyle(Qt.ToolButtonIconOnly)
+        load_button.setToolTip("Widget laden")
+        load_button.setAutoRaise(True)
+        load_button.setFixedSize(30, 30)
+        load_button.setCursor(Qt.PointingHandCursor)
+        actions_layout.addWidget(load_button)
+        control_layout.addLayout(actions_layout)
+
+        session_state["uri_input"] = uri_input
+        session_state["tool_selector"] = tool_selector
+        session_state["keep_local_checkbox"] = keep_local_checkbox
+        session_state["control_status_label"] = control_status_label
+        session_state["preview_browser"] = preview_browser
+
+        uri_input.textChanged.connect(lambda _text: self._handle_session_control_change(session_state, refresh_preview=False))
+        tool_selector.currentIndexChanged.connect(lambda _index: self._handle_session_control_change(session_state, refresh_preview=False))
+        keep_local_checkbox.stateChanged.connect(lambda _state: self._handle_session_control_change(session_state, refresh_preview=False))
+        preview_button.clicked.connect(lambda: self._refresh_connection_preview(session_state))
+        load_button.clicked.connect(lambda: self._load_extension_into_session(session_state, fit_view=True))
+
+        return control_page
+
+    def _build_session_host_page(self, session_state: dict[str, Any]) -> QWidget:
+        host_page = QWidget(self)
+        host_page.setObjectName("extensionsSessionHostPage")
+        host_layout = QVBoxLayout(host_page)
+        host_layout.setContentsMargins(0, 0, 0, 0)
+        host_layout.setSpacing(0)
+
+        host_container = QWidget(host_page)
+        host_container_layout = QVBoxLayout(host_container)
+        host_container_layout.setContentsMargins(0, 0, 0, 0)
+        host_container_layout.setSpacing(0)
+
+        host_placeholder = QLabel("Load an extension widget from the control plane.", host_container)
+        host_placeholder.setObjectName("extensionsHostPlaceholder")
+        host_placeholder.setAlignment(Qt.AlignCenter)
+        host_placeholder.setWordWrap(True)
+        host_container_layout.addWidget(host_placeholder, 1)
+
+        host_layout.addWidget(host_container, 1)
+
+        session_state["host_container"] = host_container
+        session_state["host_container_layout"] = host_container_layout
+        session_state["host_placeholder"] = host_placeholder
+
+        return host_page
+
+    def _set_session_content_widget(self, session_state: Mapping[str, Any], widget: QWidget | None) -> None:
+        host_layout = session_state.get("host_container_layout")
+        if not isinstance(host_layout, QVBoxLayout):
+            return
+
+        while host_layout.count() > 0:
+            child_item = host_layout.takeAt(0)
+            child_widget = child_item.widget()
+            if isinstance(child_widget, QWidget):
+                child_widget.setParent(None)
+                child_widget.deleteLater()
+
+        if isinstance(widget, QWidget):
+            host_layout.addWidget(widget, 1)
+
+    def _session_source_uri(self, session_state: Mapping[str, Any]) -> str:
+        uri_input = session_state.get("uri_input")
+        if isinstance(uri_input, QLineEdit):
+            return str(uri_input.text() or "").strip()
+        return ""
+
+    def _session_tool_id(self, session_state: Mapping[str, Any]) -> str:
+        tool_selector = session_state.get("tool_selector")
+        if isinstance(tool_selector, QComboBox):
+            return str(tool_selector.currentData() or tool_selector.currentText() or "").strip()
+        return ""
+
+    def _session_tool_label(self, session_state: Mapping[str, Any]) -> str:
+        tool_selector = session_state.get("tool_selector")
+        if isinstance(tool_selector, QComboBox):
+            return str(tool_selector.currentText() or self._session_tool_id(session_state) or "Extension")
+        return str(self._session_tool_id(session_state) or "Extension")
+
+    def _set_session_tab_title(self, session_state: Mapping[str, Any], *, loaded: bool) -> None:
+        tab_widget = session_state.get("tab_widget")
+        if not isinstance(tab_widget, QWidget):
+            return
+        tab_index = self.extensions_tabs.indexOf(tab_widget)
+        if tab_index < 0:
+            return
+        session_id = int(session_state.get("session_id") or 0)
+        if loaded:
+            tool_label = self._session_tool_label(session_state)
+            self.extensions_tabs.setTabText(tab_index, f"{tool_label} #{session_id}")
+        else:
+            self.extensions_tabs.setTabText(tab_index, f"Connection {session_id}")
+        self._set_tab_close_button(tab_widget)
+
+    def _refresh_connection_preview(self, session_state: dict[str, Any]) -> None:
+        source_uri = self._session_source_uri(session_state)
+        preview_payload = self._backend_service.load_connection_preview(source_uri=source_uri)
+
+        tool_selector = session_state.get("tool_selector")
+        selected_tool_id = self._session_tool_id(session_state)
+        requested_tool_id = str(session_state.get("requested_tool_id") or "").strip()
+        tool_rows = [dict(item) for item in (preview_payload.get("tools") or []) if isinstance(item, dict)]
+        if isinstance(tool_selector, QComboBox) and tool_rows:
+            blocker = QtCore.QSignalBlocker(tool_selector)
+            tool_selector.clear()
+            for tool_row in tool_rows:
+                tool_id = str(tool_row.get("tool_id") or "").strip()
+                tool_label = str(tool_row.get("label") or tool_id or "Extension").strip()
+                if tool_id:
+                    tool_selector.addItem(tool_label, tool_id)
+            preferred_tool_id = requested_tool_id or selected_tool_id
+            preferred_tool_index = tool_selector.findData(preferred_tool_id) if preferred_tool_id else -1
+            if preferred_tool_index >= 0:
+                tool_selector.setCurrentIndex(preferred_tool_index)
+            elif tool_selector.count() > 0:
+                tool_selector.setCurrentIndex(0)
+        session_state["requested_tool_id"] = ""
+
+        connection_items = []
+        for connection_row in (preview_payload.get("connections") or []):
+            if not isinstance(connection_row, dict):
+                continue
+            row_label = html.escape(str(connection_row.get("label") or "Connection"))
+            row_uri = html.escape(str(connection_row.get("uri") or ""))
+            row_status = html.escape(str(connection_row.get("status") or "configured"))
+            connection_items.append(f"<li><b>{row_label}</b>: <code>{row_uri}</code> <i>({row_status})</i></li>")
+
+        tool_items = []
+        selected_tool_id = self._session_tool_id(session_state)
+        for tool_row in tool_rows:
+            tool_id = str(tool_row.get("tool_id") or "").strip()
+            tool_label = html.escape(str(tool_row.get("label") or tool_id or "Extension"))
+            transport = html.escape(str(tool_row.get("transport") or ""))
+            class_rows = [
+                html.escape(str(class_name or "").strip())
+                for class_name in (tool_row.get("runtime_classes") or [])
+                if str(class_name or "").strip()
+            ]
+            class_info = (
+                f"<br><small>classes: <code>{', '.join(class_rows)}</code></small>"
+                if class_rows
+                else ""
+            )
+            selected_marker = " <b>[selected]</b>" if tool_id == selected_tool_id else ""
+            if tool_id:
+                tool_items.append(
+                    f"<li><b>{tool_label}</b> <code>{html.escape(tool_id)}</code> <i>{transport}</i>{selected_marker}{class_info}</li>"
+                )
+
+        preview_html = "".join(
+            [
+                "<h3>Established Connections</h3>",
+                f"<ul>{''.join(connection_items) or '<li>No configured connections detected.</li>'}</ul>",
+                "<h3>Available Widgets</h3>",
+                f"<ul>{''.join(tool_items) or '<li>No widgets advertised.</li>'}</ul>",
+                "<p>Load attaches the backend-provided widget into this tab.</p>",
+            ]
+        )
+
+        preview_browser = session_state.get("preview_browser")
+        if isinstance(preview_browser, QTextBrowser):
+            preview_browser.setHtml(preview_html)
+
+        status_text = str(preview_payload.get("status_text") or "Connection control plane ready")
+        control_status_label = session_state.get("control_status_label")
+        if isinstance(control_status_label, QLabel):
+            control_status_label.setText(status_text)
+
+        self._set_session_tab_title(session_state, loaded=bool(session_state.get("loaded")))
+        self._persist_local_widget_state(session_state)
+
+    def _load_extension_into_session(self, session_state: dict[str, Any], *, fit_view: bool) -> None:
+        source_uri = self._session_source_uri(session_state)
+        tool_id = self._session_tool_id(session_state)
+
+        if not tool_id:
+            control_status_label = session_state.get("control_status_label")
+            if isinstance(control_status_label, QLabel):
+                control_status_label.setText("No backend widget advertised for this connection.")
+            return
+
+        tab_widget = session_state.get("tab_widget")
+        if isinstance(tab_widget, QWidget):
+            tab_widget.setProperty("runtime_source_path", source_uri)
+        self.setProperty("runtime_source_path", source_uri)
+
+        try:
+            backend_widget = self._backend_service.load_object_widget(
+                object_name=tool_id,
+                source_uri=source_uri,
+                parent=session_state.get("host_container") if isinstance(session_state.get("host_container"), QWidget) else self,
+                scheme=self.scheme,
+            )
+        except Exception as exc:
+            backend_widget = QTextBrowser(self)
+            backend_widget.setOpenExternalLinks(False)
+            backend_widget.setOpenLinks(False)
+            backend_widget.setHtml(
+                f"<h3>Widget load failed</h3><p>{html.escape(type(exc).__name__)}: {html.escape(str(exc))}</p>"
+            )
+
+        self._set_session_content_widget(session_state, backend_widget)
+        session_state["loaded_widget"] = backend_widget
+        session_state["loaded"] = True
+
+        backend_signal = getattr(backend_widget, "widgetStateChanged", None)
+        if backend_signal is not None and hasattr(backend_signal, "connect"):
+            backend_signal.connect(lambda _session_state=session_state: self._handle_backend_widget_state_changed(_session_state))
+
+        stack_widget = session_state.get("stack")
+        host_page = session_state.get("host_page")
+        if isinstance(stack_widget, QStackedWidget) and isinstance(host_page, QWidget):
+            stack_widget.setCurrentWidget(host_page)
+
+        summary_payload = self._loaded_widget_summary(session_state)
+        status_text = str(summary_payload.get("status_text") or "")
+        control_status_label = session_state.get("control_status_label")
+        if status_text and isinstance(control_status_label, QLabel):
+            control_status_label.setText(status_text)
+
+        self._set_session_tab_title(session_state, loaded=True)
+        self._persist_local_widget_state(session_state)
+        self.widgetStateChanged.emit()
+
+    def _handle_backend_widget_state_changed(self, session_state: dict[str, Any]) -> None:
+        summary_payload = self._loaded_widget_summary(session_state)
+        status_text = str(summary_payload.get("status_text") or "")
+        control_status_label = session_state.get("control_status_label")
+        if status_text and isinstance(control_status_label, QLabel):
+            control_status_label.setText(status_text)
+        self._persist_local_widget_state(session_state)
+        self.widgetStateChanged.emit()
+
+    def _handle_session_control_change(self, session_state: dict[str, Any], *, refresh_preview: bool) -> None:
+        tab_widget = session_state.get("tab_widget")
+        if isinstance(tab_widget, QWidget):
+            tab_widget.setProperty("runtime_source_path", self._session_source_uri(session_state))
+        if refresh_preview:
+            self._refresh_connection_preview(session_state)
+        self._persist_local_widget_state(session_state)
+        self.widgetStateChanged.emit()
+
+    def update_scheme(
+        self,
+        accent: dict[str, str] | None = None,
+        base: dict[str, str] | None = None,
+    ) -> None:
+        if accent is not None:
+            self._accent = dict(accent)
+        if base is not None:
+            self._base = dict(base)
+        self.scheme = _build_scheme(self._accent, self._base)
+        self.setStyleSheet(
+            f"""
+QWidget#extensionsSessionControlPage,
+QWidget#extensionsSessionHostPage {{
+    background-color: {self.scheme.get('col7', '#191f2f')};
+}}
+QLabel#extensionsControlTitle {{
+    color: {self.scheme.get('col6', '#eef3ff')};
+    font-weight: 700;
+    font-size: 14px;
+}}
+QLabel#extensionsControlDescription {{
+    color: {self.scheme.get('col8', '#a8afc7')};
+}}
+QLabel#extensionsHostPlaceholder {{
+    color: {self.scheme.get('col8', '#a8afc7')};
+    font-size: 13px;
+}}
+QTabWidget#extensionsTabs::pane {{
+    border: 1px solid {self.scheme.get('col10', '#2a3350')};
+    border-top: 0;
+    background: {self.scheme.get('col7', '#191f2f')};
+}}
+QTabWidget#extensionsTabs QTabBar::tab {{
+    color: {self.scheme.get('col8', '#a8afc7')};
+    background: {self.scheme.get('col7', '#191f2f')};
+    border: 1px solid {self.scheme.get('col10', '#2a3350')};
+    border-bottom: 0;
+    border-top-left-radius: 8px;
+    border-top-right-radius: 8px;
+    padding: 8px 13px;
+    min-width: 130px;
+}}
+QTabWidget#extensionsTabs QTabBar::tab:selected {{
+    color: {self.scheme.get('col6', '#f0f4ff')};
+    background: {self.scheme.get('col9', '#22345c')};
+}}
+QToolButton#extensionsTabCloseButton {{
+    color: {self.scheme.get('col8', '#a8afc7')};
+    background: transparent;
+    border: none;
+    font-size: 13px;
+    font-weight: 700;
+    padding: 0px;
+    margin: 0px;
+}}
+QToolButton#extensionsTabCloseButton:hover {{
+    color: {self.scheme.get('col6', '#f0f4ff')};
+    background: {self.scheme.get('col9', '#22345c')};
+    border-radius: 8px;
+}}
+QLineEdit#extensionsGraphUriInput,
+QComboBox#extensionsGraphToolSelector {{
+    color: {self.scheme.get('col6', '#e7eeff')};
+    background: {self.scheme.get('col9', '#22345c')};
+    border: 1px solid {self.scheme.get('col10', '#33406a')};
+    border-radius: 8px;
+    padding: 6px 8px;
+}}
+QTextBrowser#extensionsConnectionsPreviewBrowser {{
+    color: {self.scheme.get('col6', '#e7eeff')};
+    background: {self.scheme.get('col9', '#22345c')};
+    border: 1px solid {self.scheme.get('col10', '#33406a')};
+    border-radius: 8px;
+    padding: 8px;
+}}
+QTextBrowser#extensionsConnectionsPreviewBrowser QScrollBar:vertical,
+QTextBrowser#extensionsConnectionsPreviewBrowser QScrollBar:horizontal {{
+    background: transparent;
+    margin: 0px;
+    border: none;
+}}
+QTextBrowser#extensionsConnectionsPreviewBrowser QScrollBar:vertical {{
+    width: 6px;
+}}
+QTextBrowser#extensionsConnectionsPreviewBrowser QScrollBar:horizontal {{
+    height: 6px;
+}}
+QTextBrowser#extensionsConnectionsPreviewBrowser QScrollBar:hover,
+QTextBrowser#extensionsConnectionsPreviewBrowser QScrollBar:vertical:hover,
+QTextBrowser#extensionsConnectionsPreviewBrowser QScrollBar:horizontal:hover {{
+    background: transparent;
+}}
+QTextBrowser#extensionsConnectionsPreviewBrowser QScrollBar::handle:vertical,
+QTextBrowser#extensionsConnectionsPreviewBrowser QScrollBar::handle:horizontal {{
+    background: rgba(0, 0, 0, 0.0);
+    border-radius: 3px;
+    min-height: 28px;
+    min-width: 28px;
+}}
+QTextBrowser#extensionsConnectionsPreviewBrowser QScrollBar::handle:vertical:hover,
+QTextBrowser#extensionsConnectionsPreviewBrowser QScrollBar::handle:horizontal:hover,
+QTextBrowser#extensionsConnectionsPreviewBrowser QScrollBar::handle:hover:vertical,
+QTextBrowser#extensionsConnectionsPreviewBrowser QScrollBar::handle:hover:horizontal {{
+    background: {self.scheme.get('col10', '#33406a')};
+}}
+QTextBrowser#extensionsConnectionsPreviewBrowser QScrollBar::handle:vertical:pressed,
+QTextBrowser#extensionsConnectionsPreviewBrowser QScrollBar::handle:horizontal:pressed,
+QTextBrowser#extensionsConnectionsPreviewBrowser QScrollBar::handle:pressed:vertical,
+QTextBrowser#extensionsConnectionsPreviewBrowser QScrollBar::handle:pressed:horizontal {{
+    background: {self.scheme.get('col2', '#6280ff')};
+}}
+QTextBrowser#extensionsConnectionsPreviewBrowser QScrollBar::add-line,
+QTextBrowser#extensionsConnectionsPreviewBrowser QScrollBar::sub-line,
+QTextBrowser#extensionsConnectionsPreviewBrowser QScrollBar::add-page,
+QTextBrowser#extensionsConnectionsPreviewBrowser QScrollBar::sub-page {{
+    background: none;
+    border: none;
+    width: 0px;
+    height: 0px;
+}}
+QToolButton#extensionsGraphControlButton {{
+    color: {self.scheme.get('col6', '#ecf2ff')};
+    background: {self.scheme.get('col7', '#191f2f')};
+    border: 1px solid {self.scheme.get('col10', '#33406a')};
+    border-radius: 7px;
+    padding: 2px;
+    min-width: 30px;
+    min-height: 30px;
+}}
+QToolButton#extensionsGraphControlButton:hover {{
+    background: {self.scheme.get('col9', '#22345c')};
+}}
+QLabel#extensionsGraphStatusLabel {{
+    color: {self.scheme.get('col8', '#a8afc7')};
+}}
+"""
+        )
+
+        for session_state in self._session_state_by_tab.values():
+            if not isinstance(session_state, dict):
+                continue
+            loaded_widget = session_state.get("loaded_widget")
+            update_scheme_callable = getattr(loaded_widget, "update_scheme", None)
+            if callable(update_scheme_callable):
+                try:
+                    update_scheme_callable(self.scheme)
+                except Exception:
+                    pass
+            if not bool(session_state.get("loaded")):
+                self._refresh_connection_preview(session_state)
+
+
+ExtensionsWorkspace = ExtensionsWorkspaceWidget
 
 
 class EnvConfigWidget(QWidget):
@@ -8668,7 +9814,7 @@ class EnvConfigWidget(QWidget):
 class MainAIEditor(QMainWindow):
     ORG_NAME: Final = "ai.bentu"
 
-    APP_NAME: Final = "[/\/]  AI IDE"
+    APP_NAME: Final = "/\\/ AI IDE"
     _SCHEMA:  Final = 2
 
     # ---------------------------------------------------------------- init --
@@ -8677,7 +9823,7 @@ class MainAIEditor(QMainWindow):
         super().__init__()
         self._accent, self._base = SCHEME_BLUE, SCHEME_DARK
         self._tab_docks: List[QDockWidget] = []          # store all tab docks
-        self._workspace_column_widths: list[int] = [280, 760, 460]
+        self._workspace_column_widths: list[int] = [280, 760, 460, 340]
         self._explorer_splitter_sizes: list[int] = [380, 130]
         self._explorer_database_panel_visible: bool = False
 
@@ -9317,6 +10463,23 @@ class MainAIEditor(QMainWindow):
         if self.control_plane_widget is not None:
             self.control_plane_widget.snapshotChanged.connect(self._update_control_plane_status)
             self.control_plane_widget.refresh_view()
+
+        disable_extensions = _env_truthy("AI_IDE_DISABLE_EXTENSIONS_1", "0")
+        self.extensions_dock = QDockWidget("Extensions 1", self)
+        self.extensions_dock.setObjectName("ExtensionsDock")
+        self.extensions_dock.setTitleBarWidget(QWidget())
+        self.extensions_dock.setFeatures(QDockWidget.NoDockWidgetFeatures)
+        self.extensions_dock.setAllowedAreas(Qt.LeftDockWidgetArea | Qt.RightDockWidgetArea)
+        self.extensions_dock.setMinimumSize(0, 0)
+        self.extensions_dock.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Expanding)
+        if not disable_extensions:
+            self.extensions_widget = ExtensionsWorkspace(self._accent, self._base, self)
+            self.extensions_widget.setMinimumSize(0, 0)
+            self.extensions_widget.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Expanding)
+            self.extensions_dock.setWidget(self.extensions_widget)
+        else:
+            self.extensions_widget = None
+            self.extensions_dock.setWidget(QWidget())
     
     def _initialize_explorer_workspace(self):
         """Initialize example workspace structure in the explorer."""
@@ -9356,6 +10519,36 @@ class MainAIEditor(QMainWindow):
                 pass
 
         add_to_section(section_name, key, value)
+
+    def trigger_explorer_manual_sync(self, *, source_label: str = "manual_sync") -> bool:
+        explorer = getattr(self, "explorer", None)
+        if explorer is None:
+            return False
+
+        manual_sync_runner = getattr(explorer, "run_manual_sync", None)
+        if not callable(manual_sync_runner):
+            tree_widget = getattr(explorer, "tree", None)
+            manual_sync_runner = getattr(tree_widget, "run_manual_sync", None) if tree_widget is not None else None
+        if not callable(manual_sync_runner):
+            return False
+
+        try:
+            sync_ok = bool(manual_sync_runner(source_label=source_label))
+        except Exception as exc:
+            try:
+                self.statusBar().showMessage(f"Explorer /sync failed: {exc}", 4500)
+            except Exception:
+                pass
+            return False
+
+        try:
+            if sync_ok:
+                self.statusBar().showMessage("Explorer /sync completed", 2500)
+            else:
+                self.statusBar().showMessage("Explorer /sync failed", 4500)
+        except Exception:
+            pass
+        return sync_ok
 
     def _load_agents_runtime_projection(self, agents_runtime_path: Path) -> dict[str, Any]:
         source_path = Path(agents_runtime_path)
@@ -9415,9 +10608,10 @@ class MainAIEditor(QMainWindow):
         self._strip_dock_decoration(self.files_dock)
         self._strip_dock_decoration(self.chat_dock)
         self._strip_dock_decoration(self.control_plane_dock)
+        self._strip_dock_decoration(self.extensions_dock)
 
         self.setMinimumSize(0, 0)
-        for dock in (self.files_dock, self.chat_dock, self.control_plane_dock):
+        for dock in (self.files_dock, self.chat_dock, self.control_plane_dock, self.extensions_dock):
             if isinstance(dock, QDockWidget):
                 dock.setMinimumSize(0, 0)
                 dock.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Expanding)
@@ -9430,7 +10624,8 @@ class MainAIEditor(QMainWindow):
         self.main_split.addWidget(self.files_dock)       # links
         self.main_split.addWidget(self.chat_dock)        # mitte
         self.main_split.addWidget(self.control_plane_dock)  # rechts
-        for index in range(3):
+        self.main_split.addWidget(self.extensions_dock)  # extensions
+        for index in range(self.main_split.count()):
             try:
                 self.main_split.setCollapsible(index, True)
             except Exception:
@@ -9438,9 +10633,10 @@ class MainAIEditor(QMainWindow):
         self.main_split.setStretchFactor(0, 1)
         self.main_split.setStretchFactor(1, 3)
         self.main_split.setStretchFactor(2, 2)
-        default_sizes = list(getattr(self, "_workspace_column_widths", [280, 760, 460]))
-        if len(default_sizes) != 3:
-            default_sizes = [280, 760, 460]
+        self.main_split.setStretchFactor(3, 2)
+        default_sizes = list(getattr(self, "_workspace_column_widths", [280, 760, 460, 340]))
+        if len(default_sizes) != 4:
+            default_sizes = [280, 760, 460, 340]
         self.main_split.setSizes(self._normalize_splitter_sizes(default_sizes, total=1000))
         self.main_split.splitterMoved.connect(self._remember_workspace_column_widths)
         self._remember_workspace_column_widths()
@@ -9668,10 +10864,12 @@ class MainAIEditor(QMainWindow):
 
         self.act_graph_placeholder = QAction(
             _icon("graph_7_25dp_B7B7B7_FILL0_wght500_GRAD0_opsz24.svg"),
-            "Graph",
+            "Extensions 1",
             self,
+            checkable=True,
+            checked=True,
         )
-        self.act_graph_placeholder.setToolTip("Graph (noch unverdrahtet)")
+        self.act_graph_placeholder.setToolTip("Extensions 1 anzeigen/ausblenden")
 
 
         # ---- tabable dock ------------------------------------------------
@@ -9729,6 +10927,7 @@ class MainAIEditor(QMainWindow):
                 )
         # connect visibility actions
         self.act_toggle_explorer.triggered.connect(self._toggle_explorer_project_area)
+        self.act_graph_placeholder.toggled.connect(self.extensions_dock.setVisible)
         
         self.act_toggle_tabdock.toggled.connect(
             lambda v:[ 
@@ -9862,8 +11061,6 @@ class MainAIEditor(QMainWindow):
             )
             self.addToolBar(Qt.RightToolBarArea, bar)
 
-        if hasattr(self, "act_toggle_control_plane"):
-            self.tb_right.addAction(self.act_toggle_control_plane)
         self._tb_right_spacer = QWidget(self.tb_right)
         self._tb_right_spacer.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
         self._tb_right_spacer.setStyleSheet(f"background: {chrome_bg}; border: none;")
@@ -9918,10 +11115,14 @@ class MainAIEditor(QMainWindow):
         )
         self.addToolBar(Qt.LeftToolBarArea, self.tb_left)
 
-        if hasattr(self, "act_toggle_control_plane_left"):
-            self.tb_left.addAction(self.act_toggle_control_plane_left)
         if hasattr(self, "act_toggle_explorer"):
             self.tb_left.addAction(self.act_toggle_explorer)
+        if hasattr(self, "act_toggle_control_plane_left"):
+            self.tb_left.addAction(self.act_toggle_control_plane_left)
+        if hasattr(self, "act_toggle_control_plane"):
+            self.tb_left.addAction(self.act_toggle_control_plane)
+        if hasattr(self, "act_graph_placeholder"):
+            self.tb_left.addAction(self.act_graph_placeholder)
         self._tb_left_spacer = QWidget(self.tb_left)
         self._tb_left_spacer.setStyleSheet(f"background: {chrome_bg}; border: none;")
         self._tb_left_spacer.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
@@ -10085,6 +11286,7 @@ class MainAIEditor(QMainWindow):
              self.act_toggle_chat,                        # <– 10.07.2025 
              self.act_toggle_control_plane,
              self.act_toggle_explorer,
+             self.act_graph_placeholder,
              self.act_toggle_accent,
              self.menu_visible_action,
              self.act_grey
@@ -10155,11 +11357,13 @@ class MainAIEditor(QMainWindow):
         self.control_plane_dock.visibilityChanged.connect(
             self.act_toggle_control_plane.setChecked
         )
+        self.extensions_dock.visibilityChanged.connect(self.act_graph_placeholder.setChecked)
         if hasattr(self, "act_toggle_control_plane_left"):
             self.chat_dock.visibilityChanged.connect(self.act_toggle_control_plane_left.setChecked)
         self.files_dock.visibilityChanged.connect(lambda _v: self._rebalance_workspace_columns())
         self.chat_dock.visibilityChanged.connect(lambda _v: self._rebalance_workspace_columns())
         self.control_plane_dock.visibilityChanged.connect(lambda _v: self._rebalance_workspace_columns())
+        self.extensions_dock.visibilityChanged.connect(lambda _v: self._rebalance_workspace_columns())
 
         if hasattr(self, "act_toggle_right_dock"):
             self.control_plane_dock.visibilityChanged.connect(self.act_toggle_right_dock.setChecked)
@@ -10647,24 +11851,58 @@ class MainAIEditor(QMainWindow):
         tabdock_visible = any(dock.isVisible() for dock in getattr(self, "_tab_docks", []))
         return control_visible or console_visible or tabdock_visible
 
+    def _is_extensions_workspace_visible(self) -> bool:
+        return bool(getattr(self, "extensions_dock", None) and self.extensions_dock.isVisible())
+
+    def _right_workspace_split_widgets(self) -> list[QWidget]:
+        splitter = getattr(self, "main_split", None)
+        if not isinstance(splitter, QSplitter):
+            return []
+
+        fixed_widgets = {
+            getattr(self, "files_dock", None),
+            getattr(self, "chat_dock", None),
+            getattr(self, "extensions_dock", None),
+        }
+        workspace_widgets: list[QWidget] = []
+        for index in range(splitter.count()):
+            widget = splitter.widget(index)
+            if widget is None or widget in fixed_widgets:
+                continue
+            workspace_widgets.append(widget)
+        return workspace_widgets
+
     def _remember_workspace_column_widths(self, *_args: Any) -> None:
         splitter = getattr(self, "main_split", None)
         if splitter is None:
             return
 
         sizes = splitter.sizes()
-        if len(sizes) < 3:
+        if len(sizes) < 4:
             return
 
-        if len(getattr(self, "_workspace_column_widths", [])) != 3:
-            self._workspace_column_widths = [280, 760, 460]
+        if len(getattr(self, "_workspace_column_widths", [])) != 4:
+            self._workspace_column_widths = [280, 760, 460, 340]
 
         left_widget = getattr(self, "files_dock", None)
         middle_widget = getattr(self, "chat_dock", None)
+        extensions_widget = getattr(self, "extensions_dock", None)
 
-        left_size = int(sizes[0]) if len(sizes) > 0 else 0
-        middle_size = int(sizes[1]) if len(sizes) > 1 else 0
-        right_size = int(sizes[2]) if len(sizes) > 2 else 0
+        left_index = splitter.indexOf(left_widget) if isinstance(left_widget, QWidget) else -1
+        middle_index = splitter.indexOf(middle_widget) if isinstance(middle_widget, QWidget) else -1
+        extensions_index = splitter.indexOf(extensions_widget) if isinstance(extensions_widget, QWidget) else -1
+
+        left_size = int(sizes[left_index]) if left_index >= 0 and left_index < len(sizes) else 0
+        middle_size = int(sizes[middle_index]) if middle_index >= 0 and middle_index < len(sizes) else 0
+        extensions_size = int(sizes[extensions_index]) if extensions_index >= 0 and extensions_index < len(sizes) else 0
+        right_size = 0
+        for widget in self._right_workspace_split_widgets():
+            widget_index = splitter.indexOf(widget)
+            if widget_index < 0 or widget_index >= len(sizes):
+                continue
+            if not widget.isVisible():
+                continue
+            right_size += int(sizes[widget_index])
 
         if left_widget is not None and left_widget.isVisible() and left_size > 0:
             self._workspace_column_widths[0] = left_size
@@ -10672,6 +11910,8 @@ class MainAIEditor(QMainWindow):
             self._workspace_column_widths[1] = middle_size
         if self._is_right_workspace_visible() and right_size > 0:
             self._workspace_column_widths[2] = right_size
+        if extensions_widget is not None and extensions_widget.isVisible() and extensions_size > 0:
+            self._workspace_column_widths[3] = extensions_size
 
     def _rebalance_workspace_columns(self) -> None:
         splitter = getattr(self, "main_split", None)
@@ -10680,27 +11920,65 @@ class MainAIEditor(QMainWindow):
 
         self._remember_workspace_column_widths()
 
-        fallback_widths = [280, 760, 460]
+        fallback_widths = [280, 760, 460, 340]
         preferred_widths = list(getattr(self, "_workspace_column_widths", fallback_widths))
-        if len(preferred_widths) != 3:
+        if len(preferred_widths) != 4:
             preferred_widths = fallback_widths
 
         left_visible = bool(getattr(self, "files_dock", None) and self.files_dock.isVisible())
         middle_visible = bool(getattr(self, "chat_dock", None) and self.chat_dock.isVisible())
-        right_visible = self._is_right_workspace_visible()
+        right_workspace_widgets = self._right_workspace_split_widgets()
+        visible_right_workspace_widgets = [widget for widget in right_workspace_widgets if widget.isVisible()]
+        extensions_visible = self._is_extensions_workspace_visible()
 
-        sizes: list[int] = [
-            preferred_widths[0] if left_visible else 0,
-            preferred_widths[1] if middle_visible else 0,
-            preferred_widths[2] if right_visible else 0,
-        ]
-        visible_found = left_visible or middle_visible or right_visible
+        sizes: list[int] = [0 for _ in range(splitter.count())]
+
+        left_widget = getattr(self, "files_dock", None)
+        middle_widget = getattr(self, "chat_dock", None)
+        extensions_widget = getattr(self, "extensions_dock", None)
+
+        left_index = splitter.indexOf(left_widget) if isinstance(left_widget, QWidget) else -1
+        middle_index = splitter.indexOf(middle_widget) if isinstance(middle_widget, QWidget) else -1
+        extensions_index = splitter.indexOf(extensions_widget) if isinstance(extensions_widget, QWidget) else -1
+
+        if left_visible and left_index >= 0:
+            sizes[left_index] = preferred_widths[0]
+        if middle_visible and middle_index >= 0:
+            sizes[middle_index] = preferred_widths[1]
+        if extensions_visible and extensions_index >= 0:
+            sizes[extensions_index] = preferred_widths[3]
+
+        if visible_right_workspace_widgets:
+            right_distribution = self._normalize_splitter_sizes(
+                [1 for _ in visible_right_workspace_widgets],
+                total=max(int(preferred_widths[2]), len(visible_right_workspace_widgets)),
+            )
+            for widget, width in zip(visible_right_workspace_widgets, right_distribution):
+                widget_index = splitter.indexOf(widget)
+                if widget_index >= 0:
+                    sizes[widget_index] = width
+
+        visible_found = left_visible or middle_visible or bool(visible_right_workspace_widgets) or extensions_visible
         if not visible_found:
-            sizes = preferred_widths
+            if left_index >= 0:
+                sizes[left_index] = preferred_widths[0]
+            if middle_index >= 0:
+                sizes[middle_index] = preferred_widths[1]
+            if extensions_index >= 0:
+                sizes[extensions_index] = preferred_widths[3]
+            if right_workspace_widgets:
+                fallback_distribution = self._normalize_splitter_sizes(
+                    [1 for _ in right_workspace_widgets],
+                    total=max(int(preferred_widths[2]), len(right_workspace_widgets)),
+                )
+                for widget, width in zip(right_workspace_widgets, fallback_distribution):
+                    widget_index = splitter.indexOf(widget)
+                    if widget_index >= 0:
+                        sizes[widget_index] = width
 
         normalized_sizes = self._normalize_splitter_sizes(sizes, total=1000)
-        if len(normalized_sizes) != 3:
-            splitter.setSizes([1, 1, 1])
+        if len(normalized_sizes) != splitter.count():
+            splitter.setSizes([1 for _ in range(max(1, splitter.count()))])
             return
 
         splitter.setSizes(normalized_sizes)
@@ -11204,6 +12482,7 @@ class MainAIEditor(QMainWindow):
         self._apply_main_splitter_style()
         self._sync_explorer_scheme()
         self._sync_control_plane_scheme()
+        self._sync_extensions_scheme()
 
     @Slot(bool)
     def _toggle_grey(self, on: bool):
@@ -11212,6 +12491,7 @@ class MainAIEditor(QMainWindow):
         self._apply_main_splitter_style()
         self._sync_explorer_scheme()
         self._sync_control_plane_scheme()
+        self._sync_extensions_scheme()
 
     def _sync_explorer_scheme(self) -> None:
         """Keep explorer colors/icons synced after scheme changes."""
@@ -11230,6 +12510,14 @@ class MainAIEditor(QMainWindow):
             if getattr(self, "control_plane_widget", None) is None:
                 return
             self.control_plane_widget.update_scheme(self._accent, self._base)
+        except Exception:
+            pass
+
+    def _sync_extensions_scheme(self) -> None:
+        try:
+            if getattr(self, "extensions_widget", None) is None:
+                return
+            self.extensions_widget.update_scheme(self._accent, self._base)
         except Exception:
             pass
 
@@ -11264,13 +12552,15 @@ class MainAIEditor(QMainWindow):
         self._apply_main_splitter_style()
         self._sync_explorer_scheme()
 
-        stored_widths = s.value("workspaceColumnWidths", [280, 760, 460])
+        stored_widths = s.value("workspaceColumnWidths", [280, 760, 460, 340])
         if isinstance(stored_widths, (list, tuple)):
             try:
-                parsed_widths = [int(value) for value in list(stored_widths)[:3]]
+                parsed_widths = [int(value) for value in list(stored_widths)[:4]]
             except Exception:
                 parsed_widths = []
             if len(parsed_widths) == 3 and all(value > 0 for value in parsed_widths):
+                parsed_widths.append(340)
+            if len(parsed_widths) == 4 and all(value > 0 for value in parsed_widths):
                 self._workspace_column_widths = parsed_widths
 
         stored_explorer_sizes = s.value("explorerSplitterSizes", [380, 130])
@@ -11291,6 +12581,7 @@ class MainAIEditor(QMainWindow):
         
         self.chat_dock.setVisible(s.value("showChat", True,  bool))
         self.control_plane_dock.setVisible(s.value("showControlPlane", True, bool))
+        self.extensions_dock.setVisible(s.value("showExtensions", True, bool))
 
         
         self.files_dock.setVisible(s.value("showExplorer", True,  bool))
@@ -11332,6 +12623,7 @@ class MainAIEditor(QMainWindow):
         s.setValue("showConsole",  False)
         s.setValue("showChat", self.chat_dock.isVisible())   
         s.setValue("showControlPlane", self.control_plane_dock.isVisible())
+        s.setValue("showExtensions", self.extensions_dock.isVisible())
         s.setValue("showTabDock",  False)
         control_plane_widget = getattr(self, "control_plane_widget", None)
         if control_plane_widget is not None and hasattr(control_plane_widget, "runtime_layout_path"):

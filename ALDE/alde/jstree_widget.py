@@ -17,7 +17,7 @@ won't trigger heavy work. UI interactions (e.g. loading history) assume
 buttons will show a placeholder message.
 """
 
-from typing import Any
+from typing import Any, Callable, Iterable, Mapping, Sequence
 from datetime import datetime, timezone
 import hashlib
 import importlib
@@ -25,11 +25,13 @@ import importlib.util
 import json
 import os
 import re
+import threading
+import time
 from pathlib import Path
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
-from PySide6.QtCore import Qt, QTimer, Slot, QSize
+from PySide6.QtCore import QObject, Qt, QTimer, Signal, Slot, QSize
 from PySide6.QtGui import (
     QColor,
     QFont,
@@ -54,14 +56,15 @@ from PySide6.QtWidgets import (
 )
 
 try:
-    from .agents_db import AgentDbSocketRepository, KnowledgeRepository, load_agentsdb_runtime_config_from_env, sync_parser_result_to_agentsdb_knowledge  # type: ignore
+    from .agents_db import AgentDbSocketRepository, KnowledgeRepository, load_agentsdb_runtime_config_from_env, normalize_agentsdb_socket_uri, sync_parser_result_to_agentsdb_knowledge  # type: ignore
 except Exception:
     try:
-        from alde.agents_db import AgentDbSocketRepository, KnowledgeRepository, load_agentsdb_runtime_config_from_env, sync_parser_result_to_agentsdb_knowledge  # type: ignore
+        from alde.agents_db import AgentDbSocketRepository, KnowledgeRepository, load_agentsdb_runtime_config_from_env, normalize_agentsdb_socket_uri, sync_parser_result_to_agentsdb_knowledge  # type: ignore
     except Exception:
         AgentDbSocketRepository = None  # type: ignore[assignment]
         KnowledgeRepository = None  # type: ignore[assignment]
         load_agentsdb_runtime_config_from_env = None  # type: ignore[assignment]
+        normalize_agentsdb_socket_uri = None  # type: ignore[assignment]
         sync_parser_result_to_agentsdb_knowledge = None  # type: ignore[assignment]
 
 # Try to import ChatHistory if available; keep optional.
@@ -82,11 +85,22 @@ def _load_optional_mongo_client_class() -> Any | None:
     return getattr(pymongo_module, "MongoClient", None)
 
 
+class _TreePushStreamBridge(QObject):
+    update_received = Signal(object, object)
+    stream_error = Signal(str)
+
+
 class TreeDataPersistenceService:
     """Persist tree data either in AgentDB or in a local JSON fallback file."""
 
     _ENV_ASSIGNMENT_PATTERN = re.compile(r"^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$")
     _ENV_OBJECT_NAME_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+    _AGENTSDB_REPOSITORY_SECTION_NAME = "DATABASES"
+    _AGENTSDB_REPOSITORY_SECTION_KEY = "agentsdb_repository"
+    _TREE_AGENTSDB_URI_PATTERN = re.compile(
+        r"^(?:agents?db)(?:://|::)?(?P<host>\[[^\]]+\]|[A-Za-z0-9._-]+)?(?::(?P<port>\d+))?(?::*)?$",
+        re.IGNORECASE,
+    )
 
     _AI_IDE_SECTION_NAME_ORDER: tuple[str, ...] = (
         "PROJECTS",
@@ -121,14 +135,96 @@ class TreeDataPersistenceService:
         self._mongo_collection: Any | None = None
         self._mongo_disabled = False
         self._storage_config_cache: dict[str, Any] | None = None
+        self._last_stream_cursor: dict[str, Any] | None = None
+        self._inmemory_tree_data: dict[str, Any] = self._normalize_tree_data_structure({})
+        self._inmemory_tree_hash: str | None = self._tree_data_content_hash(self._inmemory_tree_data)
+
+    def memory_only_enabled(self) -> bool:
+        value = str(os.getenv("AI_IDE_TREE_MEMORY_ONLY", "1")).strip().lower()
+        if not value:
+            value = "1"
+        return value in {"1", "true", "yes", "on", "memory", "inmemory"}
 
     def _agentsdb_strict_mode(self) -> bool:
         value = str(os.getenv("AI_IDE_AGENTS_DB_TREE_STRICT", "1")).strip().lower()
         return value not in {"0", "false", "no", "off"}
 
     def _agentsdb_tree_sync_enabled(self) -> bool:
-        value = str(os.getenv("AI_IDE_AGENTS_DB_TREE_SYNC", "0")).strip().lower()
+        value = str(os.getenv("AI_IDE_AGENTS_DB_TREE_SYNC", "")).strip().lower()
+        if not value:
+            value = str(self._load_storage_config().get("agentsdb_tree_sync", "1")).strip().lower()
+        if not value:
+            value = "1"
         return value in {"1", "true", "yes", "on"}
+
+    def live_sync_enabled(self) -> bool:
+        if self.memory_only_enabled():
+            return self.uses_repository_projection()
+        return self._agentsdb_tree_sync_enabled()
+
+    def live_sync_interval_ms(self) -> int:
+        raw_value = str(os.getenv("AI_IDE_AGENTS_DB_TREE_POLL_MS", "1200") or "1200").strip()
+        try:
+            resolved_value = int(raw_value)
+        except Exception:
+            resolved_value = 1200
+        return max(250, resolved_value)
+
+    def push_stream_enabled(self) -> bool:
+        value = str(os.getenv("AI_IDE_AGENTS_DB_TREE_PUSH_STREAM", "")).strip().lower()
+        if not value:
+            value = str(self._load_storage_config().get("agentsdb_tree_push_stream", "1")).strip().lower()
+        if not value:
+            value = "1"
+        return value in {"1", "true", "yes", "on"}
+
+    def supports_push_stream(self) -> bool:
+        if not self.live_sync_enabled() or not self.push_stream_enabled():
+            return False
+        runtime_config, repository = self._load_agentsdb_repository()
+        if self._should_project_agentsdb_repository(repository):
+            return runtime_config is not None and repository is not None and callable(getattr(repository, "subscribe_repository_stream", None))
+        return runtime_config is not None and repository is not None and callable(getattr(repository, "subscribe_tree_stream", None))
+
+    def uses_repository_projection(self) -> bool:
+        _runtime_config, repository = self._load_agentsdb_repository()
+        return self._should_project_agentsdb_repository(repository)
+
+    def live_sync_backend_name(self) -> str:
+        return "agents_db_repository" if self.uses_repository_projection() else "agents_db_live"
+
+    def live_sync_source_label(self) -> str:
+        return "agents_db_repository" if self.uses_repository_projection() else "agents_db"
+
+    def live_sync_source(self) -> str:
+        runtime_config, repository = self._load_agentsdb_repository()
+        if self._should_project_agentsdb_repository(repository):
+            return self._agentsdb_repository_source(runtime_config)
+        if self.memory_only_enabled():
+            return "inmemory"
+        return self._tree_object_id()
+
+    def _memory_view_data(self, data: dict[str, Any]) -> dict[str, Any]:
+        normalized_data = self._strip_derived_agentsdb_repository_sections(
+            self._normalize_tree_data_structure(data)
+        )
+        return self._apply_tree_storage_projection_policy(normalized_data)
+
+    def _store_inmemory_tree_data(
+        self,
+        data: dict[str, Any],
+        *,
+        change_event: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        normalized_data = self._memory_view_data(data)
+        self._inmemory_tree_data = normalized_data
+        self._inmemory_tree_hash = self._tree_data_content_hash(normalized_data)
+        stream_cursor = self._build_tree_stream_cursor(
+            normalized_data,
+            change_event or {"action": "memory_update", "origin": "tree_widget"},
+        )
+        self._last_stream_cursor = self._normalize_tree_stream_cursor(stream_cursor)
+        return dict(normalized_data)
 
     def _normalize_projection_conflict_policy_value(self, value: Any) -> str | None:
         policy_value = str(value or "").strip().lower()
@@ -204,13 +300,46 @@ class TreeDataPersistenceService:
         serialized_data = json.dumps(safe_data, ensure_ascii=False, sort_keys=True)
         return hashlib.sha256(serialized_data.encode("utf-8")).hexdigest()
 
+    def _normalize_tree_agentsdb_uri(self, uri: Any) -> str:
+        if callable(normalize_agentsdb_socket_uri):
+            return normalize_agentsdb_socket_uri(uri)
+        normalized_uri = str(uri or "").strip()
+        if not normalized_uri:
+            return "agentsdb://127.0.0.1:2331"
+
+        loose_match = self._TREE_AGENTSDB_URI_PATTERN.match(normalized_uri)
+        if loose_match is not None:
+            resolved_host = str(loose_match.group("host") or "").strip().strip("[]").lower()
+            resolved_port_text = str(loose_match.group("port") or "").strip()
+            try:
+                resolved_port = int(resolved_port_text or 2331)
+            except Exception:
+                resolved_port = 2331
+            if resolved_host in {"", "localhost", "127.0.0.1", "::1"}:
+                resolved_host = "127.0.0.1"
+            return f"agentsdb://{resolved_host or '127.0.0.1'}:{resolved_port}"
+
+        parsed_uri = urlparse(normalized_uri)
+        if str(parsed_uri.scheme or "").strip().lower() != "agentsdb":
+            return normalized_uri
+        resolved_host = str(parsed_uri.hostname or "").strip().lower()
+        if resolved_host in {"", "localhost", "127.0.0.1"}:
+            resolved_port = int(parsed_uri.port or 2331)
+            return f"agentsdb://127.0.0.1:{resolved_port}"
+        return normalized_uri
+
     def _load_agentsdb_repository(self) -> tuple[Any, Any] | tuple[None, None]:
         if not callable(load_agentsdb_runtime_config_from_env):
             return None, None
         runtime_config = load_agentsdb_runtime_config_from_env()
         if runtime_config is None:
             return None, None
-        uri = str(getattr(runtime_config, "agents_db_uri", "") or "").strip()
+        uri = self._normalize_tree_agentsdb_uri(getattr(runtime_config, "agents_db_uri", "") or "")
+        if uri and hasattr(runtime_config, "agents_db_uri"):
+            try:
+                runtime_config.agents_db_uri = uri
+            except Exception:
+                pass
         database_name = str(getattr(runtime_config, "database_name", "alde_knowledge") or "alde_knowledge").strip() or "alde_knowledge"
         if not uri:
             return None, None
@@ -225,6 +354,83 @@ class TreeDataPersistenceService:
     def _tree_object_id(self) -> str:
         configured_id = str(os.getenv("AI_IDE_TREE_AGENTS_DB_OBJECT_ID", "")).strip()
         return configured_id or "tree_widget:tree_data"
+
+    def _tree_stream_head_object_id(self) -> str:
+        return f"{self._tree_object_id()}:stream:head"
+
+    def _tree_stream_event_object_id(self, event_id: str) -> str:
+        normalized_event_id = str(event_id or "").strip() or "snapshot"
+        return f"{self._tree_object_id()}:stream:event:{normalized_event_id}"
+
+    def _normalize_tree_stream_cursor(self, cursor: Any) -> dict[str, Any] | None:
+        if not isinstance(cursor, dict):
+            return None
+        event_id = str(cursor.get("event_id") or "").strip()
+        updated_at = str(cursor.get("updated_at") or cursor.get("created_at") or "").strip()
+        tree_hash = str(cursor.get("tree_hash") or cursor.get("content_sha256") or "").strip()
+        if not event_id and not updated_at and not tree_hash:
+            return None
+        return {
+            "event_id": event_id,
+            "updated_at": updated_at,
+            "tree_hash": tree_hash,
+        }
+
+    def load_last_stream_cursor(self) -> dict[str, Any] | None:
+        if not isinstance(self._last_stream_cursor, dict):
+            return None
+        return dict(self._last_stream_cursor)
+
+    def _load_tree_record_from_agentsdb(self, repository: Any | None) -> dict[str, Any] | None:
+        if repository is None:
+            return None
+        try:
+            record = repository.load_object("document", self._tree_object_id())
+        except Exception:
+            return None
+        return record if isinstance(record, dict) else None
+
+    def _extract_tree_payload_from_record(self, record: Any) -> dict[str, Any] | None:
+        if not isinstance(record, dict):
+            return None
+        tree_payload = record.get("tree_data")
+        if not isinstance(tree_payload, dict):
+            tree_payload = record.get("data")
+        return tree_payload if isinstance(tree_payload, dict) else None
+
+    def _tree_stream_cursor_from_tree_record(self, record: Any) -> dict[str, Any] | None:
+        if not isinstance(record, dict):
+            return None
+        embedded_cursor = self._normalize_tree_stream_cursor(record.get("stream_cursor"))
+        if embedded_cursor is not None:
+            return embedded_cursor
+        tree_payload = self._extract_tree_payload_from_record(record)
+        tree_hash = str(record.get("content_sha256") or "").strip()
+        if not tree_hash and isinstance(tree_payload, dict):
+            tree_hash = self._tree_data_content_hash(tree_payload)
+        return self._normalize_tree_stream_cursor(
+            {
+                "event_id": str(record.get("last_stream_event_id") or "").strip(),
+                "updated_at": str(record.get("updated_at") or record.get("created_at") or "").strip(),
+                "tree_hash": tree_hash,
+            }
+        )
+
+    def _load_tree_stream_head(self, repository: Any | None) -> dict[str, Any] | None:
+        if repository is None:
+            return None
+        try:
+            head_payload = repository.load_object("document", self._tree_stream_head_object_id())
+        except Exception:
+            return None
+        return head_payload if isinstance(head_payload, dict) else None
+
+    def _load_tree_stream_cursor_from_agentsdb(self, repository: Any | None) -> dict[str, Any] | None:
+        head_payload = self._load_tree_stream_head(repository)
+        normalized_head_cursor = self._normalize_tree_stream_cursor(head_payload)
+        if normalized_head_cursor is not None:
+            return normalized_head_cursor
+        return self._tree_stream_cursor_from_tree_record(self._load_tree_record_from_agentsdb(repository))
 
     def _purge_agentsdb_tree_object(self, repository: Any | None) -> bool:
         if repository is None:
@@ -343,6 +549,291 @@ class TreeDataPersistenceService:
             return None
         return record.get("data")
 
+    def _agentsdb_repository_object_name_map(self, repository: Any | None) -> dict[str, str]:
+        object_collection_map = getattr(repository, "_OBJECT_COLLECTION_MAP", None)
+        if not isinstance(object_collection_map, dict):
+            return {}
+        return {
+            str(collection_name or "").strip(): str(object_name or "").strip().lower()
+            for object_name, collection_name in object_collection_map.items()
+            if str(collection_name or "").strip() and str(object_name or "").strip()
+        }
+
+    @staticmethod
+    def _coerce_tree_path_segment(segment: Any, container: Any) -> Any:
+        if isinstance(container, (list, tuple)):
+            if isinstance(segment, int):
+                return segment
+            normalized_segment = str(segment or "").strip()
+            if normalized_segment.startswith("[") and normalized_segment.endswith("]"):
+                normalized_segment = normalized_segment[1:-1].strip()
+            if normalized_segment.isdigit():
+                return int(normalized_segment)
+        return segment
+
+    def _resolve_agentsdb_repository_collection_context(
+        self,
+        *,
+        section_name: str | None,
+        path_segments: Sequence[Any],
+    ) -> dict[str, Any] | None:
+        if str(section_name or "").strip().upper() != self._AGENTSDB_REPOSITORY_SECTION_NAME:
+            return None
+
+        normalized_path = [segment for segment in path_segments if str(segment or "").strip()]
+        if len(normalized_path) < 3:
+            return None
+        if str(normalized_path[0] or "").strip() != self._AGENTSDB_REPOSITORY_SECTION_KEY:
+            return None
+
+        runtime_config, repository = self._load_agentsdb_repository()
+        if runtime_config is None or repository is None or not self._should_project_agentsdb_repository(repository):
+            return None
+
+        database_name = self._agentsdb_repository_source(runtime_config)
+        if str(normalized_path[1] or "").strip() != database_name:
+            return None
+
+        collection_name = str(normalized_path[2] or "").strip()
+        object_name = self._agentsdb_repository_object_name_map(repository).get(collection_name)
+        if not object_name:
+            return None
+
+        return {
+            "runtime_config": runtime_config,
+            "repository": repository,
+            "database_name": database_name,
+            "collection_name": collection_name,
+            "object_name": object_name,
+            "path_segments": list(normalized_path),
+        }
+
+    def resolve_agentsdb_repository_collection_binding(
+        self,
+        *,
+        section_name: str | None,
+        path_segments: Sequence[Any],
+    ) -> dict[str, Any] | None:
+        collection_context = self._resolve_agentsdb_repository_collection_context(
+            section_name=section_name,
+            path_segments=path_segments,
+        )
+        if collection_context is None:
+            return None
+        if len(list(collection_context.get("path_segments") or [])) != 3:
+            return None
+        return collection_context
+
+    def resolve_agentsdb_repository_binding(
+        self,
+        *,
+        section_name: str | None,
+        path_segments: Sequence[Any],
+    ) -> dict[str, Any] | None:
+        collection_context = self._resolve_agentsdb_repository_collection_context(
+            section_name=section_name,
+            path_segments=path_segments,
+        )
+        if collection_context is None:
+            return None
+        normalized_path = list(collection_context.get("path_segments") or [])
+        if len(normalized_path) < 4:
+            return None
+
+        record_id = str(normalized_path[3] or "").strip()
+        if not record_id:
+            return None
+
+        return {
+            "runtime_config": collection_context.get("runtime_config"),
+            "repository": collection_context.get("repository"),
+            "database_name": collection_context.get("database_name"),
+            "collection_name": collection_context.get("collection_name"),
+            "object_name": collection_context.get("object_name"),
+            "record_id": record_id,
+            "field_path": list(normalized_path[4:]),
+        }
+
+    def create_agentsdb_repository_record(
+        self,
+        *,
+        section_name: str | None,
+        path_segments: Sequence[Any],
+        record_id: str,
+        record_payload: Mapping[str, Any] | None = None,
+    ) -> bool:
+        binding = self.resolve_agentsdb_repository_collection_binding(
+            section_name=section_name,
+            path_segments=path_segments,
+        )
+        if binding is None:
+            return False
+
+        repository = binding.get("repository")
+        object_name = str(binding.get("object_name") or "").strip()
+        normalized_record_id = str(record_id or "").strip()
+        payload = dict(record_payload or {})
+        payload_record_id = str(payload.get("_id") or "").strip()
+        if not normalized_record_id:
+            normalized_record_id = payload_record_id
+        if repository is None or not object_name or not normalized_record_id:
+            return False
+
+        try:
+            existing_payload = repository.load_object(object_name, normalized_record_id)
+        except Exception:
+            existing_payload = None
+        if isinstance(existing_payload, dict):
+            return False
+
+        payload["_id"] = normalized_record_id
+        payload.setdefault("updated_at", datetime.now(timezone.utc).isoformat())
+
+        try:
+            repository.upsert_object(object_name, normalized_record_id, payload)
+        except Exception:
+            return False
+        return True
+
+    def apply_agentsdb_repository_edit(
+        self,
+        *,
+        section_name: str | None,
+        path_segments: Sequence[Any],
+        key_name: str,
+        value: Any,
+    ) -> bool:
+        binding = self.resolve_agentsdb_repository_binding(section_name=section_name, path_segments=path_segments)
+        if binding is None:
+            return False
+
+        repository = binding.get("repository")
+        object_name = str(binding.get("object_name") or "").strip()
+        record_id = str(binding.get("record_id") or "").strip()
+        field_path = list(binding.get("field_path") or [])
+        if repository is None or not object_name or not record_id or not field_path:
+            return False
+
+        try:
+            record_payload = repository.load_object(object_name, record_id)
+        except Exception:
+            return False
+        if not isinstance(record_payload, dict):
+            return False
+
+        parent_container: Any = record_payload
+        for segment in field_path[:-1]:
+            key_obj = self._coerce_tree_path_segment(segment, parent_container)
+            try:
+                parent_container = parent_container[key_obj]
+            except (KeyError, IndexError, TypeError):
+                return False
+
+        last_segment = field_path[-1]
+        key_obj = self._coerce_tree_path_segment(last_segment, parent_container)
+        normalized_key_name = str(key_name or "").strip() or str(last_segment)
+
+        if isinstance(parent_container, dict):
+            if normalized_key_name != str(last_segment):
+                try:
+                    parent_container[normalized_key_name] = parent_container.pop(key_obj)
+                except Exception:
+                    parent_container[normalized_key_name] = value
+                key_obj = normalized_key_name
+            parent_container[key_obj] = value
+        elif isinstance(parent_container, list):
+            if not isinstance(key_obj, int) or not (0 <= key_obj < len(parent_container)):
+                return False
+            parent_container[key_obj] = value
+        else:
+            return False
+
+        new_record_id = record_id
+        if len(field_path) == 1 and str(field_path[0] or "").strip() == "_id":
+            candidate_record_id = str(record_payload.get("_id") or "").strip()
+            if candidate_record_id:
+                new_record_id = candidate_record_id
+
+        try:
+            repository.upsert_object(object_name, new_record_id, record_payload)
+            if new_record_id != record_id:
+                delete_object = getattr(repository, "delete_object", None)
+                if callable(delete_object):
+                    delete_object(object_name, record_id)
+        except Exception:
+            return False
+        return True
+
+    def delete_agentsdb_repository_path(
+        self,
+        *,
+        section_name: str | None,
+        path_segments: Sequence[Any],
+    ) -> bool:
+        binding = self.resolve_agentsdb_repository_binding(section_name=section_name, path_segments=path_segments)
+        if binding is None:
+            return False
+
+        repository = binding.get("repository")
+        object_name = str(binding.get("object_name") or "").strip()
+        record_id = str(binding.get("record_id") or "").strip()
+        field_path = list(binding.get("field_path") or [])
+        if repository is None or not object_name or not record_id:
+            return False
+
+        if not field_path:
+            delete_object = getattr(repository, "delete_object", None)
+            if not callable(delete_object):
+                return False
+            try:
+                return bool(delete_object(object_name, record_id))
+            except Exception:
+                return False
+
+        try:
+            record_payload = repository.load_object(object_name, record_id)
+        except Exception:
+            return False
+        if not isinstance(record_payload, dict):
+            return False
+
+        parent_container: Any = record_payload
+        for segment in field_path[:-1]:
+            key_obj = self._coerce_tree_path_segment(segment, parent_container)
+            try:
+                parent_container = parent_container[key_obj]
+            except (KeyError, IndexError, TypeError):
+                return False
+
+        last_segment = field_path[-1]
+        key_obj = self._coerce_tree_path_segment(last_segment, parent_container)
+
+        removed = False
+        if isinstance(parent_container, dict):
+            if str(last_segment or "").strip() == "_id" and len(field_path) == 1:
+                delete_object = getattr(repository, "delete_object", None)
+                if not callable(delete_object):
+                    return False
+                try:
+                    return bool(delete_object(object_name, record_id))
+                except Exception:
+                    return False
+            removed = key_obj in parent_container
+            if removed:
+                parent_container.pop(key_obj, None)
+        elif isinstance(parent_container, list):
+            if isinstance(key_obj, int) and 0 <= key_obj < len(parent_container):
+                parent_container.pop(key_obj)
+                removed = True
+        if not removed:
+            return False
+
+        try:
+            repository.upsert_object(object_name, record_id, record_payload)
+        except Exception:
+            return False
+        return True
+
     def _upsert_projection_payload_to_agentsdb(
         self,
         *,
@@ -353,6 +844,8 @@ class TreeDataPersistenceService:
         source_uri: str,
         data: Any,
     ) -> None:
+        if self.memory_only_enabled():
+            return
         if repository is None or runtime_config is None:
             return
 
@@ -927,6 +1420,260 @@ class TreeDataPersistenceService:
             storage_payload["projection_conflict_policy"] = stored_policy
         return normalized_data
 
+    def _agentsdb_repository_projection_enabled(self) -> bool:
+        value = str(os.getenv("AI_IDE_AGENTS_DB_TREE_REPOSITORY_VIEW", "")).strip().lower()
+        if not value:
+            value = str(self._load_storage_config().get("agentsdb_repository_view", "1")).strip().lower()
+        if not value:
+            value = "1"
+        return value in {"1", "true", "yes", "on"}
+
+    def _agentsdb_repository_projection_limit(self) -> int:
+        raw_value = str(os.getenv("AI_IDE_AGENTS_DB_TREE_REPOSITORY_LIMIT", "")).strip()
+        if not raw_value:
+            raw_value = str(self._load_storage_config().get("agentsdb_repository_limit", "2000")).strip()
+        try:
+            resolved_value = int(raw_value)
+        except Exception:
+            resolved_value = 2000
+        return max(1, min(resolved_value, 10000))
+
+    def _should_project_agentsdb_repository(self, repository: Any | None) -> bool:
+        object_collection_map = getattr(repository, "_OBJECT_COLLECTION_MAP", None)
+        return self._agentsdb_repository_projection_enabled() and isinstance(object_collection_map, dict) and bool(object_collection_map)
+
+    def _agentsdb_repository_source(self, runtime_config: Any | None) -> str:
+        return str(getattr(runtime_config, "database_name", "alde_knowledge") or "alde_knowledge").strip() or "alde_knowledge"
+
+    def _compact_agentsdb_repository_value(self, value: Any, *, depth: int = 0) -> Any:
+        if depth >= 2:
+            if isinstance(value, dict):
+                return {
+                    "_meta": {
+                        "kind": "dict",
+                        "key_count": len(value),
+                    }
+                }
+            if isinstance(value, (list, tuple)):
+                return {
+                    "_meta": {
+                        "kind": "list",
+                        "length": len(value),
+                    }
+                }
+
+        if isinstance(value, dict):
+            item_list = list(value.items())
+            projected_value: dict[str, Any] = {}
+            for index, (child_key, child_value) in enumerate(item_list):
+                if index >= 24:
+                    projected_value["_meta"] = {
+                        "kind": "dict",
+                        "truncated": True,
+                        "visible_key_count": 24,
+                        "total_key_count": len(item_list),
+                    }
+                    break
+                projected_value[str(child_key)] = self._compact_agentsdb_repository_value(child_value, depth=depth + 1)
+            return projected_value
+
+        if isinstance(value, (list, tuple)):
+            sequence = list(value)
+            if sequence and all(isinstance(item, (int, float)) and not isinstance(item, bool) for item in sequence) and len(sequence) > 16:
+                return {
+                    "_meta": {
+                        "kind": "numeric_list",
+                        "length": len(sequence),
+                        "preview": [float(sequence[index]) for index in range(min(4, len(sequence)))],
+                    }
+                }
+            projected_list = [
+                self._compact_agentsdb_repository_value(item, depth=depth + 1)
+                for item in sequence[:12]
+            ]
+            if len(sequence) > len(projected_list):
+                return {
+                    "_meta": {
+                        "kind": "list",
+                        "length": len(sequence),
+                        "sample_size": len(projected_list),
+                    },
+                    "items": projected_list,
+                }
+            return projected_list
+
+        if isinstance(value, str) and len(value) > 320:
+            return {
+                "_meta": {
+                    "kind": "string",
+                    "length": len(value),
+                    "preview": value[:320],
+                }
+            }
+
+        return self._json_safe_projection_data(value)
+
+    def _agentsdb_repository_record_projection(self, record: dict[str, Any]) -> dict[str, Any]:
+        projected_record: dict[str, Any] = {}
+        for key_name, value in sorted(dict(record).items(), key=lambda item: str(item[0])):
+            projected_record[str(key_name)] = self._compact_agentsdb_repository_value(value)
+        return projected_record
+
+    def _agentsdb_repository_collection_view(
+        self,
+        repository: Any | None,
+        *,
+        object_name: str,
+        collection_name: str,
+    ) -> dict[str, Any]:
+        record_limit = self._agentsdb_repository_projection_limit()
+        record_payload_list: list[dict[str, Any]] = []
+        try:
+            load_objects = getattr(repository, "load_objects", None)
+            if callable(load_objects):
+                raw_result = load_objects(object_name, limit=record_limit)
+                if isinstance(raw_result, list):
+                    record_payload_list = [dict(item) for item in raw_result if isinstance(item, dict)]
+        except Exception:
+            record_payload_list = []
+
+        collection_payload: dict[str, Any] = {
+            "_meta": {
+                "object_name": object_name,
+                "collection_name": collection_name,
+                "record_count_visible": 0,
+                "record_limit": record_limit,
+                "truncated": False,
+                "latest_updated_at": "",
+            }
+        }
+        latest_updated_at = ""
+        for record in sorted(record_payload_list, key=lambda item: str(item.get("_id") or item.get("id") or "")):
+            record_id = str(record.get("_id") or record.get("id") or "").strip()
+            if not record_id:
+                record_id = f"{object_name}:{len(collection_payload)}"
+            collection_payload[record_id] = self._agentsdb_repository_record_projection(record)
+            updated_at = str(record.get("updated_at") or record.get("created_at") or "").strip()
+            if updated_at and updated_at > latest_updated_at:
+                latest_updated_at = updated_at
+
+        collection_meta = collection_payload["_meta"]
+        if isinstance(collection_meta, dict):
+            collection_meta["record_count_visible"] = max(0, len(collection_payload) - 1)
+            collection_meta["truncated"] = len(record_payload_list) >= record_limit
+            collection_meta["latest_updated_at"] = latest_updated_at
+        return collection_payload
+
+    def _agentsdb_repository_view_payload(
+        self,
+        *,
+        runtime_config: Any,
+        repository: Any | None,
+    ) -> dict[str, Any]:
+        database_name = self._agentsdb_repository_source(runtime_config)
+        agents_db_uri = self._normalize_tree_agentsdb_uri(getattr(runtime_config, "agents_db_uri", "") or "")
+        object_collection_map = getattr(repository, "_OBJECT_COLLECTION_MAP", None)
+        collection_payload_map: dict[str, Any] = {}
+        latest_updated_at = ""
+        visible_record_count = 0
+
+        if isinstance(object_collection_map, dict):
+            for object_name, collection_name in sorted(object_collection_map.items(), key=lambda item: str(item[1] or item[0])):
+                normalized_object_name = str(object_name or "").strip().lower()
+                normalized_collection_name = str(collection_name or "").strip()
+                if not normalized_object_name or not normalized_collection_name:
+                    continue
+                collection_payload = self._agentsdb_repository_collection_view(
+                    repository,
+                    object_name=normalized_object_name,
+                    collection_name=normalized_collection_name,
+                )
+                collection_payload_map[normalized_collection_name] = collection_payload
+                collection_meta = collection_payload.get("_meta") if isinstance(collection_payload, dict) else None
+                if isinstance(collection_meta, dict):
+                    visible_record_count += int(collection_meta.get("record_count_visible") or 0)
+                    collection_updated_at = str(collection_meta.get("latest_updated_at") or "").strip()
+                    if collection_updated_at and collection_updated_at > latest_updated_at:
+                        latest_updated_at = collection_updated_at
+
+        return {
+            "_meta": {
+                "source_of_truth": "agentsdb_repository",
+                "agents_db_uri": agents_db_uri,
+                "database_name": database_name,
+                "collection_count": len(collection_payload_map),
+                "record_count_visible": visible_record_count,
+                "record_limit_per_collection": self._agentsdb_repository_projection_limit(),
+                "latest_updated_at": latest_updated_at,
+            },
+            database_name: collection_payload_map,
+        }
+
+    def _strip_derived_agentsdb_repository_sections(self, data: dict[str, Any]) -> dict[str, Any]:
+        normalized_data = self._normalize_tree_data_structure(data)
+        section_payload = normalized_data.get(self._AGENTSDB_REPOSITORY_SECTION_NAME)
+        if not isinstance(section_payload, dict):
+            return normalized_data
+        stripped_section_payload = dict(section_payload)
+        stripped_section_payload.pop(self._AGENTSDB_REPOSITORY_SECTION_KEY, None)
+        normalized_data[self._AGENTSDB_REPOSITORY_SECTION_NAME] = stripped_section_payload
+        return normalized_data
+
+    def _overlay_agentsdb_repository_sections(
+        self,
+        data: dict[str, Any],
+        *,
+        runtime_config: Any | None = None,
+        repository: Any | None = None,
+    ) -> dict[str, Any]:
+        normalized_data = self._normalize_tree_data_structure(data)
+        if runtime_config is None or not self._should_project_agentsdb_repository(repository):
+            return normalized_data
+
+        section_payload = normalized_data.get(self._AGENTSDB_REPOSITORY_SECTION_NAME)
+        if not isinstance(section_payload, dict):
+            section_payload = {}
+        section_payload = dict(section_payload)
+        section_payload[self._AGENTSDB_REPOSITORY_SECTION_KEY] = self._agentsdb_repository_view_payload(
+            runtime_config=runtime_config,
+            repository=repository,
+        )
+        normalized_data[self._AGENTSDB_REPOSITORY_SECTION_NAME] = section_payload
+        return normalized_data
+
+    def _resolve_tree_view_data(
+        self,
+        data: dict[str, Any],
+        *,
+        runtime_config: Any | None = None,
+        repository: Any | None = None,
+    ) -> dict[str, Any]:
+        normalized_data = self._strip_derived_agentsdb_repository_sections(self._normalize_tree_data_structure(data))
+        normalized_data = self._merge_local_projection_sections(
+            normalized_data,
+            runtime_config=runtime_config,
+            repository=repository,
+        )
+        normalized_data = self._overlay_agentsdb_repository_sections(
+            normalized_data,
+            runtime_config=runtime_config,
+            repository=repository,
+        )
+        return self._apply_tree_storage_projection_policy(normalized_data)
+
+    def _build_repository_projection_cursor(self, data: dict[str, Any]) -> dict[str, Any]:
+        normalized_data = self._normalize_tree_data_structure(data)
+        repository_section = normalized_data.get(self._AGENTSDB_REPOSITORY_SECTION_NAME)
+        repository_payload = repository_section.get(self._AGENTSDB_REPOSITORY_SECTION_KEY) if isinstance(repository_section, dict) else None
+        repository_meta = repository_payload.get("_meta") if isinstance(repository_payload, dict) else None
+        updated_at = str((repository_meta or {}).get("latest_updated_at") or "").strip()
+        tree_hash = self._tree_data_content_hash(normalized_data)
+        return {
+            "event_id": tree_hash[:32],
+            "updated_at": updated_at,
+            "tree_hash": tree_hash,
+        }
+
     def _agentsdb_collection_projection(self, repository: Any | None) -> list[dict[str, Any]]:
         if repository is None:
             return []
@@ -969,21 +1716,103 @@ class TreeDataPersistenceService:
             ],
         }
 
-    def _agentsdb_tree_payload(self, *, runtime_config: Any, repository: Any | None, data: dict[str, Any]) -> dict[str, Any]:
+    def _build_tree_stream_cursor(self, data: dict[str, Any], change_event: Any) -> dict[str, Any]:
+        safe_change_event = self._json_safe_projection_data(
+            change_event if isinstance(change_event, dict) else {"action": "snapshot", "origin": "tree_widget"}
+        )
+        timestamp = datetime.now(timezone.utc).isoformat()
+        tree_hash = self._tree_data_content_hash(data)
+        serialized_seed = json.dumps(
+            {
+                "timestamp": timestamp,
+                "tree_hash": tree_hash,
+                "change": safe_change_event,
+                "nonce": time.time_ns(),
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        event_id = hashlib.sha256(serialized_seed.encode("utf-8")).hexdigest()[:32]
+        return {
+            "event_id": event_id,
+            "updated_at": timestamp,
+            "tree_hash": tree_hash,
+            "change": safe_change_event,
+        }
+
+    def _agentsdb_tree_stream_event_payload(
+        self,
+        *,
+        runtime_config: Any,
+        stream_cursor: dict[str, Any],
+    ) -> dict[str, Any]:
+        namespace_id = str(getattr(runtime_config, "namespace_id", "") or "ns_alde_default").strip() or "ns_alde_default"
+        updated_at = str(stream_cursor.get("updated_at") or datetime.now(timezone.utc).isoformat())
+        safe_change_event = self._json_safe_projection_data(stream_cursor.get("change") or {"action": "snapshot", "origin": "tree_widget"})
+        return {
+            "namespace_id": namespace_id,
+            "title": "AI IDE Tree Stream Event",
+            "summary": "Append-only change stream event for the AI IDE tree widget.",
+            "document_type": "ai_ide_tree_stream_event",
+            "source_uri": "alde://ai_ide/tree/stream",
+            "tree_object_id": self._tree_object_id(),
+            "event_id": str(stream_cursor.get("event_id") or "").strip(),
+            "tree_hash": str(stream_cursor.get("tree_hash") or "").strip(),
+            "change": safe_change_event,
+            "updated_at": updated_at,
+            "created_at": updated_at,
+        }
+
+    def _agentsdb_tree_stream_head_payload(
+        self,
+        *,
+        runtime_config: Any,
+        stream_cursor: dict[str, Any],
+    ) -> dict[str, Any]:
+        namespace_id = str(getattr(runtime_config, "namespace_id", "") or "ns_alde_default").strip() or "ns_alde_default"
+        updated_at = str(stream_cursor.get("updated_at") or datetime.now(timezone.utc).isoformat())
+        safe_change_event = self._json_safe_projection_data(stream_cursor.get("change") or {"action": "snapshot", "origin": "tree_widget"})
+        return {
+            "namespace_id": namespace_id,
+            "title": "AI IDE Tree Stream Head",
+            "summary": "Latest live cursor for the AI IDE tree widget change stream.",
+            "document_type": "ai_ide_tree_stream_head",
+            "source_uri": "alde://ai_ide/tree/stream/head",
+            "tree_object_id": self._tree_object_id(),
+            "event_id": str(stream_cursor.get("event_id") or "").strip(),
+            "tree_hash": str(stream_cursor.get("tree_hash") or "").strip(),
+            "change": safe_change_event,
+            "updated_at": updated_at,
+            "created_at": updated_at,
+        }
+
+    def _agentsdb_tree_payload(
+        self,
+        *,
+        runtime_config: Any,
+        repository: Any | None,
+        data: dict[str, Any],
+        stream_cursor: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        base_data = self._strip_derived_agentsdb_repository_sections(
+            self._normalize_tree_data_structure(data)
+        )
         normalized_data = self._merge_local_projection_sections(
-            self._normalize_tree_data_structure(data),
+            base_data,
             runtime_config=runtime_config,
             repository=repository,
         )
         timestamp = datetime.now(timezone.utc).isoformat()
         namespace_id = str(getattr(runtime_config, "namespace_id", "") or "ns_alde_default").strip() or "ns_alde_default"
-        return {
+        content_sha256 = self._tree_data_content_hash(normalized_data)
+        payload = {
             "namespace_id": namespace_id,
             "title": "AI IDE Source Tree",
             "summary": "AgentsDB stores the complete AI IDE tree as source-of-truth for UI projections.",
             "document_type": "ai_ide_tree",
             "source_uri": "alde://ai_ide/tree",
             "tree_data": normalized_data,
+            "content_sha256": content_sha256,
             "agentsdb_tree": self._agentsdb_tree_projection(runtime_config=runtime_config, repository=repository),
             "projection_contract": {
                 "source_of_truth": "agents_db",
@@ -994,6 +1823,249 @@ class TreeDataPersistenceService:
             "updated_at": timestamp,
             "created_at": timestamp,
         }
+        normalized_stream_cursor = self._normalize_tree_stream_cursor(stream_cursor)
+        if normalized_stream_cursor is not None:
+            payload["last_stream_event_id"] = str(normalized_stream_cursor.get("event_id") or "").strip() or None
+            payload["stream_cursor"] = normalized_stream_cursor
+        return payload
+
+    def _upsert_tree_payload_to_agentsdb(
+        self,
+        *,
+        repository: Any | None,
+        runtime_config: Any | None,
+        data: dict[str, Any],
+        change_event: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        if repository is None or runtime_config is None:
+            return None
+        normalized_data = self._merge_local_projection_sections(
+            self._normalize_tree_data_structure(data),
+            runtime_config=runtime_config,
+            repository=repository,
+        )
+        stream_cursor = self._build_tree_stream_cursor(normalized_data, change_event)
+        tree_payload = self._agentsdb_tree_payload(
+            runtime_config=runtime_config,
+            repository=repository,
+            data=normalized_data,
+            stream_cursor=stream_cursor,
+        )
+        stream_event_payload = self._agentsdb_tree_stream_event_payload(
+            runtime_config=runtime_config,
+            stream_cursor=stream_cursor,
+        )
+        stream_head_payload = self._agentsdb_tree_stream_head_payload(
+            runtime_config=runtime_config,
+            stream_cursor=stream_cursor,
+        )
+
+        flush_context = getattr(repository, "deferred_write_queue", None)
+        if not callable(flush_context):
+            flush_context = getattr(repository, "deferred_flush", None)
+
+        if callable(flush_context):
+            with flush_context():
+                repository.upsert_object("document", self._tree_stream_event_object_id(str(stream_cursor.get("event_id") or "")), stream_event_payload)
+                repository.upsert_object("document", self._tree_stream_head_object_id(), stream_head_payload)
+                repository.upsert_object("document", self._tree_object_id(), tree_payload)
+        else:
+            repository.upsert_object("document", self._tree_stream_event_object_id(str(stream_cursor.get("event_id") or "")), stream_event_payload)
+            repository.upsert_object("document", self._tree_stream_head_object_id(), stream_head_payload)
+            repository.upsert_object("document", self._tree_object_id(), tree_payload)
+
+        self._last_stream_cursor = self._normalize_tree_stream_cursor(stream_cursor)
+        return self.load_last_stream_cursor()
+
+    def _load_tree_seed_payload(
+        self,
+        *,
+        runtime_config: Any | None,
+        repository: Any | None,
+    ) -> tuple[dict[str, Any], str, str]:
+        tree_sync_enabled = self._agentsdb_tree_sync_enabled()
+        if repository is not None and tree_sync_enabled:
+            try:
+                record = self._load_tree_record_from_agentsdb(repository)
+                tree_payload = self._extract_tree_payload_from_record(record)
+                if isinstance(tree_payload, dict):
+                    self._last_stream_cursor = self._load_tree_stream_cursor_from_agentsdb(repository) or self._tree_stream_cursor_from_tree_record(record)
+                    return self._normalize_tree_data_structure(tree_payload), "agents_db", self._tree_object_id()
+            except Exception as exc:
+                if self._agentsdb_strict_mode():
+                    raise RuntimeError(f"agents_db tree load failed: {exc}") from exc
+                print(f"[WARNING] agents_db tree load failed, trying legacy backends: {exc}")
+
+        mongo_collection = self._get_collection()
+        if mongo_collection is not None:
+            try:
+                document = mongo_collection.find_one({"_id": self._document_key()})
+                payload = document.get("data") if isinstance(document, dict) else None
+                if isinstance(payload, dict):
+                    return self._normalize_tree_data_structure(payload), "mongodb", self._target_label()
+            except Exception as exc:
+                print(f"[WARNING] MongoDB tree load failed, falling back to JSON: {exc}")
+
+        if self._json_path.exists():
+            with open(self._json_path, "r", encoding="utf-8") as data_file:
+                loaded_data = json.load(data_file)
+            if isinstance(loaded_data, dict):
+                return self._normalize_tree_data_structure(loaded_data), "json", str(self._json_path)
+
+        return self._normalize_tree_data_structure({}), "empty", str(self._json_path)
+
+    def load_live_update(
+        self,
+        previous_cursor: dict[str, Any] | None = None,
+    ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+        if not self.live_sync_enabled():
+            return None, self.load_last_stream_cursor() or self._normalize_tree_stream_cursor(previous_cursor)
+
+        runtime_config, repository = self._load_agentsdb_repository()
+        if repository is None:
+            return None, self.load_last_stream_cursor() or self._normalize_tree_stream_cursor(previous_cursor)
+
+        if self._should_project_agentsdb_repository(repository):
+            seed_data, _backend_name, _source = self._load_tree_seed_payload(
+                runtime_config=runtime_config,
+                repository=repository,
+            )
+            resolved_tree_payload = self._resolve_tree_view_data(
+                seed_data,
+                runtime_config=runtime_config,
+                repository=repository,
+            )
+            current_cursor = self._build_repository_projection_cursor(resolved_tree_payload)
+            normalized_previous_cursor = self._normalize_tree_stream_cursor(previous_cursor)
+            if normalized_previous_cursor == current_cursor:
+                self._last_stream_cursor = dict(current_cursor)
+                return None, self.load_last_stream_cursor()
+            self._last_stream_cursor = dict(current_cursor)
+            return resolved_tree_payload, self.load_last_stream_cursor()
+
+        current_cursor = self._load_tree_stream_cursor_from_agentsdb(repository)
+        normalized_previous_cursor = self._normalize_tree_stream_cursor(previous_cursor)
+        if current_cursor is not None and normalized_previous_cursor == current_cursor:
+            self._last_stream_cursor = dict(current_cursor)
+            return None, self.load_last_stream_cursor()
+
+        tree_record = self._load_tree_record_from_agentsdb(repository)
+        tree_payload = self._extract_tree_payload_from_record(tree_record)
+        if not isinstance(tree_payload, dict):
+            if current_cursor is not None:
+                self._last_stream_cursor = dict(current_cursor)
+            return None, self.load_last_stream_cursor()
+
+        normalized_tree_payload = self._merge_local_projection_sections(
+            self._normalize_tree_data_structure(tree_payload),
+            runtime_config=runtime_config,
+            repository=repository,
+        )
+        resolved_cursor = current_cursor or self._tree_stream_cursor_from_tree_record(tree_record)
+        self._last_stream_cursor = self._normalize_tree_stream_cursor(resolved_cursor)
+        return normalized_tree_payload, self.load_last_stream_cursor()
+
+    def stream_live_updates(
+        self,
+        previous_cursor: dict[str, Any] | None = None,
+        *,
+        stop_event: threading.Event | None = None,
+        status_callback: Callable[[dict[str, Any]], None] | None = None,
+    ) -> Iterable[tuple[dict[str, Any], dict[str, Any] | None]]:
+        if not self.supports_push_stream():
+            return
+
+        runtime_config, repository = self._load_agentsdb_repository()
+        subscribe_tree_stream = getattr(repository, "subscribe_tree_stream", None) if repository is not None else None
+        subscribe_repository_stream = getattr(repository, "subscribe_repository_stream", None) if repository is not None else None
+        if runtime_config is None or repository is None:
+            return
+
+        normalized_previous_cursor = self._normalize_tree_stream_cursor(previous_cursor)
+        last_event_id = str((normalized_previous_cursor or {}).get("event_id") or "").strip() or None
+
+        if self._should_project_agentsdb_repository(repository):
+            if not callable(subscribe_repository_stream):
+                return
+            object_name_list = sorted(
+                {
+                    str(object_name or "").strip().lower()
+                    for object_name in getattr(repository, "_OBJECT_COLLECTION_MAP", {}).keys()
+                    if str(object_name or "").strip()
+                }
+            )
+            for response_payload in subscribe_repository_stream(
+                last_event_id=last_event_id,
+                stop_event=stop_event,
+                object_names=object_name_list,
+                include_meta=True,
+            ):
+                if isinstance(response_payload, dict) and (
+                    bool(response_payload.get("subscribed")) or bool(response_payload.get("heartbeat"))
+                ):
+                    if callable(status_callback):
+                        status_callback(dict(response_payload))
+                    continue
+                normalized_tree_payload = self._resolve_tree_view_data(
+                    self._inmemory_tree_data,
+                    runtime_config=runtime_config,
+                    repository=repository,
+                )
+                self._inmemory_tree_data = self._strip_derived_agentsdb_repository_sections(normalized_tree_payload)
+                projection_cursor = self._build_repository_projection_cursor(normalized_tree_payload)
+                event_cursor = self._normalize_tree_stream_cursor(
+                    response_payload.get("stream_cursor") if isinstance(response_payload, dict) else None
+                )
+                stream_cursor = {
+                    "event_id": str((event_cursor or {}).get("event_id") or projection_cursor.get("event_id") or "").strip(),
+                    "updated_at": str((event_cursor or {}).get("updated_at") or projection_cursor.get("updated_at") or "").strip(),
+                    "tree_hash": str(projection_cursor.get("tree_hash") or "").strip(),
+                }
+                normalized_stream_cursor = self._normalize_tree_stream_cursor(stream_cursor)
+                if normalized_stream_cursor is not None:
+                    self._last_stream_cursor = dict(normalized_stream_cursor)
+                    last_event_id = str(normalized_stream_cursor.get("event_id") or "").strip() or last_event_id
+                yield normalized_tree_payload, self.load_last_stream_cursor() or normalized_stream_cursor
+            return
+
+        if not callable(subscribe_tree_stream):
+            return
+
+        for response_payload in subscribe_tree_stream(
+            self._tree_object_id(),
+            last_event_id=last_event_id,
+            stop_event=stop_event,
+            include_meta=True,
+        ):
+            if isinstance(response_payload, dict) and (
+                bool(response_payload.get("subscribed")) or bool(response_payload.get("heartbeat"))
+            ):
+                if callable(status_callback):
+                    status_callback(dict(response_payload))
+                continue
+            tree_payload = response_payload.get("tree_data") if isinstance(response_payload, dict) else None
+            if not isinstance(tree_payload, dict):
+                continue
+            normalized_tree_payload = self._merge_local_projection_sections(
+                self._normalize_tree_data_structure(tree_payload),
+                runtime_config=runtime_config,
+                repository=repository,
+            )
+            stream_cursor = self._normalize_tree_stream_cursor(
+                response_payload.get("stream_cursor") if isinstance(response_payload, dict) else None
+            )
+            if stream_cursor is None:
+                stream_cursor = self._normalize_tree_stream_cursor(
+                    {
+                        "event_id": response_payload.get("event_id") if isinstance(response_payload, dict) else None,
+                        "updated_at": response_payload.get("updated_at") if isinstance(response_payload, dict) else None,
+                        "tree_hash": response_payload.get("tree_hash") if isinstance(response_payload, dict) else None,
+                    }
+                )
+            if stream_cursor is not None:
+                self._last_stream_cursor = dict(stream_cursor)
+                last_event_id = str(stream_cursor.get("event_id") or "").strip() or last_event_id
+            yield normalized_tree_payload, self.load_last_stream_cursor() or stream_cursor
 
     def _load_storage_config(self) -> dict[str, Any]:
         if self._storage_config_cache is not None:
@@ -1083,110 +2155,148 @@ class TreeDataPersistenceService:
             return None
 
     def load_data(self) -> tuple[dict[str, Any], str, str]:
+        if self.memory_only_enabled():
+            runtime_config, repository = self._load_agentsdb_repository()
+            loaded_data = self._resolve_tree_view_data(
+                self._inmemory_tree_data,
+                runtime_config=runtime_config,
+                repository=repository,
+            )
+            self._inmemory_tree_data = self._strip_derived_agentsdb_repository_sections(loaded_data)
+            self._inmemory_tree_hash = self._tree_data_content_hash(self._inmemory_tree_data)
+            if repository is not None and self._should_project_agentsdb_repository(repository):
+                self._last_stream_cursor = self._build_repository_projection_cursor(loaded_data)
+                return loaded_data, "agents_db_repository", self._agentsdb_repository_source(runtime_config)
+            return loaded_data, "memory", "inmemory"
+
         runtime_config, repository = self._load_agentsdb_repository()
         tree_sync_enabled = self._agentsdb_tree_sync_enabled()
+        self._last_stream_cursor = None
         if repository is not None and not tree_sync_enabled:
             self._purge_agentsdb_tree_object(repository)
 
-        if repository is not None and tree_sync_enabled:
-            try:
-                record = repository.load_object("document", self._tree_object_id())
-                tree_payload = record.get("tree_data") if isinstance(record, dict) else None
-                if not isinstance(tree_payload, dict) and isinstance(record, dict):
-                    tree_payload = record.get("data")
-                if isinstance(tree_payload, dict):
-                    previous_tree_hash = self._tree_data_content_hash(tree_payload)
-                    normalized_tree_payload = self._merge_local_projection_sections(
-                        self._normalize_tree_data_structure(tree_payload),
-                        runtime_config=runtime_config,
-                        repository=repository,
-                    )
-                    if previous_tree_hash != self._tree_data_content_hash(normalized_tree_payload):
-                        try:
-                            repository.upsert_object(
-                                "document",
-                                self._tree_object_id(),
-                                self._agentsdb_tree_payload(
-                                    runtime_config=runtime_config,
-                                    repository=repository,
-                                    data=normalized_tree_payload,
-                                ),
-                            )
-                        except Exception:
-                            pass
-                    return normalized_tree_payload, "agents_db", self._tree_object_id()
-            except Exception as exc:
-                if self._agentsdb_strict_mode():
-                    raise RuntimeError(f"agents_db tree load failed: {exc}") from exc
-                print(f"[WARNING] agents_db tree load failed, trying legacy backends: {exc}")
-
-        mongo_collection = self._get_collection()
-        if mongo_collection is not None:
-            try:
-                document = mongo_collection.find_one({"_id": self._document_key()})
-                payload = document.get("data") if isinstance(document, dict) else None
-                if isinstance(payload, dict):
-                    normalized_payload = self._merge_local_projection_sections(
-                        self._normalize_tree_data_structure(payload),
-                        runtime_config=runtime_config,
-                        repository=repository,
-                    )
-                    if tree_sync_enabled and repository is not None and runtime_config is not None:
-                        try:
-                            repository.upsert_object(
-                                "document",
-                                self._tree_object_id(),
-                                self._agentsdb_tree_payload(runtime_config=runtime_config, repository=repository, data=normalized_payload),
-                            )
-                        except Exception:
-                            pass
-                    return normalized_payload, "mongodb", self._mongo_target_label()
-            except Exception as exc:
-                print(f"[WARNING] MongoDB tree load failed, falling back to JSON: {exc}")
-
-        if self._json_path.exists():
-            with open(self._json_path, "r", encoding="utf-8") as data_file:
-                loaded_data = json.load(data_file)
-            if isinstance(loaded_data, dict):
-                normalized_loaded_data = self._merge_local_projection_sections(
-                    self._normalize_tree_data_structure(loaded_data),
-                    runtime_config=runtime_config,
-                    repository=repository,
-                )
-                if tree_sync_enabled and repository is not None and runtime_config is not None:
-                    try:
-                        repository.upsert_object(
-                            "document",
-                            self._tree_object_id(),
-                            self._agentsdb_tree_payload(runtime_config=runtime_config, repository=repository, data=normalized_loaded_data),
-                        )
-                    except Exception:
-                        pass
-                return normalized_loaded_data, "json", str(self._json_path)
-        if tree_sync_enabled and self._agentsdb_strict_mode():
-            raise RuntimeError("agents_db tree object not found and strict mode is enabled")
-        return self._merge_local_projection_sections(
-            self._normalize_tree_data_structure({}),
+        seed_data, seed_backend, seed_source = self._load_tree_seed_payload(
             runtime_config=runtime_config,
             repository=repository,
-        ), "json", str(self._json_path)
+        )
+        normalized_loaded_data = self._resolve_tree_view_data(
+            seed_data,
+            runtime_config=runtime_config,
+            repository=repository,
+        )
+        persistable_payload = self._strip_derived_agentsdb_repository_sections(normalized_loaded_data)
 
-    def save_data(self, data: dict[str, Any]) -> tuple[str, str]:
+        if repository is not None and self._should_project_agentsdb_repository(repository):
+            self._last_stream_cursor = self._build_repository_projection_cursor(normalized_loaded_data)
+            return normalized_loaded_data, "agents_db_repository", self._agentsdb_repository_source(runtime_config)
+
+        if seed_backend == "agents_db":
+            previous_tree_hash = self._tree_data_content_hash(seed_data)
+            if previous_tree_hash != self._tree_data_content_hash(persistable_payload):
+                try:
+                    stream_cursor = self._upsert_tree_payload_to_agentsdb(
+                        repository=repository,
+                        runtime_config=runtime_config,
+                        data=persistable_payload,
+                        change_event={
+                            "action": "projection_merge",
+                            "origin": "tree_widget_load",
+                            "source_backend": "agents_db",
+                        },
+                    )
+                    if stream_cursor is not None:
+                        self._last_stream_cursor = stream_cursor
+                except Exception:
+                    pass
+            return normalized_loaded_data, "agents_db", seed_source
+
+        if seed_backend == "mongodb":
+            if tree_sync_enabled and repository is not None and runtime_config is not None:
+                try:
+                    stream_cursor = self._upsert_tree_payload_to_agentsdb(
+                        repository=repository,
+                        runtime_config=runtime_config,
+                        data=persistable_payload,
+                        change_event={
+                            "action": "bootstrap",
+                            "origin": "mongodb",
+                            "source_backend": "mongodb",
+                        },
+                    )
+                    if stream_cursor is not None:
+                        self._last_stream_cursor = stream_cursor
+                except Exception:
+                    pass
+            return normalized_loaded_data, "mongodb", seed_source
+
+        if seed_backend == "json":
+            if tree_sync_enabled and repository is not None and runtime_config is not None:
+                try:
+                    stream_cursor = self._upsert_tree_payload_to_agentsdb(
+                        repository=repository,
+                        runtime_config=runtime_config,
+                        data=persistable_payload,
+                        change_event={
+                            "action": "bootstrap",
+                            "origin": "json",
+                            "source_backend": "json",
+                        },
+                    )
+                    if stream_cursor is not None:
+                        self._last_stream_cursor = stream_cursor
+                except Exception:
+                    pass
+            return normalized_loaded_data, "json", seed_source
+
+        empty_payload = normalized_loaded_data
+        if tree_sync_enabled and repository is not None and runtime_config is not None:
+            try:
+                stream_cursor = self._upsert_tree_payload_to_agentsdb(
+                    repository=repository,
+                    runtime_config=runtime_config,
+                    data=persistable_payload,
+                    change_event={
+                        "action": "bootstrap",
+                        "origin": "tree_widget",
+                        "reason": "empty_tree_bootstrap",
+                    },
+                )
+                if stream_cursor is not None:
+                    self._last_stream_cursor = stream_cursor
+                return empty_payload, "agents_db", self._tree_object_id()
+            except Exception as exc:
+                if self._agentsdb_strict_mode():
+                    raise RuntimeError(f"agents_db tree bootstrap failed: {exc}") from exc
+                print(f"[WARNING] agents_db tree bootstrap failed, falling back to JSON: {exc}")
+        return empty_payload, "json", str(self._json_path)
+
+    def save_data(self, data: dict[str, Any], *, change_event: dict[str, Any] | None = None) -> tuple[str, str]:
+        if self.memory_only_enabled():
+            self._store_inmemory_tree_data(
+                self._strip_derived_agentsdb_repository_sections(data),
+                change_event=change_event,
+            )
+            return "memory", "inmemory"
+
         runtime_config, repository = self._load_agentsdb_repository()
         tree_sync_enabled = self._agentsdb_tree_sync_enabled()
+        persistable_input = self._strip_derived_agentsdb_repository_sections(data)
         normalized_data = self._merge_local_projection_sections(
-            self._normalize_tree_data_structure(data),
+            self._normalize_tree_data_structure(persistable_input),
             runtime_config=runtime_config,
             repository=repository,
         )
         if repository is not None and runtime_config is not None:
             if tree_sync_enabled:
                 try:
-                    repository.upsert_object(
-                        "document",
-                        self._tree_object_id(),
-                        self._agentsdb_tree_payload(runtime_config=runtime_config, repository=repository, data=normalized_data),
+                    stream_cursor = self._upsert_tree_payload_to_agentsdb(
+                        repository=repository,
+                        runtime_config=runtime_config,
+                        data=normalized_data,
+                        change_event=change_event or {"action": "snapshot", "origin": "tree_widget"},
                     )
+                    if stream_cursor is not None:
+                        self._last_stream_cursor = stream_cursor
                     return "agents_db", self._tree_object_id()
                 except Exception as exc:
                     if self._agentsdb_strict_mode():
@@ -1699,6 +2809,12 @@ class JsonTreeWidgetWithToolbar(QWidget):
     def set_json(self, data: Any) -> None:
         self.tree.set_json(data)
 
+    def load_live_sync_diagnostic(self) -> dict[str, Any]:
+        return self.tree.load_live_sync_diagnostic()
+
+    def run_manual_sync(self, *, source_label: str = "manual_sync") -> bool:
+        return bool(self.tree.run_manual_sync(source_label=source_label))
+
 
 # ------------------------- JsonTreeWidget -------------------------------
 class JsonTreeWidget(QTreeWidget):
@@ -1736,8 +2852,22 @@ class JsonTreeWidget(QTreeWidget):
         self._initializing = True
         self._item_last_text: dict[QTreeWidgetItem, str] = {}
         self._last_saved_hash: str | None = None
+        self._live_sync_cursor: dict[str, Any] | None = None
+        self._live_sync_timer: QTimer | None = None
+        self._live_sync_poll_in_flight = False
+        self._live_sync_diagnostic_lock = threading.RLock()
+        self._live_sync_diagnostic: dict[str, Any] = {}
+        self._last_live_sync_log_key: str = ""
+        self._last_live_sync_log_at: float = 0.0
+        self._live_stream_bridge: _TreePushStreamBridge | None = None
+        self._live_stream_thread: threading.Thread | None = None
+        self._live_stream_stop_event: threading.Event | None = None
+        self._push_update_timer: QTimer | None = None
+        self._push_update_pending: tuple[Any, Any] | None = None
+        self._push_update_apply_in_flight = False
         app_data_dir = Path(__file__).parent.parent / "AppData"
         self._persistence_service = TreeDataPersistenceService(app_data_dir)
+        self._initialize_live_sync_diagnostic()
         
         # Store data for each section separately
         self._data: dict[str, dict[str, Any]] = {}
@@ -1807,6 +2937,555 @@ class JsonTreeWidget(QTreeWidget):
         self.itemChanged.connect(self._on_item_changed)
         self._remember_tree_texts()
         self._initializing = False
+        self._update_live_sync_cursor()
+        self.destroyed.connect(self._handle_widget_destroyed)
+        self._start_live_sync_transport()
+
+    def _initialize_live_sync_diagnostic(self) -> None:
+        self._live_sync_diagnostic = {
+            "enabled": bool(self._persistence_service.live_sync_enabled()),
+            "auto_sync_enabled": False,
+            "push_enabled": bool(self._persistence_service.push_stream_enabled()),
+            "push_supported": False,
+            "transport": "disabled",
+            "connection_state": "idle",
+            "reconnect_attempts": 0,
+            "backoff_seconds": 0.0,
+            "error_count": 0,
+            "last_error": "",
+            "last_error_at": "",
+            "last_event_id": "",
+            "last_event_at": "",
+            "last_update_at": "",
+            "tree_object_id": self._persistence_service._tree_object_id(),
+        }
+
+    def _live_sync_now_iso(self) -> str:
+        return datetime.now(timezone.utc).isoformat()
+
+    def _push_stream_base_backoff_seconds(self) -> float:
+        raw_value = str(os.getenv("AI_IDE_AGENTS_DB_TREE_PUSH_BACKOFF_BASE_SECONDS", "0.5") or "0.5").strip()
+        try:
+            resolved_value = float(raw_value)
+        except Exception:
+            resolved_value = 0.5
+        return max(0.1, resolved_value)
+
+    def _push_stream_max_backoff_seconds(self) -> float:
+        raw_value = str(os.getenv("AI_IDE_AGENTS_DB_TREE_PUSH_BACKOFF_MAX_SECONDS", "8.0") or "8.0").strip()
+        try:
+            resolved_value = float(raw_value)
+        except Exception:
+            resolved_value = 8.0
+        return max(self._push_stream_base_backoff_seconds(), resolved_value)
+
+    def _compute_push_stream_backoff_seconds(self, reconnect_attempts: int) -> float:
+        normalized_attempts = max(1, int(reconnect_attempts or 1))
+        base_delay = self._push_stream_base_backoff_seconds()
+        max_delay = self._push_stream_max_backoff_seconds()
+        return min(max_delay, base_delay * (2 ** max(0, normalized_attempts - 1)))
+
+    def _push_stream_coalesce_interval_ms(self) -> int:
+        raw_value = str(os.getenv("AI_IDE_AGENTS_DB_TREE_PUSH_COALESCE_MS", "200") or "200").strip()
+        try:
+            resolved_value = int(raw_value)
+        except Exception:
+            resolved_value = 200
+        return max(0, min(resolved_value, 5000))
+
+    def _push_stream_runtime_enabled(self) -> bool:
+        value = str(os.getenv("AI_IDE_AGENTS_DB_TREE_PUSH_RUNTIME", "0") or "0").strip().lower()
+        return value in {"1", "true", "yes", "on"}
+
+    def _auto_sync_runtime_enabled(self) -> bool:
+        value = str(os.getenv("AI_IDE_AGENTS_DB_TREE_AUTO_SYNC_RUNTIME", "0") or "0").strip().lower()
+        return value in {"1", "true", "yes", "on"}
+
+    def _ensure_push_update_timer(self) -> QTimer:
+        if isinstance(self._push_update_timer, QTimer):
+            return self._push_update_timer
+        timer = QTimer(self)
+        timer.setObjectName("JsonTreeWidgetPushUpdateCoalesceTimer")
+        timer.setSingleShot(True)
+        timer.timeout.connect(self._drain_push_stream_update)
+        self._push_update_timer = timer
+        return timer
+
+    def _schedule_push_stream_update(self, loaded_data: Any, stream_cursor: Any) -> None:
+        self._push_update_pending = (loaded_data, stream_cursor)
+        timer = self._ensure_push_update_timer()
+        if not timer.isActive():
+            timer.start(self._push_stream_coalesce_interval_ms())
+
+    def _set_live_sync_diagnostic(self, **updates: Any) -> None:
+        with self._live_sync_diagnostic_lock:
+            self._live_sync_diagnostic.update(updates)
+
+    def _record_live_sync_cursor(self, stream_cursor: Any, *, update_received_at: bool = False) -> None:
+        if not isinstance(stream_cursor, dict):
+            return
+        diagnostic_updates: dict[str, Any] = {}
+        event_id = str(stream_cursor.get("event_id") or "").strip()
+        updated_at = str(stream_cursor.get("updated_at") or "").strip()
+        if event_id:
+            diagnostic_updates["last_event_id"] = event_id
+        if updated_at:
+            diagnostic_updates["last_event_at"] = updated_at
+        if update_received_at:
+            diagnostic_updates["last_update_at"] = self._live_sync_now_iso()
+        if diagnostic_updates:
+            self._set_live_sync_diagnostic(**diagnostic_updates)
+
+    def _record_live_sync_failure(
+        self,
+        error_text: str,
+        *,
+        reconnect_attempts: int,
+        backoff_seconds: float,
+        connection_state: str = "backoff",
+    ) -> None:
+        with self._live_sync_diagnostic_lock:
+            error_count = int(self._live_sync_diagnostic.get("error_count") or 0) + 1
+            self._live_sync_diagnostic.update(
+                {
+                    "transport": "push",
+                    "connection_state": connection_state,
+                    "reconnect_attempts": max(0, int(reconnect_attempts or 0)),
+                    "backoff_seconds": max(0.0, float(backoff_seconds or 0.0)),
+                    "error_count": error_count,
+                    "last_error": str(error_text or "").strip(),
+                    "last_error_at": self._live_sync_now_iso(),
+                }
+            )
+
+    def load_live_sync_diagnostic(self) -> dict[str, Any]:
+        with self._live_sync_diagnostic_lock:
+            return dict(self._live_sync_diagnostic)
+
+    def _reset_tree_view_state(self, *, expanded_sections: dict[str, bool] | None = None) -> None:
+        self.clear()
+        self._root_sections = {}
+        self._item_to_section = {}
+        self._item_to_key = {}
+        self._item_kind = {}
+        self._item_badge = {}
+        self._lazy_children = {}
+        self._item_last_text = {}
+        self._data = {}
+
+        for section_name, collapsed in self._DEFAULT_ROOT_SECTION_LAYOUT:
+            section = self._add_root_section(section_name, collapsed=collapsed)
+            if isinstance(expanded_sections, dict) and section_name in expanded_sections:
+                section.setExpanded(bool(expanded_sections.get(section_name)))
+            self._data[section_name] = {}
+
+    def _apply_loaded_tree_data(
+        self,
+        loaded_data: dict[str, Any],
+        *,
+        backend_name: str,
+        source: str,
+        log_message: bool = True,
+    ) -> None:
+        normalized_loaded_data = self._persistence_service._normalize_tree_data_structure(loaded_data)
+        payload = json.dumps(normalized_loaded_data, ensure_ascii=False, sort_keys=True)
+        self._last_saved_hash = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+        expanded_sections = {
+            section_name: section.isExpanded()
+            for section_name, section in self._root_sections.items()
+            if section is not None
+        }
+
+        self._initializing = True
+        self.blockSignals(True)
+        try:
+            self._reset_tree_view_state(expanded_sections=expanded_sections)
+            for section_name, section_data in normalized_loaded_data.items():
+                if section_name not in self._root_sections:
+                    section = self._add_root_section(section_name)
+                    if section_name in expanded_sections:
+                        section.setExpanded(bool(expanded_sections.get(section_name)))
+                section = self._root_sections.get(section_name)
+                if not isinstance(section_data, dict):
+                    section_data = {}
+                self._data[section_name] = dict(section_data)
+                if section is None:
+                    continue
+
+                for key, value in section_data.items():
+                    item = self._build_item(key, value, section_name=section_name)
+                    section.addChild(item)
+                    self._item_to_section[item] = section_name
+                    self._item_to_key[item] = key
+                    self._remember_item_texts_recursive(item)
+                    if section_name.upper() in self._HISTORY_SECTION_NAMES:
+                        self._item_kind[item] = "history"
+                        badge = self._extract_history_badge(value)
+                        if badge:
+                            self._item_badge[item] = badge
+                        self._apply_item_icon(item)
+        finally:
+            self.blockSignals(False)
+            self._update_root_section_header_styles()
+            self._update_section_item_font_sizes()
+            self._remember_tree_texts()
+            self._initializing = False
+
+        self._update_live_sync_cursor()
+        if log_message:
+            print(f"[INFO] Tree data loaded from {backend_name}:{source}")
+
+    def _update_live_sync_cursor(self) -> None:
+        stream_cursor = self._persistence_service.load_last_stream_cursor()
+        if isinstance(stream_cursor, dict):
+            self._live_sync_cursor = dict(stream_cursor)
+            self._record_live_sync_cursor(stream_cursor)
+
+    @Slot(object)
+    def _handle_widget_destroyed(self, _obj: object | None = None) -> None:
+        self._set_live_sync_diagnostic(connection_state="stopped", backoff_seconds=0.0)
+        self._stop_live_sync_transport()
+
+    def _stop_live_sync_transport(self) -> None:
+        if isinstance(self._live_sync_timer, QTimer):
+            self._live_sync_timer.stop()
+            self._live_sync_timer.deleteLater()
+            self._live_sync_timer = None
+        if isinstance(self._push_update_timer, QTimer):
+            self._push_update_timer.stop()
+            self._push_update_timer.deleteLater()
+            self._push_update_timer = None
+        self._push_update_pending = None
+        self._push_update_apply_in_flight = False
+        stop_event = self._live_stream_stop_event
+        if isinstance(stop_event, threading.Event):
+            stop_event.set()
+
+    def _start_live_sync_transport(self) -> None:
+        if not self._persistence_service.live_sync_enabled():
+            self._set_live_sync_diagnostic(
+                enabled=False,
+                auto_sync_enabled=False,
+                transport="disabled",
+                connection_state="disabled",
+            )
+            return
+
+        auto_sync_enabled = self._auto_sync_runtime_enabled()
+        if not auto_sync_enabled:
+            self._stop_live_sync_transport()
+            self._set_live_sync_diagnostic(
+                enabled=True,
+                auto_sync_enabled=False,
+                push_enabled=False,
+                transport="manual",
+                connection_state="manual_waiting",
+                reconnect_attempts=0,
+                backoff_seconds=0.0,
+            )
+            return
+
+        push_enabled = bool(self._persistence_service.push_stream_enabled()) and self._push_stream_runtime_enabled()
+        self._set_live_sync_diagnostic(enabled=True, auto_sync_enabled=True, push_enabled=push_enabled)
+        if push_enabled and self._start_live_push_stream():
+            return
+        self._start_live_sync_timer()
+
+    def _start_live_push_stream(self) -> bool:
+        if not self._persistence_service.supports_push_stream():
+            self._set_live_sync_diagnostic(push_supported=False)
+            return False
+
+        self._stop_live_sync_transport()
+        self._set_live_sync_diagnostic(
+            push_supported=True,
+            transport="push",
+            connection_state="connecting",
+            reconnect_attempts=0,
+            backoff_seconds=0.0,
+        )
+        self._live_stream_bridge = _TreePushStreamBridge(self)
+        self._live_stream_bridge.update_received.connect(self._handle_push_stream_update, Qt.QueuedConnection)
+        self._live_stream_bridge.stream_error.connect(self._handle_push_stream_error, Qt.QueuedConnection)
+        stop_event = threading.Event()
+        self._live_stream_stop_event = stop_event
+
+        def worker() -> None:
+            last_cursor = dict(self._live_sync_cursor) if isinstance(self._live_sync_cursor, dict) else None
+            reconnect_attempts = 0
+            while not stop_event.is_set():
+                delivered_update = False
+                self._set_live_sync_diagnostic(
+                    transport="push",
+                    connection_state="connecting" if reconnect_attempts == 0 else "reconnecting",
+                    reconnect_attempts=reconnect_attempts,
+                    backoff_seconds=0.0,
+                )
+                try:
+                    for loaded_data, stream_cursor in self._persistence_service.stream_live_updates(
+                        previous_cursor=last_cursor,
+                        stop_event=stop_event,
+                        status_callback=self._handle_push_stream_status_payload,
+                    ):
+                        if stop_event.is_set():
+                            break
+                        delivered_update = True
+                        reconnect_attempts = 0
+                        if isinstance(stream_cursor, dict):
+                            last_cursor = dict(stream_cursor)
+                        self._set_live_sync_diagnostic(
+                            transport="push",
+                            connection_state="connected",
+                            reconnect_attempts=0,
+                            backoff_seconds=0.0,
+                        )
+                        if self._live_stream_bridge is not None:
+                            self._live_stream_bridge.update_received.emit(loaded_data, stream_cursor)
+                    if stop_event.is_set():
+                        break
+                    if not delivered_update:
+                        reconnect_attempts += 1
+                        backoff_seconds = self._compute_push_stream_backoff_seconds(reconnect_attempts)
+                        self._record_live_sync_failure(
+                            "tree_push_stream_closed",
+                            reconnect_attempts=reconnect_attempts,
+                            backoff_seconds=backoff_seconds,
+                        )
+                        if self._live_stream_bridge is not None:
+                            self._live_stream_bridge.stream_error.emit(
+                                f"tree_push_stream_closed; retry in {backoff_seconds:.1f}s"
+                            )
+                        stop_event.wait(backoff_seconds)
+                except Exception as exc:
+                    if stop_event.is_set():
+                        break
+                    reconnect_attempts += 1
+                    backoff_seconds = self._compute_push_stream_backoff_seconds(reconnect_attempts)
+                    self._record_live_sync_failure(
+                        str(exc),
+                        reconnect_attempts=reconnect_attempts,
+                        backoff_seconds=backoff_seconds,
+                    )
+                    if self._live_stream_bridge is not None:
+                        self._live_stream_bridge.stream_error.emit(
+                            f"{exc}; retry in {backoff_seconds:.1f}s"
+                        )
+                    stop_event.wait(backoff_seconds)
+
+        self._live_stream_thread = threading.Thread(
+            target=worker,
+            name="alde-tree-push-stream",
+            daemon=True,
+        )
+        self._live_stream_thread.start()
+        return True
+
+    def _start_live_sync_timer(self) -> None:
+        if not self._persistence_service.live_sync_enabled():
+            return
+        if isinstance(self._live_sync_timer, QTimer):
+            self._live_sync_timer.stop()
+            self._live_sync_timer.deleteLater()
+        self._set_live_sync_diagnostic(
+            transport="poll",
+            connection_state="polling",
+            backoff_seconds=0.0,
+            reconnect_attempts=0,
+            push_supported=bool(self._persistence_service.supports_push_stream()),
+        )
+        self._live_sync_timer = QTimer(self)
+        self._live_sync_timer.setObjectName("JsonTreeWidgetLiveSyncPollTimer")
+        self._live_sync_timer.setInterval(self._persistence_service.live_sync_interval_ms())
+        self._live_sync_timer.timeout.connect(self._poll_live_tree_updates)
+        self._live_sync_timer.start()
+
+    def _live_sync_log_enabled(self) -> bool:
+        value = str(os.getenv("AI_IDE_TREE_LIVE_SYNC_LOG", "1") or "1").strip().lower()
+        return value not in {"0", "false", "no", "off", "quiet"}
+
+    def _live_sync_log_interval_seconds(self) -> float:
+        raw_value = str(os.getenv("AI_IDE_TREE_LIVE_SYNC_LOG_INTERVAL_SECONDS", "5.0") or "5.0").strip()
+        try:
+            return max(0.0, float(raw_value))
+        except Exception:
+            return 5.0
+
+    def _emit_live_sync_log(self, *, source_label: str, source: str, payload_hash: str) -> None:
+        if not self._live_sync_log_enabled():
+            return
+        log_key = f"{source_label}:{source}:{payload_hash}"
+        current_time = time.monotonic()
+        interval_seconds = self._live_sync_log_interval_seconds()
+        if log_key == self._last_live_sync_log_key and current_time - self._last_live_sync_log_at < interval_seconds:
+            return
+        self._last_live_sync_log_key = log_key
+        self._last_live_sync_log_at = current_time
+        print(f"[INFO] Tree data live-synced from {source_label}:{source}")
+
+    def _consume_live_tree_update(
+        self,
+        loaded_data: Any,
+        stream_cursor: Any,
+        *,
+        backend_name: str,
+        source_label: str,
+        source: str,
+    ) -> None:
+        if isinstance(stream_cursor, dict):
+            self._live_sync_cursor = dict(stream_cursor)
+            self._record_live_sync_cursor(stream_cursor, update_received_at=True)
+        if not isinstance(loaded_data, dict):
+            return
+
+        is_push_source = str(source_label or "").strip().lower().endswith("_push") or source_label == "agents_db_push"
+
+        self._set_live_sync_diagnostic(
+            transport="push" if is_push_source else "poll",
+            connection_state="connected" if is_push_source else "polling",
+            reconnect_attempts=0,
+            backoff_seconds=0.0,
+        )
+
+        normalized_loaded_data = self._persistence_service._normalize_tree_data_structure(loaded_data)
+        payload_hash = hashlib.sha256(
+            json.dumps(normalized_loaded_data, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        ).hexdigest()
+        if payload_hash == self._last_saved_hash:
+            return
+
+        self._apply_loaded_tree_data(
+            normalized_loaded_data,
+            backend_name=backend_name,
+            source=source,
+            log_message=False,
+        )
+        self._emit_live_sync_log(
+            source_label=source_label,
+            source=source,
+            payload_hash=payload_hash,
+        )
+
+    @Slot()
+    def _drain_push_stream_update(self) -> None:
+        if self._push_update_apply_in_flight:
+            timer = self._ensure_push_update_timer()
+            if not timer.isActive():
+                timer.start(self._push_stream_coalesce_interval_ms())
+            return
+
+        pending_payload = self._push_update_pending
+        self._push_update_pending = None
+        if pending_payload is None:
+            return
+
+        self._push_update_apply_in_flight = True
+        try:
+            loaded_data, stream_cursor = pending_payload
+            repository_push_enabled = self._persistence_service.uses_repository_projection()
+            self._consume_live_tree_update(
+                loaded_data,
+                stream_cursor,
+                backend_name="agents_db_repository_push" if repository_push_enabled else "agents_db_push",
+                source_label="agents_db_repository_push" if repository_push_enabled else "agents_db_push",
+                source=self._persistence_service.live_sync_source(),
+            )
+        finally:
+            self._push_update_apply_in_flight = False
+
+        if self._push_update_pending is not None:
+            timer = self._ensure_push_update_timer()
+            if not timer.isActive():
+                timer.start(self._push_stream_coalesce_interval_ms())
+
+    @Slot(object, object)
+    def _handle_push_stream_update(self, loaded_data: Any, stream_cursor: Any) -> None:
+        self._schedule_push_stream_update(loaded_data, stream_cursor)
+
+    def _handle_push_stream_status_payload(self, status_payload: dict[str, Any]) -> None:
+        if not isinstance(status_payload, dict):
+            return
+        if not bool(status_payload.get("subscribed")) and not bool(status_payload.get("heartbeat")):
+            return
+        self._set_live_sync_diagnostic(
+            transport="push",
+            connection_state="connected",
+            reconnect_attempts=0,
+            backoff_seconds=0.0,
+        )
+
+    @Slot(str)
+    def _handle_push_stream_error(self, error_text: str) -> None:
+        print(f"[WARNING] Tree push stream reconnecting after error: {error_text}")
+
+    @Slot()
+    def _poll_live_tree_updates(self) -> None:
+        if self._initializing or self._live_sync_poll_in_flight:
+            return
+        if not self._persistence_service.live_sync_enabled():
+            return
+
+        self._live_sync_poll_in_flight = True
+        try:
+            loaded_data, stream_cursor = self._persistence_service.load_live_update(previous_cursor=self._live_sync_cursor)
+            self._consume_live_tree_update(
+                loaded_data,
+                stream_cursor,
+                backend_name=self._persistence_service.live_sync_backend_name(),
+                source_label=self._persistence_service.live_sync_source_label(),
+                source=self._persistence_service.live_sync_source(),
+            )
+        except Exception as exc:
+            print(f"[WARNING] Could not live-sync tree data: {exc}")
+        finally:
+            self._live_sync_poll_in_flight = False
+
+    def run_manual_sync(self, *, source_label: str = "manual_sync") -> bool:
+        normalized_source = str(source_label or "manual_sync").strip() or "manual_sync"
+        self._set_live_sync_diagnostic(
+            auto_sync_enabled=self._auto_sync_runtime_enabled(),
+            push_enabled=False,
+            transport="manual",
+            connection_state="syncing",
+            reconnect_attempts=0,
+            backoff_seconds=0.0,
+        )
+        try:
+            self._reload_tree_from_persistence(log_message=False)
+            self._set_live_sync_diagnostic(
+                transport="manual",
+                connection_state="manual",
+                reconnect_attempts=0,
+                backoff_seconds=0.0,
+                last_error="",
+                last_error_at="",
+                last_update_at=self._live_sync_now_iso(),
+            )
+            payload_hash = str(self._last_saved_hash or "").strip()
+            if payload_hash:
+                self._emit_live_sync_log(
+                    source_label=normalized_source,
+                    source=self._persistence_service.live_sync_source(),
+                    payload_hash=payload_hash,
+                )
+            return True
+        except Exception as exc:
+            with self._live_sync_diagnostic_lock:
+                error_count = int(self._live_sync_diagnostic.get("error_count") or 0) + 1
+                self._live_sync_diagnostic.update(
+                    {
+                        "auto_sync_enabled": self._auto_sync_runtime_enabled(),
+                        "push_enabled": False,
+                        "transport": "manual",
+                        "connection_state": "error",
+                        "reconnect_attempts": 0,
+                        "backoff_seconds": 0.0,
+                        "error_count": error_count,
+                        "last_error": str(exc),
+                        "last_error_at": self._live_sync_now_iso(),
+                    }
+                )
+            print(f"[WARNING] Could not manually sync tree data: {exc}")
+            return False
 
     def _should_lazy_load_children(self, section_name: str | None, value: Any) -> bool:
         section_upper = (section_name or "").upper()
@@ -2235,6 +3914,62 @@ class JsonTreeWidget(QTreeWidget):
         self._apply_item_icon(item)
         return item
 
+    @staticmethod
+    def _extract_item_key_from_text(text: str) -> str:
+        if ": " in text:
+            return text.split(": ", 1)[0].strip()
+        if text.endswith(" {...}"):
+            return text[:-5].strip()
+        if text.endswith(" [") and text.rsplit(" ", 1)[-1].endswith("]"):
+            return text.rsplit(" ", 1)[0].strip()
+        if " [" in text and text.endswith("]"):
+            return text.rsplit(" ", 1)[0].strip()
+        return text.strip()
+
+    def _resolve_section_name_for_item(self, item: QTreeWidgetItem | None) -> str | None:
+        if item is None:
+            return None
+        section_name = self._item_to_section.get(item)
+        if section_name is not None:
+            return section_name
+        parent = item.parent()
+        while parent is not None:
+            for candidate_section_name, section_item in self._root_sections.items():
+                if section_item == parent:
+                    return candidate_section_name
+            parent = parent.parent()
+        return None
+
+    def _item_path_segments(self, item: QTreeWidgetItem, column: int = 0, *, section_name: str | None = None) -> list[str]:
+        resolved_section_name = section_name or self._resolve_section_name_for_item(item)
+        if resolved_section_name is None:
+            return []
+
+        path_segments: list[str] = []
+        current = item
+        section_root = self._root_sections.get(resolved_section_name)
+        while current is not None and current != section_root:
+            path_segments.append(self._extract_item_key_from_text(current.text(column)))
+            current = current.parent()
+        path_segments.reverse()
+        return path_segments
+
+    def _reload_tree_from_persistence(self, *, log_message: bool = False) -> None:
+        loaded_data, backend_name, source = self._persistence_service.load_data()
+        if isinstance(loaded_data, dict):
+            self._apply_loaded_tree_data(
+                loaded_data,
+                backend_name=backend_name,
+                source=source,
+                log_message=log_message,
+            )
+
+    def _is_agentsdb_repository_root_item(self, *, section_name: str | None, item_key: str | None) -> bool:
+        return (
+            str(section_name or "").strip().upper() == self._persistence_service._AGENTSDB_REPOSITORY_SECTION_NAME
+            and str(item_key or "").strip() == self._persistence_service._AGENTSDB_REPOSITORY_SECTION_KEY
+        )
+
     @Slot(QTreeWidgetItem, int)
     def _on_item_changed(self, item: QTreeWidgetItem, column: int) -> None:
         """Handle item edits by syncing changes back into the stored data."""
@@ -2258,40 +3993,13 @@ class JsonTreeWidget(QTreeWidget):
         self._item_last_text[item] = new_text
         
         # Check if this item belongs to a section
-        section_name = self._item_to_section.get(item)
-        if section_name is None:
-            # Try to find section by walking up the tree
-            parent = item.parent()
-            while parent is not None:
-                for sect_name, sect_item in self._root_sections.items():
-                    if sect_item == parent:
-                        section_name = sect_name
-                        break
-                if section_name:
-                    break
-                parent = parent.parent()
+        section_name = self._resolve_section_name_for_item(item)
         
         if section_name is None or section_name not in self._data:
             return
 
-        def extract_key(text: str) -> str:
-            if ": " in text:
-                return text.split(": ", 1)[0].strip()
-            if text.endswith(" {...}"):
-                return text[:-5].strip()
-            if text.endswith(" [") and text.rsplit(" ", 1)[-1].endswith("]"):
-                # fallback, although current formatter won't hit this
-                return text.rsplit(" ", 1)[0].strip()
-            if " [" in text and text.endswith("]"):
-                return text.rsplit(" ", 1)[0].strip()
-            return text.strip()
-
         def coerce_key(segment: str, container: Any) -> Any:
-            if isinstance(container, (list, tuple)) and segment.startswith("[") and segment.endswith("]"):
-                inner = segment[1:-1]
-                if inner.isdigit():
-                    return int(inner)
-            return segment
+            return self._persistence_service._coerce_tree_path_segment(segment, container)
 
         def parse_value(text: str) -> Any:
             try:
@@ -2300,16 +4008,17 @@ class JsonTreeWidget(QTreeWidget):
                 return text
 
         # Build the path from root to the edited item (skip section root)
-        path_segments: list[str] = []
-        current = item
-        section_root = self._root_sections.get(section_name)
-        
-        while current is not None and current != section_root:
-            path_segments.append(extract_key(current.text(column)))
-            current = current.parent()
-        path_segments.reverse()
+        path_segments = self._item_path_segments(item, column, section_name=section_name)
+        repository_binding = self._persistence_service.resolve_agentsdb_repository_binding(
+            section_name=section_name,
+            path_segments=path_segments,
+        )
         
         if not path_segments:
+            return
+
+        if repository_binding is not None and ": " not in new_text:
+            self._reload_tree_from_persistence(log_message=False)
             return
 
         # Walk the stored data to reach the parent container of the edited key
@@ -2357,9 +4066,35 @@ class JsonTreeWidget(QTreeWidget):
             item.setText(column, canonical_text)
             self.blockSignals(False)
             self._item_last_text[item] = canonical_text.strip()
+
+        if repository_binding is not None:
+            synced = False
+            try:
+                synced = self._persistence_service.apply_agentsdb_repository_edit(
+                    section_name=section_name,
+                    path_segments=path_segments,
+                    key_name=str(key_part),
+                    value=parsed_value,
+                )
+            except Exception as sync_exc:
+                print(f"[WARNING] Could not sync AgentDB repository edit: {sync_exc}")
+            if not synced:
+                self._reload_tree_from_persistence(log_message=False)
+                return
+            payload = json.dumps(self._data, ensure_ascii=False, sort_keys=True)
+            self._last_saved_hash = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+            return
         
         # Persist changes to disk after successful edit
-        self._save_data()
+        self._save_data(
+            change_event={
+                "action": "edit",
+                "origin": "tree_widget",
+                "section_name": section_name,
+                "path": [str(segment) for segment in path_segments],
+                "key": str(key_part),
+            }
+        )
     
     def _initialize_root_sections(self) -> None:
         """Initialize default root sections like VS Code Explorer."""
@@ -2486,10 +4221,19 @@ class JsonTreeWidget(QTreeWidget):
         
         # Save after adding (unless this is a derived/ephemeral view)
         if persist:
-            self._save_data()
+            self._save_data(
+                change_event={
+                    "action": "upsert",
+                    "origin": "tree_widget",
+                    "section_name": section_name,
+                    "item_key": str(key),
+                }
+            )
     
     def remove_from_section(self, section_name: str, item_name: str) -> bool:
         """Remove an item from a section by name."""
+        if self._is_agentsdb_repository_root_item(section_name=section_name, item_key=item_name):
+            return False
         section = self._root_sections.get(section_name)
         if section is None:
             return False
@@ -2512,7 +4256,14 @@ class JsonTreeWidget(QTreeWidget):
                 if child in self._item_last_text:
                     del self._item_last_text[child]
                 
-                self._save_data()
+                self._save_data(
+                    change_event={
+                        "action": "delete",
+                        "origin": "tree_widget",
+                        "section_name": section_name,
+                        "item_key": str(item_name),
+                    }
+                )
                 return True
         return False
     
@@ -2560,9 +4311,14 @@ class JsonTreeWidget(QTreeWidget):
             }
             self.add_to_section("DATABASES", name, db_data)
     
-    def _save_data(self) -> None:
+    def _save_data(self, *, change_event: dict[str, Any] | None = None) -> None:
         """Save the current data structure to the configured storage backend."""
         try:
+            payload = json.dumps(self._data, ensure_ascii=False, sort_keys=True)
+            payload_hash = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+            if self._last_saved_hash == payload_hash:
+                return
+
             try:
                 env_path = self._persistence_service.persist_env_projection_from_tree_data(self._data)
                 if env_path is not None:
@@ -2570,14 +4326,11 @@ class JsonTreeWidget(QTreeWidget):
             except Exception as env_exc:
                 print(f"[WARNING] Could not write ENV projection: {env_exc}")
 
-            payload = json.dumps(self._data, ensure_ascii=False, sort_keys=True)
-            payload_hash = hashlib.sha256(payload.encode("utf-8")).hexdigest()
-            if self._last_saved_hash == payload_hash:
-                return
-
-            backend_name, target = self._persistence_service.save_data(self._data)
+            backend_name, target = self._persistence_service.save_data(self._data, change_event=change_event)
             self._last_saved_hash = payload_hash
-            print(f"[INFO] Tree data saved to {backend_name}:{target}")
+            self._update_live_sync_cursor()
+            if backend_name != "memory":
+                print(f"[INFO] Tree data saved to {backend_name}:{target}")
         except Exception as e:
             print(f"[WARNING] Could not save tree data: {e}")
     
@@ -2585,41 +4338,13 @@ class JsonTreeWidget(QTreeWidget):
         """Load the data structure from the configured storage backend."""
         try:
             loaded_data, backend_name, source = self._persistence_service.load_data()
-            if isinstance(loaded_data, dict) and loaded_data:
-
-                # Restore internal data first so edits persist correctly.
-                for section_name, section_data in loaded_data.items():
-                    if isinstance(section_data, dict):
-                        self._data[section_name] = section_data
-
-                # Snapshot hash so we don't immediately re-save identical content.
-                payload = json.dumps(self._data, ensure_ascii=False, sort_keys=True)
-                self._last_saved_hash = hashlib.sha256(payload.encode("utf-8")).hexdigest()
-                    
-                # Restore all sections
-                self.blockSignals(True)
-                for section_name, section_data in loaded_data.items():
-                    if section_name not in self._root_sections:
-                        self._add_root_section(section_name)
-                    
-                    if isinstance(section_data, dict):
-                        for key, value in section_data.items():
-                            # Don't call add_to_section during load to avoid saving again
-                            section = self._root_sections.get(section_name)
-                            if section:
-                                item = self._build_item(key, value, section_name=section_name)
-                                section.addChild(item)
-                                self._item_to_section[item] = section_name
-                                self._item_to_key[item] = key
-                                self._remember_item_texts_recursive(item)
-                                if section_name.upper() in self._HISTORY_SECTION_NAMES:
-                                    self._item_kind[item] = "history"
-                                    badge = self._extract_history_badge(value)
-                                    if badge:
-                                        self._item_badge[item] = badge
-                                    self._apply_item_icon(item)
-                self.blockSignals(False)
-                print(f"[INFO] Tree data loaded from {backend_name}:{source}")
+            if isinstance(loaded_data, dict):
+                self._apply_loaded_tree_data(
+                    loaded_data,
+                    backend_name=backend_name,
+                    source=source,
+                    log_message=backend_name != "memory",
+                )
         except Exception as e:
             print(f"[INFO] Could not load tree data (this is normal on first run): {e}")
     
@@ -2865,14 +4590,26 @@ class JsonTreeWidget(QTreeWidget):
                 correlation_id=f"tree-import:{hashlib.sha256(f'{file_path}:{key_name}:{section_name}'.encode('utf-8')).hexdigest()[:24]}",
                 result_payload={
                     "agent": "data_tree_import",
+                    "source": "data_tree_import",
+                    "source_path": str(file_path),
+                    "title": str(key_name),
+                    "record_kind": "document",
+                    "kind": "document",
+                    "object_name": "documents",
                     "file": {
                         "source_path": str(file_path),
+                        "path": str(file_path),
                         "name": Path(file_path).name,
                         "import_format": str(import_format),
                     },
                     "parse": {
                         "raw_text": serialized_payload,
                     },
+                    "content_sha256": f"tree-import:{hashlib.sha256(f'{file_path}:{key_name}:{section_name}'.encode('utf-8')).hexdigest()[:24]}",
+                    "status": "processed",
+                    "processing_state": "processed",
+                    "processed": True,
+                    "failed_reason": None,
                     "document": {
                         "title": str(key_name),
                         "summary": f"Data tree import from {Path(file_path).name}",
@@ -3295,6 +5032,22 @@ class JsonTreeWidget(QTreeWidget):
             # Regular item menu
             section_name = self._item_to_section.get(item)
             item_key = self._item_to_key.get(item)
+            resolved_section_name = section_name or self._resolve_section_name_for_item(item)
+            path_segments = self._item_path_segments(item, 0, section_name=resolved_section_name)
+            collection_binding = self._persistence_service.resolve_agentsdb_repository_collection_binding(
+                section_name=resolved_section_name,
+                path_segments=path_segments,
+            )
+            repository_binding = self._persistence_service.resolve_agentsdb_repository_binding(
+                section_name=resolved_section_name,
+                path_segments=path_segments,
+            )
+
+            if collection_binding is not None and repository_binding is None:
+                add_record_action = QAction("➕ Add record", self)
+                add_record_action.triggered.connect(lambda: self._context_add_agentsdb_repository_record(item, resolved_section_name))
+                menu.addAction(add_record_action)
+                menu.addSeparator()
             
             # Rename
             rename_action = QAction("✏️ Rename", self)
@@ -3334,6 +5087,40 @@ class JsonTreeWidget(QTreeWidget):
         key, ok = QInputDialog.getText(self, "New Item", f"Enter name for new item in {section_name}:")
         if ok and key:
             self.add_to_section(section_name, key, {"value": ""})
+
+    def _context_add_agentsdb_repository_record(self, item: QTreeWidgetItem, section_name: str | None) -> None:
+        """Create a new AgentDB record below a repository collection node."""
+        from PySide6.QtWidgets import QInputDialog
+
+        resolved_section_name = section_name or self._resolve_section_name_for_item(item)
+        path_segments = self._item_path_segments(item, 0, section_name=resolved_section_name)
+        collection_binding = self._persistence_service.resolve_agentsdb_repository_collection_binding(
+            section_name=resolved_section_name,
+            path_segments=path_segments,
+        )
+        if collection_binding is None:
+            return
+
+        collection_name = str(collection_binding.get("collection_name") or path_segments[-1] or "record").strip()
+        record_id, ok = QInputDialog.getText(
+            self,
+            "New AgentDB Record",
+            f"Enter record id for {collection_name}:",
+        )
+        normalized_record_id = str(record_id or "").strip()
+        if not ok or not normalized_record_id:
+            return
+
+        created = self._persistence_service.create_agentsdb_repository_record(
+            section_name=resolved_section_name,
+            path_segments=path_segments,
+            record_id=normalized_record_id,
+        )
+        if created:
+            self._reload_tree_from_persistence(log_message=False)
+            QMessageBox.information(self, "Created", f"'{normalized_record_id}' has been added to {collection_name}")
+        else:
+            QMessageBox.warning(self, "Create Error", f"Could not create '{normalized_record_id}' in {collection_name}")
     
     def _context_export_section(self, section_name: str) -> None:
         """Export single section."""
@@ -3405,7 +5192,13 @@ class JsonTreeWidget(QTreeWidget):
                 while section.childCount() > 0:
                     section.removeChild(section.child(0))
                 self._data[section_name] = {}
-                self._save_data()
+                self._save_data(
+                    change_event={
+                        "action": "clear_section",
+                        "origin": "tree_widget",
+                        "section_name": section_name,
+                    }
+                )
                 QMessageBox.information(self, "Cleared", f"{section_name} has been cleared")
     
     def _context_duplicate_item(self, item: QTreeWidgetItem, section_name: str, item_key: str) -> None:
@@ -3480,6 +5273,36 @@ class JsonTreeWidget(QTreeWidget):
     
     def _context_delete_item(self, item: QTreeWidgetItem, section_name: str, item_key: str) -> None:
         """Delete an item."""
+        resolved_section_name = section_name or self._resolve_section_name_for_item(item)
+        path_segments = self._item_path_segments(item, 0, section_name=resolved_section_name)
+        repository_binding = self._persistence_service.resolve_agentsdb_repository_binding(
+            section_name=resolved_section_name,
+            path_segments=path_segments,
+        )
+        if repository_binding is not None:
+            target_label = str(path_segments[-1] or item.text(0) or "item").strip()
+            reply = QMessageBox.question(
+                self,
+                "Delete Item",
+                f"Delete '{target_label}' from AgentDB?",
+                QMessageBox.Yes | QMessageBox.No,
+            )
+            if reply == QMessageBox.Yes:
+                deleted = self._persistence_service.delete_agentsdb_repository_path(
+                    section_name=resolved_section_name,
+                    path_segments=path_segments,
+                )
+                if deleted:
+                    self._reload_tree_from_persistence(log_message=False)
+                    QMessageBox.information(self, "Deleted", f"'{target_label}' has been deleted")
+                else:
+                    QMessageBox.warning(self, "Delete Error", f"Could not delete '{target_label}' from AgentDB")
+            return
+
+        if self._is_agentsdb_repository_root_item(section_name=resolved_section_name, item_key=item_key):
+            QMessageBox.information(self, "Delete Item", "The AgentDB repository view is derived from the live database and cannot be removed from the tree.")
+            return
+
         if not section_name or not item_key:
             return
         

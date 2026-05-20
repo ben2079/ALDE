@@ -86,6 +86,7 @@ class McpRequestService:
         if not isinstance(params, dict):
             params = {}
 
+
         handlers = {
             "initialize": self.load_initialize_result,
             "tools/list": self.load_tools_list_result,

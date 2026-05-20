@@ -746,20 +746,64 @@ class TestWorkflowIntegration(unittest.TestCase):
             _name="test_ready_handoff",
         )
 
-        self.assertIsNone(chat._forced_route)
+        self.assertIsInstance(chat._forced_route, dict)
+        self.assertEqual((chat._forced_route or {}).get("job_name"), "cover_letter_writer")
+        forced_output = (((chat._forced_route or {}).get("handoff_payload") or {}).get("output") or {})
+        self.assertEqual((forced_output.get("job_posting_result") or {}).get("object_name"), "job_postings")
+        self.assertEqual((forced_output.get("profile_result") or {}).get("object_name"), "profiles")
         normalized_payload = self._load_chat_input_payload(chat)
         self.assertEqual(
             ((normalized_payload.get("job_posting_result") or {}).get("correlation_id")),
             "sha-ready-2",
         )
 
-    def test_store_job_posting_result_tool_supports_non_pdf_sources(self) -> None:
+    def test_resolve_forced_route_cover_letter_writer_payload_uses_canonical_results(self) -> None:
+        route = agents_configurator.resolve_forced_route(
+            "_xrouter_xplanner",
+            {
+                "action": "generate_cover_letter",
+                "correlation_id": "job-route-cover-1",
+                "job_posting_result": {
+                    "job_posting": {
+                        "job_title": "Route Platform Engineer",
+                        "company_name": "Route Co",
+                    },
+                    "file": {
+                        "path": "/tmp/route-cover-1.pdf",
+                        "content_sha256": "job-route-cover-1",
+                    },
+                },
+                "profile_result": {
+                    "profile": {
+                        "profile_id": "profile-route-cover-1",
+                        "skills": ["python", "rag"],
+                    },
+                },
+                "options": {
+                    "language": "de",
+                },
+            },
+            {"_xworker"},
+        )
+
+        self.assertIsInstance(route, dict)
+        self.assertEqual((route or {}).get("job_name"), "cover_letter_writer")
+        output_payload = (((route or {}).get("handoff_payload") or {}).get("output") or {})
+        self.assertEqual((output_payload.get("job_posting_result") or {}).get("object_name"), "job_postings")
+        self.assertEqual((output_payload.get("job_posting_result") or {}).get("record_kind"), "document")
+        self.assertEqual((output_payload.get("job_posting_result") or {}).get("correlation_id"), "job-route-cover-1")
+        self.assertEqual((output_payload.get("job_posting_result") or {}).get("source_path"), "/tmp/route-cover-1.pdf")
+        self.assertEqual((output_payload.get("profile_result") or {}).get("object_name"), "profiles")
+        self.assertEqual((output_payload.get("profile_result") or {}).get("record_kind"), "document")
+        self.assertEqual((output_payload.get("profile_result") or {}).get("correlation_id"), "profile-route-cover-1")
+
+    def test_store_result_supports_non_pdf_job_posting_sources(self) -> None:
         with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8") as tmp:
             job_postings_db_path = tmp.name
 
         try:
             result = json.loads(
-                tools_mod.store_job_posting_result_tool(
+                tools_mod.DOCUMENT_OBJECT_SERVICE.store_result(
                     job_posting_result={
                         "agent": "job_platform_ingest",
                         "correlation_id": "platform:job-42",
@@ -787,7 +831,7 @@ class TestWorkflowIntegration(unittest.TestCase):
         finally:
             os.unlink(job_postings_db_path)
 
-    def test_store_job_posting_result_tool_includes_knowledge_sync_result(self) -> None:
+    def test_store_result_includes_knowledge_sync_for_job_postings(self) -> None:
         with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8") as tmp:
             job_postings_db_path = tmp.name
 
@@ -804,7 +848,7 @@ class TestWorkflowIntegration(unittest.TestCase):
                 },
             ) as sync_mock:
                 result = json.loads(
-                    tools_mod.store_job_posting_result_tool(
+                    tools_mod.DOCUMENT_OBJECT_SERVICE.store_result(
                         job_posting_result={
                             "agent": "job_platform_ingest",
                             "correlation_id": "platform:job-44",
@@ -832,7 +876,7 @@ class TestWorkflowIntegration(unittest.TestCase):
         finally:
             os.unlink(job_postings_db_path)
 
-    def test_store_job_posting_result_tool_uses_mongo_backend_as_primary_store(self) -> None:
+    def test_store_result_uses_mongo_backend_as_primary_store_for_job_postings(self) -> None:
         with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8") as tmp:
             job_postings_db_path = tmp.name
 
@@ -840,7 +884,7 @@ class TestWorkflowIntegration(unittest.TestCase):
             mongo_backend = _InMemoryMongoDocumentBackend()
             with patch.object(tools_mod.DOCUMENT_REPOSITORY, "_load_agentsdb_backend", return_value=mongo_backend):
                 result = json.loads(
-                    tools_mod.store_job_posting_result_tool(
+                    tools_mod.DOCUMENT_OBJECT_SERVICE.store_result(
                         job_posting_result={
                             "agent": "job_platform_ingest",
                             "correlation_id": "platform:job-43",
@@ -874,13 +918,13 @@ class TestWorkflowIntegration(unittest.TestCase):
         finally:
             os.unlink(job_postings_db_path)
 
-    def test_store_job_posting_result_tool_persists_explicit_job_posting_model(self) -> None:
+    def test_store_result_persists_explicit_job_posting_model(self) -> None:
         with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8") as tmp:
             job_postings_db_path = tmp.name
 
         try:
             result = json.loads(
-                tools_mod.store_job_posting_result_tool(
+                tools_mod.DOCUMENT_OBJECT_SERVICE.store_result(
                     job_posting_result={
                         "agent": "job_platform_ingest",
                         "correlation_id": "platform:job-explicit-55",
@@ -964,6 +1008,383 @@ class TestWorkflowIntegration(unittest.TestCase):
             self.assertEqual(dispatcher_db["documents"]["dispatch:job-44"]["source_agent"], "job_dispatcher")
         finally:
             os.unlink(dispatcher_db_path)
+
+    def test_get_dispatcher_record_returns_canonical_operational_fields_for_legacy_records(self) -> None:
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8") as tmp:
+            dispatcher_db_path = tmp.name
+
+        try:
+            correlation_id = "dispatch:job-legacy-45"
+            source_path = "/tmp/platform_engineer.pdf"
+            mongo_backend = _InMemoryMongoDocumentBackend()
+            mongo_backend.upsert_record(
+                storage_key=dispatcher_db_path,
+                record_id=correlation_id,
+                record_value={
+                    "id": correlation_id,
+                    "content_sha256": correlation_id,
+                    "source_path": source_path,
+                    "processing_state": "queued",
+                    "processed": False,
+                },
+                db_name="dispatcher_documents",
+                obj_name="documents",
+            )
+
+            with patch.object(tools_mod.DOCUMENT_REPOSITORY, "_load_agentsdb_backend", return_value=mongo_backend):
+                dispatcher_record = tools_mod.DOCUMENT_REPOSITORY.get_dispatcher_record(
+                    correlation_id,
+                    db_path=dispatcher_db_path,
+                )
+
+            self.assertIsInstance(dispatcher_record, dict)
+            self.assertEqual((dispatcher_record or {}).get("title"), "platform_engineer")
+            self.assertEqual((dispatcher_record or {}).get("record_kind"), "document")
+            self.assertEqual((dispatcher_record or {}).get("kind"), "document")
+            self.assertEqual((dispatcher_record or {}).get("object_name"), "documents")
+            self.assertEqual((dispatcher_record or {}).get("status"), "queued")
+            self.assertEqual((dispatcher_record or {}).get("db_updates", {}).get("processing_state"), "queued")
+        finally:
+            os.unlink(dispatcher_db_path)
+
+    def test_request_object_resolution_loads_legacy_db_file_with_canonical_fields(self) -> None:
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8") as tmp:
+            db_path = tmp.name
+            json.dump(
+                {
+                    "job_postings": {
+                        "legacy-job-1": {
+                            "correlation_id": "legacy-job-1",
+                            "source_agent": "job_posting_parser",
+                            "file": {
+                                "path": "/tmp/legacy_job.pdf",
+                                "content_sha256": "legacy-job-1",
+                            },
+                            "parse": {"is_job_posting": True, "language": "de", "errors": [], "warnings": []},
+                            "job_posting": {
+                                "job_title": "Legacy Platform Engineer",
+                                "company_name": "Example Co",
+                            },
+                            "db_updates": {"processing_state": "processed", "processed": True},
+                        }
+                    }
+                },
+                tmp,
+                ensure_ascii=False,
+            )
+
+        try:
+            result = tools_mod.REQUEST_OBJECT_RESOLUTION_SERVICE._load_result_from_legacy_db_file(
+                correlation_id="legacy-job-1",
+                obj_name="job_postings",
+                db_path=db_path,
+            )
+
+            self.assertIsInstance(result, dict)
+            self.assertEqual((result or {}).get("title"), "Legacy Platform Engineer")
+            self.assertEqual((result or {}).get("content_sha256"), "legacy-job-1")
+            self.assertEqual((result or {}).get("record_kind"), "document")
+            self.assertEqual((result or {}).get("object_name"), "job_postings")
+            self.assertEqual((result or {}).get("processing_state"), "processed")
+            self.assertIs((result or {}).get("processed"), True)
+            self.assertEqual((result or {}).get("db_updates", {}).get("processing_state"), "processed")
+        finally:
+            os.unlink(db_path)
+
+    def test_request_object_resolution_load_result_from_file_returns_canonical_fields(self) -> None:
+        with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False, encoding="utf-8") as tmp:
+            source_path = tmp.name
+            tmp.write("Platform Engineer role with Python and workflow orchestration.\n")
+
+        try:
+            result = tools_mod.REQUEST_OBJECT_RESOLUTION_SERVICE.load_result_from_file(
+                source_path=source_path,
+                obj_name="job_postings",
+            )
+
+            self.assertIsInstance(result, dict)
+            self.assertEqual((result or {}).get("source_path"), source_path)
+            self.assertEqual((result or {}).get("record_kind"), "document")
+            self.assertEqual((result or {}).get("kind"), "document")
+            self.assertEqual((result or {}).get("object_name"), "job_postings")
+            self.assertEqual((result or {}).get("processing_state"), "processed")
+            self.assertIs((result or {}).get("processed"), True)
+            self.assertEqual((result or {}).get("db_updates", {}).get("processing_state"), "processed")
+            self.assertEqual((result or {}).get("file", {}).get("path"), source_path)
+            self.assertTrue(str((result or {}).get("content_sha256") or "").strip())
+        finally:
+            os.unlink(source_path)
+
+    def test_routing_result_object_load_upsert_payload_adds_canonical_top_level_fields(self) -> None:
+        routing_request = {
+            "handoff": {
+                "target_agent": "_xworker",
+                "source_agent": "_xrouter_xplanner",
+                "handoff_payload": {
+                    "output": {
+                        "correlation_id": "route-job-1",
+                        "file": {
+                            "path": "/tmp/route-job-1.pdf",
+                            "content_sha256": "route-job-1",
+                        },
+                    }
+                },
+                "metadata": {
+                    "correlation_id": "route-job-1",
+                    "obj_name": "job_postings",
+                },
+            },
+            "handoff_context": {
+                "source_agent": "_xrouter_xplanner",
+                "contract": {
+                    "schema": {
+                        "result_postprocess": {
+                            "tool": "store_object_result",
+                            "source_agent": "target_agent",
+                        }
+                    }
+                },
+            },
+        }
+        result_object = agents_factory.RoutingResultObject(
+            routing_request=routing_request,
+            result_text={
+                "agent": "job_posting_parser",
+                "parse": {"is_job_posting": True, "language": "de", "errors": [], "warnings": []},
+                "job_posting": {
+                    "job_title": "Routing Platform Engineer",
+                    "company_name": "Example Co",
+                },
+                "db_updates": {
+                    "processing_state": "processed",
+                    "processed": True,
+                },
+            },
+            succeeded=True,
+        )
+
+        payload = result_object.load_upsert_payload()
+
+        self.assertEqual(payload.get("title"), "Routing Platform Engineer")
+        self.assertEqual(payload.get("object_name"), "job_postings")
+        self.assertEqual(payload.get("record_kind"), "document")
+        self.assertEqual(payload.get("kind"), "document")
+        self.assertEqual(payload.get("source"), "job_posting_parser")
+        self.assertEqual(payload.get("source_path"), "/tmp/route-job-1.pdf")
+        self.assertEqual(payload.get("content_sha256"), "route-job-1")
+        self.assertEqual(payload.get("processing_state"), "processed")
+        self.assertIs(payload.get("processed"), True)
+        self.assertEqual((payload.get("db_updates") or {}).get("processing_state"), "processed")
+
+    def test_routing_result_object_dispatcher_updates_roundtrip_canonical_fields(self) -> None:
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8") as tmp:
+            dispatcher_db_path = tmp.name
+
+        routing_request = {
+            "handoff": {
+                "target_agent": "_xworker",
+                "source_agent": "_xrouter_xplanner",
+                "handoff_payload": {
+                    "output": {
+                        "correlation_id": "route-job-2",
+                        "file": {
+                            "path": "/tmp/route-job-2.pdf",
+                            "content_sha256": "route-job-2",
+                        },
+                    }
+                },
+                "metadata": {
+                    "correlation_id": "route-job-2",
+                    "obj_name": "job_postings",
+                },
+            },
+            "handoff_context": {
+                "source_agent": "_xrouter_xplanner",
+                "contract": {
+                    "schema": {
+                        "result_postprocess": {
+                            "tool": "store_object_result",
+                            "source_agent": "target_agent",
+                        }
+                    }
+                },
+            },
+        }
+
+        try:
+            result_object = agents_factory.RoutingResultObject(
+                routing_request=routing_request,
+                result_text={
+                    "agent": "job_posting_parser",
+                    "parse": {"is_job_posting": True, "language": "de", "errors": [], "warnings": []},
+                    "job_posting": {
+                        "job_title": "Dispatcher Platform Engineer",
+                        "company_name": "Example Co",
+                    },
+                    "db_updates": {
+                        "processing_state": "processed",
+                        "processed": True,
+                    },
+                },
+                succeeded=True,
+            )
+
+            tools_mod.DOCUMENT_REPOSITORY.update_dispatcher_status(
+                correlation_id="route-job-2",
+                processing_state=result_object.load_processing_state(),
+                db_path=dispatcher_db_path,
+                processed=result_object.load_processed(),
+                failed_reason=result_object.load_failed_reason(),
+                extra_updates=result_object.load_dispatcher_updates(),
+            )
+            dispatcher_record = tools_mod.DOCUMENT_REPOSITORY.get_dispatcher_record(
+                "route-job-2",
+                db_path=dispatcher_db_path,
+            )
+
+            self.assertEqual((dispatcher_record or {}).get("title"), "Dispatcher Platform Engineer")
+            self.assertEqual((dispatcher_record or {}).get("object_name"), "job_postings")
+            self.assertEqual((dispatcher_record or {}).get("record_kind"), "document")
+            self.assertEqual((dispatcher_record or {}).get("kind"), "document")
+            self.assertEqual((dispatcher_record or {}).get("source"), "job_posting_parser")
+            self.assertEqual((dispatcher_record or {}).get("source_path"), "/tmp/route-job-2.pdf")
+            self.assertEqual((dispatcher_record or {}).get("content_sha256"), "route-job-2")
+            self.assertEqual((dispatcher_record or {}).get("processing_state"), "processed")
+            self.assertIs((dispatcher_record or {}).get("processed"), True)
+        finally:
+            os.unlink(dispatcher_db_path)
+
+    def test_routing_result_object_build_cover_letter_handoff_args_uses_canonical_results(self) -> None:
+        routing_request = {
+            "handoff": {
+                "target_agent": "_xworker",
+                "source_agent": "_xrouter_xplanner",
+                "handoff_payload": {
+                    "output": {
+                        "action": "generate_cover_letter",
+                        "correlation_id": "job-cover-1",
+                        "applicant_profile": {
+                            "source": "text",
+                            "value": {
+                                "profile_id": "profile-cover-1",
+                                "skills": ["python", "rag"],
+                            },
+                        },
+                        "options": {
+                            "language": "fr",
+                        },
+                    }
+                },
+                "metadata": {
+                    "correlation_id": "job-cover-1",
+                    "obj_name": "job_postings",
+                    "writer_job_name": "cover_letter_writer",
+                },
+            },
+            "handoff_context": {
+                "source_agent": "_xrouter_xplanner",
+                "contract": {
+                    "schema": {
+                        "result_postprocess": {
+                            "tool": "store_object_result",
+                            "source_agent": "target_agent",
+                        }
+                    }
+                },
+            },
+        }
+
+        result_object = agents_factory.RoutingResultObject(
+            routing_request=routing_request,
+            result_text={
+                "agent": "job_posting_parser",
+                "parse": {"is_job_posting": True, "language": "de", "errors": [], "warnings": []},
+                "job_posting": {
+                    "job_title": "Cover Letter Engineer",
+                    "company_name": "Example Co",
+                },
+                "file": {
+                    "path": "/tmp/job-cover-1.pdf",
+                    "content_sha256": "job-cover-1",
+                },
+                "db_updates": {
+                    "processing_state": "processed",
+                    "processed": True,
+                },
+            },
+            succeeded=True,
+        )
+
+        handoff_args = result_object.build_cover_letter_handoff_args()
+
+        self.assertIsInstance(handoff_args, dict)
+        writer_payload = ((handoff_args or {}).get("handoff_payload") or {}).get("output") or {}
+        self.assertEqual((writer_payload.get("job_posting_result") or {}).get("object_name"), "job_postings")
+        self.assertEqual((writer_payload.get("job_posting_result") or {}).get("record_kind"), "document")
+        self.assertEqual((writer_payload.get("job_posting_result") or {}).get("source_path"), "/tmp/job-cover-1.pdf")
+        self.assertEqual((writer_payload.get("profile_result") or {}).get("object_name"), "profiles")
+        self.assertEqual((writer_payload.get("profile_result") or {}).get("record_kind"), "document")
+        self.assertEqual((writer_payload.get("profile_result") or {}).get("correlation_id"), "profile-cover-1")
+        self.assertEqual(((writer_payload.get("profile_result") or {}).get("parse") or {}).get("language"), "fr")
+
+    def test_document_dispatch_service_build_cover_letter_resume_payload_uses_canonical_results(self) -> None:
+        payload = tools_mod.DOCUMENT_DISPATCH_SERVICE.build_cover_letter_resume_payload(
+            correlation_id="job-resume-1",
+            job_posting_result={
+                "job_posting": {
+                    "job_title": "Resume Platform Engineer",
+                    "company_name": "Resume Co",
+                },
+                "file": {
+                    "path": "/tmp/job-resume-1.pdf",
+                },
+            },
+            profile_result={
+                "profile": {
+                    "profile_id": "profile-resume-1",
+                    "skills": ["python"],
+                },
+            },
+            passthrough_context={
+                "action": "generate_cover_letter",
+                "options": {"tone": "modern"},
+            },
+        )
+
+        self.assertEqual((payload.get("job_posting_result") or {}).get("object_name"), "job_postings")
+        self.assertEqual((payload.get("job_posting_result") or {}).get("record_kind"), "document")
+        self.assertEqual((payload.get("job_posting_result") or {}).get("correlation_id"), "job-resume-1")
+        self.assertEqual((payload.get("profile_result") or {}).get("object_name"), "profiles")
+        self.assertEqual((payload.get("profile_result") or {}).get("record_kind"), "document")
+        self.assertEqual((payload.get("profile_result") or {}).get("correlation_id"), "profile-resume-1")
+
+    def test_document_dispatch_service_build_passthrough_context_uses_canonical_results(self) -> None:
+        passthrough_context = tools_mod.DOCUMENT_DISPATCH_SERVICE.build_passthrough_context(
+            action="document_dispatch",
+            profile_result={
+                "profile": {
+                    "profile_id": "profile-pass-1",
+                    "skills": ["python"],
+                },
+            },
+            job_posting_result={
+                "job_posting": {
+                    "job_title": "Passthrough Engineer",
+                    "company_name": "Passthrough Co",
+                },
+                "file": {
+                    "path": "/tmp/passthrough-job.pdf",
+                    "content_sha256": "job-pass-1",
+                },
+            },
+            options={"language": "de"},
+        )
+
+        self.assertEqual(passthrough_context.get("action"), "generate_cover_letter")
+        self.assertEqual((passthrough_context.get("profile_result") or {}).get("object_name"), "profiles")
+        self.assertEqual((passthrough_context.get("profile_result") or {}).get("correlation_id"), "profile-pass-1")
+        self.assertEqual((passthrough_context.get("job_posting_result") or {}).get("object_name"), "job_postings")
+        self.assertEqual((passthrough_context.get("job_posting_result") or {}).get("correlation_id"), "job-pass-1")
 
     def test_write_document_returns_structured_payload_and_persists_cover_letter(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1074,12 +1495,26 @@ class TestWorkflowIntegration(unittest.TestCase):
                 dry_run=True,
                 parser_job_name="job_posting_parser",
             )
+            legacy_agent_result = tools_mod.DOCUMENT_DISPATCH_SERVICE.dispatch_documents(
+                scan_dir=tmpdir,
+                dry_run=True,
+                agent_name="_xworker",
+                parser_job_name="job_posting_parser",
+            )
+            target_agent_result = tools_mod.DOCUMENT_DISPATCH_SERVICE.dispatch_documents(
+                scan_dir=tmpdir,
+                dry_run=True,
+                target_agent_name="_xworker",
+                parser_job_name="job_posting_parser",
+            )
 
             self.assertIsInstance(tool_result, dict)
             self.assertEqual(tool_result["agent"], "xworker")
             self.assertEqual(tool_result["job_name"], "document_dispatch")
             self.assertEqual(direct_result["agent"], "xworker")
             self.assertEqual(direct_result["job_name"], "document_dispatch")
+            self.assertEqual(legacy_agent_result.get("errors"), [])
+            self.assertEqual(target_agent_result.get("errors"), [])
 
     def test_read_document_uses_pypdf_extractor_for_pdf_files(self) -> None:
         with tempfile.NamedTemporaryFile("wb", suffix=".pdf", delete=False) as tmp:
@@ -1264,12 +1699,12 @@ class TestWorkflowIntegration(unittest.TestCase):
                 }
             }
 
-            tools_mod.store_profile_result_tool(
+            tools_mod.DOCUMENT_OBJECT_SERVICE.store_result(
                 profile_result=dispatch_payload["output"]["profile_result"],
                 correlation_id="profile:test",
                 source_agent="_xworker",
             )
-            tools_mod.store_job_posting_result_tool(
+            tools_mod.DOCUMENT_OBJECT_SERVICE.store_result(
                 job_posting_result=dispatch_payload["output"]["job_posting_result"],
                 correlation_id="job:test",
                 source_agent="_xworker",
@@ -1426,7 +1861,7 @@ class TestWorkflowIntegration(unittest.TestCase):
             }
 
             profile_store = json.loads(
-                tools_mod.store_profile_result_tool(
+                tools_mod.DOCUMENT_OBJECT_SERVICE.store_result(
                     profile_result=profile_result,
                     correlation_id=profile_correlation_id,
                     source_agent="_xworker",
@@ -1434,7 +1869,7 @@ class TestWorkflowIntegration(unittest.TestCase):
                 )
             )
             job_store = json.loads(
-                tools_mod.store_job_posting_result_tool(
+                tools_mod.DOCUMENT_OBJECT_SERVICE.store_result(
                     job_posting_result=job_posting_result,
                     correlation_id=job_correlation_id,
                     source_agent="_xworker",
@@ -1600,13 +2035,13 @@ class TestWorkflowIntegration(unittest.TestCase):
             }
 
             with patch.object(tools_mod.DOCUMENT_REPOSITORY, "_load_agentsdb_backend", return_value=backend):
-                tools_mod.store_profile_result_tool(
+                tools_mod.DOCUMENT_OBJECT_SERVICE.store_result(
                     profile_result=profile_result,
                     correlation_id=profile_correlation_id,
                     source_agent="_xworker",
                     obj_name="profiles",
                 )
-                tools_mod.store_job_posting_result_tool(
+                tools_mod.DOCUMENT_OBJECT_SERVICE.store_result(
                     job_posting_result=job_posting_result,
                     correlation_id=correlation_id,
                     source_agent="job_posting_parser",
@@ -1914,13 +2349,13 @@ class TestWorkflowIntegration(unittest.TestCase):
         )
         self.assertEqual(result, "processed retrieval")
 
-    def test_store_profile_result_tool_supports_direct_profile_storage(self) -> None:
+    def test_store_result_supports_direct_profile_storage(self) -> None:
         with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8") as tmp:
             profiles_db_path = tmp.name
 
         try:
             result = json.loads(
-                tools_mod.store_profile_result_tool(
+                tools_mod.DOCUMENT_OBJECT_SERVICE.store_result(
                     profile_result={
                         "agent": "profile_platform_ingest",
                         "correlation_id": "profile:job-board-7",
@@ -1944,13 +2379,13 @@ class TestWorkflowIntegration(unittest.TestCase):
         finally:
             os.unlink(profiles_db_path)
 
-    def test_ingest_profile_tool_supports_request_style_profile_sources(self) -> None:
+    def test_ingest_result_supports_request_style_profile_sources(self) -> None:
         with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8") as tmp:
             profiles_db_path = tmp.name
 
         try:
             result = json.loads(
-                tools_mod.ingest_profile_tool(
+                tools_mod.DOCUMENT_OBJECT_SERVICE.ingest_result(
                     applicant_profile={
                         "source": "text",
                         "value": {
@@ -1972,7 +2407,7 @@ class TestWorkflowIntegration(unittest.TestCase):
         finally:
             os.unlink(profiles_db_path)
 
-    def test_ingest_job_posting_action_returns_store_result_without_model_call(self) -> None:
+    def test_ingest_object_action_returns_store_result_without_model_call_for_job_postings(self) -> None:
         with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8") as tmp:
             job_postings_db_path = tmp.name
 
@@ -2010,7 +2445,7 @@ class TestWorkflowIntegration(unittest.TestCase):
         finally:
             os.unlink(job_postings_db_path)
 
-    def test_ingest_job_posting_tool_includes_knowledge_sync_after_persist(self) -> None:
+    def test_ingest_result_includes_knowledge_sync_for_job_postings(self) -> None:
         with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8") as tmp:
             job_postings_db_path = tmp.name
 
@@ -2028,7 +2463,7 @@ class TestWorkflowIntegration(unittest.TestCase):
                 },
             ) as sync_mock:
                 result = json.loads(
-                    tools_mod.ingest_job_posting_tool(
+                    tools_mod.DOCUMENT_OBJECT_SERVICE.ingest_result(
                         job_posting={
                             "job_title": "Platform Knowledge Engineer",
                             "company_name": "Platform Co",
@@ -2088,7 +2523,7 @@ class TestWorkflowIntegration(unittest.TestCase):
         finally:
             os.unlink(profiles_db_path)
 
-    def test_ingest_profile_action_returns_store_result_without_model_call(self) -> None:
+    def test_ingest_object_action_returns_store_result_without_model_call_for_profiles(self) -> None:
         with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8") as tmp:
             profiles_db_path = tmp.name
 
@@ -2124,7 +2559,7 @@ class TestWorkflowIntegration(unittest.TestCase):
         finally:
             os.unlink(profiles_db_path)
 
-    def test_ingest_job_posting_action_rejects_invalid_schema_request(self) -> None:
+    def test_ingest_object_action_requests_missing_job_posting_fields(self) -> None:
         request = {
             "action": "ingest_object",
             "source_agent": "job_platform_ingest",
@@ -2137,12 +2572,13 @@ class TestWorkflowIntegration(unittest.TestCase):
                 _input_text=json.dumps(request, ensure_ascii=False),
                 _name="test_workflow",
             )
-            response = json.loads(chat.get_response())
+            response = str(chat.get_response())
 
-        self.assertFalse(response["ok"])
-        self.assertEqual(response["error"], "invalid_action_request")
-        self.assertEqual(response["schema_name"], "platform_job_posting_ingest_request")
-        get_client.assert_not_called()
+        self.assertTrue(response.strip())
+        self.assertIn("missing", response.lower())
+        self.assertIn("required", response.lower())
+        self.assertIn("ingest", response.lower())
+        get_client.assert_called()
 
     def test_execute_action_request_cover_letter_writer_alias_uses_cover_letter_schema(self) -> None:
         result_text, routing_request = agents_factory.execute_tool(
@@ -2413,14 +2849,14 @@ class TestWorkflowIntegration(unittest.TestCase):
         self.assertNotEqual(assistant_entries[-1].get("content"), "[forced route prepared]")
         get_client.assert_called_once()
 
-    def test_upsert_dispatcher_job_record_tool_updates_both_stores(self) -> None:
+    def test_upsert_object_record_updates_both_stores_for_job_postings(self) -> None:
         with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8") as dispatcher_tmp, tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8") as jobs_tmp:
             dispatcher_db_path = dispatcher_tmp.name
             job_postings_db_path = jobs_tmp.name
 
         try:
             result = json.loads(
-                tools_mod.upsert_dispatcher_job_record_tool(
+                tools_mod.DOCUMENT_OBJECT_SERVICE.upsert_object_record(
                     job_posting_result={
                         "agent": "job_platform_ingest",
                         "correlation_id": "platform:atomic-1",
@@ -2451,7 +2887,7 @@ class TestWorkflowIntegration(unittest.TestCase):
             os.unlink(dispatcher_db_path)
             os.unlink(job_postings_db_path)
 
-    def test_execute_action_request_tool_supports_atomic_dispatcher_job_upsert(self) -> None:
+    def test_execute_action_request_tool_supports_atomic_object_upsert_for_job_postings(self) -> None:
         with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8") as dispatcher_tmp, tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8") as jobs_tmp:
             dispatcher_db_path = dispatcher_tmp.name
             job_postings_db_path = jobs_tmp.name
@@ -2963,7 +3399,7 @@ class TestWorkflowIntegration(unittest.TestCase):
                 },
             ) as sync_mock:
                 result = json.loads(
-                    tools_mod.store_job_posting_result_tool(
+                    tools_mod.DOCUMENT_OBJECT_SERVICE.store_result(
                         job_posting_result={
                             "agent": "document_dispatch_ingest_import_pipeline",
                             "correlation_id": "pipeline-import-002",

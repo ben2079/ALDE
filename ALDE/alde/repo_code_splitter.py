@@ -441,8 +441,19 @@ class RepoModuleParser:
 
         return {
             "agent": "repo_module_parser",
+            "source": "repo_module_parser",
+            "source_path": str(path),
+            "title": title,
+            "record_kind": "document",
+            "kind": "document",
+            "object_name": "documents",
             "job_name": "repo_module_parser",
             "correlation_id": correlation_id,
+            "content_sha256": content_sha,
+            "status": "processed",
+            "processing_state": "processed",
+            "processed": True,
+            "failed_reason": None,
             "file": {
                 "path": str(path),
                 "name": path.name,
@@ -511,35 +522,27 @@ class RepoModuleParser:
             return entity_objects, relation_objects
 
         seen_entity_keys = {"subject"}
-        seen_relations: set[tuple[str, str, str]] = set()
 
         def add_entity(*, entity_key: str, entity_type: str, canonical_name: str, section_key: str, relation_type: str | None, summary: str, source_field: str) -> None:
             if entity_key not in seen_entity_keys:
+                entity_payload: dict[str, Any] = {
+                    "entity_key": entity_key,
+                    "entity_type": entity_type,
+                    "canonical_name": canonical_name,
+                    "mention_text": canonical_name,
+                    "section_key": section_key,
+                    "summary": summary,
+                    "metadata": {"source_field": source_field, "source_path": rel_path},
+                }
+                if relation_type:
+                    entity_payload["is_target"] = True
+                    entity_payload["source_entity"] = "subject"
+                    entity_payload["is_relational"] = relation_type
+                    entity_payload["explicit_description"] = f"{module_name} {relation_type.replace('_', ' ')} {canonical_name}."
                 entity_objects.append(
-                    {
-                        "entity_key": entity_key,
-                        "entity_type": entity_type,
-                        "canonical_name": canonical_name,
-                        "mention_text": canonical_name,
-                        "section_key": section_key,
-                        "summary": summary,
-                        "metadata": {"source_field": source_field, "source_path": rel_path},
-                    }
+                    entity_payload
                 )
                 seen_entity_keys.add(entity_key)
-            if relation_type:
-                relation_key = ("subject", relation_type, entity_key)
-                if relation_key not in seen_relations:
-                    relation_objects.append(
-                        {
-                            "source_entity_key": "subject",
-                            "target_entity_key": entity_key,
-                            "relation_type": relation_type,
-                            "section_key": section_key,
-                            "metadata": {"source_field": source_field, "source_path": rel_path},
-                        }
-                    )
-                    seen_relations.add(relation_key)
 
         for node in tree.body:
             if isinstance(node, ast.ClassDef):
@@ -1313,6 +1316,7 @@ def _format_repo_knowledge_chunks(candidates: list[dict], owner_type: str) -> li
             chunk["source_entity_id"] = payload.get("source_entity_id", "")
             chunk["target_entity_id"] = payload.get("target_entity_id", "")
             meta = payload.get("metadata") or {}
+            chunk["relation_description"] = payload.get("relation_description") or meta.get("relation_description") or ""
             chunk["source_path"] = meta.get("source_path") or payload.get("source_path", "")
             chunk["score"] = item.get("score")
 
@@ -1516,7 +1520,8 @@ def load_repo_context_for_ide_agent(
                 f"[relation:{chunk.get('relation_type', '')}] "
                 f"{chunk.get('source_entity_id', '')} → {chunk.get('target_entity_id', '')}"
             )
-            content = title
+            relation_description = str(chunk.get("relation_description") or "").strip()
+            content = relation_description or title
         else:
             content = str(chunk)
             title = "repo_chunk"

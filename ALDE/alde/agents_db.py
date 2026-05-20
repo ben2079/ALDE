@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 import socket
@@ -15,14 +16,18 @@ from contextlib import contextmanager, nullcontext
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Sequence
-from urllib.parse import urlparse
+from typing import Any, Iterable, Mapping, Protocol, Sequence
+from urllib.parse import quote, unquote, urlparse
 
 
 _AGENTSDB_SOCKET_SERVER_LOCK = threading.RLock()
 _AGENTSDB_SOCKET_SERVER_STATE: dict[tuple[str, int], dict[str, Any]] = {}
 _LOGGER = logging.getLogger(__name__)
 _AGENTSDB_CONNECTION_CONFIG_CACHE: dict[str, Any] | None = None
+_AGENTSDB_SOCKET_URI_PATTERN = re.compile(
+    r"^(?:agents?db)(?:://|::)?(?P<host>\[[^\]]+\]|:::+1|::1|[A-Za-z0-9._-]+)?(?::(?P<port>\d+))?(?::*)?$",
+    re.IGNORECASE,
+)
 
 
 def _load_json_object_file(path: Path) -> dict[str, Any]:
@@ -80,17 +85,116 @@ def _connection_config_value(config_payload: Mapping[str, Any], key_candidates: 
     return ""
 
 
+def _env_or_config_value(
+    env_name: str,
+    config_payload: Mapping[str, Any],
+    key_candidates: Sequence[str],
+    default: str = "",
+) -> str:
+    env_value = str(os.getenv(env_name, "")).strip()
+    if env_value:
+        return env_value
+    config_value = _connection_config_value(config_payload, key_candidates)
+    if config_value:
+        return config_value
+    return str(default or "").strip()
+
+
+def _env_or_config_int_value(
+    env_name: str,
+    config_payload: Mapping[str, Any],
+    key_candidates: Sequence[str],
+    default: int,
+) -> int:
+    raw_value = _env_or_config_value(env_name, config_payload, key_candidates, str(default))
+    try:
+        return int(raw_value)
+    except Exception:
+        return int(default)
+
+
+def _compose_agentsdb_socket_uri(host: str, port: int) -> str:
+    normalized_host = str(host or "").strip().strip("[]") or "127.0.0.1"
+    resolved_port = max(1, int(port or 2331))
+    if ":" in normalized_host:
+        normalized_host = f"[{normalized_host}]"
+    return f"agentsdb://{normalized_host}:{resolved_port}"
+
+
+def normalize_agentsdb_socket_uri(
+    uri: Any,
+    *,
+    default_host: str = "127.0.0.1",
+    default_port: int = 2331,
+    default_on_empty: bool = True,
+) -> str:
+    normalized_uri = str(uri or "").strip()
+    if not normalized_uri:
+        return _compose_agentsdb_socket_uri(default_host, default_port) if default_on_empty else ""
+
+    loose_match = _AGENTSDB_SOCKET_URI_PATTERN.match(normalized_uri)
+    if loose_match is not None:
+        resolved_host = str(loose_match.group("host") or "").strip().strip("[]").lower()
+        resolved_port_text = str(loose_match.group("port") or "").strip()
+        try:
+            resolved_port = int(resolved_port_text or default_port)
+        except Exception:
+            resolved_port = int(default_port)
+        if resolved_host in {"", "localhost", "127.0.0.1", "::1", ":::1"}:
+            resolved_host = str(default_host or "127.0.0.1").strip().strip("[]") or "127.0.0.1"
+        return _compose_agentsdb_socket_uri(resolved_host or default_host, resolved_port)
+
+    parsed_uri = urlparse(normalized_uri)
+    if str(parsed_uri.scheme or "").strip().lower() != "agentsdb":
+        return normalized_uri
+    try:
+        resolved_port = int(parsed_uri.port or default_port)
+    except Exception:
+        return _compose_agentsdb_socket_uri(default_host, default_port)
+    resolved_host = str(parsed_uri.hostname or "").strip().strip("[]").lower()
+    if resolved_host in {"", "localhost", "127.0.0.1", "::1", ":::1"}:
+        resolved_host = str(default_host or "127.0.0.1").strip().strip("[]") or "127.0.0.1"
+    return _compose_agentsdb_socket_uri(resolved_host or default_host, resolved_port)
+
+
+def _load_agentsdb_socket_endpoint(
+    uri: Any,
+    *,
+    default_host: str = "127.0.0.1",
+    default_port: int = 2331,
+) -> tuple[str, str, int] | None:
+    normalized_uri = normalize_agentsdb_socket_uri(
+        uri,
+        default_host=default_host,
+        default_port=default_port,
+        default_on_empty=False,
+    )
+    if not normalized_uri:
+        return None
+    parsed_uri = urlparse(normalized_uri)
+    if str(parsed_uri.scheme or "").strip().lower() != "agentsdb":
+        return None
+    return (
+        normalized_uri,
+        str(parsed_uri.hostname or default_host).strip() or default_host,
+        int(parsed_uri.port or default_port),
+    )
+
+
 def _load_agentsdb_uri_from_connection_config(config_payload: Mapping[str, Any]) -> str:
     configured_uri = _connection_config_value(config_payload, ("agents_db_uri", "agentsdb_uri", "uri", "socket_uri"))
     if configured_uri:
-        return configured_uri
+        return normalize_agentsdb_socket_uri(configured_uri, default_on_empty=False) or configured_uri
     host_value = _connection_config_value(config_payload, ("host", "hostname")) or "localhost"
     port_value = _connection_config_value(config_payload, ("port",)) or "2331"
     try:
         resolved_port = int(port_value)
     except Exception:
         resolved_port = 2331
-    return f"agentsdb://{host_value}:{resolved_port}"
+    return normalize_agentsdb_socket_uri(
+        f"agentsdb://{host_value}:{resolved_port}",
+        default_on_empty=False,
+    ) or _compose_agentsdb_socket_uri(host_value, resolved_port)
 
 
 def _is_true_env(value: str | None, default: bool = True) -> bool:
@@ -120,11 +224,10 @@ def _ensure_local_agentsdb_socket_server(agents_db_uri: str, timeout_seconds: fl
         auto_start_value = _connection_config_value(connection_config, ("auto_start", "autostart", "socket_auto_start"))
     if not _is_true_env(auto_start_value, default=True):
         return False
-    parsed_uri = urlparse(str(agents_db_uri or "").strip())
-    if str(parsed_uri.scheme or "").strip().lower() != "agentsdb":
+    endpoint = _load_agentsdb_socket_endpoint(agents_db_uri)
+    if endpoint is None:
         return False
-    resolved_host = str(parsed_uri.hostname or "localhost").strip() or "localhost"
-    resolved_port = int(parsed_uri.port or 2331)
+    _normalized_uri, resolved_host, resolved_port = endpoint
     if not _is_local_socket_host(resolved_host):
         return False
     if _socket_endpoint_reachable(resolved_host, resolved_port, timeout_seconds):
@@ -174,7 +277,10 @@ def _ensure_local_agentsdb_socket_server(agents_db_uri: str, timeout_seconds: fl
     return _socket_endpoint_reachable(resolved_host, resolved_port, timeout_seconds=0.25)
 
 def _is_agentsdb_socket_uri(uri: str | None) -> bool:
-    return str(uri or "").strip().lower().startswith("agentsdb://")
+    if not str(uri or "").strip():
+        return False
+    normalized_uri = normalize_agentsdb_socket_uri(uri, default_on_empty=False)
+    return str(normalized_uri or "").strip().lower().startswith("agentsdb://")
 
 
 def _json_safe_object(value: Any) -> Any:
@@ -327,6 +433,102 @@ def _load_type_key_from_pattern(
             if normalized_value == _normalize_pattern_key(pattern_value):
                 return str(type_key).strip() or fallback_type_key
     return fallback_type_key
+
+
+def _load_type_key_alias(value: Any) -> str:
+    normalized_value = re.sub(r"[^a-z0-9]+", "_", str(value or "").strip().lower()).strip("_")
+    if not normalized_value:
+        return ""
+    return TYPE_KEY_ALIAS_MAP.get(normalized_value, normalized_value)
+
+
+def _load_type_key_from_explicit_value(
+    value: Any,
+    *,
+    fallback_type_key: str,
+    type_key_pattern_map: Mapping[str, Sequence[str]] | None = None,
+) -> str:
+    normalized_value = _load_type_key_alias(value)
+    if not normalized_value:
+        return fallback_type_key
+    for type_key in dict(type_key_pattern_map or {}).keys():
+        if _normalize_pattern_key(type_key) == _normalize_pattern_key(normalized_value):
+            return str(type_key).strip() or fallback_type_key
+    return fallback_type_key
+
+
+def _load_typed_collection_value_list(value: Any) -> list[tuple[str, str | None]]:
+    typed_value_list: list[tuple[str, str | None]] = []
+
+    def _append(value_name: Any, value_type: Any = None) -> None:
+        normalized_name = str(value_name or "").strip()
+        if not normalized_name:
+            return
+        normalized_type = str(value_type or "").strip() or None
+        typed_value_list.append((normalized_name, normalized_type))
+
+    def _collect(source_value: Any) -> None:
+        if source_value is None:
+            return
+        if isinstance(source_value, str):
+            _append(source_value)
+            return
+        if isinstance(source_value, Mapping):
+            value_name = _first_non_empty_string(
+                [
+                    source_value.get("canonical_name"),
+                    source_value.get("name"),
+                    source_value.get("label"),
+                    source_value.get("value"),
+                    source_value.get("title"),
+                    source_value.get("text"),
+                    source_value.get("tool"),
+                    source_value.get("skill"),
+                    source_value.get("technology"),
+                ],
+            )
+            value_type = _first_non_empty_string(
+                [
+                    source_value.get("type_key"),
+                    source_value.get("entity_type"),
+                    source_value.get("type"),
+                    source_value.get("category"),
+                    source_value.get("kind"),
+                    source_value.get("classification"),
+                    source_value.get("role"),
+                    source_value.get("tag"),
+                    source_value.get("group"),
+                ],
+            )
+            if value_name:
+                _append(value_name, value_type)
+                return
+            for nested_key in ("name", "label", "value", "title", "text", "tool", "skill", "technology"):
+                _collect(source_value.get(nested_key))
+            return
+        if isinstance(source_value, Sequence) and not isinstance(source_value, (str, bytes, bytearray)):
+            for nested_value in source_value:
+                _collect(nested_value)
+            return
+        _append(source_value)
+
+    _collect(value)
+
+    unique_value_list: list[tuple[str, str | None]] = []
+    existing_value_index_by_key: dict[str, int] = {}
+    for value_name, value_type in typed_value_list:
+        value_key = _normalize_pattern_key(value_name)
+        if not value_key:
+            continue
+        if value_key in existing_value_index_by_key:
+            existing_index = existing_value_index_by_key[value_key]
+            existing_name, existing_type = unique_value_list[existing_index]
+            if existing_type is None and value_type is not None:
+                unique_value_list[existing_index] = (existing_name, value_type)
+            continue
+        existing_value_index_by_key[value_key] = len(unique_value_list)
+        unique_value_list.append((value_name, value_type))
+    return unique_value_list
 
 
 def _build_namespace_object_from_runtime_config(
@@ -579,7 +781,7 @@ class RuntimeConfigObject:
     namespace_name: str = "ALDE Default Knowledge"
     default_embedding_model: str = "text-embedding-3-large"
     default_embedding_dimension: int = 3072
-    index_backend: str = "faiss"
+    index_backend: str = "cosine"
 
     @property
     def mongo_uri(self) -> str:
@@ -608,6 +810,9 @@ class MappingSeedEntityObject:
     canonical_name: str
     section_key: str | None = None
     relation_type_key: str | None = None
+    is_target: bool = False
+    source_seed_key: str | None = None
+    relation_description: str | None = None
     confidence: float = 0.95
     mention_text: str | None = None
     summary: str = ""
@@ -617,10 +822,63 @@ class MappingSeedEntityObject:
 
 
 TECHNICAL_TYPE_KEY_PATTERN_MAP: dict[str, tuple[str, ...]] = {
-    "tool": ("jira", "topdesk", "servicenow"),
-    "framework": ("itil", "scrum", "kanban"),
-    "database": ("postgresql", "postgres", "oracle", "mysql", "mongodb"),
-    "protocol": ("tcp/ip", "tcpip", "http", "https", "http(s)", "rdp", "ssh"),
+    "tool": (
+        "jira",
+        "topdesk",
+        "servicenow",
+        "git",
+        "github",
+        "gitlab",
+        "docker",
+        "kubernetes",
+        "k8s",
+        "terraform",
+        "ansible",
+        "jenkins",
+        "postman",
+        "confluence",
+        "slack",
+        "teams",
+        "notion",
+        "sap",
+        "salesforce",
+    ),
+    "framework": ("itil", "scrum", "kanban", "fastapi", "django", "flask", "spring", "react", "angular", "vue"),
+    "database": ("postgresql", "postgres", "oracle", "mysql", "mongodb", "sqlite", "mssql", "sql server"),
+    "protocol": ("tcp/ip", "tcpip", "http", "https", "http(s)", "rdp", "ssh", "rest", "graphql", "mqtt"),
+}
+
+
+TYPE_KEY_ALIAS_MAP: dict[str, str] = {
+    "tool": "tool",
+    "tools": "tool",
+    "tooling": "tool",
+    "technology": "tool",
+    "technologies": "tool",
+    "tech": "tool",
+    "tech_stack": "tool",
+    "skill": "skill",
+    "skills": "skill",
+    "hard_skill": "skill",
+    "hard_skills": "skill",
+    "technical_skill": "skill",
+    "technical_skills": "skill",
+    "framework": "framework",
+    "frameworks": "framework",
+    "methodology": "framework",
+    "methodologies": "framework",
+    "database": "database",
+    "databases": "database",
+    "db": "database",
+    "protocol": "protocol",
+    "protocols": "protocol",
+    "competency": "competency",
+    "competencies": "competency",
+    "soft_skill": "competency",
+    "soft_skills": "competency",
+    "language": "language",
+    "languages": "language",
+    "lang": "language",
 }
 
 
@@ -665,6 +923,7 @@ OBJECT_MAPPING_PATTERN_BY_NAME: dict[str, dict[str, Any]] = {
                 ],
                 "group_line_list": [
                     {"label": "Technical Skills", "path": "requirements.technical_skills"},
+                    {"label": "Tools", "path": "requirements.tools"},
                     {"label": "Soft Skills", "path": "requirements.soft_skills"},
                     {"label": "Languages", "path": "requirements.languages"},
                 ],
@@ -750,8 +1009,13 @@ OBJECT_MAPPING_PATTERN_BY_NAME: dict[str, dict[str, Any]] = {
             {
                 "seed_key_prefix": "technical_requirement",
                 "section_key": "requirements",
-                "collection_path": "requirements.technical_skills",
-                "source_field": "requirements.technical_skills",
+                "collection_path_list": (
+                    "requirements.technical_skills",
+                    "requirements.tools",
+                    "requirements.tooling",
+                    "requirements.technologies",
+                    "tools",
+                ),
                 "fallback_type_key": "skill",
                 "type_key_pattern_map": TECHNICAL_TYPE_KEY_PATTERN_MAP,
                 "relation_type_key_map": {
@@ -1036,7 +1300,7 @@ class KnowledgeRepository():
         *,
         query_vector: Sequence[float],
         namespace_id: str,
-        owner_type: str = "block",
+        owner_type: str = "",
         limit: int = 10,
         num_candidates: int = 100,
         index_name: str = "embedding_cosine",
@@ -1074,12 +1338,15 @@ class AgentDbSocketRepository:
     _DEFAULT_APPLY_OPERATIONS_BATCH_SIZE = 64
 
     def __init__(self, agents_db_uri: str, database_name: str = "alde_knowledge", timeout_seconds: float = 5.0) -> None:
-        self._agents_db_uri = str(agents_db_uri or "").strip()
+        endpoint = _load_agentsdb_socket_endpoint(agents_db_uri)
+        if endpoint is None:
+            raise ValueError(f"invalid agentsdb socket uri: {agents_db_uri}")
+        normalized_uri, resolved_host, resolved_port = endpoint
+        self._agents_db_uri = normalized_uri
         self._database_name = str(database_name or "alde_knowledge").strip() or "alde_knowledge"
         self._timeout_seconds = max(float(timeout_seconds), 0.5)
-        parsed_uri = urlparse(self._agents_db_uri)
-        self._host = str(parsed_uri.hostname or "localhost")
-        self._port = int(parsed_uri.port or 2331)
+        self._host = resolved_host
+        self._port = resolved_port
         self._write_lock = threading.RLock()
         self._deferred_write_depth = 0
         self._pending_write_operations: list[dict[str, Any]] = []
@@ -1154,6 +1421,131 @@ class AgentDbSocketRepository:
                     break
                 response_bytes += chunk
         return response_bytes
+
+    def _stream_request_messages(
+        self,
+        action_name: str,
+        action_payload: Mapping[str, Any] | None = None,
+        *,
+        stop_event: threading.Event | None = None,
+    ) -> Iterable[dict[str, Any]]:
+        request_payload = {
+            "cmd": action_name,
+            "database_name": self._database_name,
+            "payload": _deepcopy_object(dict(action_payload or {})),
+        }
+
+        def open_connection() -> socket.socket:
+            connection = socket.create_connection((self._host, self._port), timeout=self._timeout_seconds)
+            connection.settimeout(1.0)
+            serialized_request_payload = _json_safe_object(dict(request_payload))
+            connection.sendall((json.dumps(serialized_request_payload, separators=(",", ":")) + "\n").encode("utf-8"))
+            return connection
+
+        connection: socket.socket | None = None
+        read_buffer = b""
+        try:
+            try:
+                connection = open_connection()
+            except OSError:
+                if _ensure_local_agentsdb_socket_server(self._agents_db_uri, timeout_seconds=self._timeout_seconds):
+                    connection = open_connection()
+                else:
+                    raise
+
+            while stop_event is None or not stop_event.is_set():
+                try:
+                    chunk = connection.recv(4096)
+                except socket.timeout:
+                    continue
+                if not chunk:
+                    break
+                read_buffer += chunk
+                while b"\n" in read_buffer:
+                    raw_line, read_buffer = read_buffer.split(b"\n", 1)
+                    normalized_line = raw_line.decode("utf-8", errors="replace").strip()
+                    if not normalized_line:
+                        continue
+                    try:
+                        response_payload = json.loads(normalized_line)
+                    except Exception as exc:
+                        raise RuntimeError(f"agentsdb socket stream returned invalid JSON: {normalized_line}") from exc
+                    if not isinstance(response_payload, Mapping):
+                        raise RuntimeError("agentsdb socket stream returned non-object response")
+                    yield dict(response_payload)
+        finally:
+            if connection is not None:
+                try:
+                    connection.close()
+                except Exception:
+                    pass
+
+    def subscribe_tree_stream(
+        self,
+        tree_object_id: str,
+        *,
+        last_event_id: str | None = None,
+        stop_event: threading.Event | None = None,
+        heartbeat_seconds: float = 30.0,
+        include_meta: bool = False,
+    ) -> Iterable[dict[str, Any]]:
+        action_payload = {
+            "tree_object_id": str(tree_object_id or "").strip(),
+            "last_event_id": str(last_event_id or "").strip() or None,
+            "heartbeat_seconds": max(float(heartbeat_seconds), 1.0),
+        }
+        for response_payload in self._stream_request_messages(
+            "subscribe_tree_stream",
+            action_payload,
+            stop_event=stop_event,
+        ):
+            if not bool(response_payload.get("ok", True)):
+                error_text = str(response_payload.get("error") or "agentsdb tree stream failed").strip()
+                detail_text = str(response_payload.get("detail") or "").strip()
+                if detail_text:
+                    raise RuntimeError(f"{error_text}: {detail_text}")
+                raise RuntimeError(error_text)
+            if bool(response_payload.get("subscribed")) or bool(response_payload.get("heartbeat")):
+                if include_meta:
+                    yield dict(response_payload)
+                continue
+            yield dict(response_payload)
+
+    def subscribe_repository_stream(
+        self,
+        *,
+        last_event_id: str | None = None,
+        stop_event: threading.Event | None = None,
+        heartbeat_seconds: float = 30.0,
+        object_names: Sequence[str] | None = None,
+        include_meta: bool = False,
+    ) -> Iterable[dict[str, Any]]:
+        normalized_object_names = [
+            str(object_name or "").strip().lower()
+            for object_name in (object_names or [])
+            if str(object_name or "").strip()
+        ]
+        action_payload = {
+            "last_event_id": str(last_event_id or "").strip() or None,
+            "heartbeat_seconds": max(float(heartbeat_seconds), 1.0),
+            "object_names": normalized_object_names or None,
+        }
+        for response_payload in self._stream_request_messages(
+            "subscribe_repository_stream",
+            action_payload,
+            stop_event=stop_event,
+        ):
+            if not bool(response_payload.get("ok", True)):
+                error_text = str(response_payload.get("error") or "agentsdb repository stream failed").strip()
+                detail_text = str(response_payload.get("detail") or "").strip()
+                if detail_text:
+                    raise RuntimeError(f"{error_text}: {detail_text}")
+                raise RuntimeError(error_text)
+            if bool(response_payload.get("subscribed")) or bool(response_payload.get("heartbeat")):
+                if include_meta:
+                    yield dict(response_payload)
+                continue
+            yield dict(response_payload)
 
     @contextmanager
     def deferred_write_queue(self) -> Iterable[None]:
@@ -1332,6 +1724,54 @@ class AgentDbSocketRepository:
             num_candidates=num_candidates,
             index_name=index_name,
         )
+
+    def request(
+        self,
+        query_text: str,
+        *,
+        owner_types: Sequence[str] | str | None = None,
+        limit: int = 10,
+        namespace_id: str | None = None,
+        use_vector: bool = True,
+        job_name: str | None = None,
+        target_agent: str | None = None,
+        tool_name: str | None = None,
+    ) -> dict[str, Any]:
+        return AGENT_DB_QUERY_SERVICE.load_request_object(
+            query_text=query_text,
+            owner_types=owner_types,
+            limit=limit,
+            namespace_id=namespace_id,
+            use_vector=use_vector,
+            job_name=job_name,
+            target_agent=target_agent,
+            tool_name=tool_name,
+        )
+
+    def query(
+        self,
+        query_text: str,
+        *,
+        owner_types: Sequence[str] | str | None = None,
+        limit: int = 10,
+        namespace_id: str | None = None,
+        use_vector: bool = True,
+        job_name: str | None = None,
+        target_agent: str | None = None,
+        tool_name: str | None = None,
+    ) -> dict[str, Any]:
+        request_payload = self.request(
+            query_text,
+            owner_types=owner_types,
+            limit=limit,
+            namespace_id=namespace_id,
+            use_vector=use_vector,
+            job_name=job_name,
+            target_agent=target_agent,
+            tool_name=tool_name,
+        )
+        response_payload = self._request_object("query", request_payload)
+        return dict(response_payload)
 
 
 class AgentDbInMemoryRepository:
@@ -1519,6 +1959,588 @@ class AgentDbInMemoryRepository:
                 frontier = next_frontier
             return result_payload_list
 
+    def request(
+        self,
+        query_text: str,
+        *,
+        owner_types: Sequence[str] | str | None = None,
+        limit: int = 10,
+        namespace_id: str | None = None,
+        use_vector: bool = True,
+        job_name: str | None = None,
+        target_agent: str | None = None,
+        tool_name: str | None = None,
+    ) -> dict[str, Any]:
+        return AGENT_DB_QUERY_SERVICE.load_request_object(
+            query_text=query_text,
+            owner_types=owner_types,
+            limit=limit,
+            namespace_id=namespace_id,
+            image_path=self._image_path,
+            use_vector=use_vector,
+            job_name=job_name,
+            target_agent=target_agent,
+            tool_name=tool_name,
+        )
+
+    def query(
+        self,
+        query_text: str,
+        *,
+        owner_types: Sequence[str] | str | None = None,
+        limit: int = 10,
+        namespace_id: str | None = None,
+        use_vector: bool = True,
+        job_name: str | None = None,
+        target_agent: str | None = None,
+        tool_name: str | None = None,
+    ) -> dict[str, Any]:
+        return AGENT_DB_QUERY_SERVICE.query_object(
+            self,
+            query_text=query_text,
+            owner_types=owner_types,
+            limit=limit,
+            namespace_id=namespace_id,
+            image_path=self._image_path,
+            use_vector=use_vector,
+            job_name=job_name,
+            target_agent=target_agent,
+            tool_name=tool_name,
+        )
+
+
+class AgentDbQueryService:
+    """Domain service for repository query requests and local repo-knowledge retrieval."""
+
+    _DEFAULT_TARGET_AGENT = "_xworker"
+    _DEFAULT_JOB_NAME = "adb_query"
+    _DEFAULT_TOOL_NAME = None
+    _DEFAULT_NAMESPACE_ID = "ns_repo_knowledge" or "ns_default_knowledge"
+    _DEFAULT_NAMESPACE_SLUG = "repo-knowledge"
+    _DEFAULT_NAMESPACE_NAME = "ALDE Repository Knowledge"
+    _DEFAULT_OWNER_TYPES = ("block", "entity","relation")
+    _OWNER_TYPE_ALL = ("block", "entity", "relation")
+    _OWNER_TYPE_ALIAS_MAP = {
+        "block": "block",
+        "blocks": "block",
+        "document": "block",
+        "documents": "block",
+        "doc": "block",
+        "docs": "block",
+        "entity": "entity",
+        "entities": "entity",
+        "node": "entity",
+        "nodes": "entity",
+        "relation": "relation",
+        "relations": "relation",
+        "edge": "relation",
+        "edges": "relation",
+    }
+    _COLLECTION_LIMIT = 10000
+    _RESULT_LIMIT = 50
+
+    def load_request_object(
+        self,
+        *,
+        query_text: str,
+        owner_types: Sequence[str] | str | None = None,
+        limit: int = 10,
+        namespace_id: str | None = None,
+        image_path: str | None = None,
+        use_vector: bool = True,
+        job_name: str | None = None,
+        target_agent: str | None = None,
+        tool_name: str | None = None,
+    ) -> dict[str, Any]:
+        resolved_query = str(query_text or "").strip()
+        resolved_owner_types = self._load_owner_type_list(owner_types)
+        safe_limit = max(1, min(int(limit), self._RESULT_LIMIT))
+        request_payload: dict[str, Any] = {
+            "target_agent": str(target_agent or self._DEFAULT_TARGET_AGENT).strip() or self._DEFAULT_TARGET_AGENT,
+            "job_name": str(job_name or self._DEFAULT_JOB_NAME).strip() or self._DEFAULT_JOB_NAME,
+            "tool_name": str(tool_name or self._DEFAULT_TOOL_NAME).strip() or self._DEFAULT_TOOL_NAME,
+            "user_question": resolved_query,
+            "query": resolved_query,
+            "owner_types": resolved_owner_types,
+            "limit": safe_limit,
+            "namespace_id": str(namespace_id or self._DEFAULT_NAMESPACE_ID).strip() or self._DEFAULT_NAMESPACE_ID,
+            "use_vector": bool(use_vector),
+        }
+        resolved_image_path = str(image_path or "").strip()
+        if resolved_image_path:
+            request_payload["image_path"] = resolved_image_path
+        return request_payload
+
+    def query_object(
+        self,
+        repository: Any,
+        *,
+        query_text: str,
+        owner_types: Sequence[str] | str | None = None,
+        limit: int = 10,
+        namespace_id: str | None = None,
+        image_path: str | None = None,
+        use_vector: bool = True,
+        job_name: str | None = None,
+        target_agent: str | None = None,
+        tool_name: str | None = None,
+    ) -> dict[str, Any]:
+        request_payload = self.load_request_object(
+            query_text=query_text,
+            owner_types=owner_types,
+            limit=limit,
+            namespace_id=namespace_id,
+            image_path=image_path,
+            use_vector=use_vector,
+            job_name=job_name,
+            target_agent=target_agent,
+            tool_name=tool_name,
+        )
+        resolved_query = str(request_payload.get("query") or "").strip()
+        if not resolved_query:
+            return self._build_query_result(
+                request_payload=request_payload,
+                ok=False,
+                chunks=[],
+                used_vector_search=False,
+                error="query_text is required",
+            )
+
+        owner_payload_cache: dict[str, dict[str, dict[str, Any]]] = {}
+        query_vector = self._load_query_vector(
+            repository,
+            query_text=resolved_query,
+            namespace_id=str(request_payload.get("namespace_id") or self._DEFAULT_NAMESPACE_ID),
+            use_vector=bool(request_payload.get("use_vector")),
+        )
+        used_vector_search = False
+        chunk_payload_list: list[dict[str, Any]] = []
+
+        for owner_type in request_payload.get("owner_types") or []:
+            resolved_owner_type = str(owner_type or "").strip().lower()
+            if resolved_owner_type not in self._OWNER_TYPE_ALL:
+                continue
+            candidates: list[dict[str, Any]] = []
+            if query_vector is not None:
+                candidates = self._load_vector_candidate_payload_list(
+                    repository,
+                    owner_type=resolved_owner_type,
+                    query_vector=query_vector,
+                    namespace_id=str(request_payload.get("namespace_id") or self._DEFAULT_NAMESPACE_ID),
+                    limit=int(request_payload.get("limit") or 10),
+                    owner_payload_cache=owner_payload_cache,
+                )
+                if candidates:
+                    used_vector_search = True
+            if not candidates:
+                candidates = self._load_text_candidate_payload_list(
+                    repository,
+                    owner_type=resolved_owner_type,
+                    query_text=resolved_query,
+                    namespace_id=str(request_payload.get("namespace_id") or self._DEFAULT_NAMESPACE_ID),
+                    limit=int(request_payload.get("limit") or 10),
+                )
+            chunk_payload_list.extend(self._format_chunk_payload_list(candidates, resolved_owner_type))
+
+        return self._build_query_result(
+            request_payload=request_payload,
+            ok=True,
+            chunks=chunk_payload_list,
+            used_vector_search=used_vector_search,
+        )
+
+    def _build_query_result(
+        self,
+        *,
+        request_payload: Mapping[str, Any],
+        ok: bool,
+        chunks: Sequence[Mapping[str, Any]],
+        used_vector_search: bool,
+        error: str | None = None,
+    ) -> dict[str, Any]:
+        result_payload: dict[str, Any] = {
+            "ok": bool(ok),
+            "query": str(request_payload.get("query") or "").strip(),
+            "namespace_id": str(request_payload.get("namespace_id") or self._DEFAULT_NAMESPACE_ID).strip() or self._DEFAULT_NAMESPACE_ID,
+            "owner_types": [
+                str(owner_type).strip()
+                for owner_type in (request_payload.get("owner_types") or [])
+                if str(owner_type).strip()
+            ],
+            "used_vector_search": bool(used_vector_search),
+            "total": len(list(chunks)),
+            "chunks": [dict(chunk) for chunk in chunks if isinstance(chunk, Mapping)],
+            "target_agent": str(request_payload.get("target_agent") or self._DEFAULT_TARGET_AGENT).strip() or self._DEFAULT_TARGET_AGENT,
+            "job_name": str(request_payload.get("job_name") or self._DEFAULT_JOB_NAME).strip() or self._DEFAULT_JOB_NAME,
+            "tool_name": str(request_payload.get("tool_name") or self._DEFAULT_TOOL_NAME).strip() or self._DEFAULT_TOOL_NAME,
+            "request": _deepcopy_object(dict(request_payload)),
+        }
+        if error:
+            result_payload["error"] = str(error)
+        return result_payload
+
+    def _load_owner_type_list(self, owner_types: Sequence[str] | str | None) -> list[str]:
+        if owner_types is None:
+            return list(self._DEFAULT_OWNER_TYPES)
+        if isinstance(owner_types, str):
+            candidate_values = re.split(r"[,;|\s]+", owner_types)
+        else:
+            candidate_values = []
+            for value in owner_types:
+                candidate_values.extend(re.split(r"[,;|\s]+", str(value)))
+
+        resolved_owner_types: list[str] = []
+        for candidate_value in candidate_values:
+            normalized_value = str(candidate_value or "").strip().lower()
+            if not normalized_value:
+                continue
+            if normalized_value == "all":
+                for owner_type in self._OWNER_TYPE_ALL:
+                    if owner_type not in resolved_owner_types:
+                        resolved_owner_types.append(owner_type)
+                continue
+            resolved_owner_type = self._load_owner_type(normalized_value)
+            if resolved_owner_type and resolved_owner_type not in resolved_owner_types:
+                resolved_owner_types.append(resolved_owner_type)
+        return resolved_owner_types or list(self._DEFAULT_OWNER_TYPES)
+
+    def _load_owner_type(self, owner_type: str) -> str | None:
+        normalized_value = str(owner_type or "").strip().lower()
+        if not normalized_value:
+            return None
+        resolved_owner_type = self._OWNER_TYPE_ALIAS_MAP.get(normalized_value)
+        if resolved_owner_type in self._OWNER_TYPE_ALL:
+            return resolved_owner_type
+        if normalized_value.endswith("s") and normalized_value[:-1] in self._OWNER_TYPE_ALL:
+            return normalized_value[:-1]
+        if normalized_value in self._OWNER_TYPE_ALL:
+            return normalized_value
+        return None
+
+    def _load_query_vector(
+        self,
+        repository: Any,
+        *,
+        query_text: str,
+        namespace_id: str,
+        use_vector: bool,
+    ) -> list[float] | None:
+        if not use_vector:
+            return None
+        try:
+            runtime_config = self._load_runtime_config(repository, namespace_id=namespace_id)
+            embedding_service = EntityRelationEmbeddingService(KnowledgeObjectService(repository), runtime_config)
+            query_vector = embedding_service.embed_object("query", query_text)
+        except Exception:
+            return None
+        return self._normalize_vector(query_vector) or None
+
+    def _load_runtime_config(self, repository: Any, *, namespace_id: str) -> RuntimeConfigObject:
+        resolved_namespace_id = str(namespace_id or self._DEFAULT_NAMESPACE_ID).strip() or self._DEFAULT_NAMESPACE_ID
+        loaded_runtime_config = load_agentsdb_runtime_config_from_env()
+        if loaded_runtime_config is None:
+            agents_db_uri = str(getattr(repository, "_agents_db_uri", "") or "agentsmem://local").strip() or "agentsmem://local"
+            database_name = str(getattr(repository, "_database_name", "alde_knowledge") or "alde_knowledge").strip() or "alde_knowledge"
+            return RuntimeConfigObject(
+                agents_db_uri=agents_db_uri,
+                database_name=database_name,
+                namespace_id=resolved_namespace_id,
+                namespace_slug=self._DEFAULT_NAMESPACE_SLUG,
+                namespace_name=self._DEFAULT_NAMESPACE_NAME,
+            )
+
+        namespace_slug = str(getattr(loaded_runtime_config, "namespace_slug", "") or "").strip() or self._DEFAULT_NAMESPACE_SLUG
+        namespace_name = str(getattr(loaded_runtime_config, "namespace_name", "") or "").strip() or self._DEFAULT_NAMESPACE_NAME
+        if resolved_namespace_id == self._DEFAULT_NAMESPACE_ID:
+            namespace_slug = self._DEFAULT_NAMESPACE_SLUG
+            namespace_name = self._DEFAULT_NAMESPACE_NAME
+        return RuntimeConfigObject(
+            agents_db_uri=str(getattr(loaded_runtime_config, "agents_db_uri", "") or "agentsmem://local").strip() or "agentsmem://local",
+            database_name=str(getattr(loaded_runtime_config, "database_name", "alde_knowledge") or "alde_knowledge").strip() or "alde_knowledge",
+            tenant_id=str(getattr(loaded_runtime_config, "tenant_id", "tenant_default") or "tenant_default").strip() or "tenant_default",
+            namespace_id=resolved_namespace_id,
+            namespace_slug=namespace_slug,
+            namespace_name=namespace_name,
+            default_embedding_model=str(getattr(loaded_runtime_config, "default_embedding_model", "text-embedding-3-large") or "text-embedding-3-large").strip() or "text-embedding-3-large",
+            default_embedding_dimension=max(1, int(getattr(loaded_runtime_config, "default_embedding_dimension", 3072) or 3072)),
+            index_backend=str(getattr(loaded_runtime_config, "index_backend", "faiss") or "faiss").strip() or "faiss",
+        )
+
+    def _load_text_candidate_payload_list(
+        self,
+        repository: Any,
+        *,
+        owner_type: str,
+        query_text: str,
+        namespace_id: str,
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        normalized_query = str(query_text or "").strip().lower()
+        if not normalized_query:
+            return []
+        if owner_type == "block":
+            return self._load_block_text_candidate_payload_list(
+                repository,
+                query_text=normalized_query,
+                namespace_id=namespace_id,
+                limit=limit,
+            )
+
+        object_name = "entity" if owner_type == "entity" else "relation"
+        try:
+            object_payload_list = repository.load_objects(
+                object_name,
+                {"namespace_id": str(namespace_id)},
+                limit=self._COLLECTION_LIMIT,
+            )
+        except Exception:
+            return []
+
+        result_payload_list: list[dict[str, Any]] = []
+        for object_payload in object_payload_list:
+            if not isinstance(object_payload, Mapping):
+                continue
+            haystack = json.dumps(_json_safe_object(object_payload), ensure_ascii=False).lower()
+            score = self._load_text_match_score(haystack, normalized_query)
+            if score <= 0.0:
+                continue
+            result_payload_list.append({"payload": dict(object_payload), "score": score})
+            if len(result_payload_list) >= max(1, int(limit)):
+                break
+        return result_payload_list
+
+    def _load_block_text_candidate_payload_list(
+        self,
+        repository: Any,
+        *,
+        query_text: str,
+        namespace_id: str,
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        try:
+            document_payload_list = repository.load_objects(
+                "document",
+                {"namespace_id": str(namespace_id)},
+                limit=self._COLLECTION_LIMIT,
+            )
+        except Exception:
+            return []
+
+        result_payload_list: list[dict[str, Any]] = []
+        for document_payload in document_payload_list:
+            if not isinstance(document_payload, Mapping):
+                continue
+            block_payload_list = document_payload.get("blocks")
+            if not isinstance(block_payload_list, Sequence):
+                continue
+            for block_payload in block_payload_list:
+                if not isinstance(block_payload, Mapping):
+                    continue
+                haystack = json.dumps(_json_safe_object(block_payload), ensure_ascii=False).lower()
+                score = self._load_text_match_score(haystack, query_text)
+                if score <= 0.0:
+                    continue
+                result_payload_list.append({"payload": dict(block_payload), "score": score})
+                if len(result_payload_list) >= max(1, int(limit)):
+                    return result_payload_list
+        return result_payload_list
+
+    def _load_vector_candidate_payload_list(
+        self,
+        repository: Any,
+        *,
+        owner_type: str,
+        query_vector: Sequence[float],
+        namespace_id: str,
+        limit: int,
+        owner_payload_cache: dict[str, dict[str, dict[str, Any]]],
+    ) -> list[dict[str, Any]]:
+        try:
+            embedding_payload_list = repository.load_objects(
+                "embedding",
+                {"namespace_id": str(namespace_id), "owner_type": str(owner_type)},
+                limit=self._COLLECTION_LIMIT,
+            )
+        except Exception:
+            return []
+
+        owner_payload_map = owner_payload_cache.get(owner_type)
+        if owner_payload_map is None:
+            owner_payload_map = self._load_owner_payload_map(repository, owner_type=owner_type, namespace_id=namespace_id)
+            owner_payload_cache[owner_type] = owner_payload_map
+
+        scored_payload_list: list[dict[str, Any]] = []
+        for embedding_payload in embedding_payload_list:
+            if not isinstance(embedding_payload, Mapping):
+                continue
+            owner_id = str(embedding_payload.get("owner_id") or "").strip()
+            if not owner_id:
+                continue
+            owner_payload = owner_payload_map.get(owner_id)
+            if owner_payload is None:
+                continue
+            embedding_vector = self._normalize_vector(embedding_payload.get("embedding"))
+            if not embedding_vector:
+                continue
+            score = self._load_cosine_similarity(query_vector, embedding_vector)
+            scored_payload_list.append({"payload": dict(owner_payload), "score": score})
+
+        scored_payload_list.sort(key=lambda item: float(item.get("score") or 0.0), reverse=True)
+        return scored_payload_list[: max(1, int(limit))]
+
+    def _load_owner_payload_map(
+        self,
+        repository: Any,
+        *,
+        owner_type: str,
+        namespace_id: str,
+    ) -> dict[str, dict[str, Any]]:
+        if owner_type == "block":
+            return self._load_block_payload_map(repository, namespace_id=namespace_id)
+        object_name = "entity" if owner_type == "entity" else "relation"
+        try:
+            object_payload_list = repository.load_objects(
+                object_name,
+                {"namespace_id": str(namespace_id)},
+                limit=self._COLLECTION_LIMIT,
+            )
+        except Exception:
+            return {}
+
+        payload_map: dict[str, dict[str, Any]] = {}
+        for object_payload in object_payload_list:
+            if not isinstance(object_payload, Mapping):
+                continue
+            object_id = str(object_payload.get("_id") or object_payload.get("id") or "").strip()
+            if not object_id:
+                continue
+            payload_map[object_id] = dict(object_payload)
+        return payload_map
+
+    def _load_block_payload_map(self, repository: Any, *, namespace_id: str) -> dict[str, dict[str, Any]]:
+        try:
+            document_payload_list = repository.load_objects(
+                "document",
+                {"namespace_id": str(namespace_id)},
+                limit=self._COLLECTION_LIMIT,
+            )
+        except Exception:
+            return {}
+
+        payload_map: dict[str, dict[str, Any]] = {}
+        for document_payload in document_payload_list:
+            if not isinstance(document_payload, Mapping):
+                continue
+            block_payload_list = document_payload.get("blocks")
+            if not isinstance(block_payload_list, Sequence):
+                continue
+            for block_payload in block_payload_list:
+                if not isinstance(block_payload, Mapping):
+                    continue
+                block_id = str(block_payload.get("block_id") or block_payload.get("_id") or block_payload.get("id") or "").strip()
+                if not block_id:
+                    continue
+                payload_map[block_id] = dict(block_payload)
+        return payload_map
+
+    def _format_chunk_payload_list(self, candidates: Sequence[Mapping[str, Any]], owner_type: str) -> list[dict[str, Any]]:
+        chunk_payload_list: list[dict[str, Any]] = []
+        for candidate in candidates:
+            payload = candidate.get("payload") if isinstance(candidate.get("payload"), Mapping) else candidate
+            score = candidate.get("score") if isinstance(candidate, Mapping) else None
+            if not isinstance(payload, Mapping):
+                continue
+            chunk_payload: dict[str, Any] = {"owner_type": owner_type}
+            if owner_type == "block":
+                metadata = payload.get("metadata") if isinstance(payload.get("metadata"), Mapping) else {}
+                chunk_payload.update(
+                    {
+                        "heading": str(payload.get("heading") or payload.get("block_kind") or "block"),
+                        "content": str(payload.get("content") or payload.get("text") or "")[:2000],
+                        "source_path": str(metadata.get("source_path") or payload.get("source_path") or ""),
+                        "block_kind": str(payload.get("block_kind") or metadata.get("kind") or ""),
+                    }
+                )
+            elif owner_type == "entity":
+                metadata = payload.get("metadata") if isinstance(payload.get("metadata"), Mapping) else {}
+                chunk_payload.update(
+                    {
+                        "canonical_name": str(payload.get("canonical_name") or payload.get("mention_text") or ""),
+                        "entity_type": str(payload.get("entity_type") or ""),
+                        "summary": str(payload.get("summary") or "")[:500],
+                        "source_path": str(metadata.get("source_path") or payload.get("source_path") or ""),
+                    }
+                )
+            elif owner_type == "relation":
+                metadata = payload.get("metadata") if isinstance(payload.get("metadata"), Mapping) else {}
+                chunk_payload.update(
+                    {
+                        "relation_type": str(payload.get("relation_type") or ""),
+                        "source_entity_id": str(payload.get("source_entity_id") or ""),
+                        "target_entity_id": str(payload.get("target_entity_id") or ""),
+                        "relation_description": str(payload.get("relation_description") or metadata.get("relation_description") or ""),
+                        "source_path": str(metadata.get("source_path") or payload.get("source_path") or ""),
+                    }
+                )
+            else:
+                chunk_payload["raw"] = dict(payload)
+            if score is not None:
+                chunk_payload["score"] = float(score)
+            chunk_payload_list.append(chunk_payload)
+        return chunk_payload_list
+
+    def _normalize_vector(self, vector_payload: Any) -> list[float]:
+        if not isinstance(vector_payload, Sequence) or isinstance(vector_payload, (str, bytes, bytearray)):
+            return []
+        normalized_vector: list[float] = []
+        for item in vector_payload:
+            try:
+                normalized_vector.append(float(item))
+            except Exception:
+                return []
+        return normalized_vector
+
+    def _load_text_match_score(self, haystack_text: str, query_text: str) -> float:
+        normalized_haystack = str(haystack_text or "").strip().lower()
+        normalized_query = str(query_text or "").strip().lower()
+        if not normalized_haystack or not normalized_query:
+            return 0.0
+        if normalized_query in normalized_haystack:
+            return 1.0
+        query_token_list = [
+            token
+            for token in re.split(r"[^a-z0-9_]+", normalized_query)
+            if token
+        ]
+        if not query_token_list:
+            return 0.0
+        matched_token_count = sum(1 for token in query_token_list if token in normalized_haystack)
+        if matched_token_count <= 0:
+            return 0.0
+        return matched_token_count / len(query_token_list)
+
+    def _load_cosine_similarity(self, left_vector: Sequence[float], right_vector: Sequence[float]) -> float:
+        if not left_vector or not right_vector:
+            return 0.0
+        dimension = min(len(left_vector), len(right_vector))
+        if dimension <= 0:
+            return 0.0
+        dot_product = 0.0
+        left_norm = 0.0
+        right_norm = 0.0
+        for index in range(dimension):
+            left_value = float(left_vector[index])
+            right_value = float(right_vector[index])
+            dot_product += left_value * right_value
+            left_norm += left_value * left_value
+            right_norm += right_value * right_value
+        if left_norm <= 0.0 or right_norm <= 0.0:
+            return 0.0
+        return dot_product / (math.sqrt(left_norm) * math.sqrt(right_norm))
+
+
+AGENT_DB_QUERY_SERVICE = AgentDbQueryService()
+
 
 def _is_memory_backend_uri(uri: str | None) -> bool:
     normalized_uri = str(uri or "").strip().lower()
@@ -1528,6 +2550,83 @@ def _is_memory_backend_uri(uri: str | None) -> bool:
         or normalized_uri.startswith("memodb://")
         or normalized_uri.startswith("inmemdb://")
     )
+
+
+class KnowledgeRepositoryProtocol(Protocol):
+    def ensure_index_objects(self) -> None:
+        ...
+
+    def upsert_object(self, object_name: str, object_id: str, object_payload: Mapping[str, Any]) -> Mapping[str, Any]:
+        ...
+
+    def delete_object(self, object_name: str, object_id: str) -> bool:
+        ...
+
+    def load_object(self, object_name: str, object_id: str) -> dict[str, Any] | None:
+        ...
+
+    def load_objects(
+        self,
+        object_name: str,
+        object_filter: Mapping[str, Any] | None = None,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        ...
+
+    def find_objects(self, *, namespace_id: str, query_text: str, limit: int = 10) -> list[dict[str, Any]]:
+        ...
+
+    def load_relation_graph(
+        self,
+        *,
+        namespace_id: str,
+        source_entity_id: str,
+        max_depth: int = 2,
+    ) -> list[dict[str, Any]]:
+        ...
+
+
+class KnowledgeVectorRepositoryProtocol(KnowledgeRepositoryProtocol, Protocol):
+    def build_vector_search_pipeline(
+        self,
+        *,
+        query_vector: Sequence[float],
+        namespace_id: str,
+        owner_type: str = "",
+        limit: int = 10,
+        num_candidates: int = 100,
+        index_name: str = "embedding_cosine",
+    ) -> list[dict[str, Any]]:
+        ...
+
+
+@dataclass(frozen=True)
+class AgentDbRepositoryFactoryConfig:
+    backend_uri: str
+    default_database_name: str = "alde_knowledge"
+    memory_image_path: str | None = None
+    prefer_explicit_inmemory: bool = False
+
+
+class AgentDbRepositoryFactory:
+    """Create repository objects from one backend-selection policy."""
+
+    def __init__(self, config: AgentDbRepositoryFactoryConfig) -> None:
+        self._config = config
+
+    def load_repository(self, database_name: str | None = None) -> KnowledgeRepositoryProtocol:
+        resolved_database_name = str(database_name or self._config.default_database_name).strip() or self._config.default_database_name
+        if _is_agentsdb_socket_uri(self._config.backend_uri):
+            return AgentDbSocketRepository.create_from_uri(
+                self._config.backend_uri,
+                resolved_database_name,
+            )
+        if _is_memory_backend_uri(self._config.backend_uri) and self._config.prefer_explicit_inmemory:
+            return AgentDbInMemoryRepository(self._config.memory_image_path)
+        return KnowledgeRepository.create_from_uri(
+            self._config.backend_uri,
+            resolved_database_name,
+        )
 
 
 class AgentDbSocketServerService:
@@ -1542,7 +2641,18 @@ class AgentDbSocketServerService:
         self._backend_uri = normalized_backend_uri
         self._default_database_name = str(default_database_name or "alde_knowledge").strip() or "alde_knowledge"
         self._memory_image_path = str(memory_image_path or "").strip() or None
-        self._repository_cache: dict[str, Any] = {}
+        self._repository_cache: dict[str, KnowledgeRepositoryProtocol] = {}
+        self._repository_factory = AgentDbRepositoryFactory(
+            AgentDbRepositoryFactoryConfig(
+                backend_uri=self._backend_uri,
+                default_database_name=self._default_database_name,
+                memory_image_path=self._memory_image_path,
+                prefer_explicit_inmemory=True,
+            )
+        )
+        self._stream_condition = threading.Condition(threading.RLock())
+        self._stream_version_by_key: dict[tuple[str, str, str], int] = {}
+        self._repository_stream_state_by_database: dict[str, dict[str, Any]] = {}
 
     @classmethod
     def load_from_env(cls) -> AgentDbSocketServerService:
@@ -1570,17 +2680,280 @@ class AgentDbSocketServerService:
             database_name = _connection_config_value(connection_config, ("database_name", "database")) or "alde_knowledge"
         return cls(backend_uri=backend_uri, default_database_name=database_name, memory_image_path=memory_image_path)
 
-    def load_repository(self, database_name: str | None = None) -> Any:
+    def load_repository(self, database_name: str | None = None) -> KnowledgeRepositoryProtocol:
         resolved_database_name = str(database_name or self._default_database_name).strip() or self._default_database_name
-        repository:AgentDbInMemoryRepository|KnowledgeRepository = self._repository_cache.get(resolved_database_name)
+        repository = self._repository_cache.get(resolved_database_name)
         if repository is not None:
             return repository
-        if _is_memory_backend_uri(self._backend_uri):
-            repository = AgentDbInMemoryRepository(self._memory_image_path)
-        else:
-            repository = KnowledgeRepository.create_from_uri(self._backend_uri, resolved_database_name)
+        repository = self._repository_factory.load_repository(resolved_database_name)
         self._repository_cache[resolved_database_name] = repository
         return repository
+
+    def _stream_key(self, *, database_name: str | None, object_name: str, object_id: str) -> tuple[str, str, str]:
+        resolved_database_name = str(database_name or self._default_database_name).strip() or self._default_database_name
+        return (resolved_database_name, str(object_name or "").strip(), str(object_id or "").strip())
+
+    def _repository_stream_key(self, *, database_name: str | None) -> tuple[str, str, str]:
+        return self._stream_key(
+            database_name=database_name,
+            object_name="__repository__",
+            object_id="__all__",
+        )
+
+    def _load_repository_stream_state(self, *, database_name: str | None = None) -> dict[str, Any] | None:
+        resolved_database_name = str(database_name or self._default_database_name).strip() or self._default_database_name
+        with self._stream_condition:
+            state_payload = self._repository_stream_state_by_database.get(resolved_database_name)
+            return dict(state_payload) if isinstance(state_payload, Mapping) else None
+
+    def _stream_version(self, *, database_name: str | None, object_name: str, object_id: str) -> int:
+        stream_key = self._stream_key(database_name=database_name, object_name=object_name, object_id=object_id)
+        with self._stream_condition:
+            return int(self._stream_version_by_key.get(stream_key, 0))
+
+    def _notify_stream_update(
+        self,
+        *,
+        database_name: str | None,
+        object_name: str,
+        object_id: str,
+        change: Mapping[str, Any] | None = None,
+    ) -> None:
+        stream_key = self._stream_key(database_name=database_name, object_name=object_name, object_id=object_id)
+        repository_stream_key = self._repository_stream_key(database_name=database_name)
+        resolved_database_name = str(database_name or self._default_database_name).strip() or self._default_database_name
+        resolved_object_name = str(object_name or "").strip()
+        resolved_object_id = str(object_id or "").strip()
+        with self._stream_condition:
+            self._stream_version_by_key[stream_key] = int(self._stream_version_by_key.get(stream_key, 0)) + 1
+            self._stream_version_by_key[repository_stream_key] = int(self._stream_version_by_key.get(repository_stream_key, 0)) + 1
+            updated_at = _now_utc().isoformat()
+            safe_change = _json_safe_object(
+                dict(change)
+                if isinstance(change, Mapping)
+                else {
+                    "action": "update",
+                    "object_name": resolved_object_name,
+                    "object_id": resolved_object_id,
+                }
+            )
+            repository_version = int(self._stream_version_by_key.get(repository_stream_key, 0))
+            event_seed = json.dumps(
+                {
+                    "database_name": resolved_database_name,
+                    "object_name": resolved_object_name,
+                    "object_id": resolved_object_id,
+                    "repository_version": repository_version,
+                    "updated_at": updated_at,
+                    "change": safe_change,
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+            event_id = hashlib.sha256(event_seed.encode("utf-8")).hexdigest()[:32]
+            self._repository_stream_state_by_database[resolved_database_name] = {
+                "ok": True,
+                "stream": "repository_update",
+                "database_name": resolved_database_name,
+                "object_name": resolved_object_name,
+                "object_id": resolved_object_id,
+                "stream_cursor": {
+                    "event_id": event_id,
+                    "updated_at": updated_at,
+                },
+                "change": safe_change,
+            }
+            self._stream_condition.notify_all()
+
+    def _wait_for_stream_update(
+        self,
+        *,
+        database_name: str | None,
+        object_name: str,
+        object_id: str,
+        last_version: int,
+        timeout_seconds: float,
+    ) -> int:
+        stream_key = self._stream_key(database_name=database_name, object_name=object_name, object_id=object_id)
+        with self._stream_condition:
+            current_version = int(self._stream_version_by_key.get(stream_key, 0))
+            if current_version != last_version:
+                return current_version
+            self._stream_condition.wait(timeout=max(float(timeout_seconds), 0.1))
+            return int(self._stream_version_by_key.get(stream_key, 0))
+
+    def _load_tree_stream_state(
+        self,
+        *,
+        tree_object_id: str,
+        database_name: str | None = None,
+    ) -> dict[str, Any] | None:
+        normalized_tree_object_id = str(tree_object_id or "").strip()
+        if not normalized_tree_object_id:
+            return None
+        repository = self.load_repository(database_name)
+        tree_record = repository.load_object("document", normalized_tree_object_id)
+        if not isinstance(tree_record, Mapping):
+            return None
+        head_payload = repository.load_object("document", f"{normalized_tree_object_id}:stream:head")
+        tree_data = tree_record.get("tree_data")
+        if not isinstance(tree_data, Mapping):
+            tree_data = tree_record.get("data")
+        if not isinstance(tree_data, Mapping):
+            return None
+
+        head_mapping = dict(head_payload) if isinstance(head_payload, Mapping) else {}
+        event_id = str(
+            head_mapping.get("event_id")
+            or tree_record.get("last_stream_event_id")
+            or tree_record.get("content_sha256")
+            or tree_record.get("updated_at")
+            or ""
+        ).strip()
+        updated_at = str(head_mapping.get("updated_at") or tree_record.get("updated_at") or tree_record.get("created_at") or "").strip()
+        tree_hash = str(head_mapping.get("tree_hash") or tree_record.get("content_sha256") or "").strip()
+        change_payload = head_mapping.get("change") if isinstance(head_mapping.get("change"), Mapping) else None
+        return {
+            "ok": True,
+            "stream": "tree_update",
+            "tree_object_id": normalized_tree_object_id,
+            "tree_data": dict(tree_data),
+            "stream_cursor": {
+                "event_id": event_id,
+                "updated_at": updated_at,
+                "tree_hash": tree_hash,
+            },
+            "change": dict(change_payload) if isinstance(change_payload, Mapping) else None,
+        }
+
+    def iter_tree_stream(
+        self,
+        *,
+        tree_object_id: str,
+        database_name: str | None = None,
+        last_event_id: str | None = None,
+        heartbeat_seconds: float = 30.0,
+        stop_event: threading.Event | None = None,
+    ) -> Iterable[dict[str, Any]]:
+        normalized_tree_object_id = str(tree_object_id or "").strip()
+        if not normalized_tree_object_id:
+            raise ValueError("subscribe_tree_stream requires tree_object_id")
+        resolved_database_name = str(database_name or self._default_database_name).strip() or self._default_database_name
+        heartbeat_timeout = max(float(heartbeat_seconds), 1.0)
+        last_seen_event_id = str(last_event_id or "").strip() or None
+        last_version = self._stream_version(
+            database_name=resolved_database_name,
+            object_name="document",
+            object_id=normalized_tree_object_id,
+        )
+
+        yield {
+            "ok": True,
+            "subscribed": True,
+            "stream": "tree_subscription",
+            "database_name": resolved_database_name,
+            "tree_object_id": normalized_tree_object_id,
+            "last_event_id": last_seen_event_id,
+        }
+
+        while stop_event is None or not stop_event.is_set():
+            stream_state = self._load_tree_stream_state(
+                tree_object_id=normalized_tree_object_id,
+                database_name=resolved_database_name,
+            )
+            stream_cursor = stream_state.get("stream_cursor") if isinstance(stream_state, Mapping) else None
+            current_event_id = str((stream_cursor or {}).get("event_id") or "").strip()
+            if stream_state is not None and current_event_id and current_event_id != last_seen_event_id:
+                yield dict(stream_state)
+                last_seen_event_id = current_event_id
+                last_version = self._stream_version(
+                    database_name=resolved_database_name,
+                    object_name="document",
+                    object_id=normalized_tree_object_id,
+                )
+                continue
+
+            next_version = self._wait_for_stream_update(
+                database_name=resolved_database_name,
+                object_name="document",
+                object_id=normalized_tree_object_id,
+                last_version=last_version,
+                timeout_seconds=heartbeat_timeout,
+            )
+            if next_version == last_version:
+                yield {
+                    "ok": True,
+                    "heartbeat": True,
+                    "stream": "tree_heartbeat",
+                    "database_name": resolved_database_name,
+                    "tree_object_id": normalized_tree_object_id,
+                }
+            last_version = next_version
+
+    def iter_repository_stream(
+        self,
+        *,
+        database_name: str | None = None,
+        last_event_id: str | None = None,
+        heartbeat_seconds: float = 30.0,
+        stop_event: threading.Event | None = None,
+        object_names: Sequence[str] | None = None,
+    ) -> Iterable[dict[str, Any]]:
+        resolved_database_name = str(database_name or self._default_database_name).strip() or self._default_database_name
+        heartbeat_timeout = max(float(heartbeat_seconds), 1.0)
+        normalized_object_name_set = {
+            str(object_name or "").strip().lower()
+            for object_name in (object_names or [])
+            if str(object_name or "").strip()
+        }
+        last_seen_event_id = str(last_event_id or "").strip() or None
+        last_version = self._stream_version(
+            database_name=resolved_database_name,
+            object_name="__repository__",
+            object_id="__all__",
+        )
+
+        yield {
+            "ok": True,
+            "subscribed": True,
+            "stream": "repository_subscription",
+            "database_name": resolved_database_name,
+            "object_names": sorted(normalized_object_name_set),
+            "last_event_id": last_seen_event_id,
+        }
+
+        while stop_event is None or not stop_event.is_set():
+            stream_state = self._load_repository_stream_state(database_name=resolved_database_name)
+            stream_cursor = stream_state.get("stream_cursor") if isinstance(stream_state, Mapping) else None
+            current_event_id = str((stream_cursor or {}).get("event_id") or "").strip()
+            current_object_name = str((stream_state or {}).get("object_name") or "").strip().lower()
+            if stream_state is not None and current_event_id and current_event_id != last_seen_event_id:
+                last_seen_event_id = current_event_id
+                last_version = self._stream_version(
+                    database_name=resolved_database_name,
+                    object_name="__repository__",
+                    object_id="__all__",
+                )
+                if not normalized_object_name_set or current_object_name in normalized_object_name_set:
+                    yield dict(stream_state)
+                continue
+
+            next_version = self._wait_for_stream_update(
+                database_name=resolved_database_name,
+                object_name="__repository__",
+                object_id="__all__",
+                last_version=last_version,
+                timeout_seconds=heartbeat_timeout,
+            )
+            if next_version == last_version:
+                yield {
+                    "ok": True,
+                    "heartbeat": True,
+                    "stream": "repository_heartbeat",
+                    "database_name": resolved_database_name,
+                    "object_names": sorted(normalized_object_name_set),
+                }
+            last_version = next_version
 
     def dispatch_object(self, cmd: str, payload: Mapping[str, Any], database_name: str | None = None) -> dict[str, Any]:
         normalized_cmd = str(cmd or "").strip().lower()
@@ -1592,7 +2965,7 @@ class AgentDbSocketServerService:
                 "storage_backend": "inmemory" if _is_memory_backend_uri(self._backend_uri) else "dict",
                 "database_name": str(database_name or self._default_database_name),
             }
-        repository: AgentDbInMemoryRepository | KnowledgeRepository = self.load_repository(database_name)
+        repository = self.load_repository(database_name)
         if normalized_cmd == "ensure_index_objects":
             repository.ensure_index_objects()
             return {"ok": True, "ensured": True}
@@ -1603,6 +2976,16 @@ class AgentDbSocketServerService:
             if not object_name or not object_id or not isinstance(object_payload, Mapping):
                 raise ValueError("upsert_object requires object_name, object_id, and object_payload")
             stored_payload = repository.upsert_object(object_name, object_id, dict(object_payload))
+            self._notify_stream_update(
+                database_name=database_name,
+                object_name=object_name,
+                object_id=object_id,
+                change={
+                    "action": "upsert",
+                    "object_name": object_name,
+                    "object_id": object_id,
+                },
+            )
             return {"ok": True, "object_payload": _json_safe_object(stored_payload)}
         if normalized_cmd == "delete_object":
             object_name = str(payload.get("object_name") or "").strip()
@@ -1610,6 +2993,17 @@ class AgentDbSocketServerService:
             if not object_name or not object_id:
                 raise ValueError("delete_object requires object_name and object_id")
             deleted = repository.delete_object(object_name, object_id)
+            self._notify_stream_update(
+                database_name=database_name,
+                object_name=object_name,
+                object_id=object_id,
+                change={
+                    "action": "delete",
+                    "object_name": object_name,
+                    "object_id": object_id,
+                    "deleted": bool(deleted),
+                },
+            )
             return {"ok": True, "deleted": bool(deleted)}
         if normalized_cmd == "load_object":
             object_name = str(payload.get("object_name") or "").strip()
@@ -1644,6 +3038,45 @@ class AgentDbSocketServerService:
                 limit=max(1, int(limit)),
             )
             return {"ok": True, "object_payload_list": _json_safe_object(object_payload_list)}
+        if normalized_cmd in {"query", "adb_query"}:
+            query_text = str(payload.get("query") or payload.get("query_text") or payload.get("user_question") or "").strip()
+            owner_types = payload.get("owner_types")
+            if owner_types is None:
+                owner_types = payload.get("owner_type")
+            limit = payload.get("limit", 10)
+            namespace_id = str(payload.get("namespace_id") or "").strip() or None
+            use_vector_payload: Any = True
+            for candidate_key in ("use_vector", "used_vector_search", "vector_search"):
+                if candidate_key in payload:
+                    use_vector_payload = payload.get(candidate_key)
+                    break
+            parsed_use_vector = _load_bool_value(use_vector_payload)
+            if parsed_use_vector is None:
+                if isinstance(use_vector_payload, str):
+                    use_vector = str(use_vector_payload).strip().lower() not in {"", "0", "false", "no", "off"}
+                else:
+                    use_vector = bool(use_vector_payload)
+            else:
+                use_vector = parsed_use_vector
+            job_name = str(payload.get("job_name") or "").strip() or None
+            target_agent = str(payload.get("target_agent") or "").strip() or None
+            tool_name = str(payload.get("tool_name") or "").strip() or None
+            if not query_text:
+                raise ValueError("query requires query or query_text")
+            query_method = getattr(repository, "query", None)
+            if not callable(query_method):
+                raise ValueError("repository does not support query")
+            result_payload = query_method(
+                query_text,
+                owner_types=owner_types,
+                limit=max(1, int(limit)),
+                namespace_id=namespace_id,
+                use_vector=use_vector,
+                job_name=job_name,
+                target_agent=target_agent,
+                tool_name=tool_name,
+            )
+            return dict(result_payload) if isinstance(result_payload, Mapping) else {"ok": True, "result": _json_safe_object(result_payload)}
         if normalized_cmd == "load_relation_graph":
             namespace_id = str(payload.get("namespace_id") or "").strip()
             source_entity_id = str(payload.get("source_entity_id") or "").strip()
@@ -1663,6 +3096,7 @@ class AgentDbSocketServerService:
             applied = 0
             deleted = 0
             results: list[dict[str, Any]] = []
+            touched_object_key_set: set[tuple[str, str]] = set()
             flush_context = getattr(repository, "deferred_flush", None)
             if not callable(flush_context):
                 flush_context = getattr(repository, "deferred_write_queue", None)
@@ -1678,6 +3112,7 @@ class AgentDbSocketServerService:
                         if not object_name or not object_id or not isinstance(object_payload, Mapping):
                             continue
                         repository.upsert_object(object_name, object_id, dict(object_payload))
+                        touched_object_key_set.add((object_name, object_id))
                         applied += 1
                         results.append({"action": "upsert", "object_name": object_name, "object_id": object_id, "ok": True})
                         continue
@@ -1685,10 +3120,22 @@ class AgentDbSocketServerService:
                         if not object_name or not object_id:
                             continue
                         deleted_flag = bool(repository.delete_object(object_name, object_id))
+                        touched_object_key_set.add((object_name, object_id))
                         applied += 1
                         if deleted_flag:
                             deleted += 1
                         results.append({"action": "delete", "object_name": object_name, "object_id": object_id, "deleted": deleted_flag, "ok": True})
+            for object_name, object_id in sorted(touched_object_key_set):
+                self._notify_stream_update(
+                    database_name=database_name,
+                    object_name=object_name,
+                    object_id=object_id,
+                    change={
+                        "action": "apply_operations",
+                        "object_name": object_name,
+                        "object_id": object_id,
+                    },
+                )
             return {"ok": True, "applied": applied, "deleted": deleted, "results": results}
         raise ValueError(f"unknown cmd: {normalized_cmd or '<empty>'}")
 
@@ -1727,6 +3174,65 @@ def _parse_agentsdb_socket_request_line(raw_line: bytes) -> tuple[str, str | Non
 
 
 class _AgentDbSocketRequestHandler(socketserver.StreamRequestHandler):
+    def _write_response(self, response_payload: Mapping[str, Any]) -> None:
+        self.wfile.write((json.dumps(_json_safe_object(dict(response_payload)), separators=(",", ":")) + "\n").encode("utf-8"))
+        self.wfile.flush()
+
+    def _handle_tree_stream(
+        self,
+        service: AgentDbSocketServerService,
+        *,
+        payload: Mapping[str, Any],
+        database_name: str | None,
+    ) -> None:
+        tree_object_id = str(payload.get("tree_object_id") or "").strip()
+        last_event_id = str(payload.get("last_event_id") or "").strip() or None
+        heartbeat_seconds = payload.get("heartbeat_seconds", 30.0)
+        try:
+            heartbeat_value = max(float(heartbeat_seconds), 1.0)
+        except Exception:
+            heartbeat_value = 30.0
+        for response_payload in service.iter_tree_stream(
+            tree_object_id=tree_object_id,
+            database_name=database_name,
+            last_event_id=last_event_id,
+            heartbeat_seconds=heartbeat_value,
+        ):
+            try:
+                self._write_response(response_payload)
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                return
+
+    def _handle_repository_stream(
+        self,
+        service: AgentDbSocketServerService,
+        *,
+        payload: Mapping[str, Any],
+        database_name: str | None,
+    ) -> None:
+        last_event_id = str(payload.get("last_event_id") or "").strip() or None
+        heartbeat_seconds = payload.get("heartbeat_seconds", 30.0)
+        object_names = payload.get("object_names")
+        try:
+            heartbeat_value = max(float(heartbeat_seconds), 1.0)
+        except Exception:
+            heartbeat_value = 30.0
+        normalized_object_names = [
+            str(object_name or "").strip().lower()
+            for object_name in (object_names if isinstance(object_names, Sequence) and not isinstance(object_names, (str, bytes, bytearray)) else [])
+            if str(object_name or "").strip()
+        ]
+        for response_payload in service.iter_repository_stream(
+            database_name=database_name,
+            last_event_id=last_event_id,
+            heartbeat_seconds=heartbeat_value,
+            object_names=normalized_object_names,
+        ):
+            try:
+                self._write_response(response_payload)
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                return
+
     def handle(self) -> None:
         service: AgentDbSocketServerService = self.server.service
         raw_line = self.rfile.readline()
@@ -1735,6 +3241,12 @@ class _AgentDbSocketRequestHandler(socketserver.StreamRequestHandler):
         response_payload: dict[str, Any]
         try:
             cmd, database_name, payload = _parse_agentsdb_socket_request_line(raw_line)
+            if str(cmd or "").strip().lower() == "subscribe_tree_stream":
+                self._handle_tree_stream(service, payload=payload, database_name=database_name)
+                return
+            if str(cmd or "").strip().lower() == "subscribe_repository_stream":
+                self._handle_repository_stream(service, payload=payload, database_name=database_name)
+                return
             response_payload = service.dispatch_object(cmd=cmd, payload=payload, database_name=database_name)
         except Exception as exc:
             response_payload = {
@@ -1742,7 +3254,11 @@ class _AgentDbSocketRequestHandler(socketserver.StreamRequestHandler):
                 "error": "agents_db_socket_request_failed",
                 "detail": str(exc),
             }
-        self.wfile.write((json.dumps(_json_safe_object(response_payload), separators=(",", ":")) + "\n").encode("utf-8"))
+        try:
+            self._write_response(response_payload)
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            # Client disconnected before receiving the response; treat as benign.
+            return
 
 
 class _AgentDbSocketTCPServer(socketserver.ThreadingTCPServer):
@@ -1770,9 +3286,9 @@ def run_agentsdb_socket_server_from_env(host: str | None = None, port: int | Non
     agents_db_uri = str(os.getenv("AI_IDE_KNOWLEDGE_AGENTS_DB_URI", "")).strip()
     if not agents_db_uri:
         agents_db_uri = _load_agentsdb_uri_from_connection_config(connection_config)
-    parsed_uri = urlparse(agents_db_uri or "agentsdb://localhost:2331")
-    resolved_host = str(host or parsed_uri.hostname or "localhost").strip() or "localhost"
-    resolved_port = int(port or parsed_uri.port or 2331)
+    endpoint = _load_agentsdb_socket_endpoint(agents_db_uri or "agentsdb://localhost:2331")
+    resolved_host = str(host or (endpoint[1] if endpoint is not None else "localhost")).strip() or "localhost"
+    resolved_port = int(port or (endpoint[2] if endpoint is not None else 2331))
     service = AgentDbSocketServerService.load_from_env()
     with _AgentDbSocketTCPServer((resolved_host, resolved_port), _AgentDbSocketRequestHandler, service) as server:
         server.serve_forever()
@@ -1781,20 +3297,47 @@ def run_agentsdb_socket_server_from_env(host: str | None = None, port: int | Non
 class KnowledgeObjectService:
     """Domain service for storing and querying the knowledge model."""
 
-    def __init__(self, repository: KnowledgeRepository) -> None:
+    _VECTOR_COLLECTION_LIMIT = 10000
+
+    def __init__(self, repository: KnowledgeVectorRepositoryProtocol) -> None:
         self._repository = repository
 
+    def store_object(
+        self,
+        *,
+        object_name: str,
+        object_id: str,
+        object_payload: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        return self._repository.upsert_object(object_name, object_id, object_payload)
+
     def store_namespace_object(self, namespace_object: NamespaceObject) -> Mapping[str, Any]:
-        return self._repository.upsert_object("namespace", namespace_object.id, _dataclass_payload(namespace_object))
+        return self.store_object(
+            object_name="namespace",
+            object_id=namespace_object.id,
+            object_payload=_dataclass_payload(namespace_object),
+        )
 
     def store_entity_object(self, entity_object: EntityObject) -> Mapping[str, Any]:
-        return self._repository.upsert_object("entity", entity_object.id, _dataclass_payload(entity_object))
+        return self.store_object(
+            object_name="entity",
+            object_id=entity_object.id,
+            object_payload=_dataclass_payload(entity_object),
+        )
 
     def store_document_object(self, document_object: DocumentObject) -> Mapping[str, Any]:
-        return self._repository.upsert_object("document", document_object.id, _dataclass_payload(document_object))
+        return self.store_object(
+            object_name="document",
+            object_id=document_object.id,
+            object_payload=_dataclass_payload(document_object),
+        )
 
     def store_relation_object(self, relation_object: EntityRelationObject) -> Mapping[str, Any]:
-        return self._repository.upsert_object("relation", relation_object.id, _dataclass_payload(relation_object))
+        return self.store_object(
+            object_name="relation",
+            object_id=relation_object.id,
+            object_payload=_dataclass_payload(relation_object),
+        )
 
     def store_embedding_object(self, embedding_object: EmbeddingObject) -> Mapping[str, Any]:
         object_id = ":".join(
@@ -1805,20 +3348,24 @@ class KnowledgeObjectService:
                 embedding_object.model_id,
             ],
         )
-        return self._repository.upsert_object("embedding", object_id, _dataclass_payload(embedding_object))
+        return self.store_object(
+            object_name="embedding",
+            object_id=object_id,
+            object_payload=_dataclass_payload(embedding_object),
+        )
 
     def store_retrieval_run_object(self, retrieval_run_object: RetrievalRunObject) -> Mapping[str, Any]:
-        return self._repository.upsert_object(
-            "retrieval_run",
-            retrieval_run_object.id,
-            _dataclass_payload(retrieval_run_object),
+        return self.store_object(
+            object_name="retrieval_run",
+            object_id=retrieval_run_object.id,
+            object_payload=_dataclass_payload(retrieval_run_object),
         )
 
     def store_dispatcher_run_object(self, dispatcher_run_object: DispatcherRunObject) -> Mapping[str, Any]:
-        return self._repository.upsert_object(
-            "dispatcher_run",
-            dispatcher_run_object.id,
-            _dataclass_payload(dispatcher_run_object),
+        return self.store_object(
+            object_name="dispatcher_run",
+            object_id=dispatcher_run_object.id,
+            object_payload=_dataclass_payload(dispatcher_run_object),
         )
 
     def find_objects(self, *, namespace_id: str, query_text: str, limit: int = 10) -> list[dict[str, Any]]:
@@ -1831,7 +3378,7 @@ class KnowledgeObjectService:
         source_entity_id: str,
         max_depth: int = 2,
     ) -> list[dict[str, Any]]:
-        return self._repository.load_relation_object_graph(
+        return self._repository.load_relation_graph(
             namespace_id=namespace_id,
             source_entity_id=source_entity_id,
             max_depth=max_depth,
@@ -1845,12 +3392,136 @@ class KnowledgeObjectService:
         owner_type: str = "block",
         limit: int = 10,
     ) -> list[dict[str, Any]]:
-        return self._repository.build_vector_search_pipeline(
-            query_vector=query_vector,
+        normalized_owner_type = str(owner_type or "").strip().lower()
+        if normalized_owner_type not in {"block", "entity", "relation"}:
+            return []
+
+        owner_payload_map = self._load_owner_payload_map(
+            owner_type=normalized_owner_type,
             namespace_id=namespace_id,
-            owner_type=owner_type,
-            limit=limit,
         )
+        if not owner_payload_map:
+            return []
+
+        try:
+            embedding_payload_list = self._repository.load_objects(
+                "embedding",
+                {"namespace_id": str(namespace_id), "owner_type": normalized_owner_type},
+                limit=self._VECTOR_COLLECTION_LIMIT,
+            )
+        except Exception:
+            return []
+
+        normalized_query_vector = self._normalize_vector(query_vector)
+        if not normalized_query_vector:
+            return []
+
+        scored_payload_list: list[dict[str, Any]] = []
+        for embedding_payload in embedding_payload_list:
+            if not isinstance(embedding_payload, Mapping):
+                continue
+            owner_id = str(embedding_payload.get("owner_id") or "").strip()
+            if not owner_id:
+                continue
+            owner_payload = owner_payload_map.get(owner_id)
+            if owner_payload is None:
+                continue
+            embedding_vector = self._normalize_vector(embedding_payload.get("embedding"))
+            if not embedding_vector:
+                continue
+            score = self._load_cosine_similarity(normalized_query_vector, embedding_vector)
+            scored_payload_list.append({
+                "payload": dict(owner_payload),
+                "score": score,
+            })
+
+        scored_payload_list.sort(key=lambda item: float(item.get("score") or 0.0), reverse=True)
+        return scored_payload_list[: max(1, int(limit))]
+
+    def _load_owner_payload_map(
+        self,
+        *,
+        owner_type: str,
+        namespace_id: str,
+    ) -> dict[str, dict[str, Any]]:
+        if owner_type == "block":
+            return self._load_block_payload_map(namespace_id=namespace_id)
+
+        object_name = "entity" if owner_type == "entity" else "relation"
+        try:
+            object_payload_list = self._repository.load_objects(
+                object_name,
+                {"namespace_id": str(namespace_id)},
+                limit=self._VECTOR_COLLECTION_LIMIT,
+            )
+        except Exception:
+            return {}
+
+        payload_map: dict[str, dict[str, Any]] = {}
+        for object_payload in object_payload_list:
+            if not isinstance(object_payload, Mapping):
+                continue
+            object_id = str(object_payload.get("_id") or object_payload.get("id") or "").strip()
+            if not object_id:
+                continue
+            payload_map[object_id] = dict(object_payload)
+        return payload_map
+
+    def _load_block_payload_map(self, *, namespace_id: str) -> dict[str, dict[str, Any]]:
+        try:
+            document_payload_list = self._repository.load_objects(
+                "document",
+                {"namespace_id": str(namespace_id)},
+                limit=self._VECTOR_COLLECTION_LIMIT,
+            )
+        except Exception:
+            return {}
+
+        payload_map: dict[str, dict[str, Any]] = {}
+        for document_payload in document_payload_list:
+            if not isinstance(document_payload, Mapping):
+                continue
+            block_payload_list = document_payload.get("blocks")
+            if not isinstance(block_payload_list, Sequence):
+                continue
+            for block_payload in block_payload_list:
+                if not isinstance(block_payload, Mapping):
+                    continue
+                block_id = str(block_payload.get("block_id") or block_payload.get("_id") or block_payload.get("id") or "").strip()
+                if not block_id:
+                    continue
+                payload_map[block_id] = dict(block_payload)
+        return payload_map
+
+    def _normalize_vector(self, vector_payload: Any) -> list[float]:
+        if not isinstance(vector_payload, Sequence) or isinstance(vector_payload, (str, bytes, bytearray)):
+            return []
+        normalized_vector: list[float] = []
+        for item in vector_payload:
+            try:
+                normalized_vector.append(float(item))
+            except Exception:
+                return []
+        return normalized_vector
+
+    def _load_cosine_similarity(self, left_vector: Sequence[float], right_vector: Sequence[float]) -> float:
+        if not left_vector or not right_vector:
+            return 0.0
+        dimension = min(len(left_vector), len(right_vector))
+        if dimension <= 0:
+            return 0.0
+        dot_product = 0.0
+        left_norm = 0.0
+        right_norm = 0.0
+        for index in range(dimension):
+            left_value = float(left_vector[index])
+            right_value = float(right_vector[index])
+            dot_product += left_value * right_value
+            left_norm += left_value * left_value
+            right_norm += right_value * right_value
+        if left_norm <= 0.0 or right_norm <= 0.0:
+            return 0.0
+        return dot_product / (math.sqrt(left_norm) * math.sqrt(right_norm))
 
 
 class EntityRelationEmbeddingService:
@@ -1964,6 +3635,13 @@ class EntityRelationEmbeddingService:
                 value = str(obj.get(field_name) or "").strip()
                 if value:
                     parts.append(value)
+            relation_description = str(
+                obj.get("relation_description")
+                or ((obj.get("metadata") or {}).get("relation_description") if isinstance(obj.get("metadata"), dict) else "")
+                or ""
+            ).strip()
+            if relation_description:
+                parts.append(relation_description)
             weight = obj.get("weight")
             if weight is not None:
                 parts.append(f"weight:{weight}")
@@ -2258,6 +3936,53 @@ class ObjectMappingService:
         if not isinstance(relation_payload_list, Sequence) or isinstance(relation_payload_list, (str, bytes, bytearray)):
             return []
         return [dict(relation_payload) for relation_payload in relation_payload_list if isinstance(relation_payload, Mapping)]
+
+    def _build_seed_relation_payload_list(
+        self,
+        *,
+        entity_candidate_objects: Sequence[MappingSeedEntityObject],
+    ) -> list[dict[str, Any]]:
+        relation_payload_list: list[dict[str, Any]] = []
+        seen_relation_key_set: set[tuple[str, str, str]] = set()
+        for entity_candidate_object in entity_candidate_objects:
+            relation_type_key = _first_non_empty_string([entity_candidate_object.relation_type_key])
+            if not relation_type_key:
+                continue
+            source_seed_key = _first_non_empty_string([entity_candidate_object.source_seed_key]) or "subject"
+            if not source_seed_key or source_seed_key == entity_candidate_object.seed_key:
+                continue
+            relation_key = (source_seed_key, relation_type_key, entity_candidate_object.seed_key)
+            if relation_key in seen_relation_key_set:
+                continue
+            seen_relation_key_set.add(relation_key)
+            relation_metadata = _deepcopy_object(entity_candidate_object.metadata)
+            relation_description = _first_non_empty_string(
+                [
+                    entity_candidate_object.relation_description,
+                    relation_metadata.get("relation_description"),
+                    relation_metadata.get("description"),
+                ],
+            )
+            if relation_description:
+                relation_metadata["relation_description"] = relation_description
+            relation_metadata.setdefault(
+                "mapped_from",
+                str(entity_candidate_object.metadata.get("mapped_from") or ("explicit_target_seed" if entity_candidate_object.is_target else "parser_result")),
+            )
+            relation_payload: dict[str, Any] = {
+                "source_seed_key": source_seed_key,
+                "target_seed_key": entity_candidate_object.seed_key,
+                "relation_type": relation_type_key,
+                "section_key": entity_candidate_object.section_key,
+                "confidence": entity_candidate_object.confidence,
+                "weight": entity_candidate_object.confidence,
+                "metadata": relation_metadata,
+            }
+            source_field = _first_non_empty_string([relation_metadata.get("source_field")])
+            if source_field:
+                relation_payload["source_field"] = source_field
+            relation_payload_list.append(relation_payload)
+        return relation_payload_list
 
     def load_correlation_id(
         self,
@@ -2616,6 +4341,10 @@ class ObjectMappingService:
         for entity_candidate_object, entity_object in zip(entity_candidate_objects, entity_objects):
             entity_id_by_key[entity_candidate_object.seed_key] = entity_object.id
         explicit_relation_payload_list = self.load_explicit_relation_payload_list(result_payload=result_payload or {})
+        if not explicit_relation_payload_list:
+            explicit_relation_payload_list = self._build_seed_relation_payload_list(
+                entity_candidate_objects=entity_candidate_objects,
+            )
         if explicit_relation_payload_list:
             block_id_by_key = {block_seed_object.section_key: block_seed_object.block_id for block_seed_object in block_seed_objects}
             relation_objects: list[EntityRelationObject] = []
@@ -3005,28 +4734,65 @@ class ObjectMappingService:
                 ),
             )
         for entity_pattern in object_pattern.get("collection_entity_pattern_list") or []:
-            collection_value_list = _load_string_list(_mapping_value(object_payload, str(entity_pattern.get("collection_path") or "")))
-            for collection_value in collection_value_list:
-                type_key = _load_type_key_from_pattern(
-                    collection_value,
-                    fallback_type_key=str(entity_pattern.get("fallback_type_key") or object_name),
-                    type_key_pattern_map=entity_pattern.get("type_key_pattern_map"),
-                )
-                relation_type_key_map = dict(entity_pattern.get("relation_type_key_map") or {})
-                relation_type_key = str(relation_type_key_map.get(type_key) or relation_type_key_map.get(str(entity_pattern.get("fallback_type_key") or "")) or "").strip() or None
-                seed_object_list.append(
-                    MappingSeedEntityObject(
-                        seed_key=f"{str(entity_pattern.get('seed_key_prefix') or type_key)}:{_slugify_object_name(collection_value)}",
-                        type_key=type_key,
-                        canonical_name=collection_value,
-                        section_key=str(entity_pattern.get("section_key") or "primary"),
-                        relation_type_key=relation_type_key,
-                        confidence=float(entity_pattern.get("confidence") or 0.9),
-                        mention_text=collection_value,
-                        summary=str(entity_pattern.get("summary_prefix") or "Associated capability mapped from the parsed result."),
-                        metadata={"source_field": entity_pattern.get("source_field")},
-                    ),
-                )
+            collection_path_list = tuple(
+                str(path_value).strip()
+                for path_value in (entity_pattern.get("collection_path_list") or ())
+                if str(path_value).strip()
+            )
+            single_collection_path = str(entity_pattern.get("collection_path") or "").strip()
+            if single_collection_path and single_collection_path not in collection_path_list:
+                collection_path_list = tuple([*collection_path_list, single_collection_path])
+            if not collection_path_list:
+                continue
+
+            fallback_type_key = str(entity_pattern.get("fallback_type_key") or object_name)
+            relation_type_key_map = dict(entity_pattern.get("relation_type_key_map") or {})
+            seen_collection_key_set: set[tuple[str, str]] = set()
+            for collection_path in collection_path_list:
+                collection_source_field = str(entity_pattern.get("source_field") or collection_path).strip()
+                collection_source_value = _mapping_value(object_payload, collection_path)
+                collection_value_list = _load_typed_collection_value_list(collection_source_value)
+                for collection_value, explicit_type_value in collection_value_list:
+                    inferred_type_key = _load_type_key_from_pattern(
+                        collection_value,
+                        fallback_type_key=fallback_type_key,
+                        type_key_pattern_map=entity_pattern.get("type_key_pattern_map"),
+                    )
+                    explicit_type_key = _load_type_key_from_explicit_value(
+                        explicit_type_value,
+                        fallback_type_key=fallback_type_key,
+                        type_key_pattern_map=entity_pattern.get("type_key_pattern_map"),
+                    )
+
+                    type_key = inferred_type_key
+                    if explicit_type_value:
+                        type_key = explicit_type_key
+                        if explicit_type_key == fallback_type_key and inferred_type_key != fallback_type_key:
+                            type_key = inferred_type_key
+
+                    relation_type_key = str(
+                        relation_type_key_map.get(type_key)
+                        or relation_type_key_map.get(fallback_type_key)
+                        or ""
+                    ).strip() or None
+                    collection_key = (type_key, _normalize_pattern_key(collection_value))
+                    if collection_key in seen_collection_key_set:
+                        continue
+                    seen_collection_key_set.add(collection_key)
+
+                    seed_object_list.append(
+                        MappingSeedEntityObject(
+                            seed_key=f"{str(entity_pattern.get('seed_key_prefix') or type_key)}:{_slugify_object_name(collection_value)}",
+                            type_key=type_key,
+                            canonical_name=collection_value,
+                            section_key=str(entity_pattern.get("section_key") or "primary"),
+                            relation_type_key=relation_type_key,
+                            confidence=float(entity_pattern.get("confidence") or 0.9),
+                            mention_text=collection_value,
+                            summary=str(entity_pattern.get("summary_prefix") or "Associated capability mapped from the parsed result."),
+                            metadata={"source_field": collection_source_field},
+                        ),
+                    )
         unique_seed_object_list: list[MappingSeedEntityObject] = []
         seen_seed_key_set: set[str] = set()
         for seed_object in seed_object_list:
@@ -3064,6 +4830,48 @@ class ObjectMappingService:
             if source_field:
                 entity_metadata["source_field"] = source_field
             entity_metadata.setdefault("mapped_from", "explicit_entity_model")
+            relation_type_key = _first_non_empty_string(
+                [
+                    entity_payload.get("relation_type"),
+                    entity_payload.get("relation_type_key"),
+                    entity_payload.get("is_relational"),
+                    entity_payload.get("relation_name"),
+                    entity_metadata.get("relation_type"),
+                    entity_metadata.get("relation_type_key"),
+                    entity_metadata.get("is_relational"),
+                    entity_metadata.get("relation_name"),
+                ],
+            )
+            relation_description = _first_non_empty_string(
+                [
+                    entity_payload.get("relation_description"),
+                    entity_payload.get("explicit_description"),
+                    entity_payload.get("description"),
+                    entity_metadata.get("relation_description"),
+                    entity_metadata.get("explicit_description"),
+                    entity_metadata.get("description"),
+                ],
+            )
+            if relation_description:
+                entity_metadata["relation_description"] = relation_description
+            source_seed_key = _first_non_empty_string(
+                [
+                    entity_payload.get("source_seed_key"),
+                    entity_payload.get("source_entity_key"),
+                    entity_payload.get("source_entity"),
+                    entity_metadata.get("source_seed_key"),
+                    entity_metadata.get("source_entity_key"),
+                    entity_metadata.get("source_entity"),
+                ],
+            )
+            normalized_is_target = False
+            for is_target_value in (entity_payload.get("is_target"), entity_metadata.get("is_target")):
+                resolved_is_target = _load_bool_value(is_target_value)
+                if isinstance(resolved_is_target, bool):
+                    normalized_is_target = resolved_is_target
+                    break
+            if not normalized_is_target and source_seed_key and relation_type_key:
+                normalized_is_target = True
             seed_key = _first_non_empty_string([entity_payload.get("entity_key"), entity_payload.get("seed_key")]) or f"{type_key}:{_slugify_object_name(canonical_name)}"
             seed_object_list.append(
                 MappingSeedEntityObject(
@@ -3071,7 +4879,10 @@ class ObjectMappingService:
                     type_key=type_key,
                     canonical_name=canonical_name,
                     section_key=_first_non_empty_string([entity_payload.get("section_key")]) or "primary",
-                    relation_type_key=_first_non_empty_string([entity_payload.get("relation_type"), entity_payload.get("relation_type_key")]),
+                    relation_type_key=relation_type_key,
+                    is_target=normalized_is_target,
+                    source_seed_key=source_seed_key,
+                    relation_description=relation_description,
                     confidence=_first_number([entity_payload.get("confidence")]) or 0.95,
                     mention_text=_first_non_empty_string([entity_payload.get("mention_text")]) or canonical_name,
                     summary=_first_non_empty_string([entity_payload.get("summary")]) or "",
@@ -3310,62 +5121,73 @@ _AGENTS_DB_PIPELINE_SERVICE_CACHE: dict[tuple[str, ...], PipelineService] = {}
 
 def load_agentsdb_runtime_config_from_env() -> RuntimeConfigObject | None:
     connection_config = _load_agentsdb_connection_config()
-    agents_db_uri = str(
-        os.getenv("AI_IDE_KNOWLEDGE_AGENTS_DB_URI", "")
-        or os.getenv("AI_IDE_KNOWLEDGE_AGENTS_DB_BACKEND_URI", ""),
-    ).strip()
+    agents_db_uri = str(os.getenv("AI_IDE_KNOWLEDGE_AGENTS_DB_URI", "")).strip()
+    if not agents_db_uri:
+        agents_db_uri = str(os.getenv("AI_IDE_KNOWLEDGE_AGENTS_DB_BACKEND_URI", "")).strip()
     if not agents_db_uri:
         configured_socket_uri = _load_agentsdb_uri_from_connection_config(connection_config)
         backend_uri = _connection_config_value(connection_config, ("backend_uri", "agents_db_backend_uri", "storage_uri", "storage_backend_uri"))
         agents_db_uri = configured_socket_uri or backend_uri
     if not agents_db_uri:
         return None
-    try:
-        default_embedding_dimension = int(
-            os.getenv("AI_IDE_KNOWLEDGE_AGENTS_DB_EMBEDDING_DIMENSION", "")
-            or "3072"
-            or 3072,
-        )
-    except Exception:
-        default_embedding_dimension = 3072
+    agents_db_uri = normalize_agentsdb_socket_uri(agents_db_uri, default_on_empty=False) or agents_db_uri
+    default_embedding_dimension = _env_or_config_int_value(
+        "AI_IDE_KNOWLEDGE_AGENTS_DB_EMBEDDING_DIMENSION",
+        connection_config,
+        ("default_embedding_dimension", "embedding_dimension"),
+        3072,
+    )
     return RuntimeConfigObject(
         agents_db_uri=agents_db_uri,
-        database_name=str(
-            os.getenv("AI_IDE_KNOWLEDGE_AGENTS_DB_NAME", "")
-            or "alde_knowledge",
-        ).strip()
-        or _connection_config_value(connection_config, ("database_name", "database"))
+        database_name=_env_or_config_value(
+            "AI_IDE_KNOWLEDGE_AGENTS_DB_NAME",
+            connection_config,
+            ("database_name", "database"),
+            "alde_knowledge",
+        )
         or "alde_knowledge",
-        tenant_id=str(
-            os.getenv("AI_IDE_KNOWLEDGE_AGENTS_DB_TENANT_ID", "")
-            or "tenant_default",
-        ).strip()
+        tenant_id=_env_or_config_value(
+            "AI_IDE_KNOWLEDGE_AGENTS_DB_TENANT_ID",
+            connection_config,
+            ("tenant_id",),
+            "tenant_default",
+        )
         or "tenant_default",
-        namespace_id=str(
-            os.getenv("AI_IDE_KNOWLEDGE_AGENTS_DB_NAMESPACE_ID", "")
-            or "ns_alde_default",
-        ).strip()
+        namespace_id=_env_or_config_value(
+            "AI_IDE_KNOWLEDGE_AGENTS_DB_NAMESPACE_ID",
+            connection_config,
+            ("namespace_id",),
+            "ns_alde_default",
+        )
         or "ns_alde_default",
-        namespace_slug=str(
-            os.getenv("AI_IDE_KNOWLEDGE_AGENTS_DB_NAMESPACE_SLUG", "")
-            or "alde-default",
-        ).strip()
+        namespace_slug=_env_or_config_value(
+            "AI_IDE_KNOWLEDGE_AGENTS_DB_NAMESPACE_SLUG",
+            connection_config,
+            ("namespace_slug",),
+            "alde-default",
+        )
         or "alde-default",
-        namespace_name=str(
-            os.getenv("AI_IDE_KNOWLEDGE_AGENTS_DB_NAMESPACE_NAME", "")
-            or "ALDE Default Knowledge",
-        ).strip()
+        namespace_name=_env_or_config_value(
+            "AI_IDE_KNOWLEDGE_AGENTS_DB_NAMESPACE_NAME",
+            connection_config,
+            ("namespace_name",),
+            "ALDE Default Knowledge",
+        )
         or "ALDE Default Knowledge",
-        default_embedding_model=str(
-            os.getenv("AI_IDE_KNOWLEDGE_AGENTS_DB_EMBEDDING_MODEL", "")
-            or "text-embedding-3-large",
-        ).strip()
+        default_embedding_model=_env_or_config_value(
+            "AI_IDE_KNOWLEDGE_AGENTS_DB_EMBEDDING_MODEL",
+            connection_config,
+            ("default_embedding_model", "embedding_model"),
+            "text-embedding-3-large",
+        )
         or "text-embedding-3-large",
         default_embedding_dimension=max(1, default_embedding_dimension),
-        index_backend=str(
-            os.getenv("AI_IDE_KNOWLEDGE_AGENTS_DB_INDEX_BACKEND", "")
-            or "faiss",
-        ).strip()
+        index_backend=_env_or_config_value(
+            "AI_IDE_KNOWLEDGE_AGENTS_DB_INDEX_BACKEND",
+            connection_config,
+            ("index_backend",),
+            "faiss",
+        )
         or "faiss",
     )
 
@@ -3389,14 +5211,13 @@ def load_agentsdb_pipeline_service(runtime_config: RuntimeConfigObject) -> Pipel
     existing_service = _AGENTS_DB_PIPELINE_SERVICE_CACHE.get(cache_key)
     if existing_service is not None:
         return existing_service
-    if _is_agentsdb_socket_uri(runtime_config.agents_db_uri):
-        repository: Any = AgentDbSocketRepository.create_from_uri(
-            runtime_config.agents_db_uri,
-            runtime_config.database_name,
-                
+    repository_factory = AgentDbRepositoryFactory(
+        AgentDbRepositoryFactoryConfig(
+            backend_uri=runtime_config.agents_db_uri,
+            default_database_name=runtime_config.database_name,
         )
-    else:
-        repository = KnowledgeRepository.create_from_uri(runtime_config.agents_db_uri, runtime_config.database_name)
+    )
+    repository = repository_factory.load_repository()
     repository.ensure_index_objects()
     pipeline_service = PipelineService(KnowledgeObjectService(repository), runtime_config)
     _AGENTS_DB_PIPELINE_SERVICE_CACHE[cache_key] = pipeline_service
@@ -4837,3 +6658,1249 @@ AGENT_MEMORY_ATTACHMENT_SERVICE = OBJECT_MEMORY_ATTACHMENT_SERVICE
 # Backward-compatibility exports for legacy imports.
 ObjectMemoryAttachmentService = AgentMemoryAttachmentService
 
+
+import html
+
+class AgentRelationGraphService:
+    _RELATION_LIMIT = 48
+    _WIDGET_PATH_ALIASES = {"adbgraphview"}
+    _DEFAULT_WIDGET_KIND = "agent_relation_graph"
+    _DEFAULT_TOOL_ID = "agent_relation_graph"
+    _RELATIONS_VIEW_KIND = "relations_graph"
+    _WORKFLOW_VIEW_KIND = "workflow_diagram"
+    _SEQUENCE_VIEW_KIND = "sequence_diagram"
+    _GRAPH_LINK_SCHEME = "alde"
+    _GRAPH_LINK_HOST = "graph"
+    _TOOL_ITEMS: tuple[tuple[str, str, str], ...] = (
+        ("agent_relation_graph", "Agent Relation Graph", "agentsdb"),
+        ("workflow_diagram", "Workflow Diagram", "agentsdb/mcp"),
+        ("sequence_diagram", "Sequence Diagram", "agentsdb/mcp"),
+  
+    )
+    _REMOTE_TOOL_IDS: frozenset[str] = frozenset(
+        tool_id
+        for tool_id, _label, transport in _TOOL_ITEMS
+        if str(transport or "").strip().lower().startswith("agentsdb/")
+    )
+    _TOOL_RUNTIME_CLASSES: dict[str, tuple[str, ...]] = {
+        "agent_relation_graph": (
+            "AgentRelationGraphService",
+            "RelationGraphWidgetArtifactFactory",
+            "RuntimeWidget",
+        ),
+        "workflow_diagram": (
+            "AgentRelationGraphService",
+            "RelationGraphWidgetArtifactFactory",
+            "RuntimeWidget",
+        ),
+        "sequence_diagram": (
+            "AgentRelationGraphService",
+            "RelationGraphWidgetArtifactFactory",
+            "RuntimeWidget",
+        ),
+       
+ 
+    }
+    _TOOL_RUNTIME_ARTIFACTS: dict[str, dict[str, str]] = {
+        "agent_relation_graph": {
+            "artifact_kind": "native_qwidget",
+            "entry_module": "alde.widget_artifacts.relation_graph_artifact",
+            "entry_class": "RelationGraphWidgetArtifactFactory",
+            "build_method": "load_object_widget",
+        },
+        "workflow_diagram": {
+            "artifact_kind": "native_qwidget",
+            "entry_module": "alde.widget_artifacts.relation_graph_artifact",
+            "entry_class": "RelationGraphWidgetArtifactFactory",
+            "build_method": "load_object_widget",
+        },
+        "sequence_diagram": {
+            "artifact_kind": "native_qwidget",
+            "entry_module": "alde.widget_artifacts.relation_graph_artifact",
+            "entry_class": "RelationGraphWidgetArtifactFactory",
+            "build_method": "load_object_widget",
+        },
+     
+    }
+
+    def _resolve_tool_id_for_manifest(self, *, tool_id: str | None = None, source_uri: str | None = None) -> str:
+        explicit_tool_id = str(tool_id or "").strip()
+        if explicit_tool_id:
+            return explicit_tool_id
+
+        source_uri_text = str(source_uri or "").strip()
+        if source_uri_text:
+            lower_uri = source_uri_text.lower()
+            for marker in ("/tools:", "/tools/"):
+                marker_index = lower_uri.find(marker)
+                if marker_index < 0:
+                    continue
+                tail_text = source_uri_text[marker_index + len(marker):].strip()
+                if not tail_text:
+                    break
+                candidate = unquote(tail_text.split("/", 1)[0].split("?", 1)[0].split("#", 1)[0]).strip()
+                if candidate:
+                    return candidate
+
+            parsed_uri = urlparse(source_uri_text)
+            path_parts = [unquote(part) for part in str(parsed_uri.path or "").split("/") if str(part or "").strip()]
+            if len(path_parts) >= 2 and str(path_parts[0]).strip().lower() == "tools":
+                candidate = str(path_parts[1] or "").strip()
+                if candidate:
+                    return candidate
+
+        return self._DEFAULT_TOOL_ID
+
+    def _load_runtime_classes_for_tool(self, tool_id: str | None = None) -> list[str]:
+        resolved_tool_id = str(tool_id or self._DEFAULT_TOOL_ID).strip() or self._DEFAULT_TOOL_ID
+        class_rows = self._TOOL_RUNTIME_CLASSES.get(resolved_tool_id)
+        if not class_rows:
+            class_rows = ("AgentRelationGraphService", "RelationGraphWidgetArtifactFactory", "RuntimeWidget")
+        return [str(class_name) for class_name in class_rows if str(class_name or "").strip()]
+
+    def _load_runtime_artifact_for_tool(self, tool_id: str | None = None) -> dict[str, str]:
+        resolved_tool_id = str(tool_id or self._DEFAULT_TOOL_ID).strip() or self._DEFAULT_TOOL_ID
+        artifact_payload = self._TOOL_RUNTIME_ARTIFACTS.get(resolved_tool_id)
+        if not isinstance(artifact_payload, dict):
+            artifact_payload = {
+                "artifact_kind": "native_qwidget",
+                "entry_module": "alde.widget_artifacts.relation_graph_artifact",
+                "entry_class": "RelationGraphWidgetArtifactFactory",
+                "build_method": "load_object_widget",
+            }
+        return {
+            "artifact_kind": str(artifact_payload.get("artifact_kind") or "native_qwidget"),
+            "entry_module": str(artifact_payload.get("entry_module") or ""),
+            "entry_class": str(artifact_payload.get("entry_class") or ""),
+            "build_method": str(artifact_payload.get("build_method") or "load_object_widget"),
+        }
+
+    def load_tool_runtime_manifest(self, *, tool_id: str | None = None, source_uri: str | None = None) -> dict[str, Any]:
+        resolved_tool_id = self._resolve_tool_id_for_manifest(tool_id=tool_id, source_uri=source_uri)
+        return {
+            "tool_id": resolved_tool_id,
+            "runtime_classes": self._load_runtime_classes_for_tool(resolved_tool_id),
+            "runtime_artifact": self._load_runtime_artifact_for_tool(resolved_tool_id),
+        }
+
+    def load_connection_preview(self, *, source_uri: str | None = None) -> dict[str, Any]:
+        runtime_config = self._load_runtime_config()
+        normalized_source_uri = str(source_uri or "").strip()
+
+        connection_rows: list[dict[str, str]] = []
+        seen_uri_values: set[str] = set()
+
+        def _add_connection_row(uri_value: str, label: str, status: str) -> None:
+            normalized_uri_value = str(uri_value or "").strip()
+            if not normalized_uri_value:
+                return
+            if normalized_uri_value in seen_uri_values:
+                return
+            seen_uri_values.add(normalized_uri_value)
+            connection_rows.append(
+                {
+                    "uri": normalized_uri_value,
+                    "label": str(label or "connection"),
+                    "status": str(status or "configured"),
+                }
+            )
+
+        if normalized_source_uri:
+            _add_connection_row(normalized_source_uri, "Requested source", "active")
+
+        runtime_uri = str(getattr(runtime_config, "agents_db_uri", "") or "").strip() if runtime_config is not None else ""
+        if runtime_uri:
+            _add_connection_row(runtime_uri, "Runtime config", "configured")
+
+        connection_config = _load_agentsdb_connection_config()
+        connection_config_uri = _load_agentsdb_uri_from_connection_config(connection_config)
+        if connection_config_uri:
+            _add_connection_row(connection_config_uri, "Connection config", "configured")
+
+        if not connection_rows:
+            _add_connection_row("agentsdb://127.0.0.1:2331/tools:agent_relation_graph", "Default local", "fallback")
+
+        tool_rows = []
+        for tool_id, label, transport in self._TOOL_ITEMS:
+            tool_rows.append(
+                {
+                    "tool_id": tool_id,
+                    "label": label,
+                    "transport": transport,
+                    "runtime_classes": self._load_runtime_classes_for_tool(tool_id),
+                    "runtime_artifact": self._load_runtime_artifact_for_tool(tool_id),
+                }
+            )
+
+        return {
+            "status_text": "Connection control plane ready",
+            "connections": connection_rows,
+            "tools": tool_rows,
+        }
+
+    def load_widget_snapshot(self, *, tool_id: str | None = None, source_uri: str | None = None) -> dict[str, Any]:
+        resolved_tool_id = str(tool_id or self._DEFAULT_TOOL_ID).strip() or self._DEFAULT_TOOL_ID
+        resolved_source_uri = str(source_uri or "").strip()
+
+        if resolved_tool_id == self._WORKFLOW_VIEW_KIND:
+            return self._load_graphic_tool_placeholder_snapshot(
+                tool_id=resolved_tool_id,
+                source_uri=resolved_source_uri,
+                view_kind=self._WORKFLOW_VIEW_KIND,
+                status_text="Workflow diagram placeholder ready",
+                message="Workflow diagram projection is reserved for remote runtime tooling.",
+                detail_html=(
+                    "<h3>Workflow Diagram</h3>"
+                    "<p>This extension tab is reserved for a future graphical workflow projection.</p>"
+                    "<ul>"
+                    "<li>Source plan: Control Plane workflow state and runtime payload traces.</li>"
+                    "<li>Target output: state graph, transitions, and active actor context.</li>"
+                    "</ul>"
+                ),
+            )
+
+        if resolved_tool_id == self._SEQUENCE_VIEW_KIND:
+            return self._load_graphic_tool_placeholder_snapshot(
+                tool_id=resolved_tool_id,
+                source_uri=resolved_source_uri,
+                view_kind=self._SEQUENCE_VIEW_KIND,
+                status_text="Sequence diagram placeholder ready",
+                message="Sequence diagram projection is reserved for remote runtime tooling.",
+                detail_html=(
+                    "<h3>Sequence Diagram</h3>"
+                    "<p>This extension tab is reserved for a future sequence projection.</p>"
+                    "<ul>"
+                    "<li>Source plan: chat/tool/handoff traces from the monitoring surface.</li>"
+                    "<li>Target output: chronological agent-to-agent and tool-call swimlanes.</li>"
+                    "</ul>"
+                ),
+            )
+
+        if resolved_tool_id in self._REMOTE_TOOL_IDS:
+            return self._load_graphic_tool_placeholder_snapshot(
+                tool_id=resolved_tool_id,
+                source_uri=resolved_source_uri,
+                view_kind=self._RELATIONS_VIEW_KIND,
+                status_text="Graphic tool placeholder ready",
+                message="Selected remote graphic tool is not live-enumerated yet.",
+                detail_html=(
+                    "<h3>Graphic Tool</h3>"
+                    "<p>Selected remote graphic tool is reserved until live enumeration is exposed.</p>"
+                ),
+            )
+
+        try:
+            snapshot_payload = self.load_graph_snapshot(object_name=resolved_tool_id, source_uri=resolved_source_uri)
+        except Exception as exc:
+            error_text = html.escape(f"{type(exc).__name__}: {exc}")
+            return self._load_graphic_tool_placeholder_snapshot(
+                tool_id=resolved_tool_id,
+                source_uri=resolved_source_uri,
+                view_kind=self._RELATIONS_VIEW_KIND,
+                status_text="Graph refresh failed",
+                message=f"Could not load relation graph: {type(exc).__name__}",
+                detail_html=f"<h3>Relations Graph</h3><p>{error_text}</p>",
+            )
+
+        snapshot_payload["view_kind"] = str(snapshot_payload.get("view_kind") or self._RELATIONS_VIEW_KIND)
+        return snapshot_payload
+
+    def load_graph_view_state(
+        self,
+        graph_snapshot: Mapping[str, Any] | None,
+        *,
+        layout_spread: float = 1.0,
+        selected_kind: str = "",
+        selected_object_id: str = "",
+    ) -> dict[str, Any]:
+        snapshot_payload = dict(graph_snapshot or {})
+        base_overview_html = str(snapshot_payload.get("detail_html") or "<p>No graph detail available.</p>")
+        node_objects = [dict(item) for item in (snapshot_payload.get("nodes") or []) if isinstance(item, dict)]
+        edge_objects = [dict(item) for item in (snapshot_payload.get("edges") or []) if isinstance(item, dict)]
+        if not node_objects or not edge_objects:
+            return {
+                "has_graph": False,
+                "message": str(snapshot_payload.get("message") or "No relation graph available."),
+                "overview_html": base_overview_html,
+                "detail_html": base_overview_html,
+                "node_draw_objects": [],
+                "edge_draw_objects": [],
+                "render_commands": [],
+                "item_center_by_key": {},
+                "selected_kind": "",
+                "selected_object_id": "",
+            }
+
+        node_objects = sorted(node_objects, key=lambda item: str(item.get("label") or item.get("node_id") or "").lower())
+        node_by_id = {
+            str(node_object.get("node_id") or "").strip(): dict(node_object)
+            for node_object in node_objects
+            if str(node_object.get("node_id") or "").strip()
+        }
+        rendered_edge_objects, edge_by_id, edges_by_node_id = self._prepare_interactive_edge_objects(edge_objects)
+        if not rendered_edge_objects or not node_by_id:
+            return {
+                "has_graph": False,
+                "message": str(snapshot_payload.get("message") or "No relation graph available."),
+                "overview_html": base_overview_html,
+                "detail_html": base_overview_html,
+                "node_draw_objects": [],
+                "edge_draw_objects": [],
+                "render_commands": [],
+                "item_center_by_key": {},
+                "selected_kind": "",
+                "selected_object_id": "",
+            }
+
+        resolved_selected_kind = str(selected_kind or "").strip().lower()
+        resolved_selected_object_id = str(selected_object_id or "").strip()
+        if resolved_selected_kind == "node" and resolved_selected_object_id not in node_by_id:
+            resolved_selected_kind = ""
+            resolved_selected_object_id = ""
+        elif resolved_selected_kind == "edge" and resolved_selected_object_id not in edge_by_id:
+            resolved_selected_kind = ""
+            resolved_selected_object_id = ""
+        elif resolved_selected_kind not in {"", "node", "edge"}:
+            resolved_selected_kind = ""
+            resolved_selected_object_id = ""
+
+        highlight_node_ids: set[str] = set()
+        highlight_edge_ids: set[str] = set()
+        if resolved_selected_kind == "node" and resolved_selected_object_id:
+            highlight_node_ids, highlight_edge_ids = self._load_connected_graph_component(
+                edges_by_node_id,
+                resolved_selected_object_id,
+            )
+        elif resolved_selected_kind == "edge" and resolved_selected_object_id:
+            selected_edge_object = edge_by_id.get(resolved_selected_object_id)
+            if isinstance(selected_edge_object, dict):
+                source_node_id = str(selected_edge_object.get("source") or "").strip()
+                target_node_id = str(selected_edge_object.get("target") or "").strip()
+                seed_node_id = source_node_id or target_node_id
+                highlight_node_ids, highlight_edge_ids = self._load_connected_graph_component(edges_by_node_id, seed_node_id)
+                if source_node_id:
+                    highlight_node_ids.add(source_node_id)
+                if target_node_id:
+                    highlight_node_ids.add(target_node_id)
+                highlight_edge_ids.add(resolved_selected_object_id)
+
+        node_positions_by_id = self._build_vector_graph_positions(node_objects, rendered_edge_objects)
+        spread_factor = max(0.35, min(3.5, float(layout_spread or 1.0)))
+        node_width = 168.0
+        node_height = 72.0
+        node_geometry_by_id: dict[str, tuple[float, float, float, float]] = {}
+        node_draw_objects: list[dict[str, Any]] = []
+        edge_draw_objects: list[dict[str, Any]] = []
+        item_center_by_key: dict[tuple[str, str], tuple[float, float]] = {}
+
+        for node_object in node_objects:
+            node_id = str(node_object.get("node_id") or "").strip()
+            if not node_id:
+                continue
+            base_center_x, base_center_y = node_positions_by_id.get(node_id, (0.0, 0.0))
+            center_x = float(base_center_x) * spread_factor
+            center_y = float(base_center_y) * spread_factor
+            x_pos = center_x - (node_width / 2.0)
+            y_pos = center_y - (node_height / 2.0)
+            item_center_by_key[("node", node_id)] = (center_x, center_y)
+            node_geometry_by_id[node_id] = (x_pos, y_pos, node_width, node_height)
+            node_draw_objects.append(
+                {
+                    "node_id": node_id,
+                    "x": x_pos,
+                    "y": y_pos,
+                    "width": node_width,
+                    "height": node_height,
+                    "label": self._wrap_graph_label(str(node_object.get("label") or node_id)),
+                    "tooltip": f"Knoten öffnen: {str(node_object.get('label') or node_id)}",
+                    "is_highlighted": (not highlight_node_ids or node_id in highlight_node_ids),
+                }
+            )
+
+        for edge_object in rendered_edge_objects:
+            source_node_id = str(edge_object.get("source") or "").strip()
+            target_node_id = str(edge_object.get("target") or "").strip()
+            source_geometry = node_geometry_by_id.get(source_node_id)
+            target_geometry = node_geometry_by_id.get(target_node_id)
+            if source_geometry is None or target_geometry is None:
+                continue
+
+            source_x, source_y, source_width, source_height = source_geometry
+            target_x, target_y, target_width, target_height = target_geometry
+            source_center_x = source_x + (source_width / 2.0)
+            source_center_y = source_y + (source_height / 2.0)
+            target_center_x = target_x + (target_width / 2.0)
+            target_center_y = target_y + (target_height / 2.0)
+            delta_x = target_center_x - source_center_x
+            delta_y = target_center_y - source_center_y
+            distance = max(1.0, math.hypot(delta_x, delta_y))
+            unit_x = delta_x / distance
+            unit_y = delta_y / distance
+            start_x = source_center_x + unit_x * (source_width / 2.0)
+            start_y = source_center_y + unit_y * (source_height / 2.0)
+            end_x = target_center_x - unit_x * (target_width / 2.0)
+            end_y = target_center_y - unit_y * (target_height / 2.0)
+            edge_id = str(edge_object.get("edge_id") or "").strip()
+            midpoint_x = (start_x + end_x) / 2.0
+            midpoint_y = (start_y + end_y) / 2.0
+            item_center_by_key[("edge", edge_id)] = (midpoint_x, midpoint_y)
+            edge_draw_objects.append(
+                {
+                    "edge_id": edge_id,
+                    "source": source_node_id,
+                    "target": target_node_id,
+                    "start_x": start_x,
+                    "start_y": start_y,
+                    "end_x": end_x,
+                    "end_y": end_y,
+                    "label": self._short_graph_label(str(edge_object.get("label") or "related_to"), max_length=30),
+                    "tooltip": f"Relation öffnen: {str(edge_object.get('label') or 'related_to')}",
+                    "description": str(edge_object.get("description") or "").strip(),
+                    "is_highlighted": (not highlight_edge_ids or edge_id in highlight_edge_ids),
+                }
+            )
+
+        if not node_draw_objects or not edge_draw_objects:
+            return {
+                "has_graph": False,
+                "message": str(snapshot_payload.get("message") or "No relation graph available."),
+                "overview_html": base_overview_html,
+                "detail_html": base_overview_html,
+                "node_draw_objects": [],
+                "edge_draw_objects": [],
+                "render_commands": [],
+                "item_center_by_key": {},
+                "selected_kind": "",
+                "selected_object_id": "",
+            }
+
+        overview_html = (
+            base_overview_html
+            + "<hr>"
+            + "<p><b>Interaktion:</b> Knoten oder Relationen im Graph anklicken, um Details und Navigationslinks zu öffnen. "
+            + "Ctrl+Mausrad zoomt, Shift+Mausrad dreht, Alt+Mausrad zieht das Netz auseinander oder zusammen.</p>"
+        )
+
+        detail_html = overview_html
+        if resolved_selected_kind == "node" and resolved_selected_object_id in node_by_id:
+            detail_html = self._build_node_detail_html(
+                resolved_selected_object_id,
+                node_by_id,
+                edge_by_id,
+                edges_by_node_id,
+            )
+        elif resolved_selected_kind == "edge" and resolved_selected_object_id in edge_by_id:
+            detail_html = self._build_edge_detail_html(resolved_selected_object_id, node_by_id, edge_by_id)
+
+        render_commands = self._build_graph_render_commands(node_draw_objects, edge_draw_objects)
+
+        return {
+            "has_graph": True,
+            "message": "",
+            "overview_html": overview_html,
+            "detail_html": detail_html,
+            "node_draw_objects": node_draw_objects,
+            "edge_draw_objects": edge_draw_objects,
+            "render_commands": render_commands,
+            "item_center_by_key": item_center_by_key,
+            "selected_kind": resolved_selected_kind,
+            "selected_object_id": resolved_selected_object_id,
+        }
+
+    def load_graph_view_state_from_payload(
+        self,
+        graph_snapshot: Mapping[str, Any] | None,
+        payload: Mapping[str, Any] | None,
+        *,
+        layout_spread: float = 1.0,
+        fallback_selected_kind: str = "",
+        fallback_selected_object_id: str = "",
+    ) -> dict[str, Any]:
+        selected_kind = str(fallback_selected_kind or "").strip().lower()
+        selected_object_id = str(fallback_selected_object_id or "").strip()
+        payload_object = dict(payload or {})
+        payload_kind = str(payload_object.get("kind") or "").strip().lower()
+        if payload_kind == "node":
+            selected_kind = "node"
+            selected_object_id = str(payload_object.get("node_id") or "").strip()
+        elif payload_kind == "edge":
+            selected_kind = "edge"
+            selected_object_id = str(payload_object.get("edge_id") or "").strip()
+
+        return self.load_graph_view_state(
+            graph_snapshot,
+            layout_spread=layout_spread,
+            selected_kind=selected_kind,
+            selected_object_id=selected_object_id,
+        )
+
+    def load_graph_view_state_from_link(
+        self,
+        graph_snapshot: Mapping[str, Any] | None,
+        url_value: Any,
+        *,
+        layout_spread: float = 1.0,
+        fallback_selected_kind: str = "",
+        fallback_selected_object_id: str = "",
+    ) -> dict[str, Any]:
+        selected_kind = str(fallback_selected_kind or "").strip().lower()
+        selected_object_id = str(fallback_selected_object_id or "").strip()
+        url_text = str(url_value.toString() if hasattr(url_value, "toString") else url_value)
+        parsed_url = urlparse(url_text)
+        if parsed_url.scheme != self._GRAPH_LINK_SCHEME or parsed_url.netloc != self._GRAPH_LINK_HOST:
+            return self.load_graph_view_state(
+                graph_snapshot,
+                layout_spread=layout_spread,
+                selected_kind=selected_kind,
+                selected_object_id=selected_object_id,
+            )
+
+        path_parts = [unquote(part) for part in parsed_url.path.strip("/").split("/", 1)]
+        if len(path_parts) != 2:
+            return self.load_graph_view_state(
+                graph_snapshot,
+                layout_spread=layout_spread,
+                selected_kind=selected_kind,
+                selected_object_id=selected_object_id,
+            )
+
+        linked_kind = str(path_parts[0] or "").strip().lower()
+        linked_object_id = str(path_parts[1] or "").strip()
+        if linked_kind == "overview":
+            selected_kind = ""
+            selected_object_id = ""
+        elif linked_kind in {"node", "edge"} and linked_object_id:
+            selected_kind = linked_kind
+            selected_object_id = linked_object_id
+
+        return self.load_graph_view_state(
+            graph_snapshot,
+            layout_spread=layout_spread,
+            selected_kind=selected_kind,
+            selected_object_id=selected_object_id,
+        )
+
+    def load_graph_item_center(
+        self,
+        graph_view_state: Mapping[str, Any] | None,
+        *,
+        kind: str,
+        object_id: str,
+    ) -> tuple[float, float] | None:
+        if not isinstance(graph_view_state, Mapping):
+            return None
+        center_by_key = graph_view_state.get("item_center_by_key")
+        if not isinstance(center_by_key, Mapping):
+            return None
+        center = center_by_key.get((str(kind or "").strip(), str(object_id or "").strip()))
+        if not isinstance(center, Sequence) or len(center) < 2:
+            return None
+        try:
+            return float(center[0]), float(center[1])
+        except Exception:
+            return None
+
+    def load_graph_snapshot(self, object_name: str | None = None, source_uri: str | None = None) -> dict[str, Any]:
+        runtime_config = self._load_runtime_config()
+        graph_context = self._load_graph_request_context(
+            runtime_config=runtime_config,
+            object_name=object_name,
+            source_uri=source_uri,
+        )
+        snapshot_metadata = graph_context["metadata"]
+        runtime_config = graph_context.get("runtime_config") or runtime_config
+        if runtime_config is None:
+            return {
+                "status_text": "AgentsDB runtime config missing",
+                "message": "No AgentsDB runtime config found. Check AppData/agentsdb_connection.json or the AI_IDE_KNOWLEDGE_AGENTS_DB_* environment variables.",
+                "detail_html": "<h3>Graph unavailable</h3><p>No AgentsDB runtime config found.</p>",
+                "nodes": [],
+                "edges": [],
+                "metadata": snapshot_metadata,
+                "source_uri": snapshot_metadata.get("source_uri", ""),
+                "widget_uri": snapshot_metadata.get("widget_uri", ""),
+                "widget_kind": snapshot_metadata.get("widget_kind", self._DEFAULT_WIDGET_KIND),
+                "tool_id": snapshot_metadata.get("tool_id", self._DEFAULT_TOOL_ID),
+                "view_kind": self._RELATIONS_VIEW_KIND,
+            }
+
+        repository = self._load_repository(runtime_config)
+        relation_objects = self._load_relation_objects(repository, str(getattr(runtime_config, "namespace_id", "") or ""))
+        if not relation_objects:
+            namespace_id = html.escape(str(getattr(runtime_config, "namespace_id", "") or "n/a"))
+            database_name = html.escape(str(getattr(runtime_config, "database_name", "") or "n/a"))
+            return {
+                "status_text": f"No relations in {getattr(runtime_config, 'namespace_id', 'n/a')}",
+                "message": "No relation objects were found for the active namespace.",
+                "detail_html": (
+                    f"<h3>Relations Graph</h3><p>No relation objects were found in namespace <code>{namespace_id}</code> "
+                    f"for database <code>{database_name}</code>.</p>"
+                ),
+                "nodes": [],
+                "edges": [],
+                "metadata": snapshot_metadata,
+                "source_uri": snapshot_metadata.get("source_uri", ""),
+                "widget_uri": snapshot_metadata.get("widget_uri", ""),
+                "widget_kind": snapshot_metadata.get("widget_kind", self._DEFAULT_WIDGET_KIND),
+                "tool_id": snapshot_metadata.get("tool_id", self._DEFAULT_TOOL_ID),
+                "view_kind": self._RELATIONS_VIEW_KIND,
+            }
+
+        node_payload_by_id = self._load_node_payload_by_id(repository, relation_objects)
+        relation_type_counts: dict[str, int] = {}
+        edge_objects: list[dict[str, Any]] = []
+        node_objects_by_id: dict[str, dict[str, Any]] = {}
+
+        for relation_payload in relation_objects:
+            source_entity_id = str(relation_payload.get("source_entity_id") or "").strip()
+            target_entity_id = str(relation_payload.get("target_entity_id") or "").strip()
+            if not source_entity_id or not target_entity_id:
+                continue
+
+            relation_type = str(relation_payload.get("relation_type") or "related_to").strip() or "related_to"
+            relation_description = self._relation_description(relation_payload)
+            relation_type_counts[relation_type] = relation_type_counts.get(relation_type, 0) + 1
+
+            source_payload = node_payload_by_id.get(source_entity_id) or {}
+            target_payload = node_payload_by_id.get(target_entity_id) or {}
+            node_objects_by_id[source_entity_id] = {
+                "node_id": source_entity_id,
+                "label": self._entity_label(source_payload, source_entity_id),
+                "kind": str(source_payload.get("entity_type") or source_payload.get("type_key") or "entity"),
+            }
+            node_objects_by_id[target_entity_id] = {
+                "node_id": target_entity_id,
+                "label": self._entity_label(target_payload, target_entity_id),
+                "kind": str(target_payload.get("entity_type") or target_payload.get("type_key") or "entity"),
+            }
+            edge_objects.append(
+                {
+                    "source": source_entity_id,
+                    "target": target_entity_id,
+                    "label": relation_type,
+                    "description": relation_description,
+                }
+            )
+
+        node_objects = sorted(node_objects_by_id.values(), key=lambda item: str(item.get("label") or "").lower())
+        status_text = (
+            f"{len(edge_objects)} relations | {len(node_objects)} nodes | "
+            f"{str(getattr(runtime_config, 'database_name', 'n/a') or 'n/a')}"
+        )
+        return {
+            "status_text": status_text,
+            "message": "",
+            "detail_html": self._build_detail_html(runtime_config, node_objects, edge_objects, relation_type_counts, snapshot_metadata),
+            "nodes": node_objects,
+            "edges": edge_objects,
+            "metadata": snapshot_metadata,
+            "source_uri": snapshot_metadata.get("source_uri", ""),
+            "widget_uri": snapshot_metadata.get("widget_uri", ""),
+            "widget_kind": snapshot_metadata.get("widget_kind", self._DEFAULT_WIDGET_KIND),
+            "tool_id": snapshot_metadata.get("tool_id", self._DEFAULT_TOOL_ID),
+            "view_kind": self._RELATIONS_VIEW_KIND,
+        }
+
+    def _load_graphic_tool_placeholder_snapshot(
+        self,
+        *,
+        tool_id: str,
+        source_uri: str,
+        view_kind: str,
+        status_text: str,
+        message: str,
+        detail_html: str,
+    ) -> dict[str, Any]:
+        resolved_tool_id = str(tool_id or self._DEFAULT_TOOL_ID).strip() or self._DEFAULT_TOOL_ID
+        resolved_source_uri = str(source_uri or "").strip()
+        metadata = {
+            "source_uri": resolved_source_uri,
+            "widget_uri": resolved_source_uri,
+            "widget_kind": resolved_tool_id,
+            "tool_id": resolved_tool_id,
+            "object_name": resolved_tool_id,
+        }
+        return {
+            "status_text": str(status_text or "Extensions ready"),
+            "message": str(message or ""),
+            "detail_html": str(detail_html or "<p>No graph detail available.</p>"),
+            "nodes": [],
+            "edges": [],
+            "metadata": metadata,
+            "source_uri": resolved_source_uri,
+            "widget_uri": resolved_source_uri,
+            "widget_kind": resolved_tool_id,
+            "tool_id": resolved_tool_id,
+            "view_kind": str(view_kind or self._RELATIONS_VIEW_KIND),
+        }
+
+    def _prepare_interactive_edge_objects(
+        self,
+        edge_objects: Sequence[Mapping[str, Any]],
+    ) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]], dict[str, list[dict[str, Any]]]]:
+        edge_by_id: dict[str, dict[str, Any]] = {}
+        edges_by_node_id: dict[str, list[dict[str, Any]]] = {}
+        rendered_edge_objects: list[dict[str, Any]] = []
+        for edge_index, edge_object in enumerate(edge_objects):
+            source_node_id = str(edge_object.get("source") or "").strip()
+            target_node_id = str(edge_object.get("target") or "").strip()
+            if not source_node_id or not target_node_id:
+                continue
+            label = str(edge_object.get("label") or "related_to").strip() or "related_to"
+            edge_id = str(edge_object.get("edge_id") or "").strip()
+            if not edge_id:
+                edge_id = f"edge:{edge_index}:{source_node_id}->{target_node_id}:{label}"
+            interactive_edge_object = dict(edge_object)
+            interactive_edge_object["edge_id"] = edge_id
+            edge_by_id[edge_id] = interactive_edge_object
+            edges_by_node_id.setdefault(source_node_id, []).append(interactive_edge_object)
+            edges_by_node_id.setdefault(target_node_id, []).append(interactive_edge_object)
+            rendered_edge_objects.append(interactive_edge_object)
+        return rendered_edge_objects, edge_by_id, edges_by_node_id
+
+    def _load_connected_graph_component(
+        self,
+        edges_by_node_id: Mapping[str, Sequence[Mapping[str, Any]]],
+        start_node_id: str,
+    ) -> tuple[set[str], set[str]]:
+        normalized_start_node_id = str(start_node_id or "").strip()
+        if not normalized_start_node_id:
+            return set(), set()
+
+        visited_node_ids: set[str] = set()
+        visited_edge_ids: set[str] = set()
+        queue: list[str] = [normalized_start_node_id]
+        while queue:
+            current_node_id = queue.pop(0)
+            if current_node_id in visited_node_ids:
+                continue
+            visited_node_ids.add(current_node_id)
+            for edge_object in edges_by_node_id.get(current_node_id, []):
+                edge_id = str(edge_object.get("edge_id") or "")
+                if edge_id:
+                    visited_edge_ids.add(edge_id)
+                for neighbor_node_id in (
+                    str(edge_object.get("source") or ""),
+                    str(edge_object.get("target") or ""),
+                ):
+                    if neighbor_node_id and neighbor_node_id not in visited_node_ids and neighbor_node_id not in queue:
+                        queue.append(neighbor_node_id)
+        return visited_node_ids, visited_edge_ids
+
+    def _graph_detail_link(self, kind: str, object_id: str, label: str | None = None) -> str:
+        safe_label = html.escape(str(label or object_id or "open"))
+        return f'<a href="{self._GRAPH_LINK_SCHEME}://{self._GRAPH_LINK_HOST}/{quote(str(kind or ""), safe="")}/{quote(str(object_id or ""), safe="")}">{safe_label}</a>'
+
+    def _build_node_detail_html(
+        self,
+        node_id: str,
+        node_by_id: Mapping[str, Mapping[str, Any]],
+        edge_by_id: Mapping[str, Mapping[str, Any]],
+        edges_by_node_id: Mapping[str, Sequence[Mapping[str, Any]]],
+    ) -> str:
+        normalized_node_id = str(node_id or "").strip()
+        node_object = node_by_id.get(normalized_node_id) or {}
+        connected_edge_objects = [
+            edge_object
+            for edge_object in edges_by_node_id.get(normalized_node_id, [])
+            if str(edge_object.get("edge_id") or "") in edge_by_id
+        ]
+        edge_rows: list[str] = []
+        for edge_object in connected_edge_objects:
+            edge_id = str(edge_object.get("edge_id") or "")
+            source_node_id = str(edge_object.get("source") or "")
+            target_node_id = str(edge_object.get("target") or "")
+            edge_rows.append(
+                "".join(
+                    [
+                        "<li>",
+                        self._graph_detail_link("edge", edge_id, str(edge_object.get("label") or "related_to")),
+                        ": ",
+                        self._graph_detail_link("node", source_node_id, self._graph_node_label(source_node_id, node_by_id)),
+                        " → ",
+                        self._graph_detail_link("node", target_node_id, self._graph_node_label(target_node_id, node_by_id)),
+                        "</li>",
+                    ]
+                )
+            )
+        edge_html = "".join(edge_rows) if edge_rows else "<li>Keine verbundenen Relationen.</li>"
+        return "".join(
+            [
+                "<h3>Knoten</h3>",
+                f"<p><b>{html.escape(str(node_object.get('label') or normalized_node_id))}</b></p>",
+                "<ul>",
+                f"<li><b>ID:</b> <code>{html.escape(normalized_node_id)}</code></li>",
+                f"<li><b>Typ:</b> {html.escape(str(node_object.get('kind') or 'entity'))}</li>",
+                f"<li><b>Relationen:</b> {len(connected_edge_objects)}</li>",
+                "</ul>",
+                "<h4>Verbundene Relationen</h4>",
+                f"<ul>{edge_html}</ul>",
+                f"<p>{self._graph_detail_link('overview', 'overview', 'Zurück zur Übersicht')}</p>",
+            ]
+        )
+
+    def _build_edge_detail_html(
+        self,
+        edge_id: str,
+        node_by_id: Mapping[str, Mapping[str, Any]],
+        edge_by_id: Mapping[str, Mapping[str, Any]],
+    ) -> str:
+        normalized_edge_id = str(edge_id or "").strip()
+        edge_object = edge_by_id.get(normalized_edge_id) or {}
+        source_node_id = str(edge_object.get("source") or "")
+        target_node_id = str(edge_object.get("target") or "")
+        description = str(edge_object.get("description") or "").strip()
+        description_html = f"<p>{html.escape(description)}</p>" if description else "<p><i>Keine Relationsbeschreibung vorhanden.</i></p>"
+        return "".join(
+            [
+                "<h3>Relation</h3>",
+                f"<p><b>{html.escape(str(edge_object.get('label') or 'related_to'))}</b></p>",
+                "<ul>",
+                f"<li><b>Quelle:</b> {self._graph_detail_link('node', source_node_id, self._graph_node_label(source_node_id, node_by_id))}</li>",
+                f"<li><b>Ziel:</b> {self._graph_detail_link('node', target_node_id, self._graph_node_label(target_node_id, node_by_id))}</li>",
+                f"<li><b>ID:</b> <code>{html.escape(normalized_edge_id)}</code></li>",
+                "</ul>",
+                "<h4>Beschreibung</h4>",
+                description_html,
+                f"<p>{self._graph_detail_link('overview', 'overview', 'Zurück zur Übersicht')}</p>",
+            ]
+        )
+
+    def _graph_node_label(self, node_id: str, node_by_id: Mapping[str, Mapping[str, Any]]) -> str:
+        node_object = node_by_id.get(str(node_id or "")) or {}
+        return str(node_object.get("label") or node_id or "unknown")
+
+    def _wrap_graph_label(self, label_text: str, max_line_length: int = 18) -> str:
+        normalized_label = str(label_text or "").strip()
+        if not normalized_label:
+            return "unknown"
+        words = normalized_label.replace("_", " ").split()
+        if not words:
+            return self._short_graph_label(normalized_label, max_length=max_line_length)
+
+        line_objects: list[str] = []
+        current_line = ""
+        for word in words:
+            candidate_line = f"{current_line} {word}".strip()
+            if current_line and len(candidate_line) > max_line_length:
+                line_objects.append(current_line)
+                current_line = word
+                continue
+            current_line = candidate_line
+        if current_line:
+            line_objects.append(current_line)
+        if len(line_objects) > 3:
+            line_objects = line_objects[:3]
+            line_objects[-1] = self._short_graph_label(line_objects[-1], max_length=max_line_length - 1)
+        return "\n".join(line_objects)
+
+    def _short_graph_label(self, label_text: str, max_length: int = 24) -> str:
+        normalized_label = str(label_text or "").strip()
+        if len(normalized_label) <= max_length:
+            return normalized_label
+        if max_length <= 1:
+            return normalized_label[:max_length]
+        return f"{normalized_label[: max_length - 1]}…"
+
+    def _build_graph_render_commands(
+        self,
+        node_draw_objects: Sequence[Mapping[str, Any]],
+        edge_draw_objects: Sequence[Mapping[str, Any]],
+    ) -> list[dict[str, Any]]:
+        render_commands: list[dict[str, Any]] = []
+
+        for node_object in node_draw_objects:
+            node_id = str(node_object.get("node_id") or "").strip()
+            x_pos = float(node_object.get("x") or 0.0)
+            y_pos = float(node_object.get("y") or 0.0)
+            node_width = float(node_object.get("width") or 168.0)
+            node_height = float(node_object.get("height") or 72.0)
+            node_payload = {"kind": "node", "node_id": node_id}
+            node_tooltip = str(node_object.get("tooltip") or f"Knoten öffnen: {node_id}")
+            is_highlighted = bool(node_object.get("is_highlighted", True))
+
+            render_commands.append(
+                {
+                    "type": "ellipse",
+                    "x": x_pos,
+                    "y": y_pos,
+                    "width": node_width,
+                    "height": node_height,
+                    "payload": node_payload,
+                    "tooltip": node_tooltip,
+                    "style": {
+                        "stroke_role": "accent" if is_highlighted else "border",
+                        "fill_role": "surface_strong" if is_highlighted else "surface",
+                        "line_width": 3.0 if is_highlighted else 1.25,
+                    },
+                }
+            )
+            render_commands.append(
+                {
+                    "type": "text",
+                    "text": str(node_object.get("label") or node_id),
+                    "x": x_pos + 9.0,
+                    "y": y_pos + 8.0,
+                    "max_width": max(24.0, node_width - 18.0),
+                    "anchor": "top_left",
+                    "payload": node_payload,
+                    "tooltip": node_tooltip,
+                    "style": {
+                        "text_role": "text_primary" if is_highlighted else "text_secondary",
+                    },
+                }
+            )
+
+        for edge_object in edge_draw_objects:
+            edge_id = str(edge_object.get("edge_id") or "").strip()
+            start_x = float(edge_object.get("start_x") or 0.0)
+            start_y = float(edge_object.get("start_y") or 0.0)
+            end_x = float(edge_object.get("end_x") or 0.0)
+            end_y = float(edge_object.get("end_y") or 0.0)
+            is_highlighted = bool(edge_object.get("is_highlighted", True))
+            edge_payload = {"kind": "edge", "edge_id": edge_id}
+            edge_tooltip = str(edge_object.get("tooltip") or f"Relation öffnen: {edge_id}")
+
+            render_commands.append(
+                {
+                    "type": "line",
+                    "start_x": start_x,
+                    "start_y": start_y,
+                    "end_x": end_x,
+                    "end_y": end_y,
+                    "payload": edge_payload,
+                    "tooltip": edge_tooltip,
+                    "style": {
+                        "stroke_role": "accent" if is_highlighted else "link",
+                        "line_width": 4.0 if is_highlighted else 1.7,
+                    },
+                }
+            )
+
+            render_commands.append(
+                {
+                    "type": "text",
+                    "text": str(edge_object.get("label") or "related_to"),
+                    "x": (start_x + end_x) / 2.0,
+                    "y": (start_y + end_y) / 2.0,
+                    "anchor": "center_above",
+                    "payload": edge_payload,
+                    "tooltip": edge_tooltip,
+                    "style": {
+                        "text_role": "accent" if is_highlighted else "text_secondary",
+                    },
+                }
+            )
+
+        return render_commands
+
+    def _build_vector_graph_positions(
+        self,
+        node_objects: Sequence[Mapping[str, Any]],
+        edge_objects: Sequence[Mapping[str, Any]],
+    ) -> dict[str, tuple[float, float]]:
+        node_id_list = [
+            str(node_object.get("node_id") or "").strip()
+            for node_object in sorted(node_objects, key=lambda item: str(item.get("label") or item.get("node_id") or "").lower())
+            if str(node_object.get("node_id") or "").strip()
+        ]
+        if not node_id_list:
+            return {}
+
+        node_count = len(node_id_list)
+        if node_count == 1:
+            return {node_id_list[0]: (0.0, 0.0)}
+
+        relation_pairs = [
+            (str(edge_object.get("source") or "").strip(), str(edge_object.get("target") or "").strip())
+            for edge_object in edge_objects
+        ]
+        relation_pairs = [
+            (source_node_id, target_node_id)
+            for source_node_id, target_node_id in relation_pairs
+            if source_node_id in node_id_list and target_node_id in node_id_list and source_node_id != target_node_id
+        ]
+
+        radius = max(190.0, 72.0 * math.sqrt(float(node_count)) + 120.0)
+        golden_angle = math.pi * (3.0 - math.sqrt(5.0))
+        positions: dict[str, list[float]] = {}
+        for index, node_id in enumerate(node_id_list):
+            ring_radius = radius * math.sqrt((index + 0.5) / node_count)
+            angle = index * golden_angle
+            positions[node_id] = [math.cos(angle) * ring_radius, math.sin(angle) * ring_radius]
+
+        ideal_distance = max(190.0, min(360.0, 95.0 + (node_count * 8.0)))
+        canvas_radius = max(360.0, radius * 2.35)
+        node_id_pairs = [(node_id_list[i], node_id_list[j]) for i in range(node_count) for j in range(i + 1, node_count)]
+        for iteration_index in range(90):
+            temperature = max(0.08, 1.0 - (iteration_index / 90.0))
+            forces: dict[str, list[float]] = {node_id: [0.0, 0.0] for node_id in node_id_list}
+
+            for source_node_id, target_node_id in node_id_pairs:
+                source_x, source_y = positions[source_node_id]
+                target_x, target_y = positions[target_node_id]
+                delta_x = source_x - target_x
+                delta_y = source_y - target_y
+                distance = max(18.0, math.hypot(delta_x, delta_y))
+                repulsion = (ideal_distance * ideal_distance) / distance
+                force_x = (delta_x / distance) * repulsion
+                force_y = (delta_y / distance) * repulsion
+                forces[source_node_id][0] += force_x
+                forces[source_node_id][1] += force_y
+                forces[target_node_id][0] -= force_x
+                forces[target_node_id][1] -= force_y
+
+            for source_node_id, target_node_id in relation_pairs:
+                source_x, source_y = positions[source_node_id]
+                target_x, target_y = positions[target_node_id]
+                delta_x = target_x - source_x
+                delta_y = target_y - source_y
+                distance = max(18.0, math.hypot(delta_x, delta_y))
+                attraction = ((distance - ideal_distance) * 0.075)
+                force_x = (delta_x / distance) * attraction
+                force_y = (delta_y / distance) * attraction
+                forces[source_node_id][0] += force_x
+                forces[source_node_id][1] += force_y
+                forces[target_node_id][0] -= force_x
+                forces[target_node_id][1] -= force_y
+
+            for node_id in node_id_list:
+                current_x, current_y = positions[node_id]
+                forces[node_id][0] += -current_x * 0.012
+                forces[node_id][1] += -current_y * 0.012
+                force_x, force_y = forces[node_id]
+                force_distance = max(1.0, math.hypot(force_x, force_y))
+                step = min(42.0 * temperature, force_distance)
+                next_x = current_x + (force_x / force_distance) * step
+                next_y = current_y + (force_y / force_distance) * step
+                next_distance_from_origin = math.hypot(next_x, next_y)
+                if next_distance_from_origin > canvas_radius:
+                    scale = canvas_radius / next_distance_from_origin
+                    next_x *= scale
+                    next_y *= scale
+                positions[node_id] = [next_x, next_y]
+
+        return {node_id: (position[0], position[1]) for node_id, position in positions.items()}
+
+    def _load_graph_request_context(
+        self,
+        *,
+        runtime_config: Any | None,
+        object_name: str | None = None,
+        source_uri: str | None = None,
+    ) -> dict[str, Any]:
+        requested_object_name = str(object_name or "").strip()
+        requested_source_uri = str(source_uri or "").strip()
+        if not requested_source_uri and requested_object_name.lower().startswith("agentsdb://"):
+            requested_source_uri = requested_object_name
+            requested_object_name = ""
+
+        repository_uri = ""
+        widget_uri = requested_source_uri
+        if requested_source_uri:
+            repository_uri, widget_uri = self._normalize_widget_source_uri(requested_source_uri)
+
+        resolved_runtime_config = runtime_config
+        if runtime_config is None and repository_uri:
+            resolved_runtime_config = RuntimeConfigObject(agents_db_uri=repository_uri)
+        elif runtime_config is not None and repository_uri:
+            try:
+                resolved_runtime_config = RuntimeConfigObject(
+                    agents_db_uri=repository_uri,
+                    database_name=str(getattr(runtime_config, "database_name", "alde_knowledge") or "alde_knowledge"),
+                    tenant_id=str(getattr(runtime_config, "tenant_id", "tenant_default") or "tenant_default"),
+                    namespace_id=str(getattr(runtime_config, "namespace_id", "ns_alde_default") or "ns_alde_default"),
+                    namespace_slug=str(getattr(runtime_config, "namespace_slug", "alde-default") or "alde-default"),
+                    namespace_name=str(getattr(runtime_config, "namespace_name", "ALDE Default Knowledge") or "ALDE Default Knowledge"),
+                    default_embedding_model=str(getattr(runtime_config, "default_embedding_model", "text-embedding-3-large") or "text-embedding-3-large"),
+                    default_embedding_dimension=int(getattr(runtime_config, "default_embedding_dimension", 3072) or 3072),
+                    index_backend=str(getattr(runtime_config, "index_backend", "faiss") or "faiss"),
+                )
+            except Exception:
+                setattr(runtime_config, "agents_db_uri", repository_uri)
+                resolved_runtime_config = runtime_config
+
+        metadata = {
+            "source_uri": requested_source_uri,
+            "widget_uri": widget_uri,
+            "repository_uri": repository_uri,
+            "widget_kind": self._DEFAULT_WIDGET_KIND,
+            "tool_id": requested_object_name or self._DEFAULT_TOOL_ID,
+            "object_name": requested_object_name or self._DEFAULT_WIDGET_KIND,
+        }
+        return {"runtime_config": resolved_runtime_config, "metadata": metadata}
+
+    def _normalize_widget_source_uri(self, source_uri: str) -> tuple[str, str]:
+        normalized_source_uri = str(source_uri or "").strip()
+        parsed_uri = urlparse(normalized_source_uri)
+        if str(parsed_uri.scheme or "").strip().lower() != "agentsdb":
+            return normalized_source_uri, normalized_source_uri
+
+        repository_uri = normalize_agentsdb_socket_uri(normalized_source_uri, default_on_empty=False) or normalized_source_uri
+        widget_path = str(parsed_uri.path or "").strip("/")
+        normalized_widget_path = "AdbGraphVIew" if widget_path.lower() in self._WIDGET_PATH_ALIASES else widget_path
+        widget_uri = f"{repository_uri}/{normalized_widget_path}" if normalized_widget_path else repository_uri
+        return repository_uri, widget_uri
+
+    def _load_runtime_config(self) -> Any | None:
+        _, _, load_runtime_config = self._load_agentsdb_dependencies()
+        return load_runtime_config()
+
+    def _load_repository(self, runtime_config: Any) -> Any:
+        repository_factory_class, repository_factory_config_class, _ = self._load_agentsdb_dependencies()
+        project_root = Path(__file__).resolve().parents[2]
+        memory_image_path = project_root / "AppData" / "agentsdb.json"
+        repository_factory = repository_factory_class(
+            repository_factory_config_class(
+                backend_uri=str(getattr(runtime_config, "agents_db_uri", "") or "").strip(),
+                default_database_name=str(getattr(runtime_config, "database_name", "alde_knowledge") or "alde_knowledge").strip() or "alde_knowledge",
+                memory_image_path=str(memory_image_path),
+                prefer_explicit_inmemory=True,
+            )
+        )
+        return repository_factory.load_repository(str(getattr(runtime_config, "database_name", "alde_knowledge") or "alde_knowledge"))
+
+    def _load_relation_objects(self, repository: Any, namespace_id: str) -> list[dict[str, Any]]:
+        load_objects = getattr(repository, "load_objects", None)
+        if not callable(load_objects):
+            return []
+
+        relation_objects: Any = []
+        relation_filter = {"namespace_id": namespace_id} if namespace_id else None
+        try:
+            relation_objects = load_objects("relation", relation_filter, limit=self._RELATION_LIMIT)
+        except TypeError:
+            relation_objects = load_objects("relation", relation_filter)
+        except Exception:
+            relation_objects = []
+
+        if not relation_objects:
+            try:
+                relation_objects = load_objects("relation", None, limit=self._RELATION_LIMIT)
+            except TypeError:
+                relation_objects = load_objects("relation", None)
+            except Exception:
+                relation_objects = []
+
+        return [dict(item) for item in (relation_objects or []) if isinstance(item, dict)]
+
+    def _load_node_payload_by_id(self, repository: Any, relation_objects: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+        load_object = getattr(repository, "load_object", None)
+        if not callable(load_object):
+            return {}
+
+        entity_id_list: list[str] = []
+        seen_entity_ids: set[str] = set()
+        for relation_payload in relation_objects:
+            for entity_id in (
+                str(relation_payload.get("source_entity_id") or "").strip(),
+                str(relation_payload.get("target_entity_id") or "").strip(),
+            ):
+                if entity_id and entity_id not in seen_entity_ids:
+                    seen_entity_ids.add(entity_id)
+                    entity_id_list.append(entity_id)
+
+        node_payload_by_id: dict[str, dict[str, Any]] = {}
+        for entity_id in entity_id_list[: self._RELATION_LIMIT * 2]:
+            try:
+                entity_payload = load_object("entity", entity_id)
+            except Exception:
+                entity_payload = None
+            node_payload_by_id[entity_id] = dict(entity_payload) if isinstance(entity_payload, dict) else {}
+        return node_payload_by_id
+
+    def _relation_description(self, relation_payload: dict[str, Any]) -> str:
+        metadata = relation_payload.get("metadata") if isinstance(relation_payload.get("metadata"), dict) else {}
+        description = relation_payload.get("relation_description")
+        if not description:
+            description = metadata.get("relation_description")
+        return str(description or "").strip()
+
+    def _entity_label(self, entity_payload: dict[str, Any], fallback_entity_id: str) -> str:
+        for field_name in ("canonical_name", "title", "display_name", "name", "mention_text", "id", "_id"):
+            value = str(entity_payload.get(field_name) or "").strip()
+            if value:
+                return value
+        return self._short_entity_label(fallback_entity_id)
+
+    def _short_entity_label(self, entity_id: str) -> str:
+        normalized_entity_id = str(entity_id or "").strip()
+        if not normalized_entity_id:
+            return "unknown"
+        return normalized_entity_id.split(":")[-1] or normalized_entity_id
+
+    def _build_detail_html(
+        self,
+        runtime_config: Any,
+        node_objects: list[dict[str, Any]],
+        edge_objects: list[dict[str, Any]],
+        relation_type_counts: dict[str, int],
+        snapshot_metadata: Mapping[str, Any] | None = None,
+    ) -> str:
+        metadata = snapshot_metadata if isinstance(snapshot_metadata, Mapping) else {}
+        relation_rows = "".join(
+            f"<li><b>{html.escape(relation_type)}</b>: {count}</li>"
+            for relation_type, count in sorted(relation_type_counts.items(), key=lambda item: (-item[1], item[0]))[:10]
+        )
+        if not relation_rows:
+            relation_rows = "<li>No relation types loaded.</li>"
+
+        sample_edges = "".join(
+            (
+                f"<li><b>{html.escape(str(edge_object.get('label') or 'related_to'))}</b>: "
+                f"{html.escape(str(edge_object.get('source') or 'n/a'))} -> "
+                f"{html.escape(str(edge_object.get('target') or 'n/a'))}"
+                f"{'<br><span style=\"opacity:0.78;\">' + html.escape(str(edge_object.get('description') or '')) + '</span>' if str(edge_object.get('description') or '').strip() else ''}"
+                "</li>"
+            )
+            for edge_object in edge_objects[:8]
+        )
+        if not sample_edges:
+            sample_edges = "<li>No graph edges rendered.</li>"
+
+        return "".join(
+            [
+                "<h3>Relations Graph</h3>",
+                "<p>Graph projection of AgentDB relation objects for the active namespace.</p>",
+                "<ul>",
+                f"<li><b>Database:</b> {html.escape(str(getattr(runtime_config, 'database_name', 'n/a') or 'n/a'))}</li>",
+                f"<li><b>Namespace:</b> {html.escape(str(getattr(runtime_config, 'namespace_id', 'n/a') or 'n/a'))}</li>",
+                f"<li><b>Backend:</b> {html.escape(str(getattr(runtime_config, 'agents_db_uri', 'n/a') or 'n/a'))}</li>",
+                f"<li><b>Widget URI:</b> {html.escape(str(metadata.get('widget_uri') or metadata.get('source_uri') or 'n/a'))}</li>",
+                f"<li><b>Tool:</b> {html.escape(str(metadata.get('tool_id') or self._DEFAULT_TOOL_ID))}</li>",
+                f"<li><b>Nodes:</b> {len(node_objects)}</li>",
+                f"<li><b>Relations:</b> {len(edge_objects)}</li>",
+                "</ul>",
+                "<h4>Relation Types</h4>",
+                f"<ul>{relation_rows}</ul>",
+                "<h4>Rendered Edges</h4>",
+                f"<ul>{sample_edges}</ul>",
+                "<p>Workflow and sequence diagram tabs are reserved as the next extension surfaces.</p>",
+            ]
+        )
+
+    def _load_agentsdb_dependencies(self) -> tuple[Any, Any, Any]:
+        try:
+            if __package__:
+                from .agents_db import (  # type: ignore
+                    AgentDbRepositoryFactory,
+                    AgentDbRepositoryFactoryConfig,
+                    load_agentsdb_runtime_config_from_env,
+                )
+            else:
+                from alde.agents_db import (  # type: ignore
+                    AgentDbRepositoryFactory,
+                    AgentDbRepositoryFactoryConfig,
+                    load_agentsdb_runtime_config_from_env,
+                )
+        except ImportError as exc:
+            message = str(exc)
+            if "attempted relative import" in message or "no known parent package" in message:
+                from agents_db import (  # type: ignore
+                    AgentDbRepositoryFactory,
+                    AgentDbRepositoryFactoryConfig,
+                    load_agentsdb_runtime_config_from_env,
+                )
+            else:
+                raise
+        return AgentDbRepositoryFactory, AgentDbRepositoryFactoryConfig, load_agentsdb_runtime_config_from_env

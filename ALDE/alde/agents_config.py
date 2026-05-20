@@ -610,6 +610,52 @@ def _resolve_route_template_value(value: Any, *, original_text: str, original_pa
         if value == "__cover_letter_writer_payload__":
             if not isinstance(original_payload, dict):
                 return deepcopy(original_payload)
+
+            def load_canonical_cover_letter_result(result_payload: Any, *, obj_name: str, fallback_correlation_id: str | None = None) -> Any:
+                if not isinstance(result_payload, dict):
+                    return deepcopy(result_payload)
+                file_payload = result_payload.get("file") if isinstance(result_payload.get("file"), dict) else {}
+                section_key = "profile" if str(obj_name) == "profiles" else "job_posting"
+                section_payload = result_payload.get(section_key) if isinstance(result_payload.get(section_key), dict) else {}
+                correlation_id = next(
+                    (
+                        str(candidate).strip()
+                        for candidate in (
+                            result_payload.get("correlation_id"),
+                            result_payload.get("id"),
+                            section_payload.get("profile_id") if str(obj_name) == "profiles" else None,
+                            section_payload.get("id") if str(obj_name) == "profiles" else None,
+                            file_payload.get("content_sha256"),
+                            fallback_correlation_id,
+                        )
+                        if isinstance(candidate, str) and candidate.strip()
+                    ),
+                    None,
+                )
+                source_path = next(
+                    (
+                        str(candidate).strip()
+                        for candidate in (
+                            result_payload.get("source_path"),
+                            result_payload.get("path"),
+                            file_payload.get("path"),
+                            file_payload.get("source_uri"),
+                        )
+                        if isinstance(candidate, str) and candidate.strip()
+                    ),
+                    None,
+                )
+                try:
+                    from .agents_tools import REQUEST_OBJECT_RESOLUTION_SERVICE  # type: ignore
+                except Exception:
+                    from alde.agents_tools import REQUEST_OBJECT_RESOLUTION_SERVICE  # type: ignore
+                return REQUEST_OBJECT_RESOLUTION_SERVICE._augment_canonical_result_payload(
+                    deepcopy(result_payload),
+                    obj_name=obj_name,
+                    source_path=source_path,
+                    correlation_id=correlation_id,
+                )
+
             narrowed_payload: dict[str, Any] = {}
             for key in (
                 "action",
@@ -621,6 +667,17 @@ def _resolve_route_template_value(value: Any, *, original_text: str, original_pa
             ):
                 if key in original_payload:
                     narrowed_payload[key] = deepcopy(original_payload.get(key))
+            if isinstance(narrowed_payload.get("job_posting_result"), dict):
+                narrowed_payload["job_posting_result"] = load_canonical_cover_letter_result(
+                    narrowed_payload.get("job_posting_result"),
+                    obj_name="job_postings",
+                    fallback_correlation_id=str(narrowed_payload.get("correlation_id") or "").strip() or None,
+                )
+            if isinstance(narrowed_payload.get("profile_result"), dict):
+                narrowed_payload["profile_result"] = load_canonical_cover_letter_result(
+                    narrowed_payload.get("profile_result"),
+                    obj_name="profiles",
+                )
             if "applicant_profile" not in narrowed_payload:
                 profile_result = narrowed_payload.get("profile_result")
                 if isinstance(profile_result, dict):
@@ -3336,7 +3393,27 @@ def validate_runtime_contracts() -> dict[str, Any]:
 
 
 def get_specialized_system_prompt(agent_type: str, task_name: str) -> str:
-    job_prompt_name = _SPECIALIZED_JOB_PROMPT_MAP.get((agent_type, task_name))
+    normalized_agent_type = str(agent_type or "").strip()
+    normalized_task_name = str(task_name or "").strip()
+
+    job_prompt_name = _SPECIALIZED_JOB_PROMPT_MAP.get((normalized_agent_type, normalized_task_name))
+    if not job_prompt_name and normalized_task_name in JOB_PROMPT_CONFIGS:
+        # Allow callers to pass a concrete job_name directly (e.g. job_posting_parser).
+        job_prompt_name = normalized_task_name
+
+    if not job_prompt_name and normalized_task_name:
+        # Fallback for runtime callsites that route by job_name while
+        # specialized_prompt uses logical tuples such as (parser, job_posting).
+        job_config = get_job_config(normalized_task_name)
+        prompt_ref = job_config.get("specialized_prompt") if isinstance(job_config, dict) else None
+        if isinstance(prompt_ref, dict):
+            fallback_key = (
+                str(prompt_ref.get("agent_type") or "").strip(),
+                str(prompt_ref.get("task_name") or "").strip(),
+            )
+            if fallback_key[0] and fallback_key[1]:
+                job_prompt_name = _SPECIALIZED_JOB_PROMPT_MAP.get(fallback_key)
+
     if not job_prompt_name:
         return ""
 

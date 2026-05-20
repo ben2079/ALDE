@@ -14,11 +14,11 @@ if str(PKG_ROOT) not in sys.path:
     sys.path.insert(0, str(PKG_ROOT))
 
 from alde.agents_tools import (
+    DOCUMENT_OBJECT_SERVICE,
     DOCUMENT_DISPATCH_SERVICE,
     DOCUMENT_REPOSITORY,
     execute_action_request_tool,
     read_document,
-    store_object_result_tool,
 )
 
 
@@ -247,7 +247,7 @@ class TestDispatchPipelineSmoke(unittest.TestCase):
                     "processed": True,
                 },
             )
-            store_object_result_tool(
+            DOCUMENT_OBJECT_SERVICE.store_result(
                 object_result={
                     "agent": "job_posting_parser",
                     "correlation_id": correlation_id,

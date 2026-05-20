@@ -822,6 +822,25 @@ result, route = agents_factory.execute_route_to_agent(
         self.assertEqual(result, "Invalid route_to_agent payload for _xworker: missing required job_name or tool_name")
         self.assertIsNone(route)
 
+    def test_route_to_agent_defaults_target_from_job_runtime_agent(self) -> None:
+        result, route = agents_factory.execute_route_to_agent(
+            {
+                "job_name": "document_dispatch",
+                "message_text": "Dispatch documents for parsing in the specified directory.",
+                "handoff_protocol": "agent_handoff_v1",
+            },
+            source_agent_label="_xplaner_xrouter",
+        )
+
+        self.assertEqual(result, "Routing to _xworker")
+        self.assertIsInstance(route, dict)
+        self.assertEqual((route or {}).get("agent_label"), "_xworker")
+        self.assertEqual(((route or {}).get("handoff") or {}).get("target_agent"), "_xworker")
+        self.assertEqual(
+            (((route or {}).get("handoff_context") or {}).get("contract") or {}).get("job_name"),
+            "document_dispatch",
+        )
+
     def test_route_to_agent_rejects_unstructured_parser_dispatch_message(self) -> None:
         result, route = agents_factory.execute_route_to_agent(
             {
@@ -1334,7 +1353,7 @@ result, route = agents_factory.execute_route_to_agent(
         with patch("alde.chat_completion.ChatComE", _SequenceChatComE), patch(
             "alde.agents_factory.execute_tool",
             side_effect=_execute_tool,
-        ), patch("alde.agents_factory.upsert_object_record_tool", return_value={"ok": True}), patch(
+        ), patch.object(agents_factory.DOCUMENT_OBJECT_SERVICE, "upsert_object_record", return_value={"ok": True}), patch(
             "alde.agents_factory.write_document",
             return_value={"path": "/tmp/cover_letter.md"},
         ), patch(

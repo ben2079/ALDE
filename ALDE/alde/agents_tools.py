@@ -95,6 +95,9 @@ def _noop_sync_parser_result_to_agentsdb_knowledge(**_: Any) -> None:
 
 try:
     from .agents_db import (
+        AgentRelationGraphService,
+        AgentDbRepositoryFactory,
+        AgentDbRepositoryFactoryConfig,
         AgentDbSocketRepository,
         KnowledgeRepository,
         sync_parser_result_to_agentsdb_knowledge,
@@ -103,12 +106,18 @@ try:
 except Exception:
     try:
         from alde.agents_db import (  # type: ignore
+            AgentRelationGraphService,
+            AgentDbRepositoryFactory,
+            AgentDbRepositoryFactoryConfig,
             AgentDbSocketRepository,
             KnowledgeRepository,
             sync_parser_result_to_agentsdb_knowledge,
             sync_retrieval_run_to_agentsdb_knowledge,
         )
     except Exception:
+        AgentRelationGraphService = None  # type: ignore[assignment]
+        AgentDbRepositoryFactory = None  # type: ignore[assignment]
+        AgentDbRepositoryFactoryConfig = None  # type: ignore[assignment]
         AgentDbSocketRepository = None  # type: ignore[assignment]
         KnowledgeRepository = None  # type: ignore[assignment]
         sync_retrieval_run_to_agentsdb_knowledge = _noop_sync_retrieval_run_to_agentsdb_knowledge
@@ -603,7 +612,16 @@ class AgentsDbDocumentBackend:
 
         if self._is_socket_uri(agents_db_uri) and AgentDbSocketRepository is not None:
             try:
-                socket_repository = AgentDbSocketRepository.create_from_uri(agents_db_uri, database_name)
+                if AgentDbRepositoryFactory is not None and AgentDbRepositoryFactoryConfig is not None:
+                    socket_repository = AgentDbRepositoryFactory(
+                        AgentDbRepositoryFactoryConfig(
+                            backend_uri=agents_db_uri,
+                            default_database_name=database_name,
+                            memory_image_path=self._config.memory_image_path,
+                        )
+                    ).load_repository()
+                else:
+                    socket_repository = AgentDbSocketRepository.create_from_uri(agents_db_uri, database_name)
                 # Validate socket reachability before selecting this backend.
                 socket_repository.ensure_index_objects()
                 self._repository = socket_repository
@@ -617,7 +635,16 @@ class AgentsDbDocumentBackend:
             repository_uri = backend_uri or agents_db_uri
             if repository_uri:
                 try:
-                    self._repository = KnowledgeRepository.create_from_uri(repository_uri, database_name)
+                    if AgentDbRepositoryFactory is not None and AgentDbRepositoryFactoryConfig is not None:
+                        self._repository = AgentDbRepositoryFactory(
+                            AgentDbRepositoryFactoryConfig(
+                                backend_uri=repository_uri,
+                                default_database_name=database_name,
+                                memory_image_path=self._config.memory_image_path,
+                            )
+                        ).load_repository()
+                    else:
+                        self._repository = KnowledgeRepository.create_from_uri(repository_uri, database_name)
                     self._last_repository_error = None
                     return self._repository
                 except Exception as exc:
@@ -725,6 +752,8 @@ class AgentsDbDocumentBackend:
             record_id=record_id,
             record_value=record_value,
         )
+        serialized_title = str(serialized_payload.get("title") or "").strip() or f"{collection_name}:{record_id}"
+        serialized_source_uri = str(serialized_payload.get("source_uri") or "").strip() or f"alde://document_backend/{collection_name}/{hashlib.sha256(str(storage_key).encode('utf-8')).hexdigest()}/{record_id}"
         serialized_payload.update(
             {
                 "_agentsdb_backend_kind": "document_backend_record",
@@ -733,8 +762,8 @@ class AgentsDbDocumentBackend:
                 "_record_id": str(record_id),
                 "_deleted": False,
                 "document_type": "agentsdb_document_backend_record",
-                "title": f"{collection_name}:{record_id}",
-                "source_uri": f"alde://document_backend/{collection_name}/{hashlib.sha256(str(storage_key).encode('utf-8')).hexdigest()}/{record_id}",
+                "title": serialized_title,
+                "source_uri": serialized_source_uri,
                 "database_name": self._config.database_name,
                 "agents_db_uri": self._config.agents_db_uri,
                 "backend_uri": self._config.backend_uri,
@@ -1210,6 +1239,367 @@ class DocumentRepository:
         self.save_db(db_path, db, db_name=db_name, obj_name=obj_name)
         return db
 
+    def _load_document_record_title(
+        self,
+        *,
+        correlation_id: str,
+        document_section: dict[str, Any],
+        result_payload: dict[str, Any],
+        existing_record: dict[str, Any],
+    ) -> str:
+        raw_text_payload = result_payload.get("raw_text_document") if isinstance(result_payload.get("raw_text_document"), dict) else {}
+        file_payload = result_payload.get("file") if isinstance(result_payload.get("file"), dict) else {}
+        file_path = _first_non_empty_text(
+            file_payload.get("path"),
+            existing_record.get("source_path"),
+            existing_record.get("path"),
+        )
+        file_stem = Path(file_path).stem if file_path else None
+        return _first_non_empty_text(
+            document_section.get("job_title"),
+            document_section.get("title"),
+            document_section.get("name"),
+            document_section.get("full_name"),
+            raw_text_payload.get("title"),
+            file_payload.get("name"),
+            file_stem,
+            existing_record.get("title"),
+            correlation_id,
+        ) or correlation_id
+
+    def _load_document_record_source_path(
+        self,
+        *,
+        result_payload: dict[str, Any],
+        existing_record: dict[str, Any],
+        source_payload: dict[str, Any],
+        fallback_link_payload: dict[str, Any] | None = None,
+        fallback_file_payload: dict[str, Any] | None = None,
+    ) -> str | None:
+        file_payload = result_payload.get("file") if isinstance(result_payload.get("file"), dict) else {}
+        link_payload = result_payload.get("link") if isinstance(result_payload.get("link"), dict) else {}
+        source_file_payload = source_payload.get("file") if isinstance(source_payload.get("file"), dict) else {}
+        source_link_payload = source_payload.get("link") if isinstance(source_payload.get("link"), dict) else {}
+        return _first_non_empty_text(
+            file_payload.get("path"),
+            file_payload.get("source_uri"),
+            link_payload.get("url"),
+            fallback_file_payload.get("path") if isinstance(fallback_file_payload, dict) else None,
+            fallback_file_payload.get("source_uri") if isinstance(fallback_file_payload, dict) else None,
+            fallback_link_payload.get("url") if isinstance(fallback_link_payload, dict) else None,
+            source_file_payload.get("path"),
+            source_file_payload.get("source_uri"),
+            source_link_payload.get("url"),
+            source_payload.get("source_path"),
+            source_payload.get("path"),
+            existing_record.get("source_path"),
+            existing_record.get("path"),
+            existing_record.get("source_uri"),
+        )
+
+    def _resolve_document_record_status(
+        self,
+        *,
+        record: dict[str, Any],
+        result_payload: dict[str, Any],
+        resolved_obj_name: str,
+        document_section: dict[str, Any],
+    ) -> tuple[str, bool, str | None]:
+        parse_section = result_payload.get("parse") if isinstance(result_payload.get("parse"), dict) else {}
+        db_updates = result_payload.get("db_updates") if isinstance(result_payload.get("db_updates"), dict) else {}
+        resolved_section_key = _document_section_key(resolved_obj_name)
+        normalized_state = str(
+            db_updates.get("processing_state")
+            or record.get("processing_state")
+            or record.get("status")
+            or (
+                "processed"
+                if (
+                    document_section
+                    or record.get(resolved_section_key)
+                    or record.get(resolved_obj_name)
+                    or bool(parse_section.get("is_job_posting"))
+                )
+                else "failed"
+            )
+        ).strip().lower() or "failed"
+        processed_value = db_updates.get("processed")
+        if isinstance(processed_value, bool):
+            effective_processed = processed_value
+        elif isinstance(record.get("processed"), bool):
+            effective_processed = bool(record.get("processed"))
+        else:
+            effective_processed = normalized_state == "processed"
+        effective_failed_reason = _first_non_empty_text(
+            db_updates.get("failed_reason"),
+            record.get("failed_reason"),
+            record.get("last_error"),
+        )
+        return normalized_state, effective_processed, effective_failed_reason
+
+    def _build_legacy_db_updates(self, *, record: dict[str, Any]) -> dict[str, Any]:
+        legacy_updates = deepcopy(record.get("db_updates") or {}) if isinstance(record.get("db_updates"), dict) else {}
+        legacy_updates["correlation_id"] = str(record.get("correlation_id") or record.get("id") or "")
+        legacy_updates["content_sha256"] = str(record.get("content_sha256") or record.get("correlation_id") or record.get("id") or "")
+        legacy_updates["processing_state"] = str(record.get("processing_state") or record.get("status") or "failed").strip().lower() or "failed"
+        processed_value = record.get("processed")
+        legacy_updates["processed"] = bool(processed_value) if isinstance(processed_value, bool) else legacy_updates["processing_state"] == "processed"
+        legacy_updates["failed_reason"] = record.get("failed_reason")
+        return legacy_updates
+
+    def _normalize_operational_record(
+        self,
+        *,
+        record: dict[str, Any],
+        correlation_id: str,
+        object_name: str,
+        source_agent: str | None = None,
+        source_path: str | None = None,
+        title: str | None = None,
+        content_sha256: str | None = None,
+        processing_state: str | None = None,
+        processed: bool | None = None,
+        failed_reason: str | None = None,
+        touched_at: str | None = None,
+    ) -> dict[str, Any]:
+        normalized_record = dict(record)
+        normalized_object_name = _normalize_document_obj_name(object_name, "documents")
+        resolved_section_key = _document_section_key(normalized_object_name)
+        section_payload = normalized_record.get(resolved_section_key) if isinstance(normalized_record.get(resolved_section_key), dict) else {}
+        raw_text_payload = normalized_record.get("raw_text_document") if isinstance(normalized_record.get("raw_text_document"), dict) else {}
+        file_payload = normalized_record.get("file") if isinstance(normalized_record.get("file"), dict) else {}
+        link_payload = normalized_record.get("link") if isinstance(normalized_record.get("link"), dict) else {}
+        db_updates = normalized_record.get("db_updates") if isinstance(normalized_record.get("db_updates"), dict) else {}
+
+        resolved_content_sha256 = _first_non_empty_text(
+            content_sha256,
+            normalized_record.get("content_sha256"),
+            file_payload.get("content_sha256"),
+            db_updates.get("content_sha256"),
+            normalized_record.get("correlation_id"),
+            correlation_id,
+        ) or correlation_id
+        resolved_source = _first_non_empty_text(
+            source_agent,
+            normalized_record.get("source"),
+            normalized_record.get("source_agent"),
+            normalized_record.get("agent"),
+        )
+        resolved_source_path = _first_non_empty_text(
+            source_path,
+            normalized_record.get("source_path"),
+            normalized_record.get("path"),
+            file_payload.get("path"),
+            file_payload.get("source_uri"),
+            link_payload.get("url"),
+            normalized_record.get("source_uri"),
+        )
+        fallback_title_from_path = None
+        if resolved_source_path and "://" not in resolved_source_path:
+            fallback_title_from_path = Path(resolved_source_path).stem
+        resolved_title = _first_non_empty_text(
+            title,
+            normalized_record.get("title"),
+            section_payload.get("job_title"),
+            section_payload.get("title"),
+            section_payload.get("name"),
+            section_payload.get("full_name"),
+            raw_text_payload.get("title"),
+            fallback_title_from_path,
+            normalized_record.get("correlation_id"),
+            correlation_id,
+        ) or correlation_id
+        normalized_state = str(
+            processing_state
+            or normalized_record.get("processing_state")
+            or normalized_record.get("status")
+            or db_updates.get("processing_state")
+            or "failed"
+        ).strip().lower() or "failed"
+        processed_value: Any = processed if isinstance(processed, bool) else normalized_record.get("processed")
+        if isinstance(processed_value, bool):
+            effective_processed = processed_value
+        else:
+            legacy_processed = db_updates.get("processed")
+            effective_processed = legacy_processed if isinstance(legacy_processed, bool) else normalized_state == "processed"
+        effective_failed_reason = _first_non_empty_text(
+            failed_reason,
+            normalized_record.get("failed_reason"),
+            normalized_record.get("last_error"),
+            db_updates.get("failed_reason"),
+        )
+
+        normalized_record.setdefault("id", correlation_id)
+        normalized_record["correlation_id"] = str(normalized_record.get("correlation_id") or correlation_id)
+        normalized_record["content_sha256"] = resolved_content_sha256
+        normalized_record["title"] = resolved_title
+        if resolved_source:
+            normalized_record["source"] = resolved_source
+            normalized_record["source_agent"] = resolved_source
+        if resolved_source_path:
+            normalized_record["source_path"] = resolved_source_path
+            normalized_record["path"] = resolved_source_path
+            normalized_record.setdefault("source_uri", resolved_source_path)
+        normalized_record["record_kind"] = "document"
+        normalized_record["kind"] = "document"
+        normalized_record["object_name"] = normalized_object_name
+        normalized_record["status"] = normalized_state
+        normalized_record["processing_state"] = normalized_state
+        normalized_record["processed"] = effective_processed
+        if touched_at:
+            normalized_record["last_seen_at"] = touched_at
+
+        if effective_processed:
+            if touched_at:
+                normalized_record["processed_at"] = touched_at
+            normalized_record["failed_reason"] = None
+            normalized_record["last_error"] = None
+            normalized_record["last_error_at"] = None
+        else:
+            normalized_record["failed_reason"] = effective_failed_reason
+            normalized_record["last_error"] = effective_failed_reason
+            if effective_failed_reason and touched_at:
+                normalized_record["last_error_at"] = touched_at
+            elif effective_failed_reason and not normalized_record.get("last_error_at"):
+                normalized_record["last_error_at"] = normalized_record.get("updated_at") or normalized_record.get("created_at")
+
+        normalized_record["db_updates"] = self._build_legacy_db_updates(record=normalized_record)
+        return normalized_record
+
+    def _build_document_record(
+        self,
+        *,
+        existing_record: dict[str, Any] | None,
+        correlation_id: str,
+        result_payload: dict[str, Any],
+        resolved_obj_name: str,
+        source_agent: str,
+        metadata: dict[str, Any],
+        source_payload: dict[str, Any],
+        fallback_link_payload: dict[str, Any] | None = None,
+        fallback_file_payload: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        record = dict(existing_record or {})
+        resolved_section_key = _document_section_key(resolved_obj_name)
+        ts = _now_utc_iso()
+        parse_section = result_payload.get("parse") if isinstance(result_payload.get("parse"), dict) else {}
+        document_section = _extract_document_section(result_payload, resolved_obj_name)
+
+        record["correlation_id"] = correlation_id
+        record["updated_at"] = ts
+        record.setdefault("created_at", ts)
+        record["source_agent"] = str(source_agent or _document_default_agent(resolved_obj_name))
+        record["link"] = deepcopy(
+            result_payload.get("link")
+            if isinstance(result_payload.get("link"), dict)
+            else fallback_link_payload
+            if isinstance(fallback_link_payload, dict)
+            else {}
+        )
+        record["file"] = deepcopy(
+            result_payload.get("file")
+            if isinstance(result_payload.get("file"), dict)
+            else fallback_file_payload
+            if isinstance(fallback_file_payload, dict)
+            else {}
+        )
+        record["parse"] = deepcopy(parse_section)
+        for explicit_key in ("raw_text_document", "entity_objects", "relation_objects"):
+            explicit_value = result_payload.get(explicit_key)
+            if explicit_value is not None:
+                record[explicit_key] = deepcopy(explicit_value)
+        record[resolved_section_key] = deepcopy(document_section)
+        record["handoff_metadata"] = deepcopy(metadata)
+        record["source_payload"] = deepcopy(source_payload)
+        record_title = self._load_document_record_title(
+            correlation_id=correlation_id,
+            document_section=document_section,
+            result_payload=result_payload,
+            existing_record=record,
+        )
+        record_source_path = self._load_document_record_source_path(
+            result_payload=result_payload,
+            existing_record=record,
+            source_payload=source_payload,
+            fallback_link_payload=fallback_link_payload,
+            fallback_file_payload=fallback_file_payload,
+        )
+        normalized_state, effective_processed, effective_failed_reason = self._resolve_document_record_status(
+            record=record,
+            result_payload=result_payload,
+            resolved_obj_name=resolved_obj_name,
+            document_section=document_section,
+        )
+        return self._normalize_operational_record(
+            record=record,
+            correlation_id=correlation_id,
+            object_name=resolved_obj_name,
+            source_agent=record.get("source_agent"),
+            source_path=record_source_path,
+            title=record_title,
+            content_sha256=_first_non_empty_text(
+                (record.get("file") or {}).get("content_sha256") if isinstance(record.get("file"), dict) else None,
+                (result_payload.get("db_updates") or {}).get("content_sha256") if isinstance(result_payload.get("db_updates"), dict) else None,
+                record.get("content_sha256"),
+                correlation_id,
+            ),
+            processing_state=normalized_state,
+            processed=effective_processed,
+            failed_reason=effective_failed_reason,
+            touched_at=ts,
+        )
+
+    def _load_backend_record(
+        self,
+        *,
+        storage_key: str,
+        record_id: str,
+        db_name: str,
+        obj_name: str,
+    ) -> dict[str, Any] | None:
+        mongo_backend = self._require_agentsdb_backend()
+        record = mongo_backend.load_record(
+            storage_key=storage_key,
+            record_id=record_id,
+            db_name=db_name,
+            obj_name=obj_name,
+        )
+        return dict(record) if isinstance(record, dict) else None
+
+    def _upsert_backend_record(
+        self,
+        *,
+        storage_key: str,
+        record_id: str,
+        record_value: dict[str, Any],
+        db_name: str,
+        obj_name: str,
+    ) -> None:
+        mongo_backend = self._require_agentsdb_backend()
+        mongo_backend.upsert_record(
+            storage_key=storage_key,
+            record_id=record_id,
+            record_value=record_value,
+            db_name=db_name,
+            obj_name=obj_name,
+        )
+
+    def _delete_backend_record(
+        self,
+        *,
+        storage_key: str,
+        record_id: str,
+        db_name: str,
+        obj_name: str,
+    ) -> None:
+        mongo_backend = self._require_agentsdb_backend()
+        mongo_backend.delete_record(
+            storage_key=storage_key,
+            record_id=record_id,
+            db_name=db_name,
+            obj_name=obj_name,
+        )
+
     def persist_document(
         self,
         *,
@@ -1221,52 +1611,37 @@ class DocumentRepository:
         handoff_payload: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         resolved_obj_name = _normalize_document_obj_name(obj_name)
-        resolved_section_key = _document_section_key(resolved_obj_name)
         resolved_db_path = self._resolve_db_path(db_path, db_name=resolved_obj_name, obj_name=resolved_obj_name)
-        mongo_backend = self._require_agentsdb_backend()
-        existing_record = mongo_backend.load_record(
+        existing_record = self._load_backend_record(
             storage_key=resolved_db_path,
             record_id=correlation_id,
             db_name=resolved_obj_name,
             obj_name=resolved_obj_name,
         )
-        if existing_record is None:
-            record = {}
-        else:
-            record = existing_record
-        record = dict(record)
-        ts = _now_utc_iso()
 
         metadata = dict(handoff_metadata or {})
         incoming_payload = dict(handoff_payload or {})
         output_payload = incoming_payload.get("output") if isinstance(incoming_payload.get("output"), dict) else {}
-        parse_section = result_payload.get("parse") if isinstance(result_payload.get("parse"), dict) else {}
-        document_section = _extract_document_section(result_payload, resolved_obj_name)
-        db_updates = result_payload.get("db_updates") if isinstance(result_payload.get("db_updates"), dict) else {}
         fallback_source_payload = output_payload if output_payload else result_payload
 
-        record["correlation_id"] = correlation_id
-        record["updated_at"] = ts
-        record.setdefault("created_at", ts)
-        record["source_agent"] = str(
+        record = self._build_document_record(
+            existing_record=existing_record if isinstance(existing_record, dict) else None,
+            correlation_id=correlation_id,
+            result_payload=result_payload,
+            resolved_obj_name=resolved_obj_name,
+            source_agent=str(
             incoming_payload.get("agent_label")
             or metadata.get("source_agent")
             or result_payload.get("agent")
             or _document_default_agent(resolved_obj_name)
+            ),
+            metadata=metadata,
+            source_payload=fallback_source_payload,
+            fallback_link_payload=output_payload.get("link") if isinstance(output_payload.get("link"), dict) else None,
+            fallback_file_payload=output_payload.get("file") if isinstance(output_payload.get("file"), dict) else None,
         )
-        record["link"] = deepcopy(result_payload.get("link") if isinstance(result_payload.get("link"), dict) else output_payload.get("link") if isinstance(output_payload.get("link"), dict) else {})
-        record["file"] = deepcopy(result_payload.get("file") if isinstance(result_payload.get("file"), dict) else output_payload.get("file") if isinstance(output_payload.get("file"), dict) else {})
-        record["parse"] = deepcopy(parse_section)
-        for explicit_key in ("raw_text_document", "entity_objects", "relation_objects"):
-            explicit_value = result_payload.get(explicit_key)
-            if explicit_value is not None:
-                record[explicit_key] = deepcopy(explicit_value)
-        record[resolved_section_key] = deepcopy(document_section)
-        record["db_updates"] = deepcopy(db_updates)
-        record["handoff_metadata"] = deepcopy(metadata)
-        record["source_payload"] = deepcopy(fallback_source_payload)
 
-        mongo_backend.upsert_record(
+        self._upsert_backend_record(
             storage_key=resolved_db_path,
             record_id=correlation_id,
             record_value=record,
@@ -1291,26 +1666,43 @@ class DocumentRepository:
         resolved_obj_name = _normalize_document_obj_name(obj_name)
         resolved_section_key = _document_section_key(resolved_obj_name)
         resolved_db_path = self._resolve_db_path(db_path, db_name=resolved_obj_name, obj_name=resolved_obj_name)
-        mongo_backend = self._require_agentsdb_backend()
-        record = mongo_backend.load_record(
+        record = self._load_backend_record(
             storage_key=resolved_db_path,
             record_id=correlation_id,
             db_name=resolved_obj_name,
             obj_name=resolved_obj_name,
         )
-        if not isinstance(record, dict):
+        if record is None:
             return None
+        normalized_record = self._normalize_operational_record(
+            record=record,
+            correlation_id=correlation_id,
+            object_name=resolved_obj_name,
+        )
         result = {
-            "agent": str(record.get("source_agent") or record.get("agent") or _document_default_agent(resolved_obj_name)),
-            "correlation_id": str(record.get("correlation_id") or correlation_id),
-            "link": deepcopy(record.get("link") or {}),
-            "file": deepcopy(record.get("file") or {}),
-            "parse": deepcopy(record.get("parse") or {}),
-            resolved_section_key: deepcopy(record.get(resolved_section_key) or record.get(resolved_obj_name) or {}),
-            "db_updates": deepcopy(record.get("db_updates") or {}),
+            "id": str(normalized_record.get("id") or correlation_id),
+            "agent": str(normalized_record.get("source_agent") or normalized_record.get("agent") or _document_default_agent(resolved_obj_name)),
+            "correlation_id": str(normalized_record.get("correlation_id") or correlation_id),
+            "content_sha256": str(normalized_record.get("content_sha256") or correlation_id),
+            "title": str(normalized_record.get("title") or correlation_id),
+            "source": str(normalized_record.get("source") or normalized_record.get("source_agent") or ""),
+            "source_path": normalized_record.get("source_path"),
+            "path": normalized_record.get("path"),
+            "record_kind": str(normalized_record.get("record_kind") or "document"),
+            "kind": str(normalized_record.get("kind") or "document"),
+            "object_name": str(normalized_record.get("object_name") or resolved_obj_name),
+            "status": str(normalized_record.get("status") or normalized_record.get("processing_state") or "failed"),
+            "processing_state": str(normalized_record.get("processing_state") or normalized_record.get("status") or "failed"),
+            "processed": bool(normalized_record.get("processed")) if isinstance(normalized_record.get("processed"), bool) else str(normalized_record.get("processing_state") or "").strip().lower() == "processed",
+            "failed_reason": normalized_record.get("failed_reason"),
+            "link": deepcopy(normalized_record.get("link") or {}),
+            "file": deepcopy(normalized_record.get("file") or {}),
+            "parse": deepcopy(normalized_record.get("parse") or {}),
+            resolved_section_key: deepcopy(normalized_record.get(resolved_section_key) or normalized_record.get(resolved_obj_name) or {}),
+            "db_updates": self._build_legacy_db_updates(record=normalized_record),
         }
         for explicit_key in ("raw_text_document", "entity_objects", "relation_objects"):
-            explicit_value = record.get(explicit_key)
+            explicit_value = normalized_record.get(explicit_key)
             if explicit_value is not None:
                 result[explicit_key] = deepcopy(explicit_value)
         return result
@@ -1322,14 +1714,19 @@ class DocumentRepository:
         db_path: str | None = None,
     ) -> dict[str, Any] | None:
         resolved_db_path = self._resolve_db_path(db_path, db_name="dispatcher_documents")
-        mongo_backend = self._require_agentsdb_backend()
-        record = mongo_backend.load_record(
+        record = self._load_backend_record(
             storage_key=resolved_db_path,
             record_id=correlation_id,
             db_name="dispatcher_documents",
             obj_name="documents",
         )
-        return deepcopy(record) if isinstance(record, dict) else None
+        if record is None:
+            return None
+        return self._normalize_operational_record(
+            record=record,
+            correlation_id=correlation_id,
+            object_name=str(record.get("object_name") or "documents"),
+        )
 
     def get_dispatcher_records(
         self,
@@ -1342,17 +1739,20 @@ class DocumentRepository:
         if not normalized_ids:
             return {}
 
-        mongo_backend = self._require_agentsdb_backend()
         records: dict[str, dict[str, Any]] = {}
         for correlation_id in normalized_ids:
-            record = mongo_backend.load_record(
+            record = self._load_backend_record(
                 storage_key=resolved_db_path,
                 record_id=correlation_id,
                 db_name="dispatcher_documents",
                 obj_name="documents",
             )
-            if isinstance(record, dict):
-                records[correlation_id] = deepcopy(record)
+            if record is not None:
+                records[correlation_id] = self._normalize_operational_record(
+                    record=record,
+                    correlation_id=correlation_id,
+                    object_name=str(record.get("object_name") or "documents"),
+                )
         return records
 
     def update_dispatcher_status(
@@ -1366,8 +1766,7 @@ class DocumentRepository:
         extra_updates: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         resolved_db_path = self._resolve_db_path(db_path, db_name="dispatcher_documents")
-        mongo_backend = self._require_agentsdb_backend()
-        existing_record = mongo_backend.load_record(
+        existing_record = self._load_backend_record(
             storage_key=resolved_db_path,
             record_id=correlation_id,
             db_name="dispatcher_documents",
@@ -1380,23 +1779,6 @@ class DocumentRepository:
         effective_processed = bool(processed) if processed is not None else normalized_state == "processed"
         ts = _now_utc_iso()
 
-        record.setdefault("id", correlation_id)
-        record["content_sha256"] = correlation_id
-        record["processing_state"] = normalized_state
-        record["processed"] = effective_processed
-        record["last_seen_at"] = ts
-
-        if effective_processed:
-            record["processed_at"] = ts
-            record["failed_reason"] = None
-            record["last_error"] = None
-            record["last_error_at"] = None
-        else:
-            reason = str(failed_reason or "").strip() or None
-            record["failed_reason"] = reason
-            record["last_error"] = reason
-            record["last_error_at"] = ts if reason else None
-
         if isinstance(extra_updates, dict):
             for key, value in extra_updates.items():
                 if value is None and key in {"failed_reason", "last_error", "last_error_at"}:
@@ -1404,7 +1786,21 @@ class DocumentRepository:
                 elif value is not None:
                     record[str(key)] = value
 
-        mongo_backend.upsert_record(
+        record = self._normalize_operational_record(
+            record=record,
+            correlation_id=correlation_id,
+            object_name=str(record.get("object_name") or "documents"),
+            source_agent=_first_non_empty_text(record.get("source_agent"), record.get("source")),
+            source_path=_first_non_empty_text(record.get("source_path"), record.get("path")),
+            title=_first_non_empty_text(record.get("title")),
+            content_sha256=_first_non_empty_text(record.get("content_sha256"), correlation_id),
+            processing_state=normalized_state,
+            processed=effective_processed,
+            failed_reason=_first_non_empty_text(failed_reason, record.get("failed_reason"), record.get("last_error")),
+            touched_at=ts,
+        )
+
+        self._upsert_backend_record(
             storage_key=resolved_db_path,
             record_id=correlation_id,
             record_value=record,
@@ -1468,17 +1864,12 @@ class DocumentRepository:
         resolved_obj_name = _normalize_document_obj_name(obj_name)
         resolved_dispatcher_db_path = self._resolve_db_path(dispatcher_db_path, db_name="dispatcher_documents")
         resolved_obj_db_path = self._resolve_db_path(obj_db_path, db_name=resolved_obj_name, obj_name=resolved_obj_name)
-        mongo_backend = self._require_agentsdb_backend()
 
-        resolved_section_key = _document_section_key(resolved_obj_name)
-        ts = _now_utc_iso()
-        parse_section = result_payload.get("parse") if isinstance(result_payload.get("parse"), dict) else {}
-        record_section = _extract_document_section(result_payload, resolved_obj_name)
         db_updates = result_payload.get("db_updates") if isinstance(result_payload.get("db_updates"), dict) else {}
         metadata = {"source_agent": str(source_agent or result_payload.get("agent") or _document_default_agent(resolved_obj_name))}
         source_payload_dict = deepcopy(source_payload) if isinstance(source_payload, dict) else {}
 
-        existing_record = mongo_backend.load_record(
+        existing_record = self._load_backend_record(
             storage_key=resolved_obj_db_path,
             record_id=record_id,
             db_name=resolved_obj_name,
@@ -1488,33 +1879,42 @@ class DocumentRepository:
             existing_record = {}
         else:
             existing_record = dict(existing_record)
-        next_record = dict(existing_record)
-        next_record["correlation_id"] = record_id
-        next_record["updated_at"] = ts
-        next_record.setdefault("created_at", ts)
-        next_record["source_agent"] = str(source_agent or result_payload.get("agent") or _document_default_agent(resolved_obj_name))
-        next_record["link"] = deepcopy(result_payload.get("link") if isinstance(result_payload.get("link"), dict) else {})
-        next_record["file"] = deepcopy(result_payload.get("file") if isinstance(result_payload.get("file"), dict) else {})
-        next_record["parse"] = deepcopy(parse_section)
-        for explicit_key in ("raw_text_document", "entity_objects", "relation_objects"):
-            explicit_value = result_payload.get(explicit_key)
-            if explicit_value is not None:
-                next_record[explicit_key] = deepcopy(explicit_value)
-        next_record[resolved_section_key] = deepcopy(record_section)
-        next_record["db_updates"] = deepcopy(db_updates)
-        next_record["handoff_metadata"] = deepcopy(metadata)
-        next_record["source_payload"] = deepcopy(source_payload_dict)
+        next_record = self._build_document_record(
+            existing_record=existing_record,
+            correlation_id=record_id,
+            result_payload=result_payload,
+            resolved_obj_name=resolved_obj_name,
+            source_agent=str(source_agent or result_payload.get("agent") or _document_default_agent(resolved_obj_name)),
+            metadata=metadata,
+            source_payload=source_payload_dict,
+        )
 
         normalized_state = str(
             processing_state
             or db_updates.get("processing_state")
-            or ("processed" if (record_section or parse_section.get("is_job_posting")) else "failed")
+            or (
+                "processed"
+                if (
+                    next_record.get(_document_section_key(resolved_obj_name))
+                    or bool((next_record.get("parse") or {}).get("is_job_posting"))
+                )
+                else "failed"
+            )
         ).strip().lower() or "failed"
         effective_processed = bool(processed) if processed is not None else bool(db_updates.get("processed")) if isinstance(db_updates.get("processed"), bool) else normalized_state == "processed"
         effective_failed_reason = str(failed_reason or db_updates.get("failed_reason") or "").strip() or None
+        next_record = self._normalize_operational_record(
+            record=next_record,
+            correlation_id=record_id,
+            object_name=resolved_obj_name,
+            processing_state=normalized_state,
+            processed=effective_processed,
+            failed_reason=effective_failed_reason,
+            touched_at=_now_utc_iso(),
+        )
 
         try:
-            mongo_backend.upsert_record(
+            self._upsert_backend_record(
                 storage_key=resolved_obj_db_path,
                 record_id=record_id,
                 record_value=next_record,
@@ -1532,7 +1932,7 @@ class DocumentRepository:
         except Exception as exc:
             try:
                 if isinstance(existing_record, dict) and existing_record:
-                    mongo_backend.upsert_record(
+                    self._upsert_backend_record(
                         storage_key=resolved_obj_db_path,
                         record_id=record_id,
                         record_value=existing_record,
@@ -1540,7 +1940,7 @@ class DocumentRepository:
                         obj_name=resolved_obj_name,
                     )
                 else:
-                    mongo_backend.delete_record(
+                    self._delete_backend_record(
                         storage_key=resolved_obj_db_path,
                         record_id=record_id,
                         db_name=resolved_obj_name,
@@ -1611,6 +2011,706 @@ class DocumentRepository:
 
 
 DOCUMENT_REPOSITORY = DocumentRepository()
+
+
+class AgentDbOperationService:
+    _DEFAULT_AGENTS_DB_URI = "agentsdb://localhost:2331"
+    _DEFAULT_BACKEND_URI = "agentsmem://local"
+    _DEFAULT_DATABASE_NAME = "alde_knowledge"
+    _SUPPORTED_OPERATION_NAMES = (
+        "health",
+        "ensure_index_objects",
+        "upsert_object",
+        "delete_object",
+        "load_object",
+        "load_objects",
+        "find_objects",
+        "load_relation_graph",
+        "apply_operations",
+    )
+
+    def _load_operation_config(
+        self,
+        *,
+        agents_db_uri: str | None = None,
+        backend_uri: str | None = None,
+        database_name: str | None = None,
+        memory_image_path: str | None = None,
+    ) -> dict[str, Any]:
+        resolved_agents_db_uri = str(
+            agents_db_uri or os.getenv("AI_IDE_KNOWLEDGE_AGENTS_DB_URI", self._DEFAULT_AGENTS_DB_URI)
+        ).strip() or self._DEFAULT_AGENTS_DB_URI
+        resolved_backend_uri = str(
+            backend_uri or os.getenv("AI_IDE_KNOWLEDGE_AGENTS_DB_BACKEND_URI", self._DEFAULT_BACKEND_URI)
+        ).strip() or self._DEFAULT_BACKEND_URI
+        resolved_database_name = str(
+            database_name or os.getenv("AI_IDE_KNOWLEDGE_AGENTS_DB_NAME", self._DEFAULT_DATABASE_NAME)
+        ).strip() or self._DEFAULT_DATABASE_NAME
+        resolved_memory_image_path = str(
+            memory_image_path or os.getenv("AI_IDE_KNOWLEDGE_AGENTS_DB_MEMORY_IMAGE_PATH", "")
+        ).strip() or None
+        return {
+            "agents_db_uri": resolved_agents_db_uri,
+            "backend_uri": resolved_backend_uri,
+            "database_name": resolved_database_name,
+            "memory_image_path": resolved_memory_image_path,
+        }
+
+    def _load_repository(self, config: dict[str, Any]) -> Any:
+        resolved_agents_db_uri = str(config.get("agents_db_uri") or "").strip()
+        resolved_backend_uri = str(config.get("backend_uri") or "").strip()
+        resolved_database_name = str(config.get("database_name") or self._DEFAULT_DATABASE_NAME).strip() or self._DEFAULT_DATABASE_NAME
+        resolved_memory_image_path = str(config.get("memory_image_path") or "").strip() or None
+        if resolved_agents_db_uri.lower().startswith("agentsdb://") and AgentDbSocketRepository is not None:
+            try:
+                if AgentDbRepositoryFactory is not None and AgentDbRepositoryFactoryConfig is not None:
+                    socket_repository = AgentDbRepositoryFactory(
+                        AgentDbRepositoryFactoryConfig(
+                            backend_uri=resolved_agents_db_uri,
+                            default_database_name=resolved_database_name,
+                            memory_image_path=resolved_memory_image_path,
+                        )
+                    ).load_repository()
+                else:
+                    socket_repository = AgentDbSocketRepository.create_from_uri(resolved_agents_db_uri, resolved_database_name)
+                socket_repository.ensure_index_objects()
+                return socket_repository
+            except Exception:
+                pass
+
+        repository_uri = resolved_backend_uri or resolved_agents_db_uri or self._DEFAULT_BACKEND_URI
+        prefer_explicit_inmemory = str(repository_uri or "").strip().lower().startswith(("agentsmem://", "memodb://", "inmemdb://"))
+
+        if AgentDbRepositoryFactory is not None and AgentDbRepositoryFactoryConfig is not None and repository_uri:
+            return AgentDbRepositoryFactory(
+                AgentDbRepositoryFactoryConfig(
+                    backend_uri=repository_uri,
+                    default_database_name=resolved_database_name,
+                    memory_image_path=resolved_memory_image_path,
+                    prefer_explicit_inmemory=prefer_explicit_inmemory,
+                )
+            ).load_repository()
+
+        if KnowledgeRepository is not None and repository_uri:
+            return KnowledgeRepository.create_from_uri(repository_uri, resolved_database_name)
+
+        raise RuntimeError("agents_db_repository_unavailable")
+
+    def _load_backend_diagnostic(self, repository: Any, config: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "repository_type": type(repository).__name__ if repository is not None else None,
+            "agents_db_uri": str(config.get("agents_db_uri") or "").strip(),
+            "backend_uri": str(config.get("backend_uri") or "").strip(),
+            "database_name": str(config.get("database_name") or "").strip(),
+            "memory_image_path": str(config.get("memory_image_path") or "").strip() or None,
+        }
+
+    def _json_result(self, payload: dict[str, Any]) -> str:
+        return json.dumps(payload, ensure_ascii=False, default=str)
+
+    def _error_result(self, operation: str, error_code: str, detail: str | None = None) -> str:
+        payload: dict[str, Any] = {
+            "ok": False,
+            "operation": str(operation or "").strip().lower(),
+            "error": error_code,
+        }
+        if detail:
+            payload["detail"] = detail
+        return self._json_result(payload)
+
+    def _normalize_result_object_payload(self, *, object_name: str | None, object_payload: Any) -> Any:
+        if not isinstance(object_payload, typing.Mapping):
+            return object_payload
+        normalized_payload = dict(object_payload)
+        normalized_object_name = str(object_name or "").strip().lower()
+        if normalized_object_name == "relation":
+            metadata = normalized_payload.get("metadata") if isinstance(normalized_payload.get("metadata"), typing.Mapping) else {}
+            relation_description = str(
+                normalized_payload.get("relation_description")
+                or metadata.get("relation_description")
+                or ""
+            ).strip()
+            if relation_description:
+                normalized_payload["relation_description"] = relation_description
+        return normalized_payload
+
+    def _normalize_result_object_payload_list(self, *, object_name: str | None, object_payload_list: Any) -> list[Any]:
+        if not isinstance(object_payload_list, list):
+            return []
+        return [
+            self._normalize_result_object_payload(object_name=object_name, object_payload=item)
+            for item in object_payload_list
+        ]
+
+    def _apply_operation_batch(self, repository: Any, operations: list[dict[str, Any]]) -> dict[str, Any]:
+        applied = 0
+        deleted = 0
+        results: list[dict[str, Any]] = []
+
+        def execute_operations() -> None:
+            nonlocal applied, deleted
+            for operation_payload in operations:
+                action_name = str(operation_payload.get("action") or operation_payload.get("operation") or "").strip().lower()
+                object_name = str(operation_payload.get("object_name") or "").strip()
+                object_id = str(operation_payload.get("object_id") or "").strip()
+                if action_name in {"upsert", "upsert_object"}:
+                    object_payload = operation_payload.get("object_payload")
+                    if not object_name or not object_id or not isinstance(object_payload, typing.Mapping):
+                        results.append({
+                            "action": "upsert",
+                            "object_name": object_name,
+                            "object_id": object_id,
+                            "ok": False,
+                            "error": "invalid_batch_upsert_operation",
+                        })
+                        continue
+                    stored_payload = repository.upsert_object(object_name, object_id, dict(object_payload))
+                    applied += 1
+                    results.append({
+                        "action": "upsert",
+                        "object_name": object_name,
+                        "object_id": object_id,
+                        "ok": True,
+                        "object_payload": dict(stored_payload) if isinstance(stored_payload, typing.Mapping) else stored_payload,
+                    })
+                    continue
+                if action_name in {"delete", "delete_object"}:
+                    if not object_name or not object_id:
+                        results.append({
+                            "action": "delete",
+                            "object_name": object_name,
+                            "object_id": object_id,
+                            "ok": False,
+                            "error": "invalid_batch_delete_operation",
+                        })
+                        continue
+                    deleted_flag = bool(repository.delete_object(object_name, object_id))
+                    applied += 1
+                    if deleted_flag:
+                        deleted += 1
+                    results.append({
+                        "action": "delete",
+                        "object_name": object_name,
+                        "object_id": object_id,
+                        "ok": deleted_flag,
+                    })
+                    continue
+                results.append({
+                    "action": action_name,
+                    "object_name": object_name,
+                    "object_id": object_id,
+                    "ok": False,
+                    "error": "unsupported_batch_operation",
+                })
+
+        flush_context = getattr(repository, "deferred_write_queue", None)
+        if not callable(flush_context):
+            flush_context = getattr(repository, "deferred_flush", None)
+
+        if callable(flush_context):
+            with flush_context():
+                execute_operations()
+        else:
+            execute_operations()
+
+        return {
+            "ok": True,
+            "applied": applied,
+            "deleted": deleted,
+            "results": results,
+        }
+
+    def execute_operation(
+        self,
+        *,
+        operation: str,
+        object_name: str | None = None,
+        object_id: str | None = None,
+        object_payload: dict[str, Any] | None = None,
+        object_filter: dict[str, Any] | None = None,
+        limit: int | None = None,
+        namespace_id: str | None = None,
+        query_text: str | None = None,
+        source_entity_id: str | None = None,
+        max_depth: int | None = None,
+        operations: list[dict[str, Any]] | None = None,
+        agents_db_uri: str | None = None,
+        backend_uri: str | None = None,
+        database_name: str | None = None,
+        memory_image_path: str | None = None,
+    ) -> str:
+        normalized_operation = str(operation or "").strip().lower()
+        if normalized_operation not in self._SUPPORTED_OPERATION_NAMES:
+            return self._error_result(
+                normalized_operation,
+                "unsupported_adb_operation",
+                detail="supported operations: " + ", ".join(self._SUPPORTED_OPERATION_NAMES),
+            )
+
+        config = self._load_operation_config(
+            agents_db_uri=agents_db_uri,
+            backend_uri=backend_uri,
+            database_name=database_name,
+            memory_image_path=memory_image_path,
+        )
+
+        try:
+            repository = self._load_repository(config)
+        except Exception as exc:
+            return self._error_result(normalized_operation, "agents_db_repository_unavailable", detail=str(exc))
+
+        if normalized_operation != "health":
+            ensure_index_objects = getattr(repository, "ensure_index_objects", None)
+            if callable(ensure_index_objects):
+                try:
+                    ensure_index_objects()
+                except Exception:
+                    pass
+
+        try:
+            if normalized_operation == "health":
+                health_request = getattr(repository, "_request_object", None)
+                health_payload = health_request("health") if callable(health_request) else {"ok": True, "status": "ok"}
+                result_payload = dict(health_payload) if isinstance(health_payload, typing.Mapping) else {"ok": True, "status": "ok"}
+            elif normalized_operation == "ensure_index_objects":
+                repository.ensure_index_objects()
+                result_payload = {"ok": True, "ensured": True}
+            elif normalized_operation == "upsert_object":
+                normalized_object_name = str(object_name or "").strip()
+                normalized_object_id = str(object_id or "").strip()
+                if not normalized_object_name or not normalized_object_id or not isinstance(object_payload, typing.Mapping):
+                    return self._error_result(normalized_operation, "invalid_upsert_request")
+                stored_payload = repository.upsert_object(normalized_object_name, normalized_object_id, dict(object_payload))
+                result_payload = {
+                    "ok": True,
+                    "object_payload": self._normalize_result_object_payload(
+                        object_name=normalized_object_name,
+                        object_payload=dict(stored_payload) if isinstance(stored_payload, typing.Mapping) else stored_payload,
+                    ),
+                }
+            elif normalized_operation == "delete_object":
+                normalized_object_name = str(object_name or "").strip()
+                normalized_object_id = str(object_id or "").strip()
+                if not normalized_object_name or not normalized_object_id:
+                    return self._error_result(normalized_operation, "invalid_delete_request")
+                result_payload = {"ok": True, "deleted": bool(repository.delete_object(normalized_object_name, normalized_object_id))}
+            elif normalized_operation == "load_object":
+                normalized_object_name = str(object_name or "").strip()
+                normalized_object_id = str(object_id or "").strip()
+                if not normalized_object_name or not normalized_object_id:
+                    return self._error_result(normalized_operation, "invalid_load_object_request")
+                loaded_payload = repository.load_object(normalized_object_name, normalized_object_id)
+                result_payload = {
+                    "ok": True,
+                    "object_payload": self._normalize_result_object_payload(
+                        object_name=normalized_object_name,
+                        object_payload=dict(loaded_payload) if isinstance(loaded_payload, typing.Mapping) else None,
+                    ),
+                }
+            elif normalized_operation == "load_objects":
+                normalized_object_name = str(object_name or "").strip()
+                if not normalized_object_name:
+                    return self._error_result(normalized_operation, "invalid_load_objects_request")
+                if object_filter is not None and not isinstance(object_filter, dict):
+                    return self._error_result(normalized_operation, "invalid_object_filter")
+                object_payload_list = repository.load_objects(normalized_object_name, dict(object_filter or {}), max(1, int(limit or 50)))
+                result_payload = {
+                    "ok": True,
+                    "object_payload_list": self._normalize_result_object_payload_list(
+                        object_name=normalized_object_name,
+                        object_payload_list=[dict(item) if isinstance(item, typing.Mapping) else item for item in object_payload_list],
+                    ),
+                }
+            elif normalized_operation == "find_objects":
+                normalized_namespace_id = str(namespace_id or "").strip()
+                normalized_query_text = str(query_text or "").strip()
+                if not normalized_namespace_id or not normalized_query_text:
+                    return self._error_result(normalized_operation, "invalid_find_objects_request")
+                object_payload_list = repository.find_objects(
+                    namespace_id=normalized_namespace_id,
+                    query_text=normalized_query_text,
+                    limit=max(1, int(limit or 10)),
+                )
+                result_payload = {
+                    "ok": True,
+                    "object_payload_list": [dict(item) if isinstance(item, typing.Mapping) else item for item in object_payload_list],
+                }
+            elif normalized_operation == "load_relation_graph":
+                normalized_namespace_id = str(namespace_id or "").strip()
+                normalized_source_entity_id = str(source_entity_id or "").strip()
+                if not normalized_namespace_id or not normalized_source_entity_id:
+                    return self._error_result(normalized_operation, "invalid_relation_graph_request")
+                object_payload_list = repository.load_relation_graph(
+                    namespace_id=normalized_namespace_id,
+                    source_entity_id=normalized_source_entity_id,
+                    max_depth=max(0, int(max_depth or 2)),
+                )
+                result_payload = {
+                    "ok": True,
+                    "object_payload_list": self._normalize_result_object_payload_list(
+                        object_name="relation",
+                        object_payload_list=[dict(item) if isinstance(item, typing.Mapping) else item for item in object_payload_list],
+                    ),
+                }
+            else:
+                normalized_operations = [dict(item) for item in (operations or []) if isinstance(item, dict)]
+                if not normalized_operations:
+                    return self._error_result(normalized_operation, "invalid_apply_operations_request")
+                result_payload = self._apply_operation_batch(repository, normalized_operations)
+        except Exception as exc:
+            return self._error_result(normalized_operation, "adb_operation_failed", detail=f"{type(exc).__name__}: {exc}")
+
+        if not isinstance(result_payload, dict):
+            result_payload = {"ok": True, "result": result_payload}
+        result_payload.setdefault("ok", True)
+        result_payload["operation"] = normalized_operation
+        result_payload["repository"] = self._load_backend_diagnostic(repository, config)
+        return self._json_result(result_payload)
+
+
+AGENT_DB_OPERATION_SERVICE = AgentDbOperationService()
+
+
+def adb_operation(
+    operation: str,
+    object_name: str | None = None,
+    object_id: str | None = None,
+    object_payload: dict[str, Any] | None = None,
+    object_filter: dict[str, Any] | None = None,
+    limit: int | None = None,
+    namespace_id: str | None = None,
+    query_text: str | None = None,
+    source_entity_id: str | None = None,
+    max_depth: int | None = None,
+    operations: list[dict[str, Any]] | None = None,
+    agents_db_uri: str | None = None,
+    backend_uri: str | None = None,
+    database_name: str | None = None,
+    memory_image_path: str | None = None,
+) -> str:
+    return AGENT_DB_OPERATION_SERVICE.execute_operation(
+        operation=operation,
+        object_name=object_name,
+        object_id=object_id,
+        object_payload=object_payload,
+        object_filter=object_filter,
+        limit=limit,
+        namespace_id=namespace_id,
+        query_text=query_text,
+        source_entity_id=source_entity_id,
+        max_depth=max_depth,
+        operations=operations,
+        agents_db_uri=agents_db_uri,
+        backend_uri=backend_uri,
+        database_name=database_name,
+        memory_image_path=memory_image_path,
+    )
+
+
+class AgentRelationGraphToolService:
+    _DEFAULT_TOOL_ID = "agent_relation_graph"
+    _DEFAULT_SOURCE_URI = "agentsdb://127.0.0.1:2331/tools:agent_relation_graph"
+
+    def _json_result(self, payload: dict[str, Any]) -> str:
+        return json.dumps(payload, ensure_ascii=False, default=str)
+
+    def _error_result(self, error_code: str, detail: str | None = None) -> str:
+        payload: dict[str, Any] = {
+            "ok": False,
+            "tool": self._DEFAULT_TOOL_ID,
+            "error": str(error_code or "agent_relation_graph_failed"),
+        }
+        if detail:
+            payload["detail"] = str(detail)
+        return self._json_result(payload)
+
+    def _load_graph_service(self) -> Any:
+        if AgentRelationGraphService is None:
+            raise RuntimeError("agent_relation_graph_service_unavailable")
+        return AgentRelationGraphService()
+
+    def _load_source_uri(self, *, source_uri: str | None, tool_id: str) -> str:
+        normalized_source_uri = str(source_uri or "").strip()
+        if normalized_source_uri:
+            return normalized_source_uri
+
+        runtime_uri = str(os.getenv("AI_IDE_KNOWLEDGE_AGENTS_DB_URI", "")).strip()
+        if runtime_uri.lower().startswith("agentsdb://"):
+            lower_runtime_uri = runtime_uri.lower()
+            if "/tools:" in lower_runtime_uri or "/tools/" in lower_runtime_uri:
+                return runtime_uri
+            return runtime_uri.rstrip("/") + f"/tools:{tool_id}"
+        return self._DEFAULT_SOURCE_URI
+
+    def _load_degree_by_node_id(
+        self,
+        *,
+        node_objects: Sequence[typing.Mapping[str, Any]],
+        edge_objects: Sequence[typing.Mapping[str, Any]],
+    ) -> dict[str, int]:
+        degree_by_node_id: dict[str, int] = {
+            str(node_object.get("node_id") or "").strip(): 0
+            for node_object in node_objects
+            if str(node_object.get("node_id") or "").strip()
+        }
+        for edge_object in edge_objects:
+            source_node_id = str(edge_object.get("source") or "").strip()
+            target_node_id = str(edge_object.get("target") or "").strip()
+            if source_node_id:
+                degree_by_node_id[source_node_id] = degree_by_node_id.get(source_node_id, 0) + 1
+            if target_node_id:
+                degree_by_node_id[target_node_id] = degree_by_node_id.get(target_node_id, 0) + 1
+        return degree_by_node_id
+
+    def _load_relation_type_counts(
+        self,
+        *,
+        edge_objects: Sequence[typing.Mapping[str, Any]],
+    ) -> dict[str, int]:
+        relation_type_counts: dict[str, int] = {}
+        for edge_object in edge_objects:
+            relation_type = str(edge_object.get("label") or "related_to").strip() or "related_to"
+            relation_type_counts[relation_type] = relation_type_counts.get(relation_type, 0) + 1
+        return relation_type_counts
+
+    def _load_kind_counts(
+        self,
+        *,
+        node_objects: Sequence[typing.Mapping[str, Any]],
+    ) -> dict[str, int]:
+        kind_counts: dict[str, int] = {}
+        for node_object in node_objects:
+            node_kind = str(node_object.get("kind") or "entity").strip() or "entity"
+            kind_counts[node_kind] = kind_counts.get(node_kind, 0) + 1
+        return kind_counts
+
+    def _load_top_hub_rows(
+        self,
+        *,
+        node_objects: Sequence[typing.Mapping[str, Any]],
+        degree_by_node_id: dict[str, int],
+        limit: int = 8,
+    ) -> list[dict[str, Any]]:
+        node_by_id = {
+            str(node_object.get("node_id") or "").strip(): node_object
+            for node_object in node_objects
+            if str(node_object.get("node_id") or "").strip()
+        }
+        hub_rows: list[dict[str, Any]] = []
+        for node_id, degree in degree_by_node_id.items():
+            node_object = node_by_id.get(node_id) or {}
+            hub_rows.append(
+                {
+                    "node_id": node_id,
+                    "label": str(node_object.get("label") or node_id),
+                    "kind": str(node_object.get("kind") or "entity"),
+                    "degree": int(degree),
+                }
+            )
+        hub_rows.sort(key=lambda item: (-int(item.get("degree") or 0), str(item.get("label") or "").lower()))
+        return hub_rows[: max(1, int(limit or 8))]
+
+    def _load_modeling_guidance(
+        self,
+        *,
+        node_count: int,
+        edge_count: int,
+        directed_density: float,
+        relation_type_counts: dict[str, int],
+        top_hub_rows: Sequence[typing.Mapping[str, Any]],
+    ) -> list[str]:
+        guidance_rows: list[str] = []
+
+        if node_count <= 0:
+            return ["No graph nodes are available yet. Ingest entities and relations first."]
+
+        if len(relation_type_counts) <= 1 and edge_count > 0:
+            guidance_rows.append(
+                "Relation semantics are coarse-grained. Add more typed relation labels to improve AI/ML feature quality."
+            )
+
+        if node_count >= 12 and directed_density < 0.03:
+            guidance_rows.append(
+                "Graph is sparse. Consider multi-hop relation generation or ontology expansion for better neighborhood signals."
+            )
+        elif node_count >= 10 and directed_density > 0.35:
+            guidance_rows.append(
+                "Graph is dense. Consider relation pruning or confidence thresholds to reduce noise for downstream models."
+            )
+
+        if top_hub_rows:
+            top_degree = int(top_hub_rows[0].get("degree") or 0)
+            if top_degree >= max(6, int(edge_count * 0.35)):
+                guidance_rows.append(
+                    "Hub-dominant topology detected. Use hub-aware weighting to avoid central-node bias in model training."
+                )
+
+        if not guidance_rows:
+            guidance_rows.append(
+                "Graph structure looks usable for feature engineering. Validate with task-specific labels before training."
+            )
+        return guidance_rows
+
+    def execute_tool(
+        self,
+        source_uri: str | None = None,
+        tool_id: str | None = None,
+        include_view_state: bool | None = True,
+        layout_spread: float | None = 1.0,
+        selected_kind: str | None = None,
+        selected_object_id: str | None = None,
+        include_connection_preview: bool | None = False,
+    ) -> str:
+        resolved_tool_id = str(tool_id or self._DEFAULT_TOOL_ID).strip() or self._DEFAULT_TOOL_ID
+        resolved_selected_kind = str(selected_kind or "").strip().lower()
+        if resolved_selected_kind not in {"", "node", "edge"}:
+            resolved_selected_kind = ""
+        resolved_selected_object_id = str(selected_object_id or "").strip()
+        resolved_include_view_state = True if include_view_state is None else bool(include_view_state)
+        resolved_include_connection_preview = bool(include_connection_preview)
+        try:
+            resolved_layout_spread = float(layout_spread if layout_spread is not None else 1.0)
+        except Exception:
+            resolved_layout_spread = 1.0
+
+        resolved_source_uri = self._load_source_uri(source_uri=source_uri, tool_id=resolved_tool_id)
+
+        try:
+            graph_service = self._load_graph_service()
+        except Exception as exc:
+            return self._error_result("agent_relation_graph_service_unavailable", detail=f"{type(exc).__name__}: {exc}")
+
+        try:
+            snapshot_payload = dict(
+                graph_service.load_widget_snapshot(tool_id=resolved_tool_id, source_uri=resolved_source_uri) or {}
+            )
+        except Exception as exc:
+            return self._error_result("agent_relation_graph_load_failed", detail=f"{type(exc).__name__}: {exc}")
+
+        node_objects = [
+            dict(item)
+            for item in (snapshot_payload.get("nodes") or [])
+            if isinstance(item, typing.Mapping)
+        ]
+        edge_objects = [
+            dict(item)
+            for item in (snapshot_payload.get("edges") or [])
+            if isinstance(item, typing.Mapping)
+        ]
+
+        node_count = len(node_objects)
+        edge_count = len(edge_objects)
+        degree_by_node_id = self._load_degree_by_node_id(node_objects=node_objects, edge_objects=edge_objects)
+        relation_type_counts = self._load_relation_type_counts(edge_objects=edge_objects)
+        kind_counts = self._load_kind_counts(node_objects=node_objects)
+        top_hub_rows = self._load_top_hub_rows(node_objects=node_objects, degree_by_node_id=degree_by_node_id)
+        average_degree = round((2.0 * float(edge_count)) / float(node_count), 4) if node_count > 0 else 0.0
+        directed_density = (
+            round(float(edge_count) / float(node_count * (node_count - 1)), 6)
+            if node_count > 1
+            else 0.0
+        )
+
+        result_payload: dict[str, Any] = {
+            "ok": True,
+            "tool": self._DEFAULT_TOOL_ID,
+            "tool_id": str(snapshot_payload.get("tool_id") or resolved_tool_id),
+            "source_uri": str(snapshot_payload.get("source_uri") or resolved_source_uri),
+            "status_text": str(snapshot_payload.get("status_text") or ""),
+            "message": str(snapshot_payload.get("message") or ""),
+            "graph_snapshot": {
+                "view_kind": str(snapshot_payload.get("view_kind") or "relations_graph"),
+                "metadata": dict(snapshot_payload.get("metadata") or {}),
+                "nodes": node_objects,
+                "edges": edge_objects,
+            },
+            "analysis": {
+                "node_count": node_count,
+                "edge_count": edge_count,
+                "kind_counts": kind_counts,
+                "relation_type_counts": relation_type_counts,
+                "average_degree": average_degree,
+                "directed_density": directed_density,
+                "top_hubs": top_hub_rows,
+                "modeling_guidance": self._load_modeling_guidance(
+                    node_count=node_count,
+                    edge_count=edge_count,
+                    directed_density=directed_density,
+                    relation_type_counts=relation_type_counts,
+                    top_hub_rows=top_hub_rows,
+                ),
+            },
+        }
+
+        if resolved_include_view_state:
+            try:
+                view_state_payload = dict(
+                    graph_service.load_graph_view_state(
+                        snapshot_payload,
+                        layout_spread=resolved_layout_spread,
+                        selected_kind=resolved_selected_kind,
+                        selected_object_id=resolved_selected_object_id,
+                    )
+                    or {}
+                )
+                result_payload["view_state"] = {
+                    "has_graph": bool(view_state_payload.get("has_graph")),
+                    "message": str(view_state_payload.get("message") or ""),
+                    "overview_html": str(view_state_payload.get("overview_html") or ""),
+                    "detail_html": str(view_state_payload.get("detail_html") or ""),
+                    "node_draw_objects": [
+                        dict(item)
+                        for item in (view_state_payload.get("node_draw_objects") or [])
+                        if isinstance(item, typing.Mapping)
+                    ],
+                    "edge_draw_objects": [
+                        dict(item)
+                        for item in (view_state_payload.get("edge_draw_objects") or [])
+                        if isinstance(item, typing.Mapping)
+                    ],
+                    "render_commands": [
+                        dict(item)
+                        for item in (view_state_payload.get("render_commands") or [])
+                        if isinstance(item, typing.Mapping)
+                    ],
+                    "selected_kind": str(view_state_payload.get("selected_kind") or ""),
+                    "selected_object_id": str(view_state_payload.get("selected_object_id") or ""),
+                }
+            except Exception as exc:
+                result_payload["view_state_error"] = f"{type(exc).__name__}: {exc}"
+
+        if resolved_include_connection_preview:
+            try:
+                result_payload["connection_preview"] = dict(
+                    graph_service.load_connection_preview(source_uri=resolved_source_uri) or {}
+                )
+            except Exception as exc:
+                result_payload["connection_preview_error"] = f"{type(exc).__name__}: {exc}"
+
+        return self._json_result(result_payload)
+
+
+AGENT_RELATION_GRAPH_TOOL_SERVICE = AgentRelationGraphToolService()
+
+
+def agent_relation_graph(
+    source_uri: str | None = None,
+    tool_id: str | None = None,
+    include_view_state: bool | None = True,
+    layout_spread: float | None = 1.0,
+    selected_kind: str | None = None,
+    selected_object_id: str | None = None,
+    include_connection_preview: bool | None = False,
+) -> str:
+    return AGENT_RELATION_GRAPH_TOOL_SERVICE.execute_tool(
+        source_uri=source_uri,
+        tool_id=tool_id,
+        include_view_state=include_view_state,
+        layout_spread=layout_spread,
+        selected_kind=selected_kind,
+        selected_object_id=selected_object_id,
+        include_connection_preview=include_connection_preview,
+    )
 
 
 def diagnose_dispatch_backend(*, db_path: str | None = None, emit: bool = False) -> dict[str, Any]:
@@ -1728,16 +2828,16 @@ class RequestObjectResolutionService:
         "profiles": RequestObjectSpec(
             obj_name="profiles",
             result_sources=("profile_result", "resolved_profile", "parsed_profile"),
-            store_sources=("profile_id", "profiles_db", "stored_profile", "persisted_profile"),
+            store_sources=("profile_id", "profiles_db"),
             file_sources=("file", "path", "json_file", "structured_file", "document_file"),
             correlation_candidates=("correlation_id", "profile_id", "id"),
             db_path_aliases=("db_path", "profiles_db_path"),
             parse_mode="profile",
         ),
         "job_postings": RequestObjectSpec(
-            obj_name="job_postings",
+            obj_name="Jjob_postings",
             result_sources=("job_posting_result", "resolved_job_posting", "parsed_job_posting"),
-            store_sources=("correlation_id", "job_postings_db", "stored_job_posting", "persisted_job_posting"),
+            store_sources=("correlation_id", "job_postings_db"),
             file_sources=("file", "path", "text_file", "document_file", "structured_file", "json_file"),
             correlation_candidates=("correlation_id", "content_sha256", "job_id", "external_id", "title"),
             db_path_aliases=("db_path", "job_postings_db_path"),
@@ -1814,6 +2914,62 @@ class RequestObjectResolutionService:
                 return fallback_value.strip()
         return None
 
+    def _normalize_source_set(self, source_values: set[str] | tuple[str, ...]) -> set[str]:
+        return {str(item).strip().lower() for item in source_values if str(item).strip()}
+
+    def _resolve_source_sets(
+        self,
+        *,
+        spec: RequestObjectSpec,
+        store_sources: set[str] | None = None,
+        file_sources: set[str] | None = None,
+        inline_sources: set[str] | None = None,
+    ) -> dict[str, set[str]]:
+        return {
+            "result": self._normalize_source_set(spec.result_sources),
+            "store": self._normalize_source_set(store_sources or set(spec.store_sources)),
+            "file": self._normalize_source_set(file_sources or set(spec.file_sources)),
+            "inline": self._normalize_source_set(inline_sources or set(spec.inline_sources)),
+        }
+
+    def _load_result_from_source(
+        self,
+        *,
+        source: str,
+        value: Any,
+        request_payload: dict[str, Any],
+        fallback_payload: dict[str, Any] | None,
+        db_path_field: str | None,
+        spec: RequestObjectSpec,
+        resolved_obj_name: str,
+        source_sets: dict[str, set[str]],
+    ) -> dict[str, Any] | None:
+        if source in source_sets["result"] and isinstance(value, dict):
+            return deepcopy(value)
+        if source in source_sets["store"]:
+            correlation_id = self.resolve_correlation_id(
+                value=value,
+                candidates=spec.correlation_candidates,
+                fallback_values=[request_payload],
+            )
+            if not correlation_id:
+                return None
+            db_path = self.resolve_db_path(
+                request_payload=request_payload,
+                fallback_payload=fallback_payload,
+                db_path_field=db_path_field,
+                spec=spec,
+            )
+            return self.load_result_from_store(correlation_id=correlation_id, obj_name=resolved_obj_name, db_path=db_path)
+        if source in source_sets["file"]:
+            candidate_path = self.resolve_source_path(request_payload=request_payload, value=value, spec=spec)
+            if not candidate_path:
+                return None
+            return self.load_result_from_file(source_path=candidate_path, obj_name=resolved_obj_name)
+        if source in source_sets["inline"] or (not source and value is not None):
+            return self.build_inline_result(value, obj_name=resolved_obj_name)
+        return None
+
     def normalize_object_value(
         self,
         *,
@@ -1876,6 +3032,85 @@ class RequestObjectResolutionService:
             return parse_payload
         return {"errors": [], "warnings": []}
 
+    def _augment_canonical_result_payload(
+        self,
+        result_payload: dict[str, Any],
+        *,
+        obj_name: str,
+        source_path: str | None = None,
+        correlation_id: str | None = None,
+    ) -> dict[str, Any]:
+        resolved_obj_name = _normalize_document_obj_name(obj_name)
+        resolved_result_key = _document_section_key(resolved_obj_name)
+        normalized_correlation_id = str(
+            correlation_id
+            or result_payload.get("correlation_id")
+            or ((result_payload.get("file") or {}).get("content_sha256") if isinstance(result_payload.get("file"), dict) else "")
+            or ""
+        ).strip()
+        partial_record = dict(result_payload)
+        if isinstance(partial_record.get("file"), dict):
+            partial_record["file"] = deepcopy(partial_record.get("file") or {})
+        else:
+            partial_record["file"] = {}
+        if source_path and not str((partial_record.get("file") or {}).get("path") or "").strip():
+            partial_record["file"]["path"] = source_path
+        if normalized_correlation_id and not str((partial_record.get("file") or {}).get("content_sha256") or "").strip():
+            partial_record["file"]["content_sha256"] = normalized_correlation_id
+        normalized_record = DOCUMENT_REPOSITORY._normalize_operational_record(
+            record=partial_record,
+            correlation_id=normalized_correlation_id or _first_non_empty_text(source_path) or "record",
+            object_name=resolved_obj_name,
+            source_agent=_first_non_empty_text(result_payload.get("agent"), result_payload.get("source"), result_payload.get("source_agent")),
+            source_path=source_path,
+            title=_first_non_empty_text(
+                result_payload.get("title"),
+                (result_payload.get(resolved_result_key) or {}).get("title") if isinstance(result_payload.get(resolved_result_key), dict) else None,
+                (result_payload.get(resolved_result_key) or {}).get("job_title") if isinstance(result_payload.get(resolved_result_key), dict) else None,
+                (result_payload.get("raw_text_document") or {}).get("title") if isinstance(result_payload.get("raw_text_document"), dict) else None,
+            ),
+            content_sha256=_first_non_empty_text(
+                result_payload.get("content_sha256"),
+                ((result_payload.get("file") or {}).get("content_sha256") if isinstance(result_payload.get("file"), dict) else None),
+                normalized_correlation_id,
+            ),
+            processing_state=_first_non_empty_text(
+                result_payload.get("processing_state"),
+                result_payload.get("status"),
+                ((result_payload.get("db_updates") or {}).get("processing_state") if isinstance(result_payload.get("db_updates"), dict) else None),
+                "processed",
+            ),
+            processed=result_payload.get("processed") if isinstance(result_payload.get("processed"), bool) else True,
+            failed_reason=_first_non_empty_text(
+                result_payload.get("failed_reason"),
+                ((result_payload.get("db_updates") or {}).get("failed_reason") if isinstance(result_payload.get("db_updates"), dict) else None),
+            ),
+        )
+        augmented_payload = dict(result_payload)
+        augmented_payload.update(
+            {
+                "id": normalized_record.get("id"),
+                "correlation_id": normalized_record.get("correlation_id"),
+                "agent": str(normalized_record.get("source_agent") or normalized_record.get("agent") or _document_default_agent(resolved_obj_name)),
+                "source": normalized_record.get("source"),
+                "source_path": normalized_record.get("source_path"),
+                "path": normalized_record.get("path"),
+                "title": normalized_record.get("title"),
+                "record_kind": normalized_record.get("record_kind"),
+                "kind": normalized_record.get("kind"),
+                "object_name": normalized_record.get("object_name"),
+                "content_sha256": normalized_record.get("content_sha256"),
+                "status": normalized_record.get("status"),
+                "processing_state": normalized_record.get("processing_state"),
+                "processed": normalized_record.get("processed"),
+                "failed_reason": normalized_record.get("failed_reason"),
+                "db_updates": DOCUMENT_REPOSITORY._build_legacy_db_updates(record=normalized_record),
+            }
+        )
+        if isinstance(normalized_record.get("file"), dict) and normalized_record.get("file"):
+            augmented_payload["file"] = deepcopy(normalized_record.get("file") or {})
+        return augmented_payload
+
     def build_inline_result(self, raw_value: Any, *, obj_name: str, source_path: str | None = None) -> dict[str, Any] | None:
         spec = self.load_object_spec(obj_name)
         resolved_obj_name = _normalize_document_obj_name(obj_name, spec.obj_name)
@@ -1896,13 +3131,23 @@ class RequestObjectResolutionService:
                     explicit_value = object_value.get(explicit_key)
                     if explicit_value is not None:
                         result_payload[explicit_key] = deepcopy(explicit_value)
-                return result_payload
-            return {
+                return self._augment_canonical_result_payload(
+                    result_payload,
+                    obj_name=resolved_obj_name,
+                    source_path=source_path,
+                    correlation_id=correlation_id,
+                )
+            return self._augment_canonical_result_payload(
+                {
                 "agent": _document_default_agent(resolved_obj_name),
                 "correlation_id": correlation_id,
                 "parse": self.build_parse_payload(object_value=object_value, spec=spec),
                 result_key: object_value,
-            }
+                },
+                obj_name=resolved_obj_name,
+                source_path=source_path,
+                correlation_id=correlation_id,
+            )
         if isinstance(raw_value, str):
             raw_text = raw_value.strip()
             if not raw_text:
@@ -1919,18 +3164,30 @@ class RequestObjectResolutionService:
                     "metadata": {},
                 }
                 return {
+                    **self._augment_canonical_result_payload(
+                        {
                     "agent": _document_default_agent(resolved_obj_name),
                     "correlation_id": hashlib.sha256(raw_text.encode("utf-8")).hexdigest(),
                     "parse": self.build_parse_payload(object_value={"raw_text_document": raw_text_document}, spec=spec),
                     "raw_text_document": raw_text_document,
                     result_key: _build_job_posting_compatibility_section({"raw_text_document": raw_text_document}) or object_value,
+                        },
+                        obj_name=resolved_obj_name,
+                        source_path=source_path,
+                        correlation_id=hashlib.sha256(raw_text.encode("utf-8")).hexdigest(),
+                    ),
                 }
-            return {
+            return self._augment_canonical_result_payload(
+                {
                 "agent": _document_default_agent(resolved_obj_name),
                 "correlation_id": hashlib.sha256(raw_text.encode("utf-8")).hexdigest(),
                 "parse": self.build_parse_payload(object_value=object_value, spec=spec),
                 result_key: object_value,
-            }
+                },
+                obj_name=resolved_obj_name,
+                source_path=source_path,
+                correlation_id=hashlib.sha256(raw_text.encode("utf-8")).hexdigest(),
+            )
         return None
 
     def _load_result_from_legacy_db_file(
@@ -1966,7 +3223,7 @@ class RequestObjectResolutionService:
 
         result_key = _document_section_key(resolved_obj_name)
         if isinstance(stored_record.get(result_key), dict):
-            result_payload: dict[str, Any] = {
+            result_payload = self._augment_canonical_result_payload({
                 "agent": str(stored_record.get("source_agent") or stored_record.get("agent") or _document_default_agent(resolved_obj_name)),
                 "correlation_id": str(stored_record.get("correlation_id") or correlation_id),
                 "link": deepcopy(stored_record.get("link") or {}),
@@ -1974,7 +3231,7 @@ class RequestObjectResolutionService:
                 "parse": deepcopy(stored_record.get("parse") or {}),
                 result_key: deepcopy(stored_record.get(result_key) or {}),
                 "db_updates": deepcopy(stored_record.get("db_updates") or {}),
-            }
+            }, obj_name=resolved_obj_name, correlation_id=correlation_id, source_path=_first_non_empty_text(stored_record.get("source_path"), stored_record.get("path")))
             for explicit_key in ("raw_text_document", "entity_objects", "relation_objects"):
                 explicit_value = stored_record.get(explicit_key)
                 if explicit_value is not None:
@@ -2019,9 +3276,19 @@ class RequestObjectResolutionService:
                 return None
         if not isinstance(result, dict):
             return None
-        result["correlation_id"] = str(result.get("correlation_id") or _sha256_file(resolved_path))
-        result["file"] = {"path": resolved_path, "content_sha256": _sha256_file(resolved_path)}
-        return result
+        correlation_id = str(result.get("correlation_id") or _sha256_file(resolved_path))
+        result["correlation_id"] = correlation_id
+        result["file"] = {
+            **(deepcopy(result.get("file") or {}) if isinstance(result.get("file"), dict) else {}),
+            "path": resolved_path,
+            "content_sha256": _sha256_file(resolved_path),
+        }
+        return self._augment_canonical_result_payload(
+            result,
+            obj_name=obj_name,
+            source_path=resolved_path,
+            correlation_id=correlation_id,
+        )
 
     def build_result_from_request(
         self,
@@ -2040,50 +3307,173 @@ class RequestObjectResolutionService:
         resolved_obj_name = _normalize_document_obj_name(obj_name, spec.obj_name)
         source = str(request_payload.get("source") or "").strip().lower()
         value = request_payload.get("value")
-        result_sources = {str(item).strip().lower() for item in spec.result_sources if str(item).strip()}
-        effective_store_sources = store_sources or {str(item).strip().lower() for item in spec.store_sources if str(item).strip()}
-        effective_file_sources = file_sources or {str(item).strip().lower() for item in spec.file_sources if str(item).strip()}
-        effective_inline_sources = inline_sources or {str(item).strip().lower() for item in spec.inline_sources if str(item).strip()}
-
-        if source in result_sources and isinstance(value, dict):
-            return deepcopy(value)
-        if source in effective_store_sources:
-            correlation_id = self.resolve_correlation_id(
-                value=value,
-                candidates=spec.correlation_candidates,
-                fallback_values=[request_payload],
-            )
-            if not correlation_id:
-                return None
-            db_path = self.resolve_db_path(
-                request_payload=request_payload,
-                fallback_payload=fallback_payload,
-                db_path_field=db_path_field,
-                spec=spec,
-            )
-            return self.load_result_from_store(correlation_id=correlation_id, obj_name=resolved_obj_name, db_path=db_path)
-        if source in effective_file_sources:
-            candidate_path = self.resolve_source_path(request_payload=request_payload, value=value, spec=spec)
-            if not candidate_path:
-                return None
-            return self.load_result_from_file(source_path=candidate_path, obj_name=resolved_obj_name)
-        if source in effective_inline_sources or (not source and value is not None):
-            return self.build_inline_result(value, obj_name=resolved_obj_name)
-        return None
+        source_sets = self._resolve_source_sets(
+            spec=spec,
+            store_sources=store_sources,
+            file_sources=file_sources,
+            inline_sources=inline_sources,
+        )
+        return self._load_result_from_source(
+            source=source,
+            value=value,
+            request_payload=request_payload,
+            fallback_payload=fallback_payload,
+            db_path_field=db_path_field,
+            spec=spec,
+            resolved_obj_name=resolved_obj_name,
+            source_sets=source_sets,
+        )
 
 
 REQUEST_OBJECT_RESOLUTION_SERVICE = RequestObjectResolutionService()
 
 
 class DocumentObjectService:
-    def load_result_payload(self, result_payload: dict[str, Any] | str | None) -> dict[str, Any] | None:
-        parsed_payload = result_payload
+    def load_result_payload(self, object_result: dict[str, Any] | str | None) -> dict[str, Any] | None:
+        parsed_payload = object_result
         if isinstance(parsed_payload, str):
             try:
                 parsed_payload = json.loads(parsed_payload)
             except Exception:
                 return None
         return parsed_payload if isinstance(parsed_payload, dict) else None
+
+    def resolve_object_name(self, obj_name: str | None, default_obj_name: str | None = None) -> str:
+        return _normalize_document_obj_name(obj_name, default_obj_name or "documents")
+
+    def infer_object_name(
+        self,
+        *,
+        obj_name: str | None = None,
+        profile: dict[str, Any] | None = None,
+        applicant_profile: dict[str, Any] | None = None,
+        profile_result: dict[str, Any] | str | None = None,
+        job_posting: dict[str, Any] | None = None,
+        job_posting_result: dict[str, Any] | str | None = None,
+    ) -> str:
+        if str(obj_name or "").strip():
+            return self.resolve_object_name(obj_name)
+        if profile is not None or applicant_profile is not None or profile_result is not None:
+            return self.resolve_object_name("profiles")
+        if job_posting is not None or job_posting_result is not None:
+            return self.resolve_object_name("job_postings")
+        return self.resolve_object_name(obj_name)
+
+    def resolve_result_input(
+        self,
+        *,
+        object_result: dict[str, Any] | str | None = None,
+        document_result: dict[str, Any] | str | None = None,
+        profile_result: dict[str, Any] | str | None = None,
+        job_posting_result: dict[str, Any] | str | None = None,
+    ) -> dict[str, Any] | str | None:
+        for candidate in (object_result, document_result, profile_result, job_posting_result):
+            if candidate is not None:
+                return candidate
+        return None
+
+    def resolve_object_payload(
+        self,
+        *,
+        object_payload: dict[str, Any] | None = None,
+        profile: dict[str, Any] | None = None,
+        job_posting: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        for candidate in (object_payload, profile, job_posting):
+            if isinstance(candidate, dict):
+                return candidate
+        return None
+
+    def build_request_source_payload(
+        self,
+        *,
+        object_payload: dict[str, Any] | None = None,
+        request_payload: dict[str, Any] | None = None,
+        applicant_profile: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        if isinstance(request_payload, dict):
+            return request_payload
+        if isinstance(applicant_profile, dict):
+            return applicant_profile
+        if isinstance(object_payload, dict):
+            return {"source": "text", "value": object_payload}
+        return None
+
+    def _prepare_result_payload(
+        self,
+        *,
+        object_result: dict[str, Any] | str | None = None,
+        object_payload: dict[str, Any] | None = None,
+        request_payload: dict[str, Any] | None = None,
+        correlation_id: str | None = None,
+        source_agent: str | None = None,
+        source_payload: dict[str, Any] | None = None,
+        parse: dict[str, Any] | None = None,
+        obj_name: str,
+    ) -> tuple[dict[str, Any] | None, str | None, str | None]:
+        parsed_payload = self.load_result_payload(object_result)
+        resolved_obj_name = _normalize_document_obj_name(obj_name)
+        if parsed_payload is None:
+            if isinstance(request_payload, dict):
+                parsed_payload = REQUEST_OBJECT_RESOLUTION_SERVICE.build_result_from_request(request_payload, obj_name=resolved_obj_name)
+            elif isinstance(object_payload, dict):
+                parsed_payload = REQUEST_OBJECT_RESOLUTION_SERVICE.build_inline_result(object_payload, obj_name=resolved_obj_name)
+        if not isinstance(parsed_payload, dict):
+            return None, None, "document_result_must_be_object"
+
+        normalized_payload = deepcopy(parsed_payload)
+        effective_correlation_id = self.resolve_result_correlation_id(
+            result_payload=normalized_payload,
+            obj_name=resolved_obj_name,
+            correlation_id=correlation_id,
+            source_payload=source_payload,
+        )
+        if not effective_correlation_id:
+            return None, None, "missing_correlation_id"
+
+        normalized_payload["correlation_id"] = effective_correlation_id
+        if source_agent:
+            normalized_payload["agent"] = str(source_agent)
+        if isinstance(source_payload, dict):
+            normalized_payload["source_payload"] = deepcopy(source_payload)
+        if not isinstance(normalized_payload.get("parse"), dict):
+            spec = REQUEST_OBJECT_RESOLUTION_SERVICE.load_object_spec(resolved_obj_name)
+            normalized_payload["parse"] = deepcopy(parse) if isinstance(parse, dict) else REQUEST_OBJECT_RESOLUTION_SERVICE.build_parse_payload(
+                object_value={"raw_text": ""},
+                spec=spec,
+            )
+        return normalized_payload, effective_correlation_id, None
+
+    def _store_prepared_result(
+        self,
+        *,
+        normalized_payload: dict[str, Any],
+        correlation_id: str,
+        db_path: str | None,
+        source_agent: str | None,
+        source_payload: dict[str, Any] | None,
+        obj_name: str,
+    ) -> dict[str, Any]:
+        resolved_obj_name = _normalize_document_obj_name(obj_name)
+        metadata = {"source_agent": str(source_agent or normalized_payload.get("agent") or _document_default_agent(resolved_obj_name))}
+        result = DOCUMENT_REPOSITORY.persist_document(
+            correlation_id=correlation_id,
+            result_payload=normalized_payload,
+            db_path=db_path or (str(normalized_payload.get(f"{resolved_obj_name}_db_path") or "").strip() or None),
+            handoff_metadata=metadata,
+            handoff_payload=source_payload if isinstance(source_payload, dict) else None,
+            obj_name=resolved_obj_name,
+        )
+        knowledge_sync_result = sync_parser_result_to_agentsdb_knowledge(
+            object_name=resolved_obj_name,
+            result_payload=normalized_payload,
+            correlation_id=correlation_id,
+            handoff_metadata=metadata,
+            handoff_payload=source_payload if isinstance(source_payload, dict) else None,
+        )
+        if isinstance(knowledge_sync_result, dict):
+            result["knowledge_sync"] = deepcopy(knowledge_sync_result)
+        return result
 
     def resolve_result_correlation_id(
         self,
@@ -2111,43 +3501,46 @@ class DocumentObjectService:
     def store_result(
         self,
         *,
-        result_payload: dict[str, Any] | str,
+        object_result: dict[str, Any] | str | None = None,
+        document_result: dict[str, Any] | str | None = None,
+        profile_result: dict[str, Any] | str | None = None,
+        job_posting_result: dict[str, Any] | str | None = None,
         correlation_id: str | None = None,
         db_path: str | None = None,
         source_agent: str | None = None,
         source_payload: dict[str, Any] | None = None,
-        obj_name: str,
+        obj_name: str | None = None,
     ) -> str:
-        parsed_payload = self.load_result_payload(result_payload)
-        if not isinstance(parsed_payload, dict):
-            return json.dumps({"ok": False, "error": "document_result_must_be_object"}, ensure_ascii=False)
-        resolved_obj_name = _normalize_document_obj_name(obj_name)
-        effective_correlation_id = self.resolve_result_correlation_id(
-            result_payload=parsed_payload,
-            obj_name=resolved_obj_name,
+        resolved_obj_name = self.infer_object_name(
+            obj_name=obj_name,
+            profile_result=profile_result,
+            job_posting_result=job_posting_result,
+        )
+        resolved_object_result = self.resolve_result_input(
+            object_result=object_result,
+            document_result=document_result,
+            profile_result=profile_result,
+            job_posting_result=job_posting_result,
+        )
+        normalized_payload, effective_correlation_id, error_code = self._prepare_result_payload(
+            object_result=resolved_object_result,
             correlation_id=correlation_id,
+            source_agent=source_agent,
             source_payload=source_payload,
-        )
-        if not effective_correlation_id:
-            return json.dumps({"ok": False, "error": "missing_correlation_id"}, ensure_ascii=False)
-        metadata = {"source_agent": str(source_agent or parsed_payload.get("agent") or _document_default_agent(resolved_obj_name))}
-        result = DOCUMENT_REPOSITORY.persist_document(
-            correlation_id=effective_correlation_id,
-            result_payload=parsed_payload,
-            db_path=db_path or (str(parsed_payload.get(f"{resolved_obj_name}_db_path") or "").strip() or None),
-            handoff_metadata=metadata,
-            handoff_payload=source_payload if isinstance(source_payload, dict) else None,
             obj_name=resolved_obj_name,
         )
-        knowledge_sync_result = sync_parser_result_to_agentsdb_knowledge(
-            object_name=resolved_obj_name,
-            result_payload=parsed_payload,
+        if error_code:
+            return json.dumps({"ok": False, "error": error_code}, ensure_ascii=False)
+        if normalized_payload is None or effective_correlation_id is None:
+            return json.dumps({"ok": False, "error": "document_result_must_be_object"}, ensure_ascii=False)
+        result = self._store_prepared_result(
+            normalized_payload=normalized_payload,
             correlation_id=effective_correlation_id,
-            handoff_metadata=metadata,
-            handoff_payload=source_payload if isinstance(source_payload, dict) else None,
+            db_path=db_path,
+            source_agent=source_agent,
+            source_payload=source_payload,
+            obj_name=resolved_obj_name,
         )
-        if isinstance(knowledge_sync_result, dict):
-            result["knowledge_sync"] = deepcopy(knowledge_sync_result)
         return json.dumps(result, ensure_ascii=False)
 
     def ingest_result(
@@ -2155,27 +3548,109 @@ class DocumentObjectService:
         *,
         object_payload: dict[str, Any] | None = None,
         request_payload: dict[str, Any] | None = None,
-        result_payload: dict[str, Any] | str | None = None,
+        object_result: dict[str, Any] | str | None = None,
+        document_result: dict[str, Any] | str | None = None,
+        profile: dict[str, Any] | None = None,
+        applicant_profile: dict[str, Any] | None = None,
+        profile_result: dict[str, Any] | str | None = None,
+        job_posting: dict[str, Any] | None = None,
+        job_posting_result: dict[str, Any] | str | None = None,
         correlation_id: str | None = None,
         db_path: str | None = None,
         source_agent: str | None = None,
         source_payload: dict[str, Any] | None = None,
         parse: dict[str, Any] | None = None,
-        obj_name: str,
+        obj_name: str | None = None,
     ) -> str:
-        parsed_payload = self.load_result_payload(result_payload)
-        resolved_obj_name = _normalize_document_obj_name(obj_name)
-        if parsed_payload is None:
-            if isinstance(request_payload, dict):
-                parsed_payload = REQUEST_OBJECT_RESOLUTION_SERVICE.build_result_from_request(request_payload, obj_name=resolved_obj_name)
-            elif isinstance(object_payload, dict):
-                parsed_payload = REQUEST_OBJECT_RESOLUTION_SERVICE.build_inline_result(object_payload, obj_name=resolved_obj_name)
-        if not isinstance(parsed_payload, dict):
+        resolved_obj_name = self.infer_object_name(
+            obj_name=obj_name,
+            profile=profile,
+            applicant_profile=applicant_profile,
+            profile_result=profile_result,
+            job_posting=job_posting,
+            job_posting_result=job_posting_result,
+        )
+        resolved_object_payload = self.resolve_object_payload(
+            object_payload=object_payload,
+            profile=profile,
+            job_posting=job_posting,
+        )
+        resolved_request_payload = self.build_request_source_payload(
+            object_payload=resolved_object_payload,
+            request_payload=request_payload,
+            applicant_profile=applicant_profile,
+        )
+        resolved_object_result = self.resolve_result_input(
+            object_result=object_result,
+            document_result=document_result,
+            profile_result=profile_result,
+            job_posting_result=job_posting_result,
+        )
+        normalized_payload, effective_correlation_id, error_code = self._prepare_result_payload(
+            object_result=resolved_object_result,
+            object_payload=resolved_object_payload,
+            request_payload=resolved_request_payload,
+            correlation_id=correlation_id,
+            source_agent=source_agent,
+            source_payload=source_payload,
+            parse=parse,
+            obj_name=resolved_obj_name,
+        )
+        if error_code:
+            return json.dumps({"ok": False, "error": error_code}, ensure_ascii=False)
+        if normalized_payload is None or effective_correlation_id is None:
             return json.dumps({"ok": False, "error": "document_result_must_be_object"}, ensure_ascii=False)
 
-        normalized_payload = deepcopy(parsed_payload)
+        result = self._store_prepared_result(
+            normalized_payload=normalized_payload,
+            correlation_id=effective_correlation_id,
+            db_path=db_path,
+            source_agent=source_agent,
+            source_payload=source_payload,
+            obj_name=resolved_obj_name,
+        )
+        return json.dumps(result, ensure_ascii=False)
+
+    def upsert_object_record(
+        self,
+        *,
+        object_result: dict[str, Any] | str | None = None,
+        document_result: dict[str, Any] | str | None = None,
+        profile_result: dict[str, Any] | str | None = None,
+        job_posting_result: dict[str, Any] | str | None = None,
+        correlation_id: str | None = None,
+        dispatcher_db_path: str | None = None,
+        obj_db_path: str | None = None,
+        job_postings_db_path: str | None = None,
+        obj_name: str | None = None,
+        processing_state: str | None = None,
+        processed: bool | None = None,
+        failed_reason: str | None = None,
+        source_agent: str | None = None,
+        source_payload: dict[str, Any] | None = None,
+        dispatcher_updates: dict[str, Any] | None = None,
+    ) -> str:
+        parsed_result = self.resolve_result_input(
+            object_result=object_result,
+            document_result=document_result,
+            profile_result=profile_result,
+            job_posting_result=job_posting_result,
+        )
+        if isinstance(parsed_result, str):
+            try:
+                parsed_result = json.loads(parsed_result)
+            except Exception:
+                return json.dumps({"ok": False, "error": "invalid_object_result_json"}, ensure_ascii=False)
+        if not isinstance(parsed_result, dict):
+            return json.dumps({"ok": False, "error": "object_result_must_be_object"}, ensure_ascii=False)
+
+        resolved_obj_name = self.infer_object_name(
+            obj_name=obj_name,
+            profile_result=profile_result,
+            job_posting_result=job_posting_result,
+        )
         effective_correlation_id = self.resolve_result_correlation_id(
-            result_payload=normalized_payload,
+            result_payload=parsed_result,
             obj_name=resolved_obj_name,
             correlation_id=correlation_id,
             source_payload=source_payload,
@@ -2183,241 +3658,23 @@ class DocumentObjectService:
         if not effective_correlation_id:
             return json.dumps({"ok": False, "error": "missing_correlation_id"}, ensure_ascii=False)
 
-        normalized_payload["correlation_id"] = effective_correlation_id
-        if source_agent:
-            normalized_payload["agent"] = str(source_agent)
-        if isinstance(source_payload, dict):
-            normalized_payload["source_payload"] = deepcopy(source_payload)
-        if not isinstance(normalized_payload.get("parse"), dict):
-            spec = REQUEST_OBJECT_RESOLUTION_SERVICE.load_object_spec(resolved_obj_name)
-            normalized_payload["parse"] = deepcopy(parse) if isinstance(parse, dict) else REQUEST_OBJECT_RESOLUTION_SERVICE.build_parse_payload(
-                object_value={"raw_text": ""},
-                spec=spec,
-            )
-
-        return self.store_result(
-            result_payload=normalized_payload,
-            correlation_id=effective_correlation_id,
-            db_path=db_path,
+        result = DOCUMENT_REPOSITORY.upsert_db_record(
+            record_id=effective_correlation_id,
+            result_payload=parsed_result,
+            obj_name=resolved_obj_name,
+            obj_db_path=obj_db_path or job_postings_db_path,
+            dispatcher_db_path=dispatcher_db_path,
+            processing_state=processing_state,
+            processed=processed,
+            failed_reason=failed_reason,
             source_agent=source_agent,
             source_payload=source_payload,
-            obj_name=resolved_obj_name,
+            dispatcher_updates=dispatcher_updates,
         )
+        return json.dumps(result, ensure_ascii=False)
 
 
 DOCUMENT_OBJECT_SERVICE = DocumentObjectService()
-
-
-def store_object_result_tool(
-    object_result: dict[str, Any] | str,
-    correlation_id: str | None = None,
-    db_path: str | None = None,
-    source_agent: str | None = None,
-    source_payload: dict[str, Any] | None = None,
-    obj_name: str | None = None,
-) -> str:
-    return DOCUMENT_OBJECT_SERVICE.store_result(
-        result_payload=object_result,
-        correlation_id=correlation_id,
-        db_path=db_path,
-        source_agent=source_agent,
-        source_payload=source_payload,
-        obj_name=_normalize_document_obj_name(obj_name),
-    )
-
-
-def store_document_result_tool(
-    document_result: dict[str, Any] | str,
-    correlation_id: str | None = None,
-    db_path: str | None = None,
-    source_agent: str | None = None,
-    source_payload: dict[str, Any] | None = None,
-    obj_name: str | None = None,
-) -> str:
-    return store_object_result_tool(
-        object_result=document_result,
-        correlation_id=correlation_id,
-        db_path=db_path,
-        source_agent=source_agent,
-        source_payload=source_payload,
-        obj_name=obj_name,
-    )
-
-
-def ingest_object_tool(
-    object_payload: dict[str, Any] | None = None,
-    request_payload: dict[str, Any] | None = None,
-    object_result: dict[str, Any] | str | None = None,
-    correlation_id: str | None = None,
-    db_path: str | None = None,
-    source_agent: str | None = None,
-    source_payload: dict[str, Any] | None = None,
-    parse: dict[str, Any] | None = None,
-    obj_name: str | None = None,
-) -> str:
-    return DOCUMENT_OBJECT_SERVICE.ingest_result(
-        object_payload=object_payload,
-        request_payload=request_payload,
-        result_payload=object_result,
-        correlation_id=correlation_id,
-        db_path=db_path,
-        source_agent=source_agent,
-        source_payload=source_payload,
-        parse=parse,
-        obj_name=_normalize_document_obj_name(obj_name),
-    )
-
-
-def ingest_document_tool(
-    object_payload: dict[str, Any] | None = None,
-    request_payload: dict[str, Any] | None = None,
-    document_result: dict[str, Any] | str | None = None,
-    correlation_id: str | None = None,
-    db_path: str | None = None,
-    source_agent: str | None = None,
-    source_payload: dict[str, Any] | None = None,
-    parse: dict[str, Any] | None = None,
-    obj_name: str | None = None,
-) -> str:
-    return ingest_object_tool(
-        object_payload=object_payload,
-        request_payload=request_payload,
-        object_result=document_result,
-        correlation_id=correlation_id,
-        db_path=db_path,
-        source_agent=source_agent,
-        source_payload=source_payload,
-        parse=parse,
-        obj_name=obj_name,
-    )
-
-
-def upsert_object_record_tool(
-    object_result: dict[str, Any] | str,
-    correlation_id: str | None = None,
-    dispatcher_db_path: str | None = None,
-    obj_db_path: str | None = None,
-    obj_name: str | None = None,
-    processing_state: str | None = None,
-    processed: bool | None = None,
-    failed_reason: str | None = None,
-    source_agent: str | None = None,
-    source_payload: dict[str, Any] | None = None,
-    dispatcher_updates: dict[str, Any] | None = None,
-) -> str:
-    parsed_result = object_result
-    if isinstance(parsed_result, str):
-        try:
-            parsed_result = json.loads(parsed_result)
-        except Exception:
-            return json.dumps({"ok": False, "error": "invalid_object_result_json"}, ensure_ascii=False)
-    if not isinstance(parsed_result, dict):
-        return json.dumps({"ok": False, "error": "object_result_must_be_object"}, ensure_ascii=False)
-
-    resolved_obj_name = _normalize_document_obj_name(obj_name)
-    effective_correlation_id = DOCUMENT_OBJECT_SERVICE.resolve_result_correlation_id(
-        result_payload=parsed_result,
-        obj_name=resolved_obj_name,
-        correlation_id=correlation_id,
-        source_payload=source_payload,
-    )
-    if not effective_correlation_id:
-        return json.dumps({"ok": False, "error": "missing_correlation_id"}, ensure_ascii=False)
-
-    result = DOCUMENT_REPOSITORY.upsert_db_record(
-        record_id=effective_correlation_id,
-        result_payload=parsed_result,
-        obj_name=resolved_obj_name,
-        obj_db_path=obj_db_path,
-        dispatcher_db_path=dispatcher_db_path,
-        processing_state=processing_state,
-        processed=processed,
-        failed_reason=failed_reason,
-        source_agent=source_agent,
-        source_payload=source_payload,
-        dispatcher_updates=dispatcher_updates,
-    )
-    return json.dumps(result, ensure_ascii=False)
-
-def store_profile_result_tool(
-    profile_result: dict[str, Any] | str,
-    correlation_id: str | None = None,
-    db_path: str | None = None,
-    source_agent: str | None = None,
-    obj_name: str | None = None,
-    ) -> str:
-    return store_object_result_tool(
-        object_result=profile_result,
-        correlation_id=correlation_id,
-        db_path=db_path,
-        source_agent=source_agent,
-        obj_name=_normalize_document_obj_name(obj_name, "profiles"),
-    )
-
-
-def store_job_posting_result_tool(
-    job_posting_result: dict[str, Any] | str,
-    correlation_id: str | None = None,
-    db_path: str | None = None,
-    source_agent: str | None = None,
-    source_payload: dict[str, Any] | None = None,
-    obj_name: str | None = None,
-) -> str:
-    return store_object_result_tool(
-        object_result=job_posting_result,
-        correlation_id=correlation_id,
-        db_path=db_path,
-        source_agent=source_agent,
-        source_payload=source_payload,
-        obj_name=_normalize_document_obj_name(obj_name, "job_postings"),
-    )
-
-
-def ingest_profile_tool(
-    profile: dict[str, Any] | None = None,
-    applicant_profile: dict[str, Any] | None = None,
-    profile_result: dict[str, Any] | str | None = None,
-    correlation_id: str | None = None,
-    db_path: str | None = None,
-    source_agent: str | None = None,
-    source_payload: dict[str, Any] | None = None,
-    obj_name: str | None = None,
-) -> str:
-    request_payload = applicant_profile if isinstance(applicant_profile, dict) else {"source": "text", "value": profile} if isinstance(profile, dict) else None
-    return ingest_object_tool(
-        object_payload=profile,
-        request_payload=request_payload,
-        object_result=profile_result,
-        correlation_id=correlation_id,
-        db_path=db_path,
-        source_agent=source_agent,
-        source_payload=source_payload,
-        obj_name=_normalize_document_obj_name(obj_name, "profiles"),
-    )
-
-
-def ingest_job_posting_tool(
-    job_posting: dict[str, Any] | None = None,
-    job_posting_result: dict[str, Any] | str | None = None,
-    correlation_id: str | None = None,
-    db_path: str | None = None,
-    source_agent: str | None = None,
-    source_payload: dict[str, Any] | None = None,
-    parse: dict[str, Any] | None = None,
-    obj_name: str | None = None,
-) -> str:
-    request_payload = {"source": "text", "value": job_posting} if isinstance(job_posting, dict) else None
-    return ingest_object_tool(
-        object_payload=job_posting,
-        request_payload=request_payload,
-        object_result=job_posting_result,
-        correlation_id=correlation_id,
-        db_path=db_path,
-        source_agent=source_agent,
-        source_payload=source_payload,
-        parse=parse,
-        obj_name=_normalize_document_obj_name(obj_name, "job_postings"),
-    )
 
 
 class ActionRequestService:
@@ -2886,7 +4143,7 @@ class ActionRequestService:
         return DOCUMENT_OBJECT_SERVICE.ingest_result(
             object_payload=request_payload.get(object_payload_field) if isinstance(request_payload.get(object_payload_field), dict) else None,
             request_payload=request_source_payload,
-            result_payload=request_payload.get(result_payload_field),
+            object_result=request_payload.get(result_payload_field),
             correlation_id=self.resolve_string_value(request_payload=request_payload, field_names=correlation_fields),
             db_path=self.resolve_string_value(request_payload=request_payload, field_names=db_path_fields),
             source_agent=self.resolve_string_value(request_payload=request_payload, field_names=source_agent_fields),
@@ -2991,9 +4248,9 @@ class ActionRequestService:
         if not correlation_id:
             return json.dumps({"ok": False, "error": "missing_correlation_id"}, ensure_ascii=False)
 
-        result = DOCUMENT_REPOSITORY.upsert_db_record(
-            record_id=correlation_id,
-            result_payload=result_payload,
+        result = DOCUMENT_OBJECT_SERVICE.upsert_object_record(
+            object_result=result_payload,
+            correlation_id=correlation_id,
             obj_name=resolved_obj_name,
             obj_db_path=self.resolve_string_value(request_payload=request_payload, field_names=obj_db_path_fields),
             dispatcher_db_path=self.resolve_string_value(request_payload=request_payload, field_names=dispatcher_db_path_fields),
@@ -3004,7 +4261,7 @@ class ActionRequestService:
             source_payload=source_payload,
             dispatcher_updates=self.resolve_dict_value(request_payload=request_payload, field_names=dispatcher_updates_fields),
         )
-        return json.dumps(result, ensure_ascii=False)
+        return result if isinstance(result, str) else json.dumps(result, ensure_ascii=False)
 
     def execute_dispatch_documents_action(
         self,
@@ -3302,9 +4559,9 @@ AGENTS_DB_STRUCTURE_CONFIGS: dict[str, dict[str, Any]] = {
             {
                 "name": "parser_result_sync",
                 "entry_functions": [
-                    "store_object_result_tool",
-                    "ingest_object_tool",
-                    "upsert_object_record_tool",
+                    "DOCUMENT_OBJECT_SERVICE.store_result",
+                    "DOCUMENT_OBJECT_SERVICE.ingest_result",
+                    "DOCUMENT_OBJECT_SERVICE.upsert_object_record",
                     "sync_parser_result_to_mongodb_knowledge",
                 ],
                 "from_module": "tools.py",
@@ -3479,9 +4736,10 @@ class DocumentDispatchService:
         *,
         dispatch_policy: dict[str, Any],
         agent_name: str | None,
-        target_agent_name: str | None,
-        parser_agent_name: str | None,
-        parser_job_name: str | None,
+        target_agent_name: str | None = None,
+        parser_agent_name: str | None = None,
+        parser_job_name: str | None = None,
+        job_name: str | None = None,
     ) -> tuple[str, str]:
         runtime_agent_labels = {
             normalize_agent_label(str(agent_label).strip())
@@ -3508,7 +4766,7 @@ class DocumentDispatchService:
         ) or "job_posting_parser"
 
         resolved_parser_job_name = self.normalize_dispatch_job_name(
-            parser_job_name,
+            parser_job_name or job_name,
             available_job_names=available_job_names,
         )
 
@@ -3516,7 +4774,7 @@ class DocumentDispatchService:
             agent_name,
             available_agent_labels=available_agent_labels,
         )
-        parser_target_candidate = str(parser_agent_name or target_agent_name or "").strip() or None
+        parser_target_candidate = str(parser_agent_name or target_agent_name or agent_name or "").strip() or None
         explicit_parser_agent_name = self.normalize_dispatch_agent_name(
             parser_target_candidate,
             available_agent_labels=available_agent_labels,
@@ -3755,6 +5013,40 @@ class DocumentDispatchService:
         passthrough_context: dict[str, Any] = {}
         normalized_action = normalize_action_request_name(str(action or ""))
         resolved_profile_id = str(profile_id or "").strip()
+        resolved_profile_result = None
+        if isinstance(profile_result, dict) and profile_result:
+            resolved_profile_result = REQUEST_OBJECT_RESOLUTION_SERVICE._augment_canonical_result_payload(
+                deepcopy(profile_result),
+                obj_name="profiles",
+                correlation_id=str(
+                    profile_result.get("correlation_id")
+                    or ((profile_result.get("profile") or {}).get("profile_id") if isinstance(profile_result.get("profile"), dict) else "")
+                    or ((profile_result.get("profile") or {}).get("id") if isinstance(profile_result.get("profile"), dict) else "")
+                    or resolved_profile_id
+                    or ""
+                ).strip() or None,
+                source_path=_first_non_empty_text(
+                    profile_result.get("source_path"),
+                    profile_result.get("path"),
+                    ((profile_result.get("file") or {}).get("path") if isinstance(profile_result.get("file"), dict) else None),
+                ),
+            )
+        resolved_job_posting_result = None
+        if isinstance(job_posting_result, dict) and job_posting_result:
+            resolved_job_posting_result = REQUEST_OBJECT_RESOLUTION_SERVICE._augment_canonical_result_payload(
+                deepcopy(job_posting_result),
+                obj_name="job_postings",
+                correlation_id=str(
+                    job_posting_result.get("correlation_id")
+                    or ((job_posting_result.get("file") or {}).get("content_sha256") if isinstance(job_posting_result.get("file"), dict) else "")
+                    or ""
+                ).strip() or None,
+                source_path=_first_non_empty_text(
+                    job_posting_result.get("source_path"),
+                    job_posting_result.get("path"),
+                    ((job_posting_result.get("file") or {}).get("path") if isinstance(job_posting_result.get("file"), dict) else None),
+                ),
+            )
         if normalized_action in {"dispatch_documents", "document_dispatch"} and (
             bool(resolved_profile_id)
             or isinstance(applicant_profile, dict)
@@ -3780,9 +5072,9 @@ class DocumentDispatchService:
 
         for key, value in (
             ("applicant_profile", applicant_profile),
-            ("profile_result", profile_result),
+            ("profile_result", resolved_profile_result),
             ("job_posting", job_posting),
-            ("job_posting_result", job_posting_result),
+            ("job_posting_result", resolved_job_posting_result),
             ("options", options),
             ("cover_letter_context", cover_letter_context),
             ("source_document", source_document),
@@ -3812,7 +5104,24 @@ class DocumentDispatchService:
             request_payload,
             obj_name="profiles",
         )
-        return deepcopy(resolved_profile_result) if isinstance(resolved_profile_result, dict) else None
+        if not isinstance(resolved_profile_result, dict):
+            return None
+        embedded_profile = resolved_profile_result.get("profile") if isinstance(resolved_profile_result.get("profile"), dict) else {}
+        return REQUEST_OBJECT_RESOLUTION_SERVICE._augment_canonical_result_payload(
+            deepcopy(resolved_profile_result),
+            obj_name="profiles",
+            correlation_id=str(
+                resolved_profile_result.get("correlation_id")
+                or embedded_profile.get("profile_id")
+                or embedded_profile.get("id")
+                or ""
+            ).strip() or None,
+            source_path=_first_non_empty_text(
+                resolved_profile_result.get("source_path"),
+                resolved_profile_result.get("path"),
+                ((resolved_profile_result.get("file") or {}).get("path") if isinstance(resolved_profile_result.get("file"), dict) else None),
+            ),
+        )
 
     def resolve_job_posting_result(
         self,
@@ -3830,7 +5139,16 @@ class DocumentDispatchService:
                 or ""
             ).strip()
             if not request_correlation_id or request_correlation_id == correlation_id:
-                return deepcopy(request_result)
+                return REQUEST_OBJECT_RESOLUTION_SERVICE._augment_canonical_result_payload(
+                    deepcopy(request_result),
+                    obj_name=resolved_obj_name,
+                    correlation_id=request_correlation_id or correlation_id,
+                    source_path=_first_non_empty_text(
+                        request_result.get("source_path"),
+                        request_result.get("path"),
+                        ((request_result.get("file") or {}).get("path") if isinstance(request_result.get("file"), dict) else None),
+                    ),
+                )
 
         if not obj_db_path:
             return None
@@ -3840,7 +5158,18 @@ class DocumentDispatchService:
             obj_name=resolved_obj_name,
             db_path=obj_db_path,
         )
-        return deepcopy(stored_result) if isinstance(stored_result, dict) else None
+        if not isinstance(stored_result, dict):
+            return None
+        return REQUEST_OBJECT_RESOLUTION_SERVICE._augment_canonical_result_payload(
+            deepcopy(stored_result),
+            obj_name=resolved_obj_name,
+            correlation_id=str(stored_result.get("correlation_id") or correlation_id).strip() or correlation_id,
+            source_path=_first_non_empty_text(
+                stored_result.get("source_path"),
+                stored_result.get("path"),
+                ((stored_result.get("file") or {}).get("path") if isinstance(stored_result.get("file"), dict) else None),
+            ),
+        )
 
     def build_cover_letter_resume_payload(
         self,
@@ -3854,14 +5183,37 @@ class DocumentDispatchService:
         if resolved_action != "generate_cover_letter":
             resolved_action = "generate_cover_letter"
 
-        resolved_job_posting_result = deepcopy(job_posting_result)
-        resolved_job_posting_result.setdefault("correlation_id", correlation_id)
+        resolved_job_posting_result = REQUEST_OBJECT_RESOLUTION_SERVICE._augment_canonical_result_payload(
+            deepcopy(job_posting_result),
+            obj_name="job_postings",
+            correlation_id=str(job_posting_result.get("correlation_id") or correlation_id).strip() or correlation_id,
+            source_path=_first_non_empty_text(
+                job_posting_result.get("source_path"),
+                job_posting_result.get("path"),
+                ((job_posting_result.get("file") or {}).get("path") if isinstance(job_posting_result.get("file"), dict) else None),
+            ),
+        )
+        resolved_profile_result = REQUEST_OBJECT_RESOLUTION_SERVICE._augment_canonical_result_payload(
+            deepcopy(profile_result),
+            obj_name="profiles",
+            correlation_id=str(
+                profile_result.get("correlation_id")
+                or ((profile_result.get("profile") or {}).get("profile_id") if isinstance(profile_result.get("profile"), dict) else "")
+                or ((profile_result.get("profile") or {}).get("id") if isinstance(profile_result.get("profile"), dict) else "")
+                or ""
+            ).strip() or None,
+            source_path=_first_non_empty_text(
+                profile_result.get("source_path"),
+                profile_result.get("path"),
+                ((profile_result.get("file") or {}).get("path") if isinstance(profile_result.get("file"), dict) else None),
+            ),
+        )
 
         payload: dict[str, Any] = {
             "action": resolved_action,
             "correlation_id": correlation_id,
             "job_posting_result": resolved_job_posting_result,
-            "profile_result": deepcopy(profile_result),
+            "profile_result": resolved_profile_result,
             "options": deepcopy(passthrough_context.get("options") or {}),
         }
         for key in ("applicant_profile", "cover_letter_context", "source_document"):
@@ -6046,17 +7398,15 @@ _TOOL_IMPLEMENTATIONS: dict[str, Callable | None] = {
     "memorydb": memorydb,
     "vectordb": vectordb,
     "vdb_worker": vdb_worker,
+    "adb_operation": adb_operation,
+    "agent_relation_graph": agent_relation_graph,
     "repo_knowledge_worker": repo_knowledge_worker,
     "repo_knowledge_query": repo_knowledge_query,
     "build_agent_system_configs": build_agent_system_configs_tool,
     "execute_action_request": ACTION_REQUEST_SERVICE.execute_request_tool,
-    "store_object_result": store_object_result_tool,
-    "ingest_object": ingest_object_tool,
-    "upsert_object_record": upsert_object_record_tool,
-    "ingest_profile": ingest_profile_tool,
-    "ingest_job_posting": ingest_job_posting_tool,
-    "store_job_posting_result": store_job_posting_result_tool,
-    "store_profile_result": store_profile_result_tool,
+    "store_object_result": DOCUMENT_OBJECT_SERVICE.store_result,
+    "ingest_object": DOCUMENT_OBJECT_SERVICE.ingest_result,
+    "upsert_object_record": DOCUMENT_OBJECT_SERVICE.upsert_object_record,
     "write_document": write_document,
     "read_document": read_document,
     "pypdf_read_document": pypdf_read_document,

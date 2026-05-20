@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sys
 import tempfile
 import threading
@@ -20,6 +21,7 @@ from alde.agents_db import AgentDbInMemoryRepository, AgentDbSocketRepository, A
 from alde.agents_tools import get_tool_spec, repo_knowledge_worker, repo_knowledge_query
 from alde.repo_code_splitter import (
     RepoIndexService,
+    RepoModuleParser,
     PythonCodeSplitter,
     _build_default_runtime_config,
     _normalize_repo_runtime_config,
@@ -182,6 +184,259 @@ class TestRepoCodeSplitter(unittest.TestCase):
 
         self.assertEqual(str(raised.exception), "agents_db_socket_request_failed: boom")
 
+    def test_agentdb_inmemory_repository_request_and_query_use_explicit_repo_query_job(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            (root / "mymodule.py").write_text(
+                "import os\n\nclass Finder:\n    def find(self):\n        return os.getcwd()\n",
+                encoding="utf-8",
+            )
+            image_path = str(root / "agentsdb_repo_query_image.json")
+
+            repo = AgentDbInMemoryRepository(image_path)
+            repo.ensure_index_objects()
+            knowledge_service = KnowledgeObjectService(repo)
+            embedding_service = _FakeEmbeddingService()
+            index_service = RepoIndexService(
+                repo,
+                knowledge_service,
+                embedding_service,
+                workers=1,
+                runtime_config=_build_default_runtime_config(),
+            )
+            index_service.index_repo_object(str(root), extensions=(".py",))
+            repo._flush_image()
+
+            request_payload = repo.request("Finder class", use_vector=False)
+
+            self.assertEqual(request_payload["target_agent"], "_xworker")
+            self.assertEqual(request_payload["job_name"], "adb_query")
+            self.assertEqual(request_payload["tool_name"], "repo_knowledge_query")
+            self.assertEqual(request_payload["namespace_id"], "ns_repo_knowledge")
+            self.assertEqual(request_payload["image_path"], image_path)
+
+            result = repo.query("Finder class", use_vector=False)
+
+            self.assertTrue(result["ok"], msg=result.get("error"))
+            self.assertEqual(result["job_name"], "adb_query")
+            self.assertEqual(result["request"]["job_name"], "adb_query")
+            self.assertGreaterEqual(result["total"], 1)
+            self.assertIn("block", {chunk.get("owner_type") for chunk in result["chunks"]})
+            self.assertIn("mymodule.py", {chunk.get("source_path") for chunk in result["chunks"]})
+
+    def test_agentdb_socket_repository_request_and_query_use_explicit_repo_query_job(self) -> None:
+        repo = AgentDbSocketRepository("agentsdb://127.0.0.1:2331")
+        captured_calls: list[tuple[str, dict[str, object]]] = []
+        document_payload = {
+            "_id": "doc:repo_source:test",
+            "namespace_id": "ns_repo_knowledge",
+            "blocks": [
+                {
+                    "block_id": "blk:repo:test:1",
+                    "heading": "Finder class",
+                    "content": "class Finder:\n    def find(self):\n        return os.getcwd()",
+                    "block_kind": "class",
+                    "metadata": {"source_path": "mymodule.py", "kind": "class"},
+                }
+            ],
+        }
+        entity_payload = {
+            "_id": "ent:repo:test:finder",
+            "namespace_id": "ns_repo_knowledge",
+            "entity_type": "class",
+            "canonical_name": "Finder",
+            "summary": "Finder class",
+            "metadata": {"source_path": "mymodule.py"},
+        }
+
+        def fake_request_object(action_name: str, action_payload: dict[str, object] | None = None) -> dict[str, object]:
+            captured_calls.append((action_name, dict(action_payload or {})))
+            self.assertEqual(action_name, "load_objects")
+            object_name = str((action_payload or {}).get("object_name") or "")
+            if object_name == "document":
+                return {"ok": True, "object_payload_list": [document_payload]}
+            if object_name == "entity":
+                return {"ok": True, "object_payload_list": [entity_payload]}
+            if object_name in {"embedding", "relation"}:
+                return {"ok": True, "object_payload_list": []}
+            return {"ok": True, "object_payload_list": []}
+
+        repo._request_object = fake_request_object  # type: ignore[method-assign]
+
+        request_payload = repo.request("Finder class", use_vector=False)
+
+        self.assertEqual(request_payload["target_agent"], "_xworker")
+        self.assertEqual(request_payload["job_name"], "adb_query")
+        self.assertEqual(request_payload["tool_name"], "repo_knowledge_query")
+
+        result = repo.query("Finder class", use_vector=False)
+
+        self.assertTrue(result["ok"], msg=result.get("error"))
+        self.assertEqual(result["job_name"], "adb_query")
+        self.assertEqual(result["request"]["target_agent"], "_xworker")
+        self.assertGreaterEqual(result["total"], 1)
+        self.assertIn("mymodule.py", {chunk.get("source_path") for chunk in result["chunks"]})
+        self.assertEqual([call[0] for call in captured_calls], ["load_objects", "load_objects"])
+
+    def test_adb_operation_tool_executes_generic_agentdb_operations(self) -> None:
+        spec = get_tool_spec("agentdb_operation")
+        self.assertIsNotNone(spec)
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            image_path = str(Path(tmp_dir) / "agentsdb_operation_image.json")
+            base_args = {
+                "agents_db_uri": "agentsmem://local",
+                "backend_uri": "agentsmem://local",
+                "database_name": "adb_operation_test",
+                "memory_image_path": image_path,
+            }
+
+            health_payload = json.loads(spec.execute({"operation": "health", **base_args}))
+            self.assertTrue(health_payload["ok"])
+            self.assertEqual(health_payload["operation"], "health")
+
+            ensure_payload = json.loads(spec.execute({"operation": "ensure_index_objects", **base_args}))
+            self.assertTrue(ensure_payload["ok"])
+            self.assertTrue(ensure_payload["ensured"])
+
+            upsert_payload = json.loads(
+                spec.execute(
+                    {
+                        "operation": "upsert_object",
+                        "object_name": "document",
+                        "object_id": "doc:adb:1",
+                        "object_payload": {
+                            "_id": "doc:adb:1",
+                            "namespace_id": "ns_repo_knowledge",
+                            "title": "Finder class",
+                            "source_uri": "file://finder.py",
+                            "content": "class Finder: pass",
+                        },
+                        **base_args,
+                    }
+                )
+            )
+            self.assertTrue(upsert_payload["ok"])
+            self.assertEqual(upsert_payload["object_payload"]["title"], "Finder class")
+
+            load_object_payload = json.loads(
+                spec.execute(
+                    {
+                        "operation": "load_object",
+                        "object_name": "document",
+                        "object_id": "doc:adb:1",
+                        **base_args,
+                    }
+                )
+            )
+            self.assertTrue(load_object_payload["ok"])
+            self.assertEqual(load_object_payload["object_payload"]["source_uri"], "file://finder.py")
+
+            load_objects_payload = json.loads(
+                spec.execute(
+                    {
+                        "operation": "load_objects",
+                        "object_name": "document",
+                        "object_filter": {"namespace_id": "ns_repo_knowledge"},
+                        "limit": 5,
+                        **base_args,
+                    }
+                )
+            )
+            self.assertTrue(load_objects_payload["ok"])
+            self.assertEqual(len(load_objects_payload["object_payload_list"]), 1)
+
+            find_objects_payload = json.loads(
+                spec.execute(
+                    {
+                        "operation": "find_objects",
+                        "namespace_id": "ns_repo_knowledge",
+                        "query_text": "Finder",
+                        "limit": 5,
+                        **base_args,
+                    }
+                )
+            )
+            self.assertTrue(find_objects_payload["ok"])
+            self.assertEqual(len(find_objects_payload["object_payload_list"]), 1)
+
+            apply_payload = json.loads(
+                spec.execute(
+                    {
+                        "operation": "apply_operations",
+                        "operations": [
+                            {
+                                "action": "upsert",
+                                "object_name": "relation",
+                                "object_id": "rel:adb:1",
+                                "object_payload": {
+                                    "_id": "rel:adb:1",
+                                    "namespace_id": "ns_repo_knowledge",
+                                    "source_entity_id": "ent:adb:1",
+                                    "target_entity_id": "ent:adb:2",
+                                    "relation_type": "linked_to",
+                                },
+                            },
+                            {
+                                "action": "upsert",
+                                "object_name": "document",
+                                "object_id": "doc:adb:2",
+                                "object_payload": {
+                                    "_id": "doc:adb:2",
+                                    "namespace_id": "ns_repo_knowledge",
+                                    "title": "Second document",
+                                    "source_uri": "file://second.py",
+                                },
+                            },
+                        ],
+                        **base_args,
+                    }
+                )
+            )
+            self.assertTrue(apply_payload["ok"])
+            self.assertEqual(apply_payload["applied"], 2)
+
+            relation_graph_payload = json.loads(
+                spec.execute(
+                    {
+                        "operation": "load_relation_graph",
+                        "namespace_id": "ns_repo_knowledge",
+                        "source_entity_id": "ent:adb:1",
+                        "max_depth": 2,
+                        **base_args,
+                    }
+                )
+            )
+            self.assertTrue(relation_graph_payload["ok"])
+            self.assertEqual(len(relation_graph_payload["object_payload_list"]), 1)
+            self.assertEqual(relation_graph_payload["object_payload_list"][0]["target_entity_id"], "ent:adb:2")
+
+            delete_payload = json.loads(
+                spec.execute(
+                    {
+                        "operation": "delete_object",
+                        "object_name": "document",
+                        "object_id": "doc:adb:1",
+                        **base_args,
+                    }
+                )
+            )
+            self.assertTrue(delete_payload["ok"])
+            self.assertTrue(delete_payload["deleted"])
+
+            deleted_lookup_payload = json.loads(
+                spec.execute(
+                    {
+                        "operation": "load_object",
+                        "object_name": "document",
+                        "object_id": "doc:adb:1",
+                        **base_args,
+                    }
+                )
+            )
+            self.assertTrue(deleted_lookup_payload["ok"])
+            self.assertIsNone(deleted_lookup_payload["object_payload"])
+
     def test_normalize_repo_runtime_config_overrides_default_namespace(self) -> None:
         base = _build_default_runtime_config()
         base.namespace_id = "ns_alde_default"
@@ -234,6 +489,85 @@ class TestRepoCodeSplitter(unittest.TestCase):
                 {owner_type for owner_type, _ in embedding_service.calls},
                 {"block", "entity", "relation"},
             )
+
+    def test_repo_module_parser_emits_target_annotated_entity_seeds(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            module_path = root / "sample.py"
+            module_path.write_text(
+                "import os\n\nclass Demo:\n    pass\n\ndef helper():\n    return os.getcwd()\n",
+                encoding="utf-8",
+            )
+
+            parser = RepoModuleParser()
+            payload = parser.parse_object(str(module_path), repo_root=str(root))
+
+            entity_objects = list(payload.get("entity_objects") or [])
+            relation_objects = list(payload.get("relation_objects") or [])
+            target_entities = [entity for entity in entity_objects if entity.get("is_target") is True]
+
+            self.assertEqual(payload.get("title"), "sample.py")
+            self.assertEqual(payload.get("source"), "repo_module_parser")
+            self.assertEqual(payload.get("record_kind"), "document")
+            self.assertEqual(payload.get("processing_state"), "processed")
+            self.assertIs(payload.get("processed"), True)
+            self.assertEqual(relation_objects, [])
+            self.assertTrue(target_entities)
+            self.assertTrue(any(entity.get("source_entity") == "subject" for entity in target_entities))
+            self.assertIn("defines_class", {entity.get("is_relational") for entity in target_entities})
+            self.assertIn("imports_module", {entity.get("is_relational") for entity in target_entities})
+
+    def test_format_repo_knowledge_chunks_includes_relation_description(self) -> None:
+        chunks = repo_code_splitter_mod._format_repo_knowledge_chunks(
+            [
+                {
+                    "score": 0.97,
+                    "payload": {
+                        "relation_type": "defines_class",
+                        "source_entity_id": "ent:module:sample",
+                        "target_entity_id": "ent:class:demo",
+                        "metadata": {
+                            "source_path": "sample.py",
+                            "relation_description": "sample.py defines the Demo class.",
+                        },
+                    },
+                }
+            ],
+            "relation",
+        )
+
+        self.assertEqual(len(chunks), 1)
+        self.assertEqual(chunks[0]["relation_description"], "sample.py defines the Demo class.")
+        self.assertEqual(chunks[0]["source_path"], "sample.py")
+
+    def test_load_repo_context_for_ide_agent_uses_relation_description_for_relation_chunks(self) -> None:
+        with patch(
+            "alde.repo_code_splitter.repo_knowledge_query",
+            return_value={
+                "ok": True,
+                "chunks": [
+                    {
+                        "owner_type": "relation",
+                        "relation_type": "defines_class",
+                        "source_entity_id": "ent:module:sample",
+                        "target_entity_id": "ent:class:demo",
+                        "relation_description": "sample.py defines the Demo class.",
+                        "source_path": "sample.py",
+                    }
+                ],
+            },
+        ):
+            entries = load_repo_context_for_ide_agent(
+                "Demo class",
+                limit=1,
+                owner_types=["relation"],
+                use_vector=False,
+            )
+
+        self.assertEqual(len(entries), 1)
+        self.assertIn("defines_class", entries[0]["title"])
+        self.assertEqual(entries[0]["content"], "sample.py defines the Demo class.")
+        self.assertEqual(entries[0]["source_path"], "sample.py")
 
     def test_repo_knowledge_worker_is_registered_and_scans_python_files(self) -> None:
         spec = get_tool_spec("repo_knowledge_worker")
@@ -503,6 +837,107 @@ class TestRepoCodeSplitter(unittest.TestCase):
             self.assertIn("chunks", result)
             self.assertIn("total", result)
             self.assertIsInstance(result["chunks"], list)
+
+    def test_repo_knowledge_query_vector_results_include_non_empty_chunk_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            image_path = str(Path(tmp_dir) / "agentsdb_rkq_vector_image.json")
+
+            repo = AgentDbInMemoryRepository(image_path)
+            repo.ensure_index_objects()
+            repo.upsert_object(
+                "document",
+                "doc:repo:test:1",
+                {
+                    "_id": "doc:repo:test:1",
+                    "tenant_id": "tenant_default",
+                    "namespace_id": "ns_repo_knowledge",
+                    "document_type": "repo_source",
+                    "title": "finder.py",
+                    "source_uri": "file:///tmp/finder.py",
+                    "content_sha256": "sha-doc-1",
+                    "blocks": [
+                        {
+                            "block_id": "blk:repo:test:1",
+                            "block_no": 1,
+                            "heading": "class Finder",
+                            "content": "class Finder:\n    def find(self):\n        return 'ok'\n",
+                            "block_kind": "class",
+                            "metadata": {"source_path": "finder.py", "kind": "class"},
+                        }
+                    ],
+                },
+            )
+            repo.upsert_object(
+                "entity",
+                "ent:repo:test:1",
+                {
+                    "_id": "ent:repo:test:1",
+                    "tenant_id": "tenant_default",
+                    "namespace_id": "ns_repo_knowledge",
+                    "entity_type": "class",
+                    "canonical_name": "Finder",
+                    "summary": "Finder class for repo knowledge query tests.",
+                    "metadata": {"source_path": "finder.py"},
+                },
+            )
+            repo.upsert_object(
+                "embedding",
+                "ns_repo_knowledge:block:blk:repo:test:1:model",
+                {
+                    "tenant_id": "tenant_default",
+                    "namespace_id": "ns_repo_knowledge",
+                    "model_id": "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
+                    "owner_type": "block",
+                    "owner_id": "blk:repo:test:1",
+                    "content_sha256": "sha-emb-block-1",
+                    "dimension": 3,
+                    "index_namespace": "ns_repo_knowledge",
+                    "index_item_key": "block:blk:repo:test:1",
+                    "embedding": [1.0, 0.0, 0.0],
+                },
+            )
+            repo.upsert_object(
+                "embedding",
+                "ns_repo_knowledge:entity:ent:repo:test:1:model",
+                {
+                    "tenant_id": "tenant_default",
+                    "namespace_id": "ns_repo_knowledge",
+                    "model_id": "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
+                    "owner_type": "entity",
+                    "owner_id": "ent:repo:test:1",
+                    "content_sha256": "sha-emb-entity-1",
+                    "dimension": 3,
+                    "index_namespace": "ns_repo_knowledge",
+                    "index_item_key": "entity:ent:repo:test:1",
+                    "embedding": [0.9, 0.1, 0.0],
+                },
+            )
+
+            if hasattr(repo, "_flush_image"):
+                repo._flush_image()
+
+            with patch("alde.repo_code_splitter.load_agentsdb_runtime_config_from_env", return_value=None), patch(
+                "alde.repo_code_splitter.EntityRelationEmbeddingService.embed_object",
+                return_value=[1.0, 0.0, 0.0],
+            ):
+                result = repo_knowledge_query(
+                    "Finder class find method",
+                    owner_types=["block", "entity"],
+                    limit=2,
+                    image_path=image_path,
+                    use_vector=True,
+                )
+
+            self.assertTrue(result["ok"], msg=result.get("error"))
+            self.assertTrue(result["used_vector_search"])
+            self.assertGreaterEqual(result["total"], 2)
+            block_chunks = [chunk for chunk in result["chunks"] if chunk.get("owner_type") == "block"]
+            entity_chunks = [chunk for chunk in result["chunks"] if chunk.get("owner_type") == "entity"]
+            self.assertTrue(any(str(chunk.get("heading") or "").strip() for chunk in block_chunks), msg=result)
+            self.assertTrue(any(str(chunk.get("content") or "").strip() for chunk in block_chunks), msg=result)
+            self.assertTrue(any(str(chunk.get("source_path") or "").strip() for chunk in block_chunks), msg=result)
+            self.assertTrue(any(str(chunk.get("canonical_name") or "").strip() for chunk in entity_chunks), msg=result)
+            self.assertTrue(any(str(chunk.get("summary") or "").strip() for chunk in entity_chunks), msg=result)
 
     # -----------------------------------------------------------------------
     # Unified Splitter API
