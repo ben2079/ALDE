@@ -297,7 +297,7 @@ class RuntimeWidget(QWidget):
 		self.setToolTip(status_text)
 
 		view_kind = str(snapshot_payload.get("view_kind") or "relations_graph").strip().lower()
-		if view_kind not in {"relations", "relations_graph"}:
+		if view_kind not in {"relations", "relations_graph", "catalog", "catalog_graph"}:
 			detail_html = str(snapshot_payload.get("detail_html") or "<p>No details available.</p>")
 			self._detail_page.setHtml(detail_html)
 			self._content_stack.setCurrentWidget(self._detail_page)

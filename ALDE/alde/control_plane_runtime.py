@@ -35,6 +35,17 @@ def _safe_str(value: Any) -> str:
     return str(value or "").strip()
 
 
+def _load_env_float(name: str, default: float, *, minimum: float, maximum: float) -> float:
+    raw_value = _safe_str(os.getenv(name, ""))
+    if not raw_value:
+        return float(default)
+    try:
+        parsed_value = float(raw_value)
+    except Exception:
+        return float(default)
+    return max(float(minimum), min(float(maximum), parsed_value))
+
+
 def _json_safe_copy(value: Any) -> Any:
     try:
         return json.loads(json.dumps(value, ensure_ascii=False, default=str))
@@ -996,12 +1007,17 @@ class RuntimeViewService:
             session_id=session_id,
             history_entries=history_entries,
         )
+        ordered_runtime_events = self.sort_events(runtime_events)
         trace_entries = self._projection_service.load_history_trace(
             session_id=session_id,
             history_entries=history_entries,
             trace_limit=trace_limit,
         )
-        ordered_events = self.sort_events(runtime_events)
+        metrics = self._metrics_service.summarize_events(
+            ordered_runtime_events,
+            session_id=session_id,
+        )
+        ordered_events = list(ordered_runtime_events)
         if event_limit is not None and event_limit >= 0:
             ordered_events = ordered_events[-event_limit:]
 
@@ -1019,11 +1035,7 @@ class RuntimeViewService:
             "generated_at": _utc_now_iso(),
             "session_count": len(session_views),
             "event_count": len(ordered_events),
-            "metrics": self._metrics_service.load_runtime_metrics(
-                base_dir=base_dir,
-                session_id=session_id,
-                history_entries=history_entries,
-            ),
+            "metrics": metrics,
             "sessions": session_views,
             "events": [self.build_timeline_entry(event_object) for event_object in ordered_events if isinstance(event_object, dict)],
             "trace_count": len(trace_entries),
@@ -1245,9 +1257,19 @@ class QueueHealthService:
             return backend, True
 
         redis_url = _safe_str(os.getenv("ALDE_WEB_REDIS_URL", "redis://localhost:6379/0"))
+        timeout_seconds = _load_env_float(
+            "ALDE_WEB_QUEUE_HEALTH_TIMEOUT_SECONDS",
+            0.75,
+            minimum=0.1,
+            maximum=5.0,
+        )
         try:
             redis_module = importlib.import_module("redis")
-            redis_connection = redis_module.Redis.from_url(redis_url)
+            redis_connection = redis_module.Redis.from_url(
+                redis_url,
+                socket_connect_timeout=timeout_seconds,
+                socket_timeout=timeout_seconds,
+            )
             redis_connection.ping()
             return "rq", True
         except Exception:
@@ -1318,17 +1340,26 @@ class RuntimeObservabilityService:
         history_entries: list[dict[str, Any]] | None = None,
         event_limit: int | None = None,
         trace_limit: int | None = None,
+        runtime_view: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        runtime_view = self._view_service.load_runtime_view(
-            base_dir=base_dir,
-            session_id=session_id,
-            history_entries=history_entries,
-            event_limit=event_limit,
-            trace_limit=trace_limit,
+        effective_runtime_view = (
+            dict(runtime_view)
+            if isinstance(runtime_view, dict)
+            else self._view_service.load_runtime_view(
+                base_dir=base_dir,
+                session_id=session_id,
+                history_entries=history_entries,
+                event_limit=event_limit,
+                trace_limit=trace_limit,
+            )
         )
         validation_report = self._validation_service.load_report()
         queue_backend, queue_healthy = self._queue_health_service.load_queue_health()
-        session_views = [session_view for session_view in (runtime_view.get("sessions") or []) if isinstance(session_view, dict)]
+        session_views = [
+            session_view
+            for session_view in (effective_runtime_view.get("sessions") or [])
+            if isinstance(session_view, dict)
+        ]
         latest_sessions = sorted(
             session_views,
             key=lambda session_view: (
@@ -1337,7 +1368,11 @@ class RuntimeObservabilityService:
             ),
             reverse=True,
         )[:5]
-        metrics = runtime_view.get("metrics") if isinstance(runtime_view.get("metrics"), dict) else {}
+        metrics = (
+            effective_runtime_view.get("metrics")
+            if isinstance(effective_runtime_view.get("metrics"), dict)
+            else {}
+        )
         router_parallel_status = self.load_router_parallel_status()
         router_parallel_config = (
             router_parallel_status.get("config")
@@ -1346,14 +1381,14 @@ class RuntimeObservabilityService:
         )
 
         return {
-            "generated_at": runtime_view.get("generated_at") or _utc_now_iso(),
+            "generated_at": effective_runtime_view.get("generated_at") or _utc_now_iso(),
             "session_id": session_id,
             "healthy": bool(validation_report.get("valid") and queue_healthy),
             "queue_backend": queue_backend,
             "queue_healthy": bool(queue_healthy),
-            "session_count": runtime_view.get("session_count", 0),
-            "event_count": runtime_view.get("event_count", 0),
-            "trace_count": runtime_view.get("trace_count", 0),
+            "session_count": effective_runtime_view.get("session_count", 0),
+            "event_count": effective_runtime_view.get("event_count", 0),
+            "trace_count": effective_runtime_view.get("trace_count", 0),
             "active_session_count": int(metrics.get("active_session_count") or 0),
             "validation": validation_report,
             "metrics": metrics,
@@ -1462,12 +1497,18 @@ class OperatorStatusService:
         host = _safe_str(parsed_uri.hostname) or "127.0.0.1"
         port = int(parsed_uri.port or 2331)
         endpoint = f"{host}:{port}"
+        timeout_seconds = _load_env_float(
+            "ALDE_CONTROL_PLANE_AGENTSDB_TIMEOUT_SECONDS",
+            1.0,
+            minimum=0.2,
+            maximum=5.0,
+        )
 
         try:
             repository = socket_repository_class.create_from_uri(
                 agentsdb_uri,
                 database_name,
-                timeout_seconds=2.0,
+                timeout_seconds=timeout_seconds,
             )
             health_payload = repository._request_object("health")
             healthy = bool(health_payload.get("ok"))
@@ -1974,6 +2015,7 @@ class DesktopMonitoringSnapshotService:
             history_entries=history_entries,
             event_limit=event_limit,
             trace_limit=trace_limit,
+            runtime_view=runtime_view,
         )
 
         sessions = [session_view for session_view in (runtime_view.get("sessions") or []) if isinstance(session_view, dict)]

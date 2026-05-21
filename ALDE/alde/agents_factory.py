@@ -2116,6 +2116,65 @@ class AgentRoutingDispatcher:
             current = current.get(segment)
         return current is not None
 
+    @staticmethod
+    def _load_bool_flag(value: Any) -> bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return bool(value)
+        if isinstance(value, str):
+            normalized_value = value.strip().lower()
+            if normalized_value in {"1", "true", "yes", "on"}:
+                return True
+            if normalized_value in {"0", "false", "no", "off", ""}:
+                return False
+        return False
+
+    @staticmethod
+    def _load_positive_int(value: Any) -> int | None:
+        try:
+            loaded_value = int(str(value).strip()) if isinstance(value, str) else int(value)
+        except Exception:
+            return None
+        return loaded_value if loaded_value >= 1 else None
+
+    def _load_async_route_config(
+        self,
+        *,
+        args: dict[str, Any],
+        handoff_payload: Any,
+        handoff_metadata: Any,
+    ) -> tuple[bool, int | None]:
+        metadata_object = handoff_metadata if isinstance(handoff_metadata, dict) else {}
+        payload_object = handoff_payload if isinstance(handoff_payload, dict) else {}
+
+        async_requested = any(
+            [
+                self._load_bool_flag(args.get("run_async")),
+                self._load_bool_flag(args.get("async")),
+                self._load_bool_flag(metadata_object.get("run_async")),
+                self._load_bool_flag(metadata_object.get("async")),
+                self._load_bool_flag(payload_object.get("run_async")),
+                self._load_bool_flag(payload_object.get("async")),
+            ]
+        )
+
+        max_agents: int | None = None
+        for candidate in (
+            args.get("max_agents"),
+            metadata_object.get("max_agents"),
+            payload_object.get("max_agents"),
+        ):
+            parsed_value = self._load_positive_int(candidate)
+            if parsed_value is not None:
+                max_agents = parsed_value
+                break
+
+        if not async_requested and max_agents is not None:
+            async_requested = True
+
+        return async_requested, max_agents
+
     def _load_route_guard_config(self, *, target: str, job_name: str | None) -> dict[str, Any]:
         normalized_job_name = str(job_name or "").strip()
         if normalize_agent_label(target) != "_xworker" or not normalized_job_name:
@@ -2221,6 +2280,24 @@ class AgentRoutingDispatcher:
             if route_handoff_payload:
                 handoff_payload = route_handoff_payload
                 args["handoff_payload"] = deepcopy(route_handoff_payload)
+
+        async_requested, max_agents = self._load_async_route_config(
+            args=args,
+            handoff_payload=handoff_payload,
+            handoff_metadata=handoff_metadata,
+        )
+        if async_requested and max_agents is None:
+            result = "Invalid route_to_agent payload: run_async=true requires max_agents >= 1"
+            _default_on_result('route_to_agent', result, tool_call_id)
+            return result, None
+        if async_requested and max_agents is not None:
+            args["run_async"] = True
+            args["max_agents"] = int(max_agents)
+            normalized_handoff_metadata = deepcopy(handoff_metadata) if isinstance(handoff_metadata, dict) else {}
+            normalized_handoff_metadata["run_async"] = True
+            normalized_handoff_metadata["max_agents"] = int(max_agents)
+            handoff_metadata = normalized_handoff_metadata
+            args["handoff_metadata"] = deepcopy(normalized_handoff_metadata)
 
         target = normalize_agent_label(
             str(args.get('target_agent') or object_name or '').strip()
@@ -4648,10 +4725,16 @@ class ToolCallExecutionService:
             return []
 
         config = self.load_handoff_parallel_object_config("tool_handoff")
-        worker_count = min(
-            int(config.get("worker_count") or 1),
-            len(handoff_items),
+        async_max_agents_override = self._load_async_max_agents_override_from_route_args(
+            [handoff_args for _, handoff_args in handoff_items]
         )
+        if async_max_agents_override is not None:
+            worker_count = min(max(1, int(async_max_agents_override)), len(handoff_items))
+        else:
+            worker_count = min(
+                int(config.get("worker_count") or 1),
+                len(handoff_items),
+            )
         if worker_count <= 1:
             return [
                 self.execute_handoff_object_message(
@@ -4692,15 +4775,90 @@ class ToolCallExecutionService:
         tool_function = getattr(tool_call, "function", None)
         return normalize_tool_name(str(getattr(tool_function, "name", "") or ""))
 
+    @staticmethod
+    def _load_bool_object_flag(value: Any) -> bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return bool(value)
+        if isinstance(value, str):
+            normalized_value = value.strip().lower()
+            if normalized_value in {"1", "true", "yes", "on"}:
+                return True
+            if normalized_value in {"0", "false", "no", "off", ""}:
+                return False
+        return False
+
+    @staticmethod
+    def _load_positive_object_int(value: Any) -> int | None:
+        try:
+            loaded_value = int(str(value).strip()) if isinstance(value, str) else int(value)
+        except Exception:
+            return None
+        return loaded_value if loaded_value >= 1 else None
+
+    def _load_async_route_args_config(self, route_args: dict[str, Any]) -> tuple[bool, int | None]:
+        handoff_metadata = route_args.get("handoff_metadata") if isinstance(route_args.get("handoff_metadata"), dict) else {}
+        handoff_payload = route_args.get("handoff_payload") if isinstance(route_args.get("handoff_payload"), dict) else {}
+
+        async_requested = any(
+            [
+                self._load_bool_object_flag(route_args.get("run_async")),
+                self._load_bool_object_flag(route_args.get("async")),
+                self._load_bool_object_flag(handoff_metadata.get("run_async")),
+                self._load_bool_object_flag(handoff_metadata.get("async")),
+                self._load_bool_object_flag(handoff_payload.get("run_async")),
+                self._load_bool_object_flag(handoff_payload.get("async")),
+            ]
+        )
+
+        max_agents: int | None = None
+        for candidate in (
+            route_args.get("max_agents"),
+            handoff_metadata.get("max_agents"),
+            handoff_payload.get("max_agents"),
+        ):
+            parsed_value = self._load_positive_object_int(candidate)
+            if parsed_value is not None:
+                max_agents = parsed_value
+                break
+
+        if not async_requested and max_agents is not None:
+            async_requested = True
+
+        return async_requested, max_agents
+
+    def _load_async_max_agents_override_from_route_args(self, route_args_list: list[dict[str, Any]]) -> int | None:
+        max_agents_override: int | None = None
+        for route_args in route_args_list:
+            if not isinstance(route_args, dict):
+                continue
+            async_requested, max_agents = self._load_async_route_args_config(route_args)
+            if not async_requested or max_agents is None:
+                continue
+            max_agents_override = max(max_agents_override or 0, int(max_agents))
+        return max_agents_override
+
+    def _load_async_max_agents_override_from_tool_calls(self, tool_calls: list[Any]) -> int | None:
+        route_args_list: list[dict[str, Any]] = []
+        for tool_call in tool_calls:
+            if self._load_tool_call_object_name(tool_call) != "route_to_agent":
+                continue
+            tool_function = getattr(tool_call, "function", None)
+            raw_arguments = str(getattr(tool_function, "arguments", "{}") or "{}")
+            try:
+                parsed_arguments = json.loads(raw_arguments)
+            except Exception:
+                parsed_arguments = {}
+            route_args_list.append(parsed_arguments if isinstance(parsed_arguments, dict) else {})
+        return self._load_async_max_agents_override_from_route_args(route_args_list)
+
     def should_execute_router_parallel_object_calls(
         self,
         *,
         agent_msg: Any,
         agent_label: str,
     ) -> bool:
-        config = self.load_router_branch_parallel_object_config("router_branch")
-        if not bool(config.get("parallel_enabled")):
-            return False
         if not _agent_can_route(agent_label):
             return False
 
@@ -4711,6 +4869,9 @@ class ToolCallExecutionService:
         return all(
             self._load_tool_call_object_name(tool_call) == "route_to_agent"
             for tool_call in tool_calls
+        ) and (
+            bool(self.load_router_branch_parallel_object_config("router_branch").get("parallel_enabled"))
+            or self._load_async_max_agents_override_from_tool_calls(tool_calls) is not None
         )
 
     def build_router_branch_object_tool_call(
@@ -4999,14 +5160,19 @@ class ToolCallExecutionService:
                 "branch_count": 0,
                 "worker_count": 1,
                 "timeout_seconds": 0.0,
+                "requested_max_agents": None,
                 "duration_ms": 0.0,
             }
 
         config = self.load_router_branch_parallel_object_config("router_branch")
-        worker_count = min(
-            int(config.get("worker_count") or 1),
-            len(branch_calls),
-        )
+        async_max_agents_override = self._load_async_max_agents_override_from_tool_calls(list(tool_calls or []))
+        if async_max_agents_override is not None:
+            worker_count = min(max(1, int(async_max_agents_override)), len(branch_calls))
+        else:
+            worker_count = min(
+                int(config.get("worker_count") or 1),
+                len(branch_calls),
+            )
         timeout_seconds = float(config.get("timeout_seconds") or 0.0)
         hard_timeout_enabled = bool(config.get("hard_timeout_enabled"))
         if worker_count <= 1:
@@ -5086,6 +5252,7 @@ class ToolCallExecutionService:
             "worker_count": worker_count,
             "timeout_seconds": timeout_seconds,
             "hard_timeout_enabled": hard_timeout_enabled,
+            "requested_max_agents": int(async_max_agents_override) if async_max_agents_override is not None else None,
             "duration_ms": round(max(time.perf_counter() - execution_started, 0.0) * 1000.0, 2),
         }
 
@@ -5181,6 +5348,7 @@ class ToolCallExecutionService:
                 "failed_branch_count": failed_branch_count,
                 "completed_branch_count": completed_branch_count,
                 "configured_worker_count": int(branch_execution.get("worker_count") or 1),
+                "requested_max_agents": branch_execution.get("requested_max_agents"),
                 "configured_timeout_seconds": float(branch_execution.get("timeout_seconds") or 0.0),
                 "hard_timeout_enabled": bool(branch_execution.get("hard_timeout_enabled")),
                 "run_duration_ms": float(branch_execution.get("duration_ms") or 0.0),
@@ -5196,6 +5364,7 @@ class ToolCallExecutionService:
                 "failed_branch_count": failed_branch_count,
                 "completed_branch_count": completed_branch_count,
                 "hard_timeout_enabled": bool(branch_execution.get("hard_timeout_enabled")),
+                "requested_max_agents": branch_execution.get("requested_max_agents"),
             }
             branch_failed = partial_fail
             if branch_failed:

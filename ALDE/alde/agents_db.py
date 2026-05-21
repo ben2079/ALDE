@@ -17,7 +17,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Protocol, Sequence
-from urllib.parse import quote, unquote, urlparse
+from urllib.parse import parse_qs, quote, unquote, urlparse
 
 
 _AGENTSDB_SOCKET_SERVER_LOCK = threading.RLock()
@@ -6663,10 +6663,12 @@ import html
 
 class AgentRelationGraphService:
     _RELATION_LIMIT = 48
+    _CATALOG_LIMIT = 120
     _WIDGET_PATH_ALIASES = {"adbgraphview"}
     _DEFAULT_WIDGET_KIND = "agent_relation_graph"
     _DEFAULT_TOOL_ID = "agent_relation_graph"
     _RELATIONS_VIEW_KIND = "relations_graph"
+    _CATALOG_VIEW_KIND = "catalog_graph"
     _WORKFLOW_VIEW_KIND = "workflow_diagram"
     _SEQUENCE_VIEW_KIND = "sequence_diagram"
     _GRAPH_LINK_SCHEME = "alde"
@@ -7208,6 +7210,7 @@ class AgentRelationGraphService:
             source_uri=source_uri,
         )
         snapshot_metadata = graph_context["metadata"]
+        projection_config = self._load_projection_config(snapshot_metadata)
         runtime_config = graph_context.get("runtime_config") or runtime_config
         if runtime_config is None:
             return {
@@ -7221,10 +7224,20 @@ class AgentRelationGraphService:
                 "widget_uri": snapshot_metadata.get("widget_uri", ""),
                 "widget_kind": snapshot_metadata.get("widget_kind", self._DEFAULT_WIDGET_KIND),
                 "tool_id": snapshot_metadata.get("tool_id", self._DEFAULT_TOOL_ID),
-                "view_kind": self._RELATIONS_VIEW_KIND,
+                "view_kind": projection_config.get("view_kind", self._RELATIONS_VIEW_KIND),
             }
 
         repository = self._load_repository(runtime_config)
+
+        projection_mode = str(projection_config.get("mode") or "relations").strip().lower()
+        if projection_mode == "catalog":
+            return self._load_catalog_snapshot(
+                repository=repository,
+                runtime_config=runtime_config,
+                snapshot_metadata=snapshot_metadata,
+                projection_config=projection_config,
+            )
+
         relation_objects = self._load_relation_objects(repository, str(getattr(runtime_config, "namespace_id", "") or ""))
         if not relation_objects:
             namespace_id = html.escape(str(getattr(runtime_config, "namespace_id", "") or "n/a"))
@@ -7243,7 +7256,7 @@ class AgentRelationGraphService:
                 "widget_uri": snapshot_metadata.get("widget_uri", ""),
                 "widget_kind": snapshot_metadata.get("widget_kind", self._DEFAULT_WIDGET_KIND),
                 "tool_id": snapshot_metadata.get("tool_id", self._DEFAULT_TOOL_ID),
-                "view_kind": self._RELATIONS_VIEW_KIND,
+                "view_kind": projection_config.get("view_kind", self._RELATIONS_VIEW_KIND),
             }
 
         node_payload_by_id = self._load_node_payload_by_id(repository, relation_objects)
@@ -7298,8 +7311,315 @@ class AgentRelationGraphService:
             "widget_uri": snapshot_metadata.get("widget_uri", ""),
             "widget_kind": snapshot_metadata.get("widget_kind", self._DEFAULT_WIDGET_KIND),
             "tool_id": snapshot_metadata.get("tool_id", self._DEFAULT_TOOL_ID),
-            "view_kind": self._RELATIONS_VIEW_KIND,
+            "view_kind": projection_config.get("view_kind", self._RELATIONS_VIEW_KIND),
         }
+
+    def _load_projection_config(self, metadata: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        metadata_payload = metadata if isinstance(metadata, Mapping) else {}
+        source_uri = str(metadata_payload.get("source_uri") or metadata_payload.get("widget_uri") or "").strip()
+        parsed_uri = urlparse(source_uri)
+        query_payload = parse_qs(str(parsed_uri.query or ""), keep_blank_values=False)
+
+        def _q(name: str, default_value: str = "") -> str:
+            values = query_payload.get(name) or []
+            if not values:
+                return str(default_value or "")
+            return str(values[0] or default_value).strip()
+
+        mode_value = _q("mode", _q("view", "relations")).strip().lower()
+        if mode_value in {"adb", "catalog", "collections", "all", "model", "analysis"}:
+            mode_value = "catalog"
+        else:
+            mode_value = "relations"
+
+        namespace_id = _q("namespace", _q("namespace_id", "")).strip()
+        include_embeddings = _q("embeddings", "1").strip().lower() not in {"0", "false", "no", "off"}
+        include_documents = _q("documents", "1").strip().lower() not in {"0", "false", "no", "off"}
+        include_blocks = _q("blocks", "1").strip().lower() not in {"0", "false", "no", "off"}
+        include_seeds = _q("seeds", "1").strip().lower() not in {"0", "false", "no", "off"}
+
+        return {
+            "mode": mode_value,
+            "view_kind": self._CATALOG_VIEW_KIND if mode_value == "catalog" else self._RELATIONS_VIEW_KIND,
+            "namespace_id": namespace_id,
+            "include_embeddings": include_embeddings,
+            "include_documents": include_documents,
+            "include_blocks": include_blocks,
+            "include_seeds": include_seeds,
+        }
+
+    def _load_catalog_snapshot(
+        self,
+        *,
+        repository: Any,
+        runtime_config: Any,
+        snapshot_metadata: Mapping[str, Any],
+        projection_config: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        namespace_id = str(
+            projection_config.get("namespace_id")
+            or getattr(runtime_config, "namespace_id", "")
+            or ""
+        ).strip()
+
+        nodes_by_id: dict[str, dict[str, Any]] = {}
+        edges: list[dict[str, Any]] = []
+        type_counts: dict[str, int] = {}
+
+        def add_node(node_id: str, label: str, kind: str) -> None:
+            normalized_node_id = str(node_id or "").strip()
+            if not normalized_node_id:
+                return
+            if normalized_node_id in nodes_by_id:
+                return
+            nodes_by_id[normalized_node_id] = {
+                "node_id": normalized_node_id,
+                "label": str(label or normalized_node_id),
+                "kind": str(kind or "object"),
+            }
+            type_counts[str(kind or "object")] = type_counts.get(str(kind or "object"), 0) + 1
+
+        def add_edge(source_id: str, target_id: str, label: str, description: str = "") -> None:
+            src = str(source_id or "").strip()
+            tgt = str(target_id or "").strip()
+            if not src or not tgt or src == tgt:
+                return
+            edges.append(
+                {
+                    "source": src,
+                    "target": tgt,
+                    "label": str(label or "related_to"),
+                    "description": str(description or ""),
+                }
+            )
+
+        namespace_node_id = f"namespace:{namespace_id or 'default'}"
+        add_node(namespace_node_id, namespace_id or "default namespace", "namespace")
+
+        load_objects = getattr(repository, "load_objects", None)
+        if not callable(load_objects):
+            return {
+                "status_text": "Repository does not support load_objects",
+                "message": "Unable to enumerate ADB objects for catalog view.",
+                "detail_html": "<h3>ADB Catalog Graph</h3><p>Repository does not support object enumeration.</p>",
+                "nodes": [],
+                "edges": [],
+                "metadata": snapshot_metadata,
+                "source_uri": snapshot_metadata.get("source_uri", ""),
+                "widget_uri": snapshot_metadata.get("widget_uri", ""),
+                "widget_kind": snapshot_metadata.get("widget_kind", self._DEFAULT_WIDGET_KIND),
+                "tool_id": snapshot_metadata.get("tool_id", self._DEFAULT_TOOL_ID),
+                "view_kind": self._CATALOG_VIEW_KIND,
+            }
+
+        collection_object_names: list[str] = ["entity", "relation"]
+        if bool(projection_config.get("include_documents", True)):
+            collection_object_names.append("document")
+        if bool(projection_config.get("include_embeddings", True)):
+            collection_object_names.append("embedding")
+
+        owner_type_nodes: dict[str, str] = {}
+        entity_node_ids: set[str] = set()
+
+        for object_name in collection_object_names:
+            collection_node_id = f"collection:{object_name}"
+            add_node(collection_node_id, object_name, "collection")
+            add_edge(namespace_node_id, collection_node_id, "contains_collection")
+
+            object_filter = {"namespace_id": namespace_id} if namespace_id else None
+            try:
+                payload_rows = load_objects(object_name, object_filter, limit=self._CATALOG_LIMIT)
+            except TypeError:
+                payload_rows = load_objects(object_name, object_filter)
+            except Exception:
+                payload_rows = []
+
+            for payload in payload_rows or []:
+                if not isinstance(payload, Mapping):
+                    continue
+                payload_id = str(payload.get("_id") or payload.get("id") or "").strip()
+                if not payload_id:
+                    continue
+
+                if object_name == "entity":
+                    node_id = f"entity:{payload_id}"
+                    label = str(payload.get("canonical_name") or payload.get("title") or payload_id)
+                    entity_type = str(payload.get("entity_type") or "entity").strip() or "entity"
+                    add_node(node_id, label, entity_type)
+                    entity_node_ids.add(node_id)
+                    add_edge(collection_node_id, node_id, "contains")
+
+                    type_node_id = f"type:entity:{entity_type}"
+                    add_node(type_node_id, entity_type, "entity_type")
+                    add_edge(type_node_id, node_id, "typed_as")
+
+                    if bool(projection_config.get("include_seeds", True)):
+                        for key_name in ("seed_key", "source_seed_key"):
+                            seed_value = str(payload.get(key_name) or "").strip()
+                            if seed_value:
+                                seed_node_id = f"seed:{seed_value}"
+                                add_node(seed_node_id, seed_value, "seed")
+                                add_edge(seed_node_id, node_id, "maps_to")
+
+                elif object_name == "relation":
+                    relation_node_id = f"relation:{payload_id}"
+                    relation_type = str(payload.get("relation_type") or "related_to").strip() or "related_to"
+                    add_node(relation_node_id, relation_type, "relation")
+                    add_edge(collection_node_id, relation_node_id, "contains")
+
+                    type_node_id = f"type:relation:{relation_type}"
+                    add_node(type_node_id, relation_type, "relation_type")
+                    add_edge(type_node_id, relation_node_id, "typed_as")
+
+                    source_entity_id = str(payload.get("source_entity_id") or "").strip()
+                    target_entity_id = str(payload.get("target_entity_id") or "").strip()
+                    if source_entity_id:
+                        source_node_id = f"entity:{source_entity_id}"
+                        if source_node_id not in nodes_by_id:
+                            add_node(source_node_id, self._short_entity_label(source_entity_id), "entity")
+                        add_edge(relation_node_id, source_node_id, "source")
+                    if target_entity_id:
+                        target_node_id = f"entity:{target_entity_id}"
+                        if target_node_id not in nodes_by_id:
+                            add_node(target_node_id, self._short_entity_label(target_entity_id), "entity")
+                        add_edge(relation_node_id, target_node_id, "target")
+
+                    if bool(projection_config.get("include_seeds", True)):
+                        relation_seed = str(payload.get("source_seed_key") or payload.get("seed_key") or "").strip()
+                        if relation_seed:
+                            seed_node_id = f"seed:{relation_seed}"
+                            add_node(seed_node_id, relation_seed, "seed")
+                            add_edge(seed_node_id, relation_node_id, "describes")
+
+                elif object_name == "document":
+                    document_node_id = f"document:{payload_id}"
+                    title = str(payload.get("title") or payload.get("source_uri") or payload_id)
+                    add_node(document_node_id, title, "document")
+                    add_edge(collection_node_id, document_node_id, "contains")
+
+                    document_type = str(payload.get("document_type") or "document").strip() or "document"
+                    doc_type_node_id = f"type:document:{document_type}"
+                    add_node(doc_type_node_id, document_type, "document_type")
+                    add_edge(doc_type_node_id, document_node_id, "typed_as")
+
+                    if bool(projection_config.get("include_blocks", True)):
+                        block_rows = payload.get("blocks") if isinstance(payload.get("blocks"), Sequence) else []
+                        for block_payload in block_rows:
+                            if not isinstance(block_payload, Mapping):
+                                continue
+                            block_id = str(
+                                block_payload.get("block_id")
+                                or block_payload.get("_id")
+                                or block_payload.get("id")
+                                or ""
+                            ).strip()
+                            if not block_id:
+                                continue
+                            block_node_id = f"block:{block_id}"
+                            block_label = str(block_payload.get("heading") or block_payload.get("block_kind") or block_id)
+                            add_node(block_node_id, block_label, "block")
+                            add_edge(document_node_id, block_node_id, "contains_block")
+
+                elif object_name == "embedding":
+                    owner_type = str(payload.get("owner_type") or "owner").strip() or "owner"
+                    owner_id = str(payload.get("owner_id") or "").strip()
+                    embedding_node_id = f"embedding:{payload_id}"
+                    model_id = str(payload.get("model_id") or "embedding")
+                    add_node(embedding_node_id, model_id, "embedding")
+                    add_edge(collection_node_id, embedding_node_id, "contains")
+
+                    if owner_type:
+                        owner_type_node_id = owner_type_nodes.get(owner_type)
+                        if not owner_type_node_id:
+                            owner_type_node_id = f"owner_type:{owner_type}"
+                            owner_type_nodes[owner_type] = owner_type_node_id
+                            add_node(owner_type_node_id, owner_type, "owner_type")
+                            add_edge(namespace_node_id, owner_type_node_id, "supports_owner")
+                        add_edge(owner_type_node_id, embedding_node_id, "owns_embedding")
+
+                    if owner_id:
+                        owner_node_id = f"{owner_type}:{owner_id}"
+                        if owner_node_id not in nodes_by_id:
+                            owner_label = self._short_entity_label(owner_id)
+                            add_node(owner_node_id, owner_label, owner_type or "owner")
+                        add_edge(embedding_node_id, owner_node_id, "embeds")
+
+                    key_name = str(payload.get("index_item_key") or "").strip()
+                    if key_name:
+                        key_node_id = f"key:{key_name}"
+                        add_node(key_node_id, key_name, "key")
+                        add_edge(key_node_id, embedding_node_id, "indexes")
+
+        node_objects = sorted(nodes_by_id.values(), key=lambda item: str(item.get("label") or "").lower())
+        detail_html = self._build_catalog_detail_html(
+            runtime_config=runtime_config,
+            node_objects=node_objects,
+            edge_objects=edges,
+            type_counts=type_counts,
+            snapshot_metadata=snapshot_metadata,
+        )
+        return {
+            "status_text": f"ADB Catalog | {len(node_objects)} nodes | {len(edges)} edges",
+            "message": "",
+            "detail_html": detail_html,
+            "nodes": node_objects,
+            "edges": edges,
+            "metadata": snapshot_metadata,
+            "source_uri": snapshot_metadata.get("source_uri", ""),
+            "widget_uri": snapshot_metadata.get("widget_uri", ""),
+            "widget_kind": snapshot_metadata.get("widget_kind", self._DEFAULT_WIDGET_KIND),
+            "tool_id": snapshot_metadata.get("tool_id", self._DEFAULT_TOOL_ID),
+            "view_kind": self._CATALOG_VIEW_KIND,
+        }
+
+    def _build_catalog_detail_html(
+        self,
+        *,
+        runtime_config: Any,
+        node_objects: Sequence[Mapping[str, Any]],
+        edge_objects: Sequence[Mapping[str, Any]],
+        type_counts: Mapping[str, int],
+        snapshot_metadata: Mapping[str, Any] | None = None,
+    ) -> str:
+        metadata = snapshot_metadata if isinstance(snapshot_metadata, Mapping) else {}
+        type_rows = "".join(
+            f"<li><b>{html.escape(str(type_name))}</b>: {int(type_count)}</li>"
+            for type_name, type_count in sorted(type_counts.items(), key=lambda item: (-int(item[1]), str(item[0])))[:16]
+        )
+        if not type_rows:
+            type_rows = "<li>No object types loaded.</li>"
+
+        sample_edges = "".join(
+            (
+                f"<li><b>{html.escape(str(edge_object.get('label') or 'related_to'))}</b>: "
+                f"{html.escape(str(edge_object.get('source') or 'n/a'))} -> "
+                f"{html.escape(str(edge_object.get('target') or 'n/a'))}</li>"
+            )
+            for edge_object in list(edge_objects)[:12]
+        )
+        if not sample_edges:
+            sample_edges = "<li>No graph edges rendered.</li>"
+
+        return "".join(
+            [
+                "<h3>ADB Catalog Graph</h3>",
+                "<p>Unified graph projection for collection analysis, modeling and exploration.</p>",
+                "<ul>",
+                f"<li><b>Database:</b> {html.escape(str(getattr(runtime_config, 'database_name', 'n/a') or 'n/a'))}</li>",
+                f"<li><b>Namespace:</b> {html.escape(str(getattr(runtime_config, 'namespace_id', 'n/a') or 'n/a'))}</li>",
+                f"<li><b>Backend:</b> {html.escape(str(getattr(runtime_config, 'agents_db_uri', 'n/a') or 'n/a'))}</li>",
+                f"<li><b>Widget URI:</b> {html.escape(str(metadata.get('widget_uri') or metadata.get('source_uri') or 'n/a'))}</li>",
+                f"<li><b>Tool:</b> {html.escape(str(metadata.get('tool_id') or self._DEFAULT_TOOL_ID))}</li>",
+                f"<li><b>Nodes:</b> {len(list(node_objects))}</li>",
+                f"<li><b>Edges:</b> {len(list(edge_objects))}</li>",
+                "</ul>",
+                "<h4>Object Types</h4>",
+                f"<ul>{type_rows}</ul>",
+                "<h4>Sample Links</h4>",
+                f"<ul>{sample_edges}</ul>",
+                "<p>Tip: use source URI query <code>?mode=catalog</code> to open this analysis projection explicitly.</p>",
+            ]
+        )
 
     def _load_graphic_tool_placeholder_snapshot(
         self,

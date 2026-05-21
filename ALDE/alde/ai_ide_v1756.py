@@ -18,7 +18,7 @@ import shutil
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from threading import Thread
-from urllib.parse import quote, unquote, urlparse
+from urllib.parse import parse_qsl, quote, unquote, urlencode, urlparse, urlunparse
 
 # Keep both repository roots on sys.path so local imports work in direct-script
 # mode and when the module is imported through the lowercase package alias.
@@ -4329,6 +4329,20 @@ class ControlPlaneWidget(QWidget):
         self._refresh_timer.start()
         self.refresh_view()
 
+    def set_external_tabs(self, tabs_widget: Any) -> None:
+        """Set an external QTabWidget to use instead of the internal tabs.
+        
+        This is used when ControlPlaneWidget tabs should be displayed in a parent container.
+        The internal self.tabs will be replaced with the external widget, so all future tab
+        operations (add/remove) use the external widget.
+        """
+        if tabs_widget is None or not isinstance(tabs_widget, QTabWidget):
+            return
+        
+        # Replace the internal tabs with the external one
+        # We don't need to remove the old tabs - they'll be replaced
+        self.tabs = tabs_widget
+
     def _control_plane_settings(self) -> QSettings:
         try:
             settings = QSettings(MainAIEditor.ORG_NAME, MainAIEditor.APP_NAME)
@@ -8571,6 +8585,7 @@ class ExtensionsWorkspaceWidget(QWidget):
         base: dict[str, str] | None = None,
         parent: QWidget | None = None,
         source_uri: str | None = None,
+        control_plane_widget_ref: Any = None,
     ) -> None:
         super().__init__(parent)
         self._accent = dict(accent or {})
@@ -8581,8 +8596,12 @@ class ExtensionsWorkspaceWidget(QWidget):
         self._session_state_by_tab: dict[QWidget, dict[str, Any]] = {}
         self._preview_initialized = False
         self._initial_source_uri = str(source_uri or "").strip()
+        self._control_plane_widget = control_plane_widget_ref
 
         self._build_ui()
+        # Add ControlPlaneWidget as first tab if provided
+        if self._control_plane_widget is not None:
+            self._add_control_plane_tab()
         restored_state = self._load_local_widget_state()
         initial_source_uri = self._initial_source_uri or str(restored_state.get("uri") or "")
         self._add_extension_tab(
@@ -8718,6 +8737,44 @@ class ExtensionsWorkspaceWidget(QWidget):
         self.add_tab_button = None
 
         root_layout.addWidget(self.extensions_tabs, 1)
+
+    def _add_control_plane_tab(self) -> None:
+        """Integrate ControlPlaneWidget's tabs directly into the main tab row."""
+        if self._control_plane_widget is None:
+            return
+        
+        # Get reference to ControlPlaneWidget's internal tabs
+        internal_tabs = getattr(self._control_plane_widget, "tabs", None)
+        
+        if internal_tabs is None or not isinstance(internal_tabs, QTabWidget):
+            return
+        
+        # Copy all Control Plane tabs (Configuration, Monitoring, Operations) to extensions_tabs
+        tabs_to_copy = []
+        for i in range(internal_tabs.count()):
+            tab_widget = internal_tabs.widget(i)
+            tab_text = internal_tabs.tabText(i)
+            if tab_widget is not None:
+                tabs_to_copy.append((tab_widget, tab_text))
+        
+        # Insert tabs at the beginning (in order)
+        for tab_widget, tab_text in tabs_to_copy:
+            self.extensions_tabs.insertTab(0, tab_widget, tab_text)
+            # Disable close button for control plane tabs
+            tab_bar = self.extensions_tabs.tabBar()
+            tab_bar.setTabButton(0, QTabBar.RightSide, None)
+        
+        # Clear the internal tabs (they're now managed by extensions_tabs)
+        while internal_tabs.count() > 0:
+            internal_tabs.removeTab(0)
+        
+        # Tell ControlPlaneWidget to use extensions_tabs for all future operations
+        if hasattr(self._control_plane_widget, "set_external_tabs"):
+            self._control_plane_widget.set_external_tabs(self.extensions_tabs)
+        
+        # Initialize the control plane widget
+        if hasattr(self._control_plane_widget, "refresh_view"):
+            self._control_plane_widget.refresh_view()
 
     def open_new_connection_tab(self, *, activate: bool = True) -> None:
         self._add_extension_tab(activate=activate)
@@ -8885,6 +8942,41 @@ class ExtensionsWorkspaceWidget(QWidget):
         uri_input.setText(str(source_uri or "agentsdb://127.0.0.1:2331/tools:agent_relation_graph"))
         form_layout.addRow("Source URI:", uri_input)
 
+        presets_container = QWidget(control_page)
+        presets_layout = QHBoxLayout(presets_container)
+        presets_layout.setContentsMargins(0, 0, 0, 0)
+        presets_layout.setSpacing(6)
+
+        preset_relations_button = QToolButton(presets_container)
+        preset_relations_button.setObjectName("extensionsUriPresetButton")
+        preset_relations_button.setText("Relations")
+        preset_relations_button.setToolButtonStyle(Qt.ToolButtonTextOnly)
+        preset_relations_button.setCursor(Qt.PointingHandCursor)
+        preset_relations_button.setAutoRaise(False)
+        preset_relations_button.setToolTip("Graph relation projection")
+        presets_layout.addWidget(preset_relations_button)
+
+        preset_catalog_button = QToolButton(presets_container)
+        preset_catalog_button.setObjectName("extensionsUriPresetButton")
+        preset_catalog_button.setText("Catalog")
+        preset_catalog_button.setToolButtonStyle(Qt.ToolButtonTextOnly)
+        preset_catalog_button.setCursor(Qt.PointingHandCursor)
+        preset_catalog_button.setAutoRaise(False)
+        preset_catalog_button.setToolTip("ADB catalog projection (collections, entities, relations, docs, blocks, seeds, embeddings)")
+        presets_layout.addWidget(preset_catalog_button)
+
+        preset_catalog_light_button = QToolButton(presets_container)
+        preset_catalog_light_button.setObjectName("extensionsUriPresetButton")
+        preset_catalog_light_button.setText("Catalog Light")
+        preset_catalog_light_button.setToolButtonStyle(Qt.ToolButtonTextOnly)
+        preset_catalog_light_button.setCursor(Qt.PointingHandCursor)
+        preset_catalog_light_button.setAutoRaise(False)
+        preset_catalog_light_button.setToolTip("Catalog projection without embeddings")
+        presets_layout.addWidget(preset_catalog_light_button)
+
+        presets_layout.addStretch(1)
+        form_layout.addRow("Presets:", presets_container)
+
         tool_selector = QComboBox(control_page)
         tool_selector.setObjectName("extensionsGraphToolSelector")
         session_state["requested_tool_id"] = str(tool_id or "").strip()
@@ -8947,6 +9039,27 @@ class ExtensionsWorkspaceWidget(QWidget):
         keep_local_checkbox.stateChanged.connect(lambda _state: self._handle_session_control_change(session_state, refresh_preview=False))
         preview_button.clicked.connect(lambda: self._refresh_connection_preview(session_state))
         load_button.clicked.connect(lambda: self._load_extension_into_session(session_state, fit_view=True))
+        preset_relations_button.clicked.connect(
+            lambda: self._apply_session_source_uri_preset(
+                session_state,
+                mode_value="relations",
+                include_embeddings=True,
+            )
+        )
+        preset_catalog_button.clicked.connect(
+            lambda: self._apply_session_source_uri_preset(
+                session_state,
+                mode_value="catalog",
+                include_embeddings=True,
+            )
+        )
+        preset_catalog_light_button.clicked.connect(
+            lambda: self._apply_session_source_uri_preset(
+                session_state,
+                mode_value="catalog",
+                include_embeddings=False,
+            )
+        )
 
         return control_page
 
@@ -8996,6 +9109,63 @@ class ExtensionsWorkspaceWidget(QWidget):
         if isinstance(uri_input, QLineEdit):
             return str(uri_input.text() or "").strip()
         return ""
+
+    def _apply_session_source_uri_preset(
+        self,
+        session_state: dict[str, Any],
+        *,
+        mode_value: str,
+        include_embeddings: bool,
+    ) -> None:
+        uri_input = session_state.get("uri_input")
+        if not isinstance(uri_input, QLineEdit):
+            return
+        base_uri = str(uri_input.text() or "").strip()
+        if not base_uri:
+            base_uri = "agentsdb://127.0.0.1:2331/tools:agent_relation_graph"
+
+        resolved_uri = self._build_session_source_uri_with_mode(
+            base_uri,
+            mode_value=mode_value,
+            include_embeddings=include_embeddings,
+        )
+        blocker = QtCore.QSignalBlocker(uri_input)
+        uri_input.setText(resolved_uri)
+        del blocker
+
+        self._handle_session_control_change(session_state, refresh_preview=False)
+        self._refresh_connection_preview(session_state)
+
+    def _build_session_source_uri_with_mode(
+        self,
+        source_uri: str,
+        *,
+        mode_value: str,
+        include_embeddings: bool,
+    ) -> str:
+        uri_text = str(source_uri or "").strip()
+        if not uri_text:
+            uri_text = "agentsdb://127.0.0.1:2331/tools:agent_relation_graph"
+
+        parsed_uri = urlparse(uri_text)
+        query_pairs = [(str(key), str(value)) for key, value in parse_qsl(str(parsed_uri.query or ""), keep_blank_values=False)]
+        preserved_pairs = [(key, value) for key, value in query_pairs if key not in {"mode", "view", "embeddings"}]
+        preserved_pairs.append(("mode", str(mode_value or "relations")))
+        if str(mode_value or "").strip().lower() == "catalog":
+            preserved_pairs.append(("embeddings", "1" if include_embeddings else "0"))
+
+        rebuilt_query = urlencode(preserved_pairs, doseq=True)
+        rebuilt_uri = urlunparse(
+            (
+                parsed_uri.scheme,
+                parsed_uri.netloc,
+                parsed_uri.path,
+                parsed_uri.params,
+                rebuilt_query,
+                parsed_uri.fragment,
+            )
+        )
+        return rebuilt_uri
 
     def _session_tool_id(self, session_state: Mapping[str, Any]) -> str:
         tool_selector = session_state.get("tool_selector")
@@ -9240,6 +9410,16 @@ QComboBox#extensionsGraphToolSelector {{
     border: 1px solid {self.scheme.get('col10', '#33406a')};
     border-radius: 8px;
     padding: 6px 8px;
+}}
+QToolButton#extensionsUriPresetButton {{
+    color: {self.scheme.get('col6', '#e7eeff')};
+    background: {self.scheme.get('col9', '#22345c')};
+    border: 1px solid {self.scheme.get('col10', '#33406a')};
+    border-radius: 7px;
+    padding: 4px 10px;
+}}
+QToolButton#extensionsUriPresetButton:hover {{
+    background: {self.scheme.get('col10', '#33406a')};
 }}
 QTextBrowser#extensionsConnectionsPreviewBrowser {{
     color: {self.scheme.get('col6', '#e7eeff')};
@@ -10445,27 +10625,19 @@ class MainAIEditor(QMainWindow):
                 self.explorer.set_accent_color(scheme.get("col1", "#3a5fff"))
 
         disable_control_plane = _env_truthy("AI_IDE_DISABLE_CONTROL_PLANE", "0")
-        self.control_plane_dock = QDockWidget("Control Plane", self)
-        self.control_plane_dock.setObjectName("ControlPlaneDock")
-        self.control_plane_dock.setTitleBarWidget(QWidget())
-        self.control_plane_dock.setFeatures(QDockWidget.NoDockWidgetFeatures)
-        self.control_plane_dock.setAllowedAreas(Qt.LeftDockWidgetArea | Qt.RightDockWidgetArea)
-        self.control_plane_dock.setMinimumSize(0, 0)
-        self.control_plane_dock.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Expanding)
+        # Create ControlPlaneWidget and pass it to ExtensionsWorkspaceWidget
         if not disable_control_plane:
             self.control_plane_widget = ControlPlaneWidget(self._accent, self._base, self)
             self.control_plane_widget.setMinimumSize(0, 0)
             self.control_plane_widget.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Expanding)
-            self.control_plane_dock.setWidget(self.control_plane_widget)
+            if self.control_plane_widget is not None:
+                self.control_plane_widget.snapshotChanged.connect(self._update_control_plane_status)
         else:
             self.control_plane_widget = None
-            self.control_plane_dock.setWidget(QWidget())
-        if self.control_plane_widget is not None:
-            self.control_plane_widget.snapshotChanged.connect(self._update_control_plane_status)
-            self.control_plane_widget.refresh_view()
 
+        # Create extensions dock and pass control_plane_widget to it
         disable_extensions = _env_truthy("AI_IDE_DISABLE_EXTENSIONS_1", "0")
-        self.extensions_dock = QDockWidget("Extensions 1", self)
+        self.extensions_dock = QDockWidget("Extensions & Control Plane", self)
         self.extensions_dock.setObjectName("ExtensionsDock")
         self.extensions_dock.setTitleBarWidget(QWidget())
         self.extensions_dock.setFeatures(QDockWidget.NoDockWidgetFeatures)
@@ -10473,13 +10645,21 @@ class MainAIEditor(QMainWindow):
         self.extensions_dock.setMinimumSize(0, 0)
         self.extensions_dock.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Expanding)
         if not disable_extensions:
-            self.extensions_widget = ExtensionsWorkspace(self._accent, self._base, self)
+            self.extensions_widget = ExtensionsWorkspaceWidget(
+                self._accent,
+                self._base,
+                self,
+                control_plane_widget_ref=self.control_plane_widget,
+            )
             self.extensions_widget.setMinimumSize(0, 0)
             self.extensions_widget.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Expanding)
             self.extensions_dock.setWidget(self.extensions_widget)
         else:
             self.extensions_widget = None
             self.extensions_dock.setWidget(QWidget())
+        
+        # Keep control_plane_dock for backward compatibility (hidden)
+        self.control_plane_dock = None  # No longer used; merged into extensions_dock
     
     def _initialize_explorer_workspace(self):
         """Initialize example workspace structure in the explorer."""
@@ -10607,11 +10787,10 @@ class MainAIEditor(QMainWindow):
     def _create_central_splitters(self):
         self._strip_dock_decoration(self.files_dock)
         self._strip_dock_decoration(self.chat_dock)
-        self._strip_dock_decoration(self.control_plane_dock)
         self._strip_dock_decoration(self.extensions_dock)
 
         self.setMinimumSize(0, 0)
-        for dock in (self.files_dock, self.chat_dock, self.control_plane_dock, self.extensions_dock):
+        for dock in (self.files_dock, self.chat_dock, self.extensions_dock):
             if isinstance(dock, QDockWidget):
                 dock.setMinimumSize(0, 0)
                 dock.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Expanding)
@@ -10623,8 +10802,7 @@ class MainAIEditor(QMainWindow):
         self.main_split.setOpaqueResize(True)
         self.main_split.addWidget(self.files_dock)       # links
         self.main_split.addWidget(self.chat_dock)        # mitte
-        self.main_split.addWidget(self.control_plane_dock)  # rechts
-        self.main_split.addWidget(self.extensions_dock)  # extensions
+        self.main_split.addWidget(self.extensions_dock)  # extensions & control plane (merged)
         for index in range(self.main_split.count()):
             try:
                 self.main_split.setCollapsible(index, True)
@@ -10805,7 +10983,7 @@ class MainAIEditor(QMainWindow):
             checked=True,
         )
         self.act_toggle_control_plane.setToolTip("Configuration- und Monitoring-Panel anzeigen/ausblenden")
-        self.act_toggle_control_plane.toggled.connect(self.control_plane_dock.setVisible)
+        self.act_toggle_control_plane.toggled.connect(self.extensions_dock.setVisible)
 
         self.act_refresh_control_plane = QAction(
             _icon("reload_.svg"),
@@ -10828,7 +11006,7 @@ class MainAIEditor(QMainWindow):
             checked=True,
         )
         self.act_toggle_right_dock.setToolTip("Monitor anzeigen/ausblenden")
-        self.act_toggle_right_dock.toggled.connect(self.control_plane_dock.setVisible)
+        self.act_toggle_right_dock.toggled.connect(self.extensions_dock.setVisible)
 
         polymer_icon_path = Path(__file__).with_name("polymer_24dp_E3E3E3_FILL0_wght400_GRAD0_opsz24.svg")
         polymer_icon = QIcon(str(polymer_icon_path)) if polymer_icon_path.is_file() else _icon("polymer_24dp_E3E3E3_FILL0_wght400_GRAD0_opsz24.svg")
@@ -11354,7 +11532,7 @@ class MainAIEditor(QMainWindow):
             )
         self.chat_dock.visibilityChanged.connect(        #  << NEU
             self.act_toggle_chat.setChecked)
-        self.control_plane_dock.visibilityChanged.connect(
+        self.extensions_dock.visibilityChanged.connect(
             self.act_toggle_control_plane.setChecked
         )
         self.extensions_dock.visibilityChanged.connect(self.act_graph_placeholder.setChecked)
@@ -11362,14 +11540,13 @@ class MainAIEditor(QMainWindow):
             self.chat_dock.visibilityChanged.connect(self.act_toggle_control_plane_left.setChecked)
         self.files_dock.visibilityChanged.connect(lambda _v: self._rebalance_workspace_columns())
         self.chat_dock.visibilityChanged.connect(lambda _v: self._rebalance_workspace_columns())
-        self.control_plane_dock.visibilityChanged.connect(lambda _v: self._rebalance_workspace_columns())
         self.extensions_dock.visibilityChanged.connect(lambda _v: self._rebalance_workspace_columns())
 
         if hasattr(self, "act_toggle_right_dock"):
-            self.control_plane_dock.visibilityChanged.connect(self.act_toggle_right_dock.setChecked)
-            self.control_plane_dock.visibilityChanged.connect(self._update_right_dock_icon)
+            self.extensions_dock.visibilityChanged.connect(self.act_toggle_right_dock.setChecked)
+            self.extensions_dock.visibilityChanged.connect(self._update_right_dock_icon)
             # Initialize icon state
-            self._update_right_dock_icon(self.control_plane_dock.isVisible())
+            self._update_right_dock_icon(self.extensions_dock.isVisible())
         self._rebalance_workspace_columns()
 
     @Slot()
@@ -11410,9 +11587,9 @@ class MainAIEditor(QMainWindow):
             self.statusBar().showMessage("ACP disabled", 2500)
             return
 
-        if hasattr(self, "control_plane_dock") and isinstance(self.control_plane_dock, QDockWidget):
-            if not self.control_plane_dock.isVisible():
-                self.control_plane_dock.show()
+        if hasattr(self, "extensions_dock") and isinstance(self.extensions_dock, QDockWidget):
+            if not self.extensions_dock.isVisible():
+                self.extensions_dock.show()
 
         try:
             control_plane._open_new_runtime_tab()
@@ -11438,9 +11615,9 @@ class MainAIEditor(QMainWindow):
             )
             return
 
-        if hasattr(self, "control_plane_dock") and isinstance(self.control_plane_dock, QDockWidget):
-            if not self.control_plane_dock.isVisible():
-                self.control_plane_dock.show()
+        if hasattr(self, "extensions_dock") and isinstance(self.extensions_dock, QDockWidget):
+            if not self.extensions_dock.isVisible():
+                self.extensions_dock.show()
 
         try:
             reload_runtime = getattr(control_plane, "_reload_runtime_layout_from_path", None)
@@ -11467,9 +11644,9 @@ class MainAIEditor(QMainWindow):
             self.statusBar().showMessage("ACP disabled", 2500)
             return
 
-        if hasattr(self, "control_plane_dock") and isinstance(self.control_plane_dock, QDockWidget):
-            if not self.control_plane_dock.isVisible():
-                self.control_plane_dock.show()
+        if hasattr(self, "extensions_dock") and isinstance(self.extensions_dock, QDockWidget):
+            if not self.extensions_dock.isVisible():
+                self.extensions_dock.show()
 
         try:
             persist_runtime = getattr(control_plane, "persist_runtime_tabs_state", None)
@@ -11625,9 +11802,9 @@ class MainAIEditor(QMainWindow):
             self.statusBar().showMessage("ACP disabled", 2500)
             return
 
-        if hasattr(self, "control_plane_dock") and isinstance(self.control_plane_dock, QDockWidget):
-            if not self.control_plane_dock.isVisible():
-                self.control_plane_dock.show()
+        if hasattr(self, "extensions_dock") and isinstance(self.extensions_dock, QDockWidget):
+            if not self.extensions_dock.isVisible():
+                self.extensions_dock.show()
 
         try:
             runtime_text = selected_path.read_text(encoding="utf-8", errors="replace")
@@ -11750,9 +11927,9 @@ class MainAIEditor(QMainWindow):
             self.statusBar().showMessage("ACP disabled", 2500)
             return
 
-        if hasattr(self, "control_plane_dock") and isinstance(self.control_plane_dock, QDockWidget):
-            if not self.control_plane_dock.isVisible():
-                self.control_plane_dock.show()
+        if hasattr(self, "extensions_dock") and isinstance(self.extensions_dock, QDockWidget):
+            if not self.extensions_dock.isVisible():
+                self.extensions_dock.show()
 
         finder = getattr(control_plane, "_find_runtime_tab_by_name", None)
         tab_widget = None
@@ -11798,9 +11975,9 @@ class MainAIEditor(QMainWindow):
             self.statusBar().showMessage("ACP disabled", 2500)
             return
 
-        if hasattr(self, "control_plane_dock") and isinstance(self.control_plane_dock, QDockWidget):
-            if not self.control_plane_dock.isVisible():
-                self.control_plane_dock.show()
+        if hasattr(self, "extensions_dock") and isinstance(self.extensions_dock, QDockWidget):
+            if not self.extensions_dock.isVisible():
+                self.extensions_dock.show()
 
         try:
             control_plane.create_runtime_tab_for_kind(widget_kind, tab_name=tab_name, activate=True)
@@ -11846,10 +12023,11 @@ class MainAIEditor(QMainWindow):
 
     def _is_right_workspace_visible(self) -> bool:
         """Return True if any widget in the right workspace column is visible."""
-        control_visible = bool(getattr(self, "control_plane_dock", None) and self.control_plane_dock.isVisible())
+        # Control Plane is now part of extensions_dock (merged)
+        extensions_visible = bool(getattr(self, "extensions_dock", None) and self.extensions_dock.isVisible())
         console_visible = bool(getattr(self, "console_dock", None) and self.console_dock.isVisible())
         tabdock_visible = any(dock.isVisible() for dock in getattr(self, "_tab_docks", []))
-        return control_visible or console_visible or tabdock_visible
+        return extensions_visible or console_visible or tabdock_visible
 
     def _is_extensions_workspace_visible(self) -> bool:
         return bool(getattr(self, "extensions_dock", None) and self.extensions_dock.isVisible())
@@ -12004,7 +12182,8 @@ class MainAIEditor(QMainWindow):
             target_splitter = getattr(self, "main_split", None)
 
         if isinstance(target_splitter, QSplitter):
-            anchor_widget = self.control_plane_dock if target_splitter.indexOf(self.control_plane_dock) >= 0 else self.chat_dock
+            # Use extensions_dock (which now includes control plane) as anchor, fallback to chat_dock
+            anchor_widget = self.extensions_dock if target_splitter.indexOf(self.extensions_dock) >= 0 else self.chat_dock
             insert_index = target_splitter.indexOf(anchor_widget)
             if insert_index < 0:
                 insert_index = target_splitter.count()
@@ -12580,7 +12759,7 @@ class MainAIEditor(QMainWindow):
                 self.explorer_splitter.setSizes([1, 0])
         
         self.chat_dock.setVisible(s.value("showChat", True,  bool))
-        self.control_plane_dock.setVisible(s.value("showControlPlane", True, bool))
+        # Control Plane visibility is now managed by extensions_dock (merged into single dock)
         self.extensions_dock.setVisible(s.value("showExtensions", True, bool))
 
         
@@ -12622,7 +12801,7 @@ class MainAIEditor(QMainWindow):
         s.setValue("showExplorer", self.files_dock.isVisible())
         s.setValue("showConsole",  False)
         s.setValue("showChat", self.chat_dock.isVisible())   
-        s.setValue("showControlPlane", self.control_plane_dock.isVisible())
+        # Control Plane visibility is now managed by extensions_dock (merged into single dock)
         s.setValue("showExtensions", self.extensions_dock.isVisible())
         s.setValue("showTabDock",  False)
         control_plane_widget = getattr(self, "control_plane_widget", None)

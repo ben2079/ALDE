@@ -489,12 +489,12 @@ class TestAgentRouting(unittest.TestCase):
         self.assertEqual(session.get("current_state"), "job_posting_parser_active")
         self.assertFalse(bool(session.get("terminal")))
 
-    def test_worker_runtime_tools_exclude_route_to_agent(self) -> None:
+    def test_worker_runtime_tools_include_route_to_agent(self) -> None:
         worker_tools = agents_factory.get_agent_runtime_tools("_xworker")
         tool_names = {tool["function"]["name"] for tool in worker_tools}
 
-        self.assertNotIn("route_to_agent", tool_names)
-        self.assertFalse(agents_factory._agent_can_route("_xworker"))
+        self.assertIn("route_to_agent", tool_names)
+        self.assertTrue(agents_factory._agent_can_route("_xworker"))
 
     def test_planner_runtime_tools_include_route_to_agent(self) -> None:
         planner_tools = agents_factory.get_agent_runtime_tools("_xplaner_xrouter")
@@ -581,14 +581,15 @@ result, route = agents_factory.execute_route_to_agent(
 
         self.assertEqual(job_config.get("default_object_name"), "cover_letters")
 
-    def test_worker_route_to_agent_is_denied(self) -> None:
+    def test_worker_route_to_agent_can_delegate_to_planner(self) -> None:
         result, route = agents_factory.execute_route_to_agent(
             {"target_agent": "_xplaner_xrouter", "user_question": "continue this thread"},
             source_agent_label="_xworker",
         )
 
-        self.assertIn("Routing denied", result)
-        self.assertIsNone(route)
+        self.assertEqual(result, "Routing to _xrouter_xplanner")
+        self.assertIsInstance(route, dict)
+        self.assertEqual((route or {}).get("agent_label"), "_xrouter_xplanner")
 
     def test_worker_internal_auto_handoff_self_route_is_allowed(self) -> None:
         result, route = agents_factory.execute_tool(
@@ -682,7 +683,7 @@ result, route = agents_factory.execute_route_to_agent(
             "job_posting_parser",
         )
 
-    def test_worker_internal_handoff_flag_does_not_allow_cross_agent_route(self) -> None:
+    def test_worker_internal_handoff_flag_allows_cross_agent_route(self) -> None:
         result, route = agents_factory.execute_tool(
             "route_to_agent",
             {
@@ -693,8 +694,9 @@ result, route = agents_factory.execute_route_to_agent(
             source_agent_label="_xworker",
         )
 
-        self.assertIn("Tool 'route_to_agent' is not allowed for agent _xworker", result)
-        self.assertIsNone(route)
+        self.assertEqual(result, "Routing to _xrouter_xplanner")
+        self.assertIsInstance(route, dict)
+        self.assertEqual((route or {}).get("agent_label"), "_xrouter_xplanner")
 
     def test_dispatch_action_ignores_outer_target_agent_for_internal_worker_handoff(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -821,6 +823,39 @@ result, route = agents_factory.execute_route_to_agent(
 
         self.assertEqual(result, "Invalid route_to_agent payload for _xworker: missing required job_name or tool_name")
         self.assertIsNone(route)
+
+    def test_route_to_agent_rejects_async_without_max_agents(self) -> None:
+        result, route = agents_factory.execute_route_to_agent(
+            {
+                "target_agent": "_xworker",
+                "job_name": "cover_letter_writer",
+                "user_question": "run async writer",
+                "run_async": True,
+            },
+            source_agent_label="_xplaner_xrouter",
+        )
+
+        self.assertEqual(result, "Invalid route_to_agent payload: run_async=true requires max_agents >= 1")
+        self.assertIsNone(route)
+
+    def test_route_to_agent_async_with_max_agents_normalizes_handoff_metadata(self) -> None:
+        result, route = agents_factory.execute_route_to_agent(
+            {
+                "target_agent": "_xworker",
+                "job_name": "cover_letter_writer",
+                "user_question": "run async writer",
+                "run_async": True,
+                "max_agents": 3,
+            },
+            source_agent_label="_xplaner_xrouter",
+        )
+
+        self.assertEqual(result, "Routing to _xworker")
+        self.assertIsInstance(route, dict)
+        handoff = (route or {}).get("handoff") if isinstance((route or {}).get("handoff"), dict) else {}
+        metadata = handoff.get("metadata") if isinstance(handoff.get("metadata"), dict) else {}
+        self.assertTrue(bool(metadata.get("run_async")))
+        self.assertEqual(int(metadata.get("max_agents") or 0), 3)
 
     def test_route_to_agent_defaults_target_from_job_runtime_agent(self) -> None:
         result, route = agents_factory.execute_route_to_agent(
@@ -1368,6 +1403,237 @@ result, route = agents_factory.execute_route_to_agent(
         writer_result = json.loads(handoff_results[0])
         self.assertEqual(writer_result.get("job_name"), "cover_letter_writer")
         self.assertEqual(writer_result.get("correlation", {}).get("correlation_id"), "sha-cover-1")
+
+    def test_nested_handoff_planner_worker_worker_parallel_branch_payload(self) -> None:
+        history = agents_factory.get_history()
+        history._thread_iD = 661
+        history._history_ = [{"role": "user", "content": "fanout nested route", "thread-id": history._thread_iD}]
+
+        class _NestedBranchChatComE:
+            def __init__(self, _model: str, _messages: list, tools: list[dict], tool_choice: str) -> None:
+                self.messages = list(_messages)
+
+            def _response(self):
+                user_content = ""
+                for message in reversed(self.messages):
+                    if isinstance(message, dict) and str(message.get("role") or "").strip().lower() == "user":
+                        user_content = str(message.get("content") or "")
+                        break
+
+                has_parallel_tool_result = any(
+                    isinstance(message, dict)
+                    and str(message.get("role") or "").strip().lower() == "tool"
+                    and "router_parallel_branches" in str(message.get("content") or "")
+                    for message in self.messages
+                )
+
+                if user_content == "fanout-root" and not has_parallel_tool_result:
+                    msg = SimpleNamespace(
+                        content="",
+                        tool_calls=[
+                            _tool_call(
+                                "route_to_agent",
+                                json.dumps(
+                                    {
+                                        "target_agent": "_xworker",
+                                        "job_name": "cover_letter_writer",
+                                        "user_question": "leaf-a",
+                                        "run_async": True,
+                                        "max_agents": 2,
+                                    },
+                                    ensure_ascii=False,
+                                ),
+                                call_id="nested_route_a",
+                            ),
+                            _tool_call(
+                                "route_to_agent",
+                                json.dumps(
+                                    {
+                                        "target_agent": "_xworker",
+                                        "job_name": "cover_letter_writer",
+                                        "user_question": "leaf-b",
+                                        "run_async": True,
+                                        "max_agents": 2,
+                                    },
+                                    ensure_ascii=False,
+                                ),
+                                call_id="nested_route_b",
+                            ),
+                        ],
+                    )
+                    return SimpleNamespace(choices=[SimpleNamespace(message=msg)])
+
+                if user_content in {"leaf-a", "leaf-b"}:
+                    return SimpleNamespace(
+                        choices=[
+                            SimpleNamespace(
+                                message=SimpleNamespace(content=user_content, tool_calls=None)
+                            )
+                        ]
+                    )
+
+                if has_parallel_tool_result:
+                    return SimpleNamespace(
+                        choices=[
+                            SimpleNamespace(
+                                message=SimpleNamespace(content="fanout-complete", tool_calls=None)
+                            )
+                        ]
+                    )
+
+                return SimpleNamespace(
+                    choices=[
+                        SimpleNamespace(
+                            message=SimpleNamespace(content="ok", tool_calls=None)
+                        )
+                    ]
+                )
+
+        execute_calls: list[tuple[str, dict[str, object], str | None]] = []
+        original_execute_tool = agents_factory.execute_tool
+
+        def _execute_tool(name: str, args: dict, tool_call_id: str | None = None, source_agent_label: str | None = None):
+            execute_calls.append((name, dict(args or {}), source_agent_label))
+            return original_execute_tool(name, args, tool_call_id, source_agent_label=source_agent_label)
+
+        agent_msg = SimpleNamespace(
+            content="",
+            tool_calls=[
+                _tool_call(
+                    "route_to_agent",
+                    json.dumps(
+                        {
+                            "target_agent": "_xworker",
+                            "job_name": "adb_worker",
+                            "user_question": "fanout-root",
+                        },
+                        ensure_ascii=False,
+                    ),
+                    call_id="root_route",
+                )
+            ],
+        )
+
+        with patch.dict(
+            os.environ,
+            {
+                "ALDE_ROUTER_BRANCH_PARALLEL_ENABLED": "1",
+                "ALDE_ROUTER_BRANCH_PARALLEL_WORKERS": "2",
+            },
+            clear=False,
+        ), patch("alde.chat_completion.ChatComE", _NestedBranchChatComE), patch(
+            "alde.agents_factory.execute_tool",
+            side_effect=_execute_tool,
+        ):
+            result = agents_factory._handle_tool_calls(agent_msg, agent_label="_xplaner_xrouter")
+
+        self.assertTrue(isinstance(result, str) and result.strip())
+        worker_route_calls = [
+            route_args
+            for tool_name, route_args, source_agent_label in execute_calls
+            if tool_name == "route_to_agent" and source_agent_label == "_xworker"
+        ]
+        self.assertEqual(len(worker_route_calls), 2)
+        self.assertTrue(all(bool(route_args.get("run_async")) for route_args in worker_route_calls))
+        self.assertTrue(all(int(route_args.get("max_agents") or 0) == 2 for route_args in worker_route_calls))
+
+    def test_router_parallel_branch_mode_uses_async_max_agents_override(self) -> None:
+        history = agents_factory.get_history()
+        history._thread_iD = 662
+        history._history_ = [{"role": "user", "content": "run async branch override", "thread-id": history._thread_iD}]
+
+        class _EchoChatComE:
+            def __init__(self, _model: str, _messages: list, tools: list[dict], tool_choice: str) -> None:
+                self.messages = list(_messages)
+
+            def _response(self):
+                user_content = ""
+                for message in reversed(self.messages):
+                    if isinstance(message, dict) and str(message.get("role") or "").strip().lower() == "user":
+                        user_content = str(message.get("content") or "")
+                        break
+                return SimpleNamespace(
+                    choices=[
+                        SimpleNamespace(
+                            message=SimpleNamespace(content=user_content, tool_calls=None)
+                        )
+                    ]
+                )
+
+        def _execute_tool(name: str, args: dict, tool_call_id: str | None = None, source_agent_label: str | None = None):
+            if name == "route_to_agent":
+                branch_name = str(args.get("user_question") or "")
+                if branch_name == "branch-1":
+                    time.sleep(0.03)
+                else:
+                    time.sleep(0.01)
+                return (
+                    f"Routing to _xworker ({branch_name})",
+                    {
+                        "messages": [
+                            {"role": "system", "content": "xworker system"},
+                            {"role": "user", "content": branch_name},
+                        ],
+                        "tools": [],
+                        "model": "gpt-test",
+                        "agent_label": "_xworker",
+                        "include_history": False,
+                    },
+                )
+            return "ok", None
+
+        agent_msg = SimpleNamespace(
+            content="",
+            tool_calls=[
+                _tool_call(
+                    "route_to_agent",
+                    json.dumps(
+                        {
+                            "target_agent": "_xworker",
+                            "job_name": "cover_letter_writer",
+                            "user_question": "branch-1",
+                            "run_async": True,
+                            "max_agents": 2,
+                        },
+                        ensure_ascii=False,
+                    ),
+                    call_id="override_branch_1",
+                ),
+                _tool_call(
+                    "route_to_agent",
+                    json.dumps(
+                        {
+                            "target_agent": "_xworker",
+                            "job_name": "cover_letter_writer",
+                            "user_question": "branch-2",
+                            "run_async": True,
+                            "max_agents": 2,
+                        },
+                        ensure_ascii=False,
+                    ),
+                    call_id="override_branch_2",
+                ),
+            ],
+        )
+
+        with patch.dict(
+            os.environ,
+            {
+                "ALDE_ROUTER_BRANCH_PARALLEL_ENABLED": "0",
+                "ALDE_ROUTER_BRANCH_PARALLEL_WORKERS": "1",
+            },
+            clear=False,
+        ), patch("alde.chat_completion.ChatComE", _EchoChatComE), patch(
+            "alde.agents_factory.execute_tool",
+            side_effect=_execute_tool,
+        ):
+            result = agents_factory._handle_tool_calls(agent_msg, agent_label="_xplaner_xrouter")
+
+        parsed_result = json.loads(result)
+        self.assertEqual(parsed_result.get("mode"), "router_parallel_branches")
+        self.assertEqual(parsed_result.get("configured_worker_count"), 2)
+        self.assertEqual(parsed_result.get("requested_max_agents"), 2)
+        self.assertEqual(parsed_result.get("branch_results"), ["branch-1", "branch-2"])
 
     def test_router_parallel_branch_mode_merges_results_in_tool_call_order(self) -> None:
         history = agents_factory.get_history()

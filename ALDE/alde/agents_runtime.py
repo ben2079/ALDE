@@ -26,6 +26,7 @@ SYSTEM_PROMPT: dict[str, dict[str, Any]] = {
             - Route explicit AgentDB CRUD, lookup, relation-graph, and batch-operation requests to a suitable sub-agent (default: _xworker) with explicit job_name or tool_name.
             - Support multi-hop delegation when complex async or parallel task trees require sub-agent fanout.
             - Every route_to_agent call must include an explicit job_name or tool_name that matches the intended worker execution path.
+            - For asynchronous route_to_agent calls, include run_async=true and max_agents>=1.
             - Prefer structured handoff payloads when downstream execution depends on schema-bound input.
             - Do not delegate until the brief is specific enough for deterministic execution.
             - Never invent file contents, paths, tool results, database state, or code behavior.
@@ -55,6 +56,7 @@ SYSTEM_PROMPT: dict[str, dict[str, Any]] = {
             - Keep outputs stable, explicit, and task-bounded.
             - Do not invent unsupported claims or runtime results.
             - Delegate further to sub-agents when async or parallel execution branches are explicitly required.
+            - For asynchronous route_to_agent calls, include run_async=true and max_agents>=1.
             """
         ),
         "task": {
@@ -656,7 +658,7 @@ JOB_PROMPTS: dict[str, dict[str, Any]] = {
             - Route only to _xworker.
             - Use explicit job_name per branch: adb_worker or adb_query.
             - Keep branch payloads source-grounded and deterministic.
-            - For asynchronous branch execution, assume parallel worker target 4.
+            - For asynchronous branch execution, set run_async=true and explicit max_agents (default 4) on every route_to_agent branch.
             - Do not invent tool outputs.
             """
         ),
@@ -681,11 +683,15 @@ JOB_PROMPTS: dict[str, dict[str, Any]] = {
                     "target_agent": "_xworker",
                     "job_name": "adb_worker",
                     "user_question": "{...tool payload json...}",
+                    "run_async": True,
+                    "max_agents": 4,
                 },
                 {
                     "target_agent": "_xworker",
                     "job_name": "adb_query",
                     "user_question": "{...tool payload json...}",
+                    "run_async": True,
+                    "max_agents": 4,
                 },
             ],
             "parallel": {
@@ -775,6 +781,8 @@ JOB_CONFIGS: dict[str, dict[str, Any]] = {
                 "workflow_name": "xrouter_repo_knowledge_async_router",
                 "parallel_mode": "router_parallel_branches",
                 "parallel_workers": 4,
+                "run_async": True,
+                "max_agents": 4,
                 "parallel_enabled_env": "ALDE_ROUTER_BRANCH_PARALLEL_ENABLED",
                 "parallel_workers_env": "ALDE_ROUTER_BRANCH_PARALLEL_WORKERS",
             },
@@ -1887,6 +1895,8 @@ TOOL_CONFIGS: list[dict[str, Any]] = [
             {"name": "tools", "type": "array", "description": "Optional explicit xworker tool allowlist. Provide concrete tool names such as ['read_document'] to restrict the routed worker call to those tools.", "required": False, "items": {"type": "string"}},
             {"name": "message_text", "type": "string", "description": "Plain-text handoff message to pass to the agent.", "required": False},
             {"name": "user_question", "type": "string", "description": "Legacy alias for message_text.", "required": False},
+            {"name": "run_async", "type": "boolean", "description": "Enable asynchronous routed execution. When true, max_agents is required.", "required": False, "default": False},
+            {"name": "max_agents", "type": "integer", "description": "Maximum number of parallel agent branches for async routed execution. Required when run_async=true.", "required": False},
             {"name": "handoff_protocol", "type": "string", "description": "Optional handoff protocol. Supported: message_text, agent_handoff_v1.", "required": False},
             {"name": "agent_response", "type": "object", "description": "Structured response object to normalize into a handoff envelope. Example: {agent_label, output|generated|msg, handoff_to}.", "required": False},
             {"name": "handoff_payload", "type": "object", "description": "Structured payload for handoff protocols.", "required": False},
