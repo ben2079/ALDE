@@ -580,10 +580,10 @@ JOB_PROMPTS: dict[str, dict[str, Any]] = {
             """
             === Job: adb_worker ===
             Description: Deterministic repository indexing execution job.
-            Goal: Run the repo_knowledge_worker tool with explicit parameters and return its result unchanged.
+            Goal: Run the adb_worker tool with explicit parameters and return its result unchanged.
 
             Rules:
-            - Use only the repo_knowledge_worker tool for this job.
+            - Use only the adb_worker tool for this job.
                         - Keep operation explicit: scan, build, cleanup, delete, rebuild, status, or repair_namespace.
                         - Use repair_namespace to cleanup wrong namespace writes and rebuild in one deterministic run.
                         - For long runs prefer run_async=true and poll with operation=status + job_id.
@@ -595,7 +595,7 @@ JOB_PROMPTS: dict[str, dict[str, Any]] = {
         ),
         "task": {
             "mode": "tool_execution",
-            "tool_name": "repo_knowledge_worker",
+            "tool_name": "adb_worker",
         },
         "output_schema": {
             "ok": True,
@@ -623,10 +623,10 @@ JOB_PROMPTS: dict[str, dict[str, Any]] = {
             """
             === Job: adb_query ===
             Description: Deterministic repository retrieval execution job.
-            Goal: Run the repo_knowledge_query tool and return context chunks for downstream reasoning.
+            Goal: Run the adb_query tool and return context chunks for downstream reasoning.
 
             Rules:
-            - Use only the repo_knowledge_query tool for this job.
+            - Use only the adb_query tool for this job.
             - Require a non-empty query.
             - Pass owner_types, limit, namespace_id, image_path, and use_vector only when provided.
             - Return the tool result payload unchanged.
@@ -635,7 +635,7 @@ JOB_PROMPTS: dict[str, dict[str, Any]] = {
         ),
         "task": {
             "mode": "tool_execution",
-            "tool_name": "repo_knowledge_query",
+            "tool_name": "adb_query",
         },
         "output_schema": {
             "ok": True,
@@ -651,7 +651,7 @@ JOB_PROMPTS: dict[str, dict[str, Any]] = {
         "prompt": _text(
             """
             === Job: Xrouter_Xplanner for repo_knowledge_async ===
-            Description: Specialized router planner for asynchronous repo-knowledge fanout to xworker.
+            Description: Specialized router planner forns_repo asynchronous repo-knowledge fanout to xworker.
             Goal: Emit deterministic route_to_agent branches for adb_worker and adb_query execution.
 
             Rules:
@@ -1623,12 +1623,12 @@ TOOL_CONFIGS: list[dict[str, Any]] = [
         ],
     },
     {
-        "name": "agent_relation_graph",
+        "name": "adb_relation_graph",
         "description": "Load and analyze the AgentsDB relation graph for visualization and AI/ML data-model exploration.",
-        "implementation_name": "agent_relation_graph",
+        "implementation_name": "adb_relation_graph",
         "parameters": [
-            {"name": "source_uri", "type": "string", "description": "Optional AgentsDB tool endpoint URI. Example: agentsdb://127.0.0.1:2331/tools:agent_relation_graph.", "required": False},
-            {"name": "tool_id", "type": "string", "description": "Graphic tool id to resolve. Default: agent_relation_graph.", "required": False, "enum": ["agent_relation_graph", "workflow_diagram", "sequence_diagram"], "default": "agent_relation_graph"},
+            {"name": "source_uri", "type": "string", "description": "Optional AgentsDB tool endpoint URI. Example: agentsdb://127.0.0.1:2331/tools:adb_relation_graph.", "required": False},
+            {"name": "tool_id", "type": "string", "description": "Graphic tool id to resolve. Default: adb_relation_graph.", "required": False, "enum": ["adb_relation_graph", "workflow_diagram", "sequence_diagram"], "default": "adb_relation_graph"},
             {"name": "include_view_state", "type": "boolean", "description": "When true, include render-oriented node/edge draw objects.", "required": False, "default": True},
             {"name": "layout_spread", "type": "number", "description": "Optional graph layout spread factor used for view_state generation.", "required": False, "default": 1.0},
             {"name": "selected_kind", "type": "string", "description": "Optional focus selector kind for the graph view state.", "required": False, "enum": ["", "node", "edge"], "default": ""},
@@ -1648,14 +1648,14 @@ TOOL_CONFIGS: list[dict[str, Any]] = [
             {"name": "cleanup_before_build", "type": "boolean", "description": "When operation=build, run cleanup first via delete_object calls.", "required": False, "default": False},
             {"name": "cleanup_namespace_ids", "type": "array", "description": "Namespaces to clean during cleanup/rebuild. Default: ['ns_alde_default', 'ns_repo_knowledge'].", "required": False, "items": {"type": "string"}},
             {"name": "cleanup_object_names", "type": "array", "description": "Object types to clean: embedding|relation|entity|document.", "required": False, "items": {"type": "string"}},
-            {"name": "cleanup_owner_prefixes", "type": "array", "description": "Owner-id prefixes used for safe embedding cleanup. Default: ['blk:repo:'].", "required": False, "items": {"type": "string"}},
+            {"name": "cleanup_owner_prefixes", "type": "array", "description": "Owner-i.d prefixes used for safe embedding cleanup. Default: ['blk:repo:'].", "required": False, "items": {"type": "string"}},
             {"name": "delete_async", "type": "boolean", "description": "Perform delete phase concurrently (ThreadPool) for cleanup/rebuild operations.", "required": False, "default": True},
             {"name": "run_async", "type": "boolean", "description": "Run build/cleanup/rebuild/repair in background and return job_id immediately.", "required": False, "default": False},
             {"name": "job_id", "type": "string", "description": "Job id for operation=status polling. Optional custom id when run_async=true.", "required": False},
         ],
     },
     {
-        "name": "repo_knowledge_query",
+        "name": "adb_query",
         "description": "Query indexed repository knowledge and return relevant code context chunks (blocks, entities, relations) for the IDE Agent. Uses dense-vector search with text-search fallback.",
         "parameters": [
             {"name": "query", "type": "string", "description": "Natural-language search query, e.g. 'how does the AgentsDB pipeline store embeddings'.", "required": True},
@@ -1910,10 +1910,10 @@ TOOL_NAMES: dict[str, str] = {
     "adb_operation": "adb_operation",
     "agentdb_operation": "adb_operation",
     "agentsdb_operation": "adb_operation",
-    "agent_relation_graph": "agent_relation_graph",
-    "agentdb_relation_graph": "agent_relation_graph",
-    "agentsdb_relation_graph": "agent_relation_graph",
-    "agentsdb://127.0.0.1:2331/tools:agent_relation_graph": "agent_relation_graph",
+    "agent_relation_graph": "adb_relation_graph",
+    "agentdb_relation_graph": "adb_relation_graph",
+    "agentsdb_relation_graph": "adb_relation_graph",
+    "agentsdb://127.0.0.1:2331/tools:agent_relation_graph": "adb_relation_graph",
     "dispatch_docs": "dispatch_documents",
     "dispatch_documents": "dispatch_documents",
     "data_dispatcher/dispatch_documents": "dispatch_documents",

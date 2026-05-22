@@ -1059,7 +1059,7 @@ def create_repo_index_service(
     )
 
 
-def _run_repo_knowledge_operation(
+def run_repo_knowledge_operation(
     *,
     operation: str,
     root_dir: str | None,
@@ -1169,10 +1169,10 @@ def _run_repo_knowledge_operation(
     }
 
 
-def _run_repo_worker_job(job_id: str, job_payload: Mapping[str, Any]) -> None:
+def run_repo_worker_job(job_id: str, job_payload: Mapping[str, Any]) -> None:
     _update_repo_worker_job(job_id, status="running", started_at=time.time(), error=None)
     try:
-        result = _run_repo_knowledge_operation(**dict(job_payload))
+        result = run_repo_knowledge_operation(**dict(job_payload))
         _update_repo_worker_job(
             job_id,
             status="completed",
@@ -1188,7 +1188,7 @@ def _run_repo_worker_job(job_id: str, job_payload: Mapping[str, Any]) -> None:
             error=f"{type(exc).__name__}: {exc}",
         )
 
-def repo_knowledge_worker(
+def adb_worker(
     operation: str,
     root_dir: str | None = None,
     image_path: str | None = None,
@@ -1249,7 +1249,7 @@ def repo_knowledge_worker(
             _store_repo_worker_job(normalized_job_id, job_state)
 
             worker_thread = threading.Thread(
-                target=_run_repo_worker_job,
+                target= run_repo_worker_job,
                 args=(normalized_job_id, operation_payload),
                 name=f"repo-knowledge-worker:{normalized_job_id}",
                 daemon=True,
@@ -1267,7 +1267,7 @@ def repo_knowledge_worker(
                 },
             }
 
-        result = _run_repo_knowledge_operation(**operation_payload)
+        result = run_repo_knowledge_operation(**operation_payload)
         result["async"] = False
         return result
     except BaseException as exc:
@@ -1327,7 +1327,7 @@ def _format_repo_knowledge_chunks(candidates: list[dict], owner_type: str) -> li
     return chunks
 
 
-def repo_knowledge_query(
+def adb_query(
     query: str,
     owner_types: list[str] | str | None = None,
     limit: int = 10,
@@ -1489,7 +1489,7 @@ def load_repo_context_for_ide_agent(
     image_path:   Optional in-memory snapshot path.
     use_vector:   Whether to use vector search (falls back to text if False).
     """
-    result = repo_knowledge_query(
+    result = adb_query(
         query=query,
         owner_types=owner_types,
         limit=limit,

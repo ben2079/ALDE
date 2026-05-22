@@ -1923,6 +1923,13 @@ class AgentExecutionSelectionService:
         allowed_tool_names = _get_allowed_tool_names(agent_label)
         disallowed_tool_names = [tool_name for tool_name in unique_tool_names if tool_name not in allowed_tool_names]
         if disallowed_tool_names:
+            # Routed xworker jobs may carry stale or job-like tool hints (for example
+            # `adb_query`) that are not part of the runtime tool allowlist. When a
+            # concrete job is present, prefer dropping invalid hints and falling back
+            # to job defaults instead of rejecting the whole handoff.
+            selected_job_name = self.load_job_name(routing_request)
+            if normalize_agent_label(agent_label) == "_xworker" and selected_job_name:
+                return [tool_name for tool_name in unique_tool_names if tool_name in allowed_tool_names]
             raise ValueError(
                 "explicit tools are not allowed for {agent}: {tools}".format(
                     agent=agent_label,
@@ -2010,6 +2017,64 @@ AGENT_EXECUTION_SELECTION_SERVICE = AgentExecutionSelectionService()
 
 
 class AgentRoutingDispatcher:
+    def _sanitize_route_tool_selection(
+        self,
+        *,
+        target: str,
+        job_name: str | None,
+        tool_name: str | None,
+        explicit_tools: list[str],
+        handoff_metadata: dict[str, Any] | None,
+        args: dict[str, Any],
+    ) -> tuple[str | None, list[str], dict[str, Any] | None]:
+        normalized_target = normalize_agent_label(str(target or "").strip())
+        if not normalized_target:
+            return tool_name, explicit_tools, handoff_metadata
+
+        allowed_tool_names = _get_allowed_tool_names(normalized_target)
+        if not allowed_tool_names:
+            return tool_name, explicit_tools, handoff_metadata
+
+        filtered_tools: list[str] = []
+        filtered_tool_set: set[str] = set()
+        rejected_tool_set: set[str] = set()
+
+        for raw_tool_name in explicit_tools:
+            normalized_tool_name = normalize_tool_name(str(raw_tool_name or "").strip())
+            if not normalized_tool_name:
+                continue
+            if normalized_tool_name in allowed_tool_names:
+                if normalized_tool_name not in filtered_tool_set:
+                    filtered_tools.append(normalized_tool_name)
+                    filtered_tool_set.add(normalized_tool_name)
+            else:
+                rejected_tool_set.add(normalized_tool_name)
+
+        normalized_tool_name = normalize_tool_name(str(tool_name or "").strip()) if tool_name else ""
+        if normalized_tool_name and normalized_tool_name not in allowed_tool_names:
+            rejected_tool_set.add(normalized_tool_name)
+            # For xworker job-routes, tool_name is optional and can safely fall back
+            # to the job defaults when a forwarded explicit tool is disallowed.
+            if normalized_target == "_xworker" and str(job_name or "").strip():
+                tool_name = None
+
+        if rejected_tool_set:
+            args["tools"] = list(filtered_tools)
+            if tool_name is None:
+                args.pop("tool_name", None)
+            if isinstance(handoff_metadata, dict):
+                sanitized_handoff_metadata = deepcopy(handoff_metadata)
+                if "tools" in sanitized_handoff_metadata:
+                    sanitized_handoff_metadata["tools"] = list(filtered_tools)
+                if tool_name is None:
+                    metadata_tool_name = normalize_tool_name(str(sanitized_handoff_metadata.get("tool_name") or ""))
+                    if metadata_tool_name in rejected_tool_set:
+                        sanitized_handoff_metadata.pop("tool_name", None)
+                handoff_metadata = sanitized_handoff_metadata
+                args["handoff_metadata"] = deepcopy(sanitized_handoff_metadata)
+
+        return tool_name, filtered_tools if rejected_tool_set else explicit_tools, handoff_metadata
+
     def _load_canonical_job_name(self, job_name: str | None) -> str | None:
         normalized_job_name = str(job_name or "").strip()
         if not normalized_job_name:
@@ -2302,6 +2367,15 @@ class AgentRoutingDispatcher:
         target = normalize_agent_label(
             str(args.get('target_agent') or object_name or '').strip()
         ) if str(args.get('target_agent') or object_name or '').strip() else ""
+
+        tool_name, explicit_tools, handoff_metadata = self._sanitize_route_tool_selection(
+            target=target,
+            job_name=job_name,
+            tool_name=tool_name,
+            explicit_tools=explicit_tools,
+            handoff_metadata=handoff_metadata,
+            args=args,
+        )
 
         denied_result = AGENT_ROUTING_REQUEST_SERVICE.load_denied_result(
             target=target,
@@ -5462,6 +5536,7 @@ class ToolCallExecutionService:
             tool_content = self.render_object_result(result)
             tool_results.append(tool_content)
             tool_failed = _message_indicates_failure(tool_content) and request is None
+            missing_tool_implementation = "has no implementation" in str(tool_content or "")
             recoverable_direct_failure = bool(tool_failed and direct_final_result)
 
             if tool_failed and not recoverable_direct_failure:
@@ -5512,6 +5587,9 @@ class ToolCallExecutionService:
                 terminal_tool_result = tool_content
                 terminal_tool_name = normalize_tool_name(str(tool_name))
             elif direct_final_result and request is None and not tool_failed:
+                terminal_tool_result = tool_content
+                terminal_tool_name = normalize_tool_name(str(tool_name))
+            elif missing_tool_implementation and request is None:
                 terminal_tool_result = tool_content
                 terminal_tool_name = normalize_tool_name(str(tool_name))
 

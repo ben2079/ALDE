@@ -1410,13 +1410,45 @@ class AgentDbSocketRepository:
             raise RuntimeError(error_text)
         return dict(response_payload)
 
+    @staticmethod
+    def _is_dispatcher_healthcheck_request(request_payload: Mapping[str, Any]) -> bool:
+        if str(request_payload.get("cmd") or "").strip().lower() != "load_object":
+            return False
+        payload = request_payload.get("payload") if isinstance(request_payload.get("payload"), Mapping) else {}
+        return str(payload.get("object_id") or "").strip() == "__dispatch_healthcheck__"
+
+    def _load_request_timeout_seconds(self, request_payload: Mapping[str, Any]) -> float:
+        default_timeout_seconds = max(float(self._timeout_seconds), 0.5)
+        if not self._is_dispatcher_healthcheck_request(request_payload):
+            return default_timeout_seconds
+
+        raw_timeout = str(os.getenv("AI_IDE_DISPATCHER_HEALTHCHECK_TIMEOUT_SECONDS", "1.0") or "1.0").strip()
+        try:
+            healthcheck_timeout_seconds = float(raw_timeout)
+        except Exception:
+            healthcheck_timeout_seconds = 1.0
+        healthcheck_timeout_seconds = max(0.1, healthcheck_timeout_seconds)
+        return min(default_timeout_seconds, healthcheck_timeout_seconds)
+
     def _send_request_bytes(self, request_payload: Mapping[str, Any]) -> bytes:
         serialized_request_payload = _json_safe_object(dict(request_payload))
-        with socket.create_connection((self._host, self._port), timeout=self._timeout_seconds) as connection:
+        request_timeout_seconds = self._load_request_timeout_seconds(request_payload)
+        deadline = time.monotonic() + max(float(request_timeout_seconds), 0.1)
+        with socket.create_connection((self._host, self._port), timeout=request_timeout_seconds) as connection:
+            # Keep recv polling bounded so callers in the UI thread cannot block forever.
+            connection.settimeout(min(max(float(request_timeout_seconds), 0.1), 1.0))
             connection.sendall((json.dumps(serialized_request_payload, separators=(",", ":")) + "\n").encode("utf-8"))
             response_bytes = b""
             while b"\n" not in response_bytes:
-                chunk = connection.recv(4096)
+                remaining_seconds = deadline - time.monotonic()
+                if remaining_seconds <= 0:
+                    command_name = str(request_payload.get("cmd") or "request").strip() or "request"
+                    raise TimeoutError(f"agentsdb socket timed out waiting for {command_name} response")
+                connection.settimeout(min(max(remaining_seconds, 0.05), 1.0))
+                try:
+                    chunk = connection.recv(4096)
+                except socket.timeout:
+                    continue
                 if not chunk:
                     break
                 response_bytes += chunk
@@ -5190,11 +5222,7 @@ def load_agentsdb_runtime_config_from_env() -> RuntimeConfigObject | None:
         )
         or "faiss",
     )
-
-
-def load_mongodb_runtime_config_from_env() -> RuntimeConfigObject | None:
-    return load_agentsdb_runtime_config_from_env()
-
+##
 
 def load_agentsdb_pipeline_service(runtime_config: RuntimeConfigObject) -> PipelineService:
     cache_key = (
@@ -5223,10 +5251,7 @@ def load_agentsdb_pipeline_service(runtime_config: RuntimeConfigObject) -> Pipel
     _AGENTS_DB_PIPELINE_SERVICE_CACHE[cache_key] = pipeline_service
     return pipeline_service
 
-
-def load_mongodb_pipeline_service(runtime_config: RuntimeConfigObject) -> PipelineService:
-    return load_agentsdb_pipeline_service(runtime_config)
-
+##
 
 def sync_retrieval_run_to_agentsdb_knowledge(
     *,

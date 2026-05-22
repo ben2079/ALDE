@@ -14,7 +14,7 @@ Pipeline
 - Es entstehen Block-Segmente fuer Modul-Doku, Imports, Klassen, Funktionen und Rest-Code.
 - Pro Modul wird ein parser-kompatibles Payload erzeugt.
 - Dieses Payload laeuft durch `ObjectMappingService` und erzeugt `document`, `entity` und `relation` Objekte.
-- Danach werden alle Owner-Typen embedded: `block`, `entity`, `relation`.
+- Danach werden alle Owner-Typen embedded: `block`, `entity`, `outrelation`.
 
 Runtime Tool
 

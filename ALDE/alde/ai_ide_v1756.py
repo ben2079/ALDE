@@ -2,7 +2,6 @@ from __future__ import annotations    ## ai_ide_v1756.py
 
 # Maintainer contact: see repository README.
 
-import PySide6
 import os
 import sys
 import importlib

@@ -2693,7 +2693,7 @@ class AgentRelationGraphToolService:
 AGENT_RELATION_GRAPH_TOOL_SERVICE = AgentRelationGraphToolService()
 
 
-def agent_relation_graph(
+def adb_relation_graph(
     source_uri: str | None = None,
     tool_id: str | None = None,
     include_view_state: bool | None = True,
@@ -5956,8 +5956,7 @@ def _looks_like_missing_gpu_faiss(msg: str) -> bool:
 
 def _run_vectordb_in_micromamba(
     kind: str,
-    query: str,
-    k: int,
+     k: int,
     *,
     store_dir: str | None = None,
     manifest_file: str | None = None,
@@ -5986,7 +5985,6 @@ def _run_vectordb_in_micromamba(
         "-m",
         "alde.vdb_worker_cli",
         kind,
-        query,
         "-k",
         str(int(k)),
     ]
@@ -7390,18 +7388,20 @@ _TOOL_RUNTIME_REFS: dict[str, Any] = {
 }
 
 try:
-    from .repo_code_splitter import repo_knowledge_worker, repo_knowledge_query
+    from .repo_code_splitter import adb_worker, adb_query
 except ImportError:
-    from alde.repo_code_splitter import repo_knowledge_worker, repo_knowledge_query
+    from alde.repo_code_splitter import adb_worker, adb_query
 
 _TOOL_IMPLEMENTATIONS: dict[str, Callable | None] = {
     "memorydb": memorydb,
     "vectordb": vectordb,
     "vdb_worker": vdb_worker,
     "adb_operation": adb_operation,
-    "agent_relation_graph": agent_relation_graph,
-    "repo_knowledge_worker": repo_knowledge_worker,
-    "repo_knowledge_query": repo_knowledge_query,
+    "adb_relation_graph": adb_relation_graph,
+    "adb_knowledge_worker": adb_worker,
+    "adb_knowledge_query": adb_query,
+    "repo_knowledge_worker": adb_worker,
+    "repo_knowledge_query": adb_query,
     "build_agent_system_configs": build_agent_system_configs_tool,
     "execute_action_request": ACTION_REQUEST_SERVICE.execute_request_tool,
     "store_object_result": DOCUMENT_OBJECT_SERVICE.store_result,
