@@ -414,21 +414,21 @@ From `agents_factory.py:342-353`, the system uses hash-based caching for expensi
 ```python
 _TOOL_CACHE: dict[str, str] = {}
 
-def execute_vectordb(query: str) -> str:
+def execute_repo_knowledge_query(query: str) -> str:
     """
-    Execute vector database query with caching.
+    Execute repo-index retrieval with caching.
     
     Complexity: O(1) for cache hit, O(log n) for cache miss
     """
     # Generate cache key
-    cache_key = f"VectorDB:{query.lower()}"
+    cache_key = f"repo_knowledge_query:{query.lower()}"
     
     # Check cache: O(1)
     if cache_key in _TOOL_CACHE:
         return _TOOL_CACHE[cache_key]
     
     # Cache miss: execute query O(log n)
-    result = vectordb(query, k=3)
+    result = repo_knowledge_query(query=query, limit=3, use_vector=True)
     
     # Store in cache
     _TOOL_CACHE[cache_key] = result
@@ -736,7 +736,7 @@ $$
 
 3. **`rag_core.py`**
    - Embedding generation
-   - FAISS vector store
+    - Repo index retrieval integration
    - Chunking algorithms
 
 4. **`agents_config.py`**

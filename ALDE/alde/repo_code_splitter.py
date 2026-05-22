@@ -22,9 +22,11 @@ from __future__ import annotations
 
 import argparse
 import ast
+import copy
 import hashlib
 import json
 import os
+import re
 import sys
 import threading
 import time
@@ -165,6 +167,7 @@ from agents_db import (  # type: ignore
     RuntimeConfigObject,
     load_agentsdb_pipeline_service,
     load_agentsdb_runtime_config_from_env,
+    sync_retrieval_run_to_agentsdb_knowledge,
 )
 
 
@@ -1283,6 +1286,107 @@ _REPO_KNOWLEDGE_NS = "ns_repo_knowledge"
 _OWNER_TYPE_ALL = ("block", "entity", "relation")
 
 
+def _tokenize_learning_query_text(text: str) -> set[str]:
+    normalized_text = str(text or "").strip().lower()
+    if not normalized_text:
+        return set()
+    return {
+        token
+        for token in re.findall(r"[a-z0-9_]{3,}", normalized_text)
+        if token
+    }
+
+
+def _build_chunk_learning_text(chunk_payload: Mapping[str, Any]) -> str:
+    text_parts = [
+        str(chunk_payload.get("heading") or ""),
+        str(chunk_payload.get("content") or ""),
+        str(chunk_payload.get("canonical_name") or ""),
+        str(chunk_payload.get("summary") or ""),
+        str(chunk_payload.get("relation_description") or ""),
+        str(chunk_payload.get("source_path") or ""),
+        str(chunk_payload.get("entity_type") or ""),
+        str(chunk_payload.get("relation_type") or ""),
+    ]
+    return " ".join(part for part in text_parts if part)
+
+
+def _apply_learning_rerank_to_chunks(
+    *,
+    chunks: list[dict[str, Any]],
+    query_text: str,
+    learning_profile: Mapping[str, Any] | None,
+) -> list[dict[str, Any]]:
+    if not chunks:
+        return []
+    if not isinstance(learning_profile, Mapping):
+        return list(chunks)
+
+    owner_type_boost = (
+        learning_profile.get("owner_type_boost")
+        if isinstance(learning_profile.get("owner_type_boost"), Mapping)
+        else {}
+    )
+    term_weights = (
+        learning_profile.get("term_weights")
+        if isinstance(learning_profile.get("term_weights"), Mapping)
+        else {}
+    )
+    matched_runs = int(learning_profile.get("matched_runs") or 0)
+    if matched_runs <= 0 or (not owner_type_boost and not term_weights):
+        return list(chunks)
+
+    query_token_set = _tokenize_learning_query_text(query_text)
+    max_term_weight = 0.0
+    for weight_value in term_weights.values():
+        try:
+            max_term_weight = max(max_term_weight, float(weight_value))
+        except Exception:
+            continue
+    if max_term_weight <= 0.0:
+        max_term_weight = 1.0
+
+    scored_chunks: list[tuple[float, float, int, dict[str, Any]]] = []
+    for index, chunk_payload in enumerate(chunks):
+        if not isinstance(chunk_payload, Mapping):
+            continue
+        chunk = dict(chunk_payload)
+
+        try:
+            base_score = float(chunk.get("score") or 0.0)
+        except Exception:
+            base_score = 0.0
+
+        owner_type = str(chunk.get("owner_type") or "").strip().lower()
+        try:
+            owner_bonus = float(owner_type_boost.get(owner_type) or 0.0)
+        except Exception:
+            owner_bonus = 0.0
+
+        chunk_token_set = _tokenize_learning_query_text(_build_chunk_learning_text(chunk))
+        query_overlap_ratio = 0.0
+        if query_token_set and chunk_token_set:
+            query_overlap_ratio = float(len(query_token_set.intersection(chunk_token_set))) / float(len(query_token_set))
+
+        weighted_overlap = 0.0
+        for token in chunk_token_set:
+            try:
+                weighted_overlap += float(term_weights.get(token) or 0.0)
+            except Exception:
+                continue
+        weighted_overlap_norm = weighted_overlap / (max_term_weight * max(1, len(chunk_token_set)))
+
+        learning_bonus = (0.35 * owner_bonus) + (0.45 * weighted_overlap_norm) + (0.20 * query_overlap_ratio)
+        final_score = (base_score * 0.70) + learning_bonus
+
+        chunk["learning_rerank_score"] = round(final_score, 6)
+        chunk["learning_bonus"] = round(learning_bonus, 6)
+        scored_chunks.append((final_score, base_score, -index, chunk))
+
+    scored_chunks.sort(key=lambda item: (item[0], item[1], item[2]), reverse=True)
+    return [item[3] for item in scored_chunks]
+
+
 def _format_repo_knowledge_chunks(candidates: list[dict], owner_type: str) -> list[dict]:
     """Normalise raw agentsdb hits into lightweight context chunks."""
     chunks: list[dict] = []
@@ -1349,26 +1453,6 @@ def adb_query(
                    Default: True.
     """
     try:
-        try:
-            from .repo_code_splitter import create_repo_index_service  # type: ignore
-        except ImportError:
-            from alde.repo_code_splitter import create_repo_index_service  # type: ignore
-
-        try:
-            from .agents_db import (  # type: ignore
-                EntityRelationEmbeddingService,
-                load_agentsdb_runtime_config_from_env,
-                load_agentsdb_pipeline_service,
-                sync_retrieval_run_to_agentsdb_knowledge,
-            )
-        except ImportError:
-            from alde.agents_db import (  # type: ignore
-                EntityRelationEmbeddingService,
-                load_agentsdb_runtime_config_from_env,
-                load_agentsdb_pipeline_service,
-                sync_retrieval_run_to_agentsdb_knowledge,
-            )
-
         # --- resolve owner_types ---
         if owner_types is None:
             resolved_owner_types: list[str] = ["block", "entity"]
@@ -1434,12 +1518,36 @@ def adb_query(
 
             all_chunks.extend(_format_repo_knowledge_chunks(candidates, ot))
 
+        learning_profile: dict[str, Any] = {}
+        learning_rerank_applied = False
+        try:
+            learning_profile = knowledge_service.load_learning_rank_profile(
+                namespace_id=ns,
+                query_text=query,
+                tool_name="repo_knowledge_query",
+            )
+            all_chunks = _apply_learning_rerank_to_chunks(
+                chunks=all_chunks,
+                query_text=query,
+                learning_profile=learning_profile,
+            )
+            learning_rerank_applied = bool(int(learning_profile.get("matched_runs") or 0) > 0)
+        except Exception:
+            learning_profile = {}
+            learning_rerank_applied = False
+
         result: dict = {
             "ok": True,
             "query": query,
             "namespace_id": ns,
             "owner_types": resolved_owner_types,
             "used_vector_search": used_vector,
+            "learning_rerank": {
+                "applied": learning_rerank_applied,
+                "matched_runs": int(learning_profile.get("matched_runs") or 0),
+                "successful_runs": int(learning_profile.get("successful_runs") or 0),
+                "strategy": "learning_success_patterns_v1",
+            },
             "total": len(all_chunks),
             "chunks": all_chunks,
         }
@@ -1449,7 +1557,12 @@ def adb_query(
             sync_retrieval_run_to_agentsdb_knowledge(
                 tool_name="repo_knowledge_query",
                 query_event={"query": query, "namespace_id": ns, "owner_types": resolved_owner_types, "limit": safe_limit},
-                outcome_event={"total": len(all_chunks), "used_vector_search": used_vector},
+                outcome_event={
+                    "total": len(all_chunks),
+                    "used_vector_search": used_vector,
+                    "learning_rerank_applied": learning_rerank_applied,
+                    "learning_matched_runs": int(learning_profile.get("matched_runs") or 0),
+                },
                 retrieval_result=result,
             )
         except Exception:
@@ -1462,10 +1575,428 @@ def adb_query(
 
 
 # ---------------------------------------------------------------------------
-# load_repo_context_for_ide_agent – format query results for ChatWindow
+# load_context – format query results for ChatWindow
 # ---------------------------------------------------------------------------
 
-def load_repo_context_for_ide_agent(
+
+class LoadContextPromptParser:
+    """Parse load_context prompts for graph-intent hints.
+
+    If the user prompt contains graph-oriented terms like entity/relation or
+    node/edge, the parser derives matching owner_types for adb_query.
+    """
+
+    _ENTITY_HINTS = {"entity", "entities", "node", "nodes"}
+    _RELATION_HINTS = {"relation", "relations", "edge", "edges"}
+    _HINT_TOKEN_PATTERN = re.compile(r"\b(entity|entities|relation|relations|node|nodes|edge|edges)\b", re.IGNORECASE)
+    _SUBJECT_ROLE_PATTERNS = [
+        re.compile(r"(?P<name>[A-Za-z0-9_\-ÄÖÜäöüß]+)\s*(?:=|ist|als)?\s*subjekt\b", re.IGNORECASE),
+        re.compile(r"\bsubjekt\s*(?:=|:)?\s*(?P<name>[A-Za-z0-9_\-ÄÖÜäöüß]+)", re.IGNORECASE),
+    ]
+    _OBJECT_ROLE_PATTERNS = [
+        re.compile(r"(?P<name>[A-Za-z0-9_\-ÄÖÜäöüß]+)\s*(?:=|ist|als)?\s*objekt\b", re.IGNORECASE),
+        re.compile(r"\bobjekt\s*(?:=|:)?\s*(?P<name>[A-Za-z0-9_\-ÄÖÜäöüß]+)", re.IGNORECASE),
+    ]
+    _RELATION_BETWEEN_PATTERN = re.compile(
+        r"(?:beziehung(?:en)?|relation(?:en)?)\s*(?:zwischen|zwichen)\s*"
+        r"(?P<source>[A-Za-z0-9_\-ÄÖÜäöüß]+)\s*(?:und|&)\s*(?P<target>[A-Za-z0-9_\-ÄÖÜäöüß]+)"
+        r"\s*(?:=|:|ist)?\s*(?P<relation>[^\.\n;]+)",
+        re.IGNORECASE,
+    )
+    _RELATION_LABEL_PATTERN = re.compile(
+        r"(?:beziehung(?:en)?|relation(?:en)?|is_relational)\s*(?:=|:|ist)\s*(?P<relation>[^\.\n;]+)",
+        re.IGNORECASE,
+    )
+    _TYPE_PATTERN = re.compile(
+        r"(?P<name>[A-Za-z0-9_\-ÄÖÜäöüß]+)\s*(?:=|ist)?\s*(?:subjekt|objekt)?\s*(?:und|ud|,)?\s*typ\s*(?P<types>[^\.\n;]+)",
+        re.IGNORECASE,
+    )
+
+    class PatternEmbeddingModel:
+        """Lightweight learnable pattern model for owner-type inference.
+
+        The model maps prompt-pattern features into a fixed-dimensional embedding
+        vector and uses weighted feature scores to infer entity/relation intent.
+        """
+
+        def __init__(
+            self,
+            *,
+            dimension: int = 12,
+            learning_rate: float = 0.08,
+            min_score_threshold: float = 0.20,
+        ) -> None:
+            self.dimension = max(4, int(dimension))
+            self.learning_rate = max(0.0, float(learning_rate))
+            self.min_score_threshold = max(0.0, float(min_score_threshold))
+            self._lock = threading.RLock()
+
+            self._feature_weights: dict[str, float] = {
+                "hint_entity": 1.00,
+                "hint_relation": 1.00,
+                "subject_count": 1.15,
+                "object_count": 1.10,
+                "relation_count": 1.35,
+                "type_count": 0.95,
+                "has_between_relation": 1.25,
+                "has_role_keywords": 1.05,
+                "has_type_keyword": 0.90,
+                "has_relation_keyword": 1.20,
+            }
+
+            self._entity_feature_set = {
+                "hint_entity",
+                "subject_count",
+                "object_count",
+                "type_count",
+                "has_role_keywords",
+                "has_type_keyword",
+            }
+            self._relation_feature_set = {
+                "hint_relation",
+                "relation_count",
+                "has_between_relation",
+                "has_relation_keyword",
+            }
+
+            # Stable feature-to-dimension mapping by insertion order.
+            self._feature_dims: dict[str, int] = {
+                feature_name: index % self.dimension
+                for index, feature_name in enumerate(self._feature_weights.keys())
+            }
+
+        @staticmethod
+        def _normalize_embedding_object(values: list[float]) -> list[float]:
+            squared_sum = sum(float(item) * float(item) for item in values)
+            if squared_sum <= 0.0:
+                return values
+            norm = squared_sum ** 0.5
+            return [float(item) / norm for item in values]
+
+        def _weight_value_object(self, feature_name: str) -> float:
+            return float(self._feature_weights.get(feature_name, 0.0))
+
+        def _score_feature_set_object(self, feature_values: Mapping[str, float], feature_set: set[str]) -> float:
+            score_value = 0.0
+            for feature_name in feature_set:
+                value = float(feature_values.get(feature_name, 0.0))
+                if value <= 0.0:
+                    continue
+                score_value += value * self._weight_value_object(feature_name)
+            return score_value
+
+        def _embedding_object(self, feature_values: Mapping[str, float]) -> list[float]:
+            embedding_values = [0.0] * self.dimension
+            for feature_name, value in feature_values.items():
+                numeric_value = float(value)
+                if numeric_value <= 0.0:
+                    continue
+                dim_index = int(self._feature_dims.get(feature_name, 0))
+                embedding_values[dim_index] += numeric_value * self._weight_value_object(feature_name)
+            return self._normalize_embedding_object(embedding_values)
+
+        def _update_weights_object(self, feature_values: Mapping[str, float]) -> None:
+            if self.learning_rate <= 0.0:
+                return
+            for feature_name, feature_value in feature_values.items():
+                numeric_value = float(feature_value)
+                if numeric_value <= 0.0:
+                    continue
+                current_weight = self._weight_value_object(feature_name)
+                updated_weight = current_weight + (self.learning_rate * numeric_value)
+                # Keep weights bounded and numerically stable.
+                self._feature_weights[feature_name] = min(max(updated_weight, 0.05), 4.00)
+
+        def infer_object(self, feature_values: Mapping[str, float]) -> dict[str, Any]:
+            with self._lock:
+                entity_score = self._score_feature_set_object(feature_values, self._entity_feature_set)
+                relation_score = self._score_feature_set_object(feature_values, self._relation_feature_set)
+
+                owner_types: list[str] = []
+                if entity_score >= self.min_score_threshold:
+                    owner_types.append("entity")
+                if relation_score >= self.min_score_threshold:
+                    owner_types.append("relation")
+
+                if not owner_types and (entity_score > 0.0 or relation_score > 0.0):
+                    owner_types = ["entity"] if entity_score >= relation_score else ["relation"]
+
+                embedding_values = self._embedding_object(feature_values)
+
+                # Online adaptation: reinforce frequently observed active features.
+                self._update_weights_object(feature_values)
+
+            return {
+                "owner_types": owner_types,
+                "embedding": embedding_values,
+                "scores": {
+                    "entity": entity_score,
+                    "relation": relation_score,
+                },
+                "dimension": self.dimension,
+            }
+
+        def export_state_object(self) -> dict[str, Any]:
+            with self._lock:
+                return {
+                    "dimension": self.dimension,
+                    "learning_rate": self.learning_rate,
+                    "weights": dict(self._feature_weights),
+                }
+
+    _ROLE_KEYWORD_PATTERN = re.compile(r"\b(subjekt|objekt|subject|object)\b", re.IGNORECASE)
+    _TYPE_KEYWORD_PATTERN = re.compile(r"\btyp(?:en)?\b", re.IGNORECASE)
+    _RELATION_KEYWORD_PATTERN = re.compile(r"\b(beziehung|beziehungen|relation|relationen|edge|edges)\b", re.IGNORECASE)
+    _ROLE_STOPWORDS = {
+        "und",
+        "oder",
+        "mit",
+        "zum",
+        "zur",
+        "ist",
+        "als",
+        "typ",
+        "subjekt",
+        "objekt",
+        "beziehung",
+        "relation",
+    }
+
+    def __init__(self) -> None:
+        self._pattern_embedding_model = self.PatternEmbeddingModel()
+
+    @staticmethod
+    def _deduplicate_object(values: list[str]) -> list[str]:
+        normalized_values: list[str] = []
+        seen_values: set[str] = set()
+        for value in values:
+            item_value = str(value or "").strip()
+            if not item_value:
+                continue
+            lower_value = item_value.lower()
+            if lower_value in seen_values:
+                continue
+            seen_values.add(lower_value)
+            normalized_values.append(item_value)
+        return normalized_values
+
+    def _normalize_role_name_object(self, role_value: str) -> str:
+        normalized_value = str(role_value or "").strip(" .,;:-")
+        if not normalized_value:
+            return ""
+        if normalized_value.lower() in self._ROLE_STOPWORDS:
+            return ""
+        return normalized_value
+
+    def _extract_hint_flags(self, query_text: str) -> tuple[bool, bool]:
+        tokens = {match.group(1).lower() for match in self._HINT_TOKEN_PATTERN.finditer(str(query_text or ""))}
+        wants_entities = bool(tokens & self._ENTITY_HINTS)
+        wants_relations = bool(tokens & self._RELATION_HINTS)
+        return wants_entities, wants_relations
+
+    def _sanitize_query_object(self, query_text: str) -> str:
+        """Remove pure owner-type hint tokens to keep semantic query terms."""
+        cleaned = self._HINT_TOKEN_PATTERN.sub(" ", str(query_text or ""))
+        cleaned = re.sub(r"\s+", " ", cleaned).strip(" ,;:-")
+        return cleaned
+
+    def _extract_role_payload(self, query_object: str) -> dict[str, list[str]]:
+        query_text = str(query_object or "")
+        subject_names: list[str] = []
+        object_names: list[str] = []
+        relation_labels: list[str] = []
+        type_labels: list[str] = []
+
+        for pattern in self._SUBJECT_ROLE_PATTERNS:
+            for match in pattern.finditer(query_text):
+                subject_name = self._normalize_role_name_object(str(match.group("name") or ""))
+                if subject_name:
+                    subject_names.append(subject_name)
+
+        for pattern in self._OBJECT_ROLE_PATTERNS:
+            for match in pattern.finditer(query_text):
+                object_name = self._normalize_role_name_object(str(match.group("name") or ""))
+                if object_name:
+                    object_names.append(object_name)
+
+        for match in self._RELATION_BETWEEN_PATTERN.finditer(query_text):
+            source_name = self._normalize_role_name_object(str(match.group("source") or ""))
+            target_name = self._normalize_role_name_object(str(match.group("target") or ""))
+            relation_text = str(match.group("relation") or "").strip(" ,")
+            if source_name:
+                subject_names.append(source_name)
+            if target_name:
+                object_names.append(target_name)
+            if relation_text:
+                relation_labels.append(relation_text)
+
+        for match in self._RELATION_LABEL_PATTERN.finditer(query_text):
+            relation_text = str(match.group("relation") or "").strip(" ,")
+            if relation_text:
+                relation_labels.append(relation_text)
+
+        for match in self._TYPE_PATTERN.finditer(query_text):
+            raw_types = str(match.group("types") or "")
+            for value in re.split(r"[,/|]+", raw_types):
+                cleaned_type = str(value or "").strip(" .")
+                if cleaned_type:
+                    type_labels.append(cleaned_type)
+
+        return {
+            "subjects": self._deduplicate_object(subject_names),
+            "objects": self._deduplicate_object(object_names),
+            "relations": self._deduplicate_object(relation_labels),
+            "types": self._deduplicate_object(type_labels),
+        }
+
+    def _build_semantic_query_object(self, query_text: str, role_payload: Mapping[str, Sequence[str]]) -> str:
+        query_terms: list[str] = [str(query_text or "").strip()]
+        query_terms.extend([str(value) for value in role_payload.get("subjects", [])])
+        query_terms.extend([str(value) for value in role_payload.get("objects", [])])
+        query_terms.extend([str(value) for value in role_payload.get("relations", [])])
+        query_terms.extend([str(value) for value in role_payload.get("types", [])])
+        merged_query = " ".join(self._deduplicate_object(query_terms)).strip()
+        return merged_query
+
+    def _build_feature_values_object(
+        self,
+        query_text: str,
+        role_payload: Mapping[str, Sequence[str]],
+        wants_entities: bool,
+        wants_relations: bool,
+    ) -> dict[str, float]:
+        normalized_query_text = str(query_text or "")
+        relation_values = list(role_payload.get("relations") or [])
+        feature_values: dict[str, float] = {
+            "hint_entity": 1.0 if wants_entities else 0.0,
+            "hint_relation": 1.0 if wants_relations else 0.0,
+            "subject_count": float(len(list(role_payload.get("subjects") or []))),
+            "object_count": float(len(list(role_payload.get("objects") or []))),
+            "relation_count": float(len(relation_values)),
+            "type_count": float(len(list(role_payload.get("types") or []))),
+            "has_between_relation": 1.0 if (" zwischen " in f" {normalized_query_text.lower()} " or " between " in f" {normalized_query_text.lower()} ") else 0.0,
+            "has_role_keywords": 1.0 if self._ROLE_KEYWORD_PATTERN.search(normalized_query_text) else 0.0,
+            "has_type_keyword": 1.0 if self._TYPE_KEYWORD_PATTERN.search(normalized_query_text) else 0.0,
+            "has_relation_keyword": 1.0 if self._RELATION_KEYWORD_PATTERN.search(normalized_query_text) else 0.0,
+        }
+        return feature_values
+
+    def parse_object(
+        self,
+        query_object: str,
+        owner_types_object: list[str] | str | None,
+    ) -> tuple[str, list[str] | str | None]:
+        parsed_query, parsed_owner_types, _signal_payload = self.parse_with_signal_object(
+            query_object=query_object,
+            owner_types_object=owner_types_object,
+        )
+        return parsed_query, parsed_owner_types
+
+    def parse_with_signal_object(
+        self,
+        query_object: str,
+        owner_types_object: list[str] | str | None,
+    ) -> tuple[str, list[str] | str | None, dict[str, Any]]:
+        """Return normalized query + inferred owner_types for load_context."""
+        query_text = str(query_object or "").strip()
+        if not query_text:
+            return query_text, owner_types_object, {"mode": "empty_query", "pattern_embedding": []}
+
+        # Respect explicit owner_types from caller and avoid overriding intent.
+        if owner_types_object is not None:
+            return query_text, owner_types_object, {
+                "mode": "explicit_owner_types",
+                "pattern_embedding": [],
+                "owner_types": owner_types_object,
+            }
+
+        role_payload = self._extract_role_payload(query_text)
+        wants_entities, wants_relations = self._extract_hint_flags(query_text)
+        if role_payload.get("subjects") or role_payload.get("objects") or role_payload.get("types"):
+            wants_entities = True
+        if role_payload.get("relations"):
+            wants_relations = True
+        if not wants_entities and not wants_relations:
+            return query_text, None, {
+                "mode": "no_pattern_match",
+                "pattern_embedding": [],
+                "role_payload": role_payload,
+            }
+
+        feature_values = self._build_feature_values_object(
+            query_text=query_text,
+            role_payload=role_payload,
+            wants_entities=wants_entities,
+            wants_relations=wants_relations,
+        )
+        model_result = self._pattern_embedding_model.infer_object(feature_values)
+        resolved_owner_types = list(model_result.get("owner_types") or [])
+        if not resolved_owner_types:
+            if wants_entities and wants_relations:
+                resolved_owner_types = ["entity", "relation"]
+            elif wants_entities:
+                resolved_owner_types = ["entity"]
+            else:
+                resolved_owner_types = ["relation"]
+
+        sanitized_query = self._sanitize_query_object(query_text)
+        semantic_query = self._build_semantic_query_object(sanitized_query, role_payload)
+        signal_payload = {
+            "mode": "pattern_embedding_inference",
+            "feature_values": feature_values,
+            "role_payload": role_payload,
+            "model_scores": copy.deepcopy(model_result.get("scores") or {}),
+            "pattern_embedding": list(model_result.get("embedding") or []),
+            "embedding_dimension": int(model_result.get("dimension") or 0),
+            "weight_snapshot": self._pattern_embedding_model.export_state_object(),
+            "owner_types": list(resolved_owner_types),
+        }
+        return (semantic_query or sanitized_query or query_text), resolved_owner_types, signal_payload
+
+
+_LOAD_CONTEXT_PROMPT_PARSER = LoadContextPromptParser()
+
+
+def _sync_load_context_learning_signal(
+    *,
+    user_prompt: str,
+    parsed_query: str,
+    parsed_owner_types: list[str] | str | None,
+    model_result: Any,
+    runtime_context: Any,
+    retrieval_result: Mapping[str, Any],
+    entries: Sequence[Mapping[str, Any]],
+    pattern_signal: Mapping[str, Any] | None,
+    correlation_id: str | None,
+    namespace_id: str | None,
+) -> None:
+    try:
+        try:
+            from .agents_db import sync_learning_interaction_to_agentsdb_knowledge
+        except ImportError:
+            from alde.agents_db import sync_learning_interaction_to_agentsdb_knowledge
+
+        context_payload = {
+            "entries": [dict(item) for item in entries if isinstance(item, Mapping)],
+            "chunks": list(retrieval_result.get("chunks") or []),
+            "runtime_context": copy.deepcopy(runtime_context),
+            "owner_types": copy.deepcopy(parsed_owner_types),
+            "parsed_query": str(parsed_query or ""),
+        }
+        sync_learning_interaction_to_agentsdb_knowledge(
+            tool_name="load_context",
+            user_prompt=str(user_prompt or ""),
+            model_result=model_result,
+            context_payload=context_payload,
+            pattern_signal=pattern_signal,
+            correlation_id=correlation_id,
+            namespace_id=namespace_id,
+        )
+    except Exception:
+        # Best-effort telemetry: never break load_context on sync issues.
+        return
+
+def load_context(
     query: str,
     *,
     limit: int = 5,
@@ -1473,6 +2004,9 @@ def load_repo_context_for_ide_agent(
     namespace_id: str | None = None,
     image_path: str | None = None,
     use_vector: bool = True,
+    model_result: Any = None,
+    runtime_context: Any = None,
+    correlation_id: str | None = None,
 ) -> list[dict]:
     """Query indexed repo knowledge and return context entries ready for
     ``ChatWindow.attach_runtime_context()``.
@@ -1488,12 +2022,20 @@ def load_repo_context_for_ide_agent(
     namespace_id: Restrict to a specific AgentsDB namespace.
     image_path:   Optional in-memory snapshot path.
     use_vector:   Whether to use vector search (falls back to text if False).
+    model_result: Optional model output to persist as learning signal.
+    runtime_context: Optional additional context payload for learning sync.
+    correlation_id: Optional correlation id for persisted learning events.
     """
+    parsed_query, parsed_owner_types, pattern_signal = _LOAD_CONTEXT_PROMPT_PARSER.parse_with_signal_object(
+        query_object=query,
+        owner_types_object=owner_types,
+    )
+
     result = adb_query(
-        query=query,
-        owner_types=owner_types,
+        query=parsed_query,
+        owner_types=parsed_owner_types,
         limit=limit,
-        namespace_id=namespace_id,
+        namespace_id=namespace_id, 
         image_path=image_path,
         use_vector=use_vector,
     )
@@ -1536,7 +2078,46 @@ def load_repo_context_for_ide_agent(
             "source_path": chunk.get("source_path") or "",
         })
 
+    _sync_load_context_learning_signal(
+        user_prompt=query,
+        parsed_query=parsed_query,
+        parsed_owner_types=parsed_owner_types,
+        model_result=model_result,
+        runtime_context=runtime_context,
+        retrieval_result=result,
+        entries=entries,
+        pattern_signal=pattern_signal,
+        correlation_id=correlation_id,
+        namespace_id=namespace_id,
+    )
+
     return entries
+
+
+def load_repo_context_for_ide_agent(
+    query: str,
+    *,
+    limit: int = 5,
+    owner_types: list[str] | str | None = None,
+    namespace_id: str | None = None,
+    image_path: str | None = None,
+    use_vector: bool = True,
+    model_result: Any = None,
+    runtime_context: Any = None,
+    correlation_id: str | None = None,
+) -> list[dict]:
+    """Backward-compatible alias for load_context()."""
+    return load_context(
+        query=query,
+        limit=limit,
+        owner_types=owner_types,
+        namespace_id=namespace_id,
+        image_path=image_path,
+        use_vector=use_vector,
+        model_result=model_result,
+        runtime_context=runtime_context,
+        correlation_id=correlation_id,
+    )
 
 
 def main(argv: Sequence[str] | None = None) -> int:

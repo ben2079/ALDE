@@ -21,7 +21,8 @@ SYSTEM_PROMPT: dict[str, dict[str, Any]] = {
             - Ask follow-up questions when the request is  missing required inputs.
             - Build a minimal explicit execution plan before delegating: goal, selected target_agent, selected job_name or tool_name, required inputs, and expected result.
             - Use direct tools only when the work is trivial, deterministic, and does not need a worker specialization.
-            - If the user provides a concrete filesystem path and asks to read, open, or load it, call read_document directly instead of routing or querying memorydb or vectordb.
+            - If the user provides a concrete filesystem path and asks to read, open, or load it, call read_document directly instead of routing or retrieval queries.
+            - If the user asks for indexed repository/code context for the IDE agent or ChatWindow runtime context, call load_context directly with query and optional limit, owner_types, namespace_id, image_path, and use_vector.
             - Keep xrouter_xplanner as the main orchestration agent and delegate execution to suitable sub-agents.
             - Route explicit AgentDB CRUD, lookup, relation-graph, and batch-operation requests to a suitable sub-agent (default: _xworker) with explicit job_name or tool_name.
             - Support multi-hop delegation when complex async or parallel task trees require sub-agent fanout.
@@ -52,7 +53,7 @@ SYSTEM_PROMPT: dict[str, dict[str, Any]] = {
             - Execute delegated jobs from planner or worker handoffs with deterministic boundaries.
             - Resolve the skill profile from tool_name first when configured, then fall back to job_name.
             - Respect explicit routed tool constraints when tools are provided as task options.
-            - When the request names a concrete filesystem path to read, open, or load, use read_document; memorydb and vectordb are retrieval tools, not direct file loaders.
+            - When the request names a concrete filesystem path to read, open, or load, use read_document; use repo_knowledge_query or load_context for indexed retrieval, not file loading.
             - Keep outputs stable, explicit, and task-bounded.
             - Do not invent unsupported claims or runtime results.
             - Delegate further to sub-agents when async or parallel execution branches are explicitly required.
@@ -904,6 +905,8 @@ def _tool_skill_profiles_for_agent(agent_label: str) -> dict[str, str]:
         "vdb_worker": "xworker_core",
         "repo_knowledge_worker": "xworker_core",
         "repo_knowledge_query": "xworker_core",
+        "load_context": "xworker_core",
+        "load_repo_context_for_ide_agent": "xworker_core",
         "dispatch_documents": "xworker_dispatch",
         "read_document": "xworker_core",
         "list_documents": "xworker_core",
@@ -947,7 +950,14 @@ AGENT_RUNTIME: dict[str, dict[str, Any]] = {
     "_xrouter_xplanner": {
         "canonical_name": "xrouter_xplanner",
         "model": "gpt-4o",
-        "tools": [ "route_to_agent", "execute_action_request", "upsert_object_record", "@dispatcher", "@doc_rw"],
+        "tools": [
+            "route_to_agent",
+            "execute_action_request",
+            "upsert_object_record",
+            "load_context",
+            "@dispatcher",
+            "@doc_rw",
+        ],
         "defaults": {
             "job_name": _default_job_name_for_agent("_xrouter_xplanner"),
             "skill": "",
@@ -1667,6 +1677,36 @@ TOOL_CONFIGS: list[dict[str, Any]] = [
         ],
     },
     {
+        "name": "load_context",
+        "description": "Query indexed repo knowledge and return ChatWindow.attach_runtime_context()-ready context entries with title, language, content, and source_path.",
+        "parameters": [
+            {"name": "query", "type": "string", "description": "Natural-language or symbol query for the indexed repository knowledge.", "required": True},
+            {"name": "limit", "type": "integer", "description": "Maximum number of context entries to return. Default: 5.", "default": 5},
+            {"name": "owner_types", "type": "array", "description": "Optional owner types to query: block | entity | relation.", "items": {"type": "string"}},
+            {"name": "namespace_id", "type": "string", "description": "Optional AgentsDB namespace restriction."},
+            {"name": "image_path", "type": "string", "description": "Optional in-memory snapshot path for the repository knowledge backend."},
+            {"name": "use_vector", "type": "boolean", "description": "Attempt vector search before text fallback. Default: true.", "default": True},
+            {"name": "model_result", "type": "object", "description": "Optional model result payload persisted as learning signal with prompt and context.", "required": False},
+            {"name": "runtime_context", "type": "object", "description": "Optional runtime context payload persisted together with retrieved context entries.", "required": False},
+            {"name": "correlation_id", "type": "string", "description": "Optional correlation id for AgentsDB learning run persistence.", "required": False},
+        ],
+    },
+    {
+        "name": "load_repo_context_for_ide_agent",
+        "description": "Deprecated alias for load_context. Query indexed repo knowledge and return ChatWindow.attach_runtime_context()-ready context entries.",
+        "parameters": [
+            {"name": "query", "type": "string", "description": "Natural-language or symbol query for the indexed repository knowledge.", "required": True},
+            {"name": "limit", "type": "integer", "description": "Maximum number of context entries to return. Default: 5.", "default": 5},
+            {"name": "owner_types", "type": "array", "description": "Optional owner types to query: block | entity | relation.", "items": {"type": "string"}},
+            {"name": "namespace_id", "type": "string", "description": "Optional AgentsDB namespace restriction."},
+            {"name": "image_path", "type": "string", "description": "Optional in-memory snapshot path for the repository knowledge backend."},
+            {"name": "use_vector", "type": "boolean", "description": "Attempt vector search before text fallback. Default: true.", "default": True},
+            {"name": "model_result", "type": "object", "description": "Optional model result payload persisted as learning signal with prompt and context.", "required": False},
+            {"name": "runtime_context", "type": "object", "description": "Optional runtime context payload persisted together with retrieved context entries.", "required": False},
+            {"name": "correlation_id", "type": "string", "description": "Optional correlation id for AgentsDB learning run persistence.", "required": False},
+        ],
+    },
+    {
         "name": "write_document",
         "description": "Persist the generated document to disk.",
         "parameters": [
@@ -1919,6 +1959,10 @@ TOOL_NAMES: dict[str, str] = {
     "data_dispatcher/dispatch_documents": "dispatch_documents",
     "data_dispatcher.dispatch_documents": "dispatch_documents",
     "dispatch_job_posting_pdfs": "dispatch_documents",
+    "load_context": "load_context",
+    "load_repo_context": "load_context",
+    "load_repo_context_for_ide_agent": "load_context",
+    "repo_context_for_ide_agent": "load_context",
     "ingest_object": "ingest_object",
     "ingest_profile": "ingest_object",
     "ingest_job_posting": "ingest_object",
@@ -1997,7 +2041,7 @@ TOOL_GROUPS: dict[str, list[str]] = {
     "code": ["code_tool", "iter_documents"],
     "dispatcher": ["dispatch_documents", "execute_action_request", "upsert_object_record", "ingest_object", "store_object_result", "vdb_worker", "repo_knowledge_worker"],
     "agentdb": ["adb_operation", "agent_relation_graph", "repo_knowledge_worker", "repo_knowledge_query"],
-    "repo_knowledge": ["adb_operation", "agent_relation_graph", "repo_knowledge_worker", "repo_knowledge_query"],
+    "repo_knowledge": ["adb_operation", "agent_relation_graph", "repo_knowledge_worker", "repo_knowledge_query", "load_context"],
 }
 
 

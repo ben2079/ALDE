@@ -16,7 +16,8 @@ flowchart TB
     Temporal[Workflow Engine Temporal]
     Postgres[(Postgres)]
     Redis[(Redis)]
-    VectorStore[(FAISS / Vector Store)]
+    RepoIndex[(Repo Index / AgentDB Retrieval)]
+    LegacyVectorStore[(Legacy Vector Store Optional)]
     Observability[OpenTelemetry / Langfuse / Grafana]
 
     UI --> Coordinator
@@ -26,7 +27,8 @@ flowchart TB
     Specialists --> ToolGateway
     ToolGateway --> MCPServer
     ToolGateway --> Retrieval
-    Retrieval --> VectorStore
+    Retrieval --> RepoIndex
+    Retrieval -. explicit legacy opt-in .-> LegacyVectorStore
 
     Specialists --> Learning
     Retrieval --> Learning

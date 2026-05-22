@@ -3470,6 +3470,160 @@ class KnowledgeObjectService:
         scored_payload_list.sort(key=lambda item: float(item.get("score") or 0.0), reverse=True)
         return scored_payload_list[: max(1, int(limit))]
 
+    def load_learning_rank_profile(
+        self,
+        *,
+        namespace_id: str,
+        query_text: str,
+        tool_name: str | None = None,
+        limit: int = 120,
+    ) -> dict[str, Any]:
+        normalized_query_text = str(query_text or "").strip()
+        if not normalized_query_text:
+            return {
+                "query_text": "",
+                "matched_runs": 0,
+                "successful_runs": 0,
+                "owner_type_boost": {},
+                "term_weights": {},
+            }
+
+        try:
+            retrieval_run_payload_list = self._repository.load_objects(
+                "retrieval_run",
+                {"namespace_id": str(namespace_id)},
+                limit=max(1, int(limit)),
+            )
+        except Exception:
+            retrieval_run_payload_list = []
+
+        query_token_set = self._tokenize_learning_text(normalized_query_text)
+        owner_type_weight_map = {"block": 0.0, "entity": 0.0, "relation": 0.0}
+        term_weight_map: dict[str, float] = {}
+        matched_runs = 0
+        successful_runs = 0
+        normalized_tool_name = str(tool_name or "").strip().lower()
+
+        for retrieval_run_payload in retrieval_run_payload_list:
+            if not isinstance(retrieval_run_payload, Mapping):
+                continue
+            filters_payload = (
+                retrieval_run_payload.get("filters")
+                if isinstance(retrieval_run_payload.get("filters"), Mapping)
+                else {}
+            )
+            run_tool_name = str(filters_payload.get("tool_name") or "").strip().lower()
+            if normalized_tool_name and run_tool_name and run_tool_name != normalized_tool_name:
+                continue
+
+            learning_signal = bool(filters_payload.get("learning_signal"))
+            success_value = filters_payload.get("success")
+            success_signal = bool(success_value) if success_value is not None else False
+            if not learning_signal and not success_signal:
+                continue
+
+            run_query_text = str(retrieval_run_payload.get("query_text") or "").strip()
+            model_result_excerpt = str(filters_payload.get("model_result_excerpt") or "").strip()
+            query_similarity = self._load_prompt_similarity_score(normalized_query_text, run_query_text)
+            model_similarity = self._load_prompt_similarity_score(normalized_query_text, model_result_excerpt)
+            run_similarity = max(query_similarity, model_similarity * 0.9)
+            if run_similarity <= 0.0:
+                continue
+
+            matched_runs += 1
+            if success_signal:
+                successful_runs += 1
+
+            signal_weight = run_similarity * (1.15 if learning_signal else 1.0)
+            result_payload_list = retrieval_run_payload.get("results")
+            if not isinstance(result_payload_list, Sequence) or isinstance(result_payload_list, (str, bytes, bytearray)):
+                result_payload_list = []
+
+            for result_payload in result_payload_list:
+                if not isinstance(result_payload, Mapping):
+                    continue
+                if result_payload.get("chosen") is False:
+                    continue
+
+                result_type = str(result_payload.get("result_type") or "").strip().lower()
+                if result_type in owner_type_weight_map:
+                    owner_type_weight_map[result_type] += signal_weight
+
+                metadata_payload = (
+                    result_payload.get("metadata")
+                    if isinstance(result_payload.get("metadata"), Mapping)
+                    else {}
+                )
+                text_samples = [
+                    run_query_text,
+                    model_result_excerpt,
+                    str(metadata_payload.get("heading") or ""),
+                    str(metadata_payload.get("content") or ""),
+                    str(metadata_payload.get("summary") or ""),
+                    str(metadata_payload.get("relation_description") or ""),
+                    str(metadata_payload.get("canonical_name") or ""),
+                    str(metadata_payload.get("source_path") or ""),
+                    str(metadata_payload.get("entity_type") or ""),
+                    str(metadata_payload.get("relation_type") or ""),
+                ]
+                for text_sample in text_samples:
+                    for token in self._tokenize_learning_text(text_sample):
+                        if query_token_set and token not in query_token_set and len(token) <= 3:
+                            continue
+                        term_weight_map[token] = float(term_weight_map.get(token) or 0.0) + signal_weight
+
+        max_owner_weight = max(owner_type_weight_map.values()) if owner_type_weight_map else 0.0
+        if max_owner_weight > 0.0:
+            normalized_owner_type_boost = {
+                owner_type: round(float(weight) / max_owner_weight, 6)
+                for owner_type, weight in owner_type_weight_map.items()
+                if float(weight) > 0.0
+            }
+        else:
+            normalized_owner_type_boost = {}
+
+        sorted_term_weights = sorted(
+            (
+                (token, float(weight))
+                for token, weight in term_weight_map.items()
+                if str(token).strip() and float(weight) > 0.0
+            ),
+            key=lambda item: item[1],
+            reverse=True,
+        )
+        if len(sorted_term_weights) > 80:
+            sorted_term_weights = sorted_term_weights[:80]
+        term_weights = {token: round(weight, 6) for token, weight in sorted_term_weights}
+
+        return {
+            "query_text": normalized_query_text,
+            "matched_runs": int(matched_runs),
+            "successful_runs": int(successful_runs),
+            "owner_type_boost": normalized_owner_type_boost,
+            "term_weights": term_weights,
+        }
+
+    def _tokenize_learning_text(self, text: str) -> set[str]:
+        normalized_text = str(text or "").strip().lower()
+        if not normalized_text:
+            return set()
+        return {
+            token
+            for token in re.findall(r"[a-z0-9_]{3,}", normalized_text)
+            if token
+        }
+
+    def _load_prompt_similarity_score(self, left_text: str, right_text: str) -> float:
+        left_tokens = self._tokenize_learning_text(left_text)
+        right_tokens = self._tokenize_learning_text(right_text)
+        if not left_tokens or not right_tokens:
+            return 0.0
+        intersection_size = len(left_tokens.intersection(right_tokens))
+        union_size = len(left_tokens.union(right_tokens))
+        if union_size <= 0:
+            return 0.0
+        return float(intersection_size) / float(union_size)
+
     def _load_owner_payload_map(
         self,
         *,
@@ -5147,6 +5301,136 @@ class ObjectMappingService:
             "retrieval_run_id": retrieval_run_object.id,
         }
 
+    def _build_learning_context_results(
+        self,
+        *,
+        tool_name: str,
+        context_payload: Any,
+    ) -> list[RetrievalResultObject]:
+        if isinstance(context_payload, Mapping):
+            candidate_items = context_payload.get("entries")
+            if not isinstance(candidate_items, list):
+                candidate_items = context_payload.get("chunks")
+        elif isinstance(context_payload, list):
+            candidate_items = context_payload
+        else:
+            candidate_items = []
+
+        if not isinstance(candidate_items, list):
+            candidate_items = []
+
+        result_objects: list[RetrievalResultObject] = []
+        for index, item in enumerate(candidate_items, start=1):
+            if isinstance(item, Mapping):
+                item_payload = dict(item)
+                result_id = _first_non_empty_string(
+                    [
+                        item_payload.get("id"),
+                        item_payload.get("source_path"),
+                        item_payload.get("title"),
+                        f"context:{index}",
+                    ]
+                )
+                result_type = str(item_payload.get("owner_type") or item_payload.get("result_type") or "context").strip() or "context"
+                source_stage = str(item_payload.get("source_stage") or tool_name).strip() or tool_name
+                metadata = _deepcopy_object(item_payload)
+                lexical_score = _first_number([item_payload.get("lexical_score")])
+                vector_score = _first_number([item_payload.get("vector_score"), item_payload.get("score")])
+                graph_score = _first_number([item_payload.get("graph_score")])
+                rerank_score = _first_number([item_payload.get("rerank_score")])
+            else:
+                result_id = f"context:{index}"
+                result_type = "context"
+                source_stage = tool_name
+                metadata = {"value": _deepcopy_object(item)}
+                lexical_score = None
+                vector_score = None
+                graph_score = None
+                rerank_score = None
+
+            result_objects.append(
+                RetrievalResultObject(
+                    rank_no=index,
+                    result_type=result_type,
+                    result_id=result_id,
+                    source_stage=source_stage,
+                    chosen=True,
+                    lexical_score=lexical_score,
+                    vector_score=vector_score,
+                    graph_score=graph_score,
+                    rerank_score=rerank_score,
+                    metadata=metadata,
+                )
+            )
+        return result_objects
+
+    def store_learning_interaction(
+        self,
+        *,
+        tool_name: str,
+        user_prompt: str,
+        model_result: Any = None,
+        context_payload: Any = None,
+        pattern_signal: Mapping[str, Any] | None = None,
+        correlation_id: str | None = None,
+        namespace_id: str | None = None,
+    ) -> Mapping[str, Any]:
+        namespace_handoff = {"namespace_id": namespace_id} if str(namespace_id or "").strip() else None
+        namespace_object = self.load_namespace_object(
+            handoff_metadata=namespace_handoff,
+            handoff_payload=namespace_handoff,
+        )
+
+        created_at = _now_utc()
+        prompt_text = str(user_prompt or "").strip()
+        context_results = self._build_learning_context_results(tool_name=tool_name, context_payload=context_payload)
+
+        prompt_sha = _stable_sha256(prompt_text)
+        model_digest_source = json.dumps(_deepcopy_object(model_result), sort_keys=True, ensure_ascii=False, default=str)
+        model_result_sha = _stable_sha256(model_digest_source)
+        resolved_correlation_id = _first_non_empty_string([correlation_id, prompt_sha[:16], f"learning:{created_at.timestamp()}"])
+
+        retrieval_run_object = RetrievalRunObject(
+            id=f"learning:{resolved_correlation_id}:{int(created_at.timestamp() * 1000)}",
+            tenant_id=namespace_object.tenant_id,
+            namespace_id=namespace_object.id,
+            query_text=prompt_text,
+            requested_k=max(1, len(context_results) or 1),
+            lexical_k=None,
+            graph_hops=None,
+            vector_k=max(1, len(context_results) or 1),
+            rerank_strategy="pattern_embedding_v1",
+            correlation_id=resolved_correlation_id,
+            filters={
+                "tool_name": str(tool_name or "").strip(),
+                "learning_signal": True,
+                "prompt_sha256": prompt_sha,
+                "model_result_sha256": model_result_sha,
+                "context_items": len(context_results),
+                "pattern_signal": _deepcopy_object(pattern_signal or {}),
+            },
+            results=context_results,
+            created_at=created_at,
+        )
+
+        if model_result is not None:
+            retrieval_run_object.filters["model_result_excerpt"] = str(model_result)[:1200]
+        if isinstance(context_payload, Mapping):
+            retrieval_run_object.filters["context_metadata"] = {
+                "has_entries": bool(context_payload.get("entries")),
+                "has_chunks": bool(context_payload.get("chunks")),
+            }
+
+        self._knowledge_service.store_namespace_object(namespace_object)
+        self._knowledge_service.store_retrieval_run_object(retrieval_run_object)
+        return {
+            "ok": True,
+            "stored": True,
+            "backend": "agents_db",
+            "namespace_id": namespace_object.id,
+            "learning_run_id": retrieval_run_object.id,
+        }
+
 
 _AGENTS_DB_PIPELINE_SERVICE_CACHE: dict[tuple[str, ...], PipelineService] = {}
 
@@ -5277,6 +5561,40 @@ def sync_retrieval_run_to_agentsdb_knowledge(
             "stored": False,
             "backend": "agents_db",
             "error": "agents_db_sync_failed",
+            "detail": str(exc),
+        }
+
+
+def sync_learning_interaction_to_agentsdb_knowledge(
+    *,
+    tool_name: str,
+    user_prompt: str,
+    model_result: Any = None,
+    context_payload: Any = None,
+    pattern_signal: Mapping[str, Any] | None = None,
+    correlation_id: str | None = None,
+    namespace_id: str | None = None,
+) -> Mapping[str, Any] | None:
+    runtime_config = load_agentsdb_runtime_config_from_env()
+    if runtime_config is None:
+        return None
+    try:
+        pipeline_service = load_agentsdb_pipeline_service(runtime_config)
+        return pipeline_service.store_learning_interaction(
+            tool_name=tool_name,
+            user_prompt=user_prompt,
+            model_result=model_result,
+            context_payload=context_payload,
+            pattern_signal=pattern_signal,
+            correlation_id=correlation_id,
+            namespace_id=namespace_id,
+        )
+    except Exception as exc:
+        return {
+            "ok": False,
+            "stored": False,
+            "backend": "agents_db",
+            "error": "agents_db_learning_sync_failed",
             "detail": str(exc),
         }
 

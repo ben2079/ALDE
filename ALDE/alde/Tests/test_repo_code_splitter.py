@@ -20,11 +20,13 @@ from alde import agents_db as agents_db_mod
 from alde.agents_db import AgentDbInMemoryRepository, AgentDbSocketRepository, AgentDbSocketServerService, KnowledgeObjectService
 from alde.agents_tools import get_tool_spec, repo_knowledge_worker, repo_knowledge_query
 from alde.repo_code_splitter import (
+    LoadContextPromptParser,
     RepoIndexService,
     RepoModuleParser,
     PythonCodeSplitter,
     _build_default_runtime_config,
     _normalize_repo_runtime_config,
+    load_context,
     load_repo_context_for_ide_agent,
 )
 
@@ -540,6 +542,119 @@ class TestRepoCodeSplitter(unittest.TestCase):
         self.assertEqual(chunks[0]["relation_description"], "sample.py defines the Demo class.")
         self.assertEqual(chunks[0]["source_path"], "sample.py")
 
+    def test_learning_rank_profile_prefers_successful_patterns(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            repo = AgentDbInMemoryRepository(str(Path(tmp_dir) / "agentsdb_learning_profile.json"))
+            repo.ensure_index_objects()
+            knowledge_service = KnowledgeObjectService(repo)
+
+            repo.upsert_object(
+                "retrieval_run",
+                "retrieval:ok:1",
+                {
+                    "id": "retrieval:ok:1",
+                    "namespace_id": "ns_repo_knowledge",
+                    "query_text": "Frau Hund Besitzverhaeltnis",
+                    "filters": {
+                        "success": True,
+                        "tool_name": "repo_knowledge_query",
+                    },
+                    "results": [
+                        {
+                            "rank_no": 1,
+                            "result_type": "entity",
+                            "result_id": "ent:frau",
+                            "source_stage": "repo_knowledge_query",
+                            "chosen": True,
+                            "metadata": {
+                                "canonical_name": "Frau",
+                                "summary": "Tierhalter",
+                            },
+                        }
+                    ],
+                },
+            )
+            repo.upsert_object(
+                "retrieval_run",
+                "retrieval:fail:1",
+                {
+                    "id": "retrieval:fail:1",
+                    "namespace_id": "ns_repo_knowledge",
+                    "query_text": "irrelevant failed run",
+                    "filters": {
+                        "success": False,
+                        "tool_name": "repo_knowledge_query",
+                    },
+                    "results": [
+                        {
+                            "rank_no": 1,
+                            "result_type": "relation",
+                            "result_id": "rel:ignored",
+                            "source_stage": "repo_knowledge_query",
+                            "chosen": True,
+                            "metadata": {
+                                "relation_description": "ignored relation",
+                            },
+                        }
+                    ],
+                },
+            )
+
+            profile = knowledge_service.load_learning_rank_profile(
+                namespace_id="ns_repo_knowledge",
+                query_text="Frau und Hund",
+                tool_name="repo_knowledge_query",
+            )
+
+            self.assertGreaterEqual(int(profile.get("matched_runs") or 0), 1)
+            self.assertGreaterEqual(int(profile.get("successful_runs") or 0), 1)
+            owner_boost = dict(profile.get("owner_type_boost") or {})
+            self.assertGreater(float(owner_boost.get("entity") or 0.0), 0.0)
+            self.assertEqual(float(owner_boost.get("relation") or 0.0), 0.0)
+
+    def test_apply_learning_rerank_boosts_similar_entity_chunks(self) -> None:
+        chunks = [
+            {
+                "owner_type": "block",
+                "heading": "General Notes",
+                "content": "Unrelated content",
+                "source_path": "general.py",
+                "score": 0.8,
+            },
+            {
+                "owner_type": "entity",
+                "canonical_name": "Frau",
+                "summary": "Tierhalter und Besitzerin",
+                "source_path": "profile.py",
+                "score": 0.6,
+            },
+        ]
+        learning_profile = {
+            "matched_runs": 2,
+            "owner_type_boost": {
+                "entity": 1.0,
+                "block": 0.1,
+            },
+            "term_weights": {
+                "frau": 2.0,
+                "tierhalter": 1.5,
+            },
+        }
+
+        reranked_chunks = repo_code_splitter_mod._apply_learning_rerank_to_chunks(
+            chunks=chunks,
+            query_text="Frau Tierhalter",
+            learning_profile=learning_profile,
+        )
+
+        self.assertEqual(len(reranked_chunks), 2)
+        self.assertEqual(reranked_chunks[0].get("owner_type"), "entity")
+        self.assertIn("learning_rerank_score", reranked_chunks[0])
+        self.assertGreater(
+            float(reranked_chunks[0].get("learning_rerank_score") or 0.0),
+            float(reranked_chunks[1].get("learning_rerank_score") or 0.0),
+        )
+
     def test_load_repo_context_for_ide_agent_uses_relation_description_for_relation_chunks(self) -> None:
         with patch(
             "alde.repo_code_splitter.repo_knowledge_query",
@@ -568,6 +683,135 @@ class TestRepoCodeSplitter(unittest.TestCase):
         self.assertIn("defines_class", entries[0]["title"])
         self.assertEqual(entries[0]["content"], "sample.py defines the Demo class.")
         self.assertEqual(entries[0]["source_path"], "sample.py")
+
+    def test_load_repo_context_parser_derives_entity_and_relation_from_subject_object_prompt(self) -> None:
+        captured_call: dict[str, object] = {}
+
+        def _capture_adb_query(*args, **kwargs):
+            _ = args
+            captured_call.update(kwargs)
+            return {"ok": True, "chunks": []}
+
+        query_text = (
+            "Die Frau geht mit Ihrem Hund zum Einkauf. "
+            "Frau = Subjekt und Typ Tierhalter,Hundehalter. "
+            "Hund ist Objekt und Typ Besitz/Eigentum. "
+            "Beziehung zwischen Frau und Hund = Eigentums/Besitzverhaeltnis."
+        )
+
+        with patch("alde.repo_code_splitter.adb_query", side_effect=_capture_adb_query):
+            entries = load_repo_context_for_ide_agent(
+                query_text,
+                limit=5,
+                use_vector=False,
+            )
+
+        self.assertEqual(entries, [])
+        self.assertEqual(captured_call.get("owner_types"), ["entity", "relation"])
+        normalized_query = str(captured_call.get("query") or "")
+        self.assertIn("Frau", normalized_query)
+        self.assertIn("Hund", normalized_query)
+        self.assertIn("Tierhalter", normalized_query)
+        self.assertIn("Eigentums/Besitzverhaeltnis", normalized_query)
+
+    def test_load_repo_context_parser_respects_explicit_owner_types(self) -> None:
+        captured_call: dict[str, object] = {}
+
+        def _capture_adb_query(*args, **kwargs):
+            _ = args
+            captured_call.update(kwargs)
+            return {"ok": True, "chunks": []}
+
+        query_text = "Frau = Subjekt. Hund ist Objekt. Beziehung zwischen Frau und Hund = Besitz."
+
+        with patch("alde.repo_code_splitter.adb_query", side_effect=_capture_adb_query):
+            load_repo_context_for_ide_agent(
+                query_text,
+                limit=3,
+                owner_types=["block"],
+                use_vector=False,
+            )
+
+        self.assertEqual(captured_call.get("owner_types"), ["block"])
+
+    def test_load_context_pattern_embedding_model_returns_fixed_dimension_and_scores(self) -> None:
+        parser = LoadContextPromptParser()
+        role_payload = {
+            "subjects": ["Frau"],
+            "objects": ["Hund"],
+            "relations": ["Eigentums/Besitzverhaeltnis"],
+            "types": ["Tierhalter", "Hundehalter", "Besitz", "Eigentum"],
+        }
+        feature_values = parser._build_feature_values_object(
+            query_text="Frau = Subjekt. Hund ist Objekt. Beziehung zwischen Frau und Hund = Eigentums/Besitzverhaeltnis.",
+            role_payload=role_payload,
+            wants_entities=True,
+            wants_relations=True,
+        )
+
+        model_result = parser._pattern_embedding_model.infer_object(feature_values)
+
+        self.assertEqual(model_result.get("dimension"), 12)
+        embedding = list(model_result.get("embedding") or [])
+        self.assertEqual(len(embedding), 12)
+        self.assertIn("entity", list(model_result.get("owner_types") or []))
+        self.assertIn("relation", list(model_result.get("owner_types") or []))
+        scores = dict(model_result.get("scores") or {})
+        self.assertGreater(float(scores.get("entity") or 0.0), 0.0)
+        self.assertGreater(float(scores.get("relation") or 0.0), 0.0)
+
+    def test_load_context_parser_returns_learning_signal_payload(self) -> None:
+        parser = LoadContextPromptParser()
+        query_text = (
+            "Frau = Subjekt und Typ Tierhalter,Hundehalter. "
+            "Hund ist Objekt und Typ Besitz/Eigentum. "
+            "Beziehung zwischen Frau und Hund = Eigentums/Besitzverhaeltnis."
+        )
+
+        parsed_query, parsed_owner_types, signal_payload = parser.parse_with_signal_object(query_text, None)
+
+        self.assertEqual(parsed_owner_types, ["entity", "relation"])
+        self.assertIn("Frau", parsed_query)
+        self.assertIn("Hund", parsed_query)
+        self.assertEqual(signal_payload.get("mode"), "pattern_embedding_inference")
+        self.assertEqual(int(signal_payload.get("embedding_dimension") or 0), 12)
+        self.assertEqual(len(list(signal_payload.get("pattern_embedding") or [])), 12)
+        self.assertIn("model_scores", signal_payload)
+        self.assertIn("weight_snapshot", signal_payload)
+
+    def test_load_context_syncs_learning_signal_to_agentsdb(self) -> None:
+        captured_sync: dict[str, object] = {}
+
+        def _capture_learning_sync(**kwargs):
+            captured_sync.update(kwargs)
+
+        with patch(
+            "alde.repo_code_splitter.adb_query",
+            return_value={
+                "ok": True,
+                "chunks": [
+                    {
+                        "owner_type": "entity",
+                        "canonical_name": "Frau",
+                        "entity_type": "person",
+                        "summary": "Person subject",
+                        "source_path": "demo.py",
+                    }
+                ],
+            },
+        ), patch("alde.repo_code_splitter._sync_load_context_learning_signal", side_effect=_capture_learning_sync):
+            entries = load_context(
+                query="Frau = Subjekt. Hund ist Objekt. Beziehung zwischen Frau und Hund = Besitz.",
+                model_result={"answer": "ok"},
+                runtime_context={"context_kind": "chat_runtime"},
+                correlation_id="corr:test:1",
+                use_vector=False,
+            )
+
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(str(captured_sync.get("user_prompt") or "")[:4], "Frau")
+        self.assertEqual(captured_sync.get("correlation_id"), "corr:test:1")
+        self.assertIsInstance(captured_sync.get("pattern_signal"), dict)
 
     def test_repo_knowledge_worker_is_registered_and_scans_python_files(self) -> None:
         spec = get_tool_spec("repo_knowledge_worker")
@@ -837,6 +1081,13 @@ class TestRepoCodeSplitter(unittest.TestCase):
             self.assertIn("chunks", result)
             self.assertIn("total", result)
             self.assertIsInstance(result["chunks"], list)
+
+    def test_load_repo_context_for_ide_agent_tool_is_registered(self) -> None:
+        spec = get_tool_spec("load_repo_context_for_ide_agent")
+
+        self.assertIsNotNone(spec)
+        self.assertTrue(callable(spec.implementation))
+        self.assertEqual(spec.name, "load_repo_context_for_ide_agent")
 
     def test_repo_knowledge_query_vector_results_include_non_empty_chunk_fields(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:

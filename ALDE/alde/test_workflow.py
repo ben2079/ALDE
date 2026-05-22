@@ -1578,13 +1578,16 @@ class TestWorkflowIntegration(unittest.TestCase):
 
         self.assertIn("concrete filesystem path", router_prompt)
         self.assertIn("read_document", router_prompt)
-        self.assertIn("memorydb", router_prompt)
-        self.assertIn("vectordb", router_prompt)
+        self.assertNotIn("memorydb", router_prompt)
+        self.assertNotIn("vectordb", router_prompt)
+        self.assertIn("load_context", router_prompt)
 
         self.assertIn("concrete filesystem path", worker_prompt)
         self.assertIn("read_document", worker_prompt)
-        self.assertIn("memorydb", worker_prompt)
-        self.assertIn("vectordb", worker_prompt)
+        self.assertNotIn("memorydb", worker_prompt)
+        self.assertNotIn("vectordb", worker_prompt)
+        self.assertIn("repo_knowledge_query", worker_prompt)
+        self.assertIn("load_context", worker_prompt)
 
         self.assertIsNotNone(read_document_spec)
         self.assertIsNone(memorydb_spec)
@@ -2304,6 +2307,74 @@ class TestWorkflowIntegration(unittest.TestCase):
         self.assertEqual(mongo_sync.call_args.kwargs["query_event"]["query_text"], "Python RAG")
         self.assertEqual(mongo_sync.call_args.kwargs["outcome_event"]["result_count"], 1)
         self.assertEqual(mongo_sync.call_args.kwargs["retrieval_result"][0]["document_id"], "doc_job_0001")
+
+    def test_vectordb_tool_defaults_to_repo_knowledge_query(self) -> None:
+        with patch("alde.agents_factory.repo_knowledge_query", return_value={"answer": "repo-index"}) as repo_query:
+            with patch("alde.agents_factory.vectordb") as vectordb_mock:
+                with patch("alde.agents_factory.memorydb") as memorydb_mock:
+                    result, routing_request = agents_factory.execute_tool(
+                        "vectordb_tool",
+                        {"Query": "load_context status", "k": 4},
+                        source_agent_label="_xplaner_xrouter",
+                    )
+
+        self.assertEqual(result, {"answer": "repo-index"})
+        self.assertIsNone(routing_request)
+        repo_query.assert_called_once_with(
+            query="load_context status",
+            owner_types=None,
+            limit=4,
+            use_vector=True,
+        )
+        vectordb_mock.assert_not_called()
+        memorydb_mock.assert_not_called()
+
+    def test_vectordb_tool_uses_legacy_vector_only_when_explicit(self) -> None:
+        with patch("alde.agents_factory.vectordb", return_value=[{"source": "legacy"}]) as vectordb_mock:
+            with patch("alde.agents_factory.memorydb") as memorydb_mock:
+                with patch("alde.agents_factory.repo_knowledge_query") as repo_query:
+                    result, _ = agents_factory.execute_tool(
+                        "vectordb_tool",
+                        {
+                            "Query": "legacy query",
+                            "vector_tools": "VectorDB",
+                            "use_legacy_vector_tools": True,
+                        },
+                        source_agent_label="_xplaner_xrouter",
+                    )
+
+        self.assertEqual(result, [{"source": "legacy"}])
+        vectordb_mock.assert_called_once_with("legacy query", k=3)
+        memorydb_mock.assert_not_called()
+        repo_query.assert_not_called()
+
+    def test_vectordb_tool_applies_query_rewrite_only_when_explicit(self) -> None:
+        with patch("alde.agents_factory.repo_knowledge_query", return_value={"ok": True}) as repo_query:
+            agents_factory.execute_tool(
+                "vectordb_tool",
+                {
+                    "Query": "original query",
+                    "rewritten_query": "rewritten query",
+                    "k": 2,
+                },
+                source_agent_label="_xplaner_xrouter",
+            )
+            agents_factory.execute_tool(
+                "vectordb_tool",
+                {
+                    "Query": "original query",
+                    "rewritten_query": "rewritten query",
+                    "rewrite_query": True,
+                    "k": 2,
+                },
+                source_agent_label="_xplaner_xrouter",
+            )
+
+        self.assertEqual(repo_query.call_count, 2)
+        first_query = repo_query.call_args_list[0].kwargs["query"]
+        second_query = repo_query.call_args_list[1].kwargs["query"]
+        self.assertEqual(first_query, "original query")
+        self.assertEqual(second_query, "rewritten query")
 
     def test_vector_search_logging_emits_raw_result_without_wrapper(self) -> None:
         result_object = [{"rank": 1, "source": "knowledge.md", "content": "alpha"}]

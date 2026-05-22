@@ -142,6 +142,57 @@ class TestAgentRouting(unittest.TestCase):
 
         self.assertEqual(result, "final question")
 
+    def test_runtime_learning_sync_for_assistant_text_response(self) -> None:
+        history = agents_factory.get_history()
+        history._history_ = [
+            {"role": "user", "content": "please summarize"},
+        ]
+
+        with patch("alde.agents_factory._sync_runtime_learning_signal") as sync_mock:
+            result = agents_factory.ASSISTANT_RESPONSE_SERVICE._handle_text_response(
+                text="summary complete",
+                routing_request=None,
+                history=history,
+                response_agent_label="_xworker",
+                workflow_session=None,
+                tool_results=["tool output"],
+            )
+
+        self.assertEqual(result, "summary complete")
+        self.assertTrue(sync_mock.called)
+        sync_kwargs = dict(sync_mock.call_args.kwargs)
+        self.assertEqual(sync_kwargs.get("tool_name"), "runtime_assistant_response")
+        self.assertEqual((sync_kwargs.get("model_result") or {}).get("content"), "summary complete")
+
+    def test_runtime_learning_sync_for_terminal_tool_result(self) -> None:
+        history = agents_factory.get_history()
+        history._history_ = [
+            {"role": "user", "content": "write this file"},
+        ]
+        agent_msg = SimpleNamespace(
+            content="",
+            tool_calls=[_tool_call("write_document", '{"content":"hello"}', call_id="call_sync")],
+        )
+
+        with patch.object(
+            agents_factory.TOOL_CALL_EXECUTION_SERVICE,
+            "process_object_calls",
+            return_value={
+                "workflow_session": None,
+                "routing_request": None,
+                "tool_results": ["stored"],
+                "terminal_tool_result": "stored",
+                "terminal_tool_name": "write_document",
+            },
+        ), patch("alde.agents_factory._sync_runtime_learning_signal") as sync_mock:
+            result = agents_factory._handle_tool_calls(agent_msg, agent_label="_xworker")
+
+        self.assertEqual(result, "stored")
+        self.assertTrue(sync_mock.called)
+        sync_kwargs = dict(sync_mock.call_args.kwargs)
+        self.assertEqual(sync_kwargs.get("tool_name"), "runtime_tool_terminal")
+        self.assertTrue(bool((sync_kwargs.get("model_result") or {}).get("direct_tool_result")))
+
     def test_routed_agent_keeps_xworker_label_for_nested_tool_followup(self) -> None:
         captured_calls: list[dict[str, object]] = []
 
@@ -501,6 +552,7 @@ class TestAgentRouting(unittest.TestCase):
         tool_names = {tool["function"]["name"] for tool in planner_tools}
 
         self.assertIn("route_to_agent", tool_names)
+        self.assertIn("load_repo_context_for_ide_agent", tool_names)
         self.assertTrue(agents_factory._agent_can_route("_xplaner_xrouter"))
 
     def test_create_agents_command_resolves_to_xplaner_planning_job(self) -> None:
@@ -823,6 +875,31 @@ result, route = agents_factory.execute_route_to_agent(
 
         self.assertEqual(result, "Invalid route_to_agent payload for _xworker: missing required job_name or tool_name")
         self.assertIsNone(route)
+
+    def test_route_to_agent_promotes_xworker_job_hint_from_tools(self) -> None:
+        result, route = agents_factory.execute_route_to_agent(
+            {
+                "target_agent": "_xworker",
+                "tool_name": "cover_letter_writer",
+                "tools": ["cover_letter_writer"],
+                "handoff_protocol": "agent_handoff_v1",
+                "handoff_payload": {
+                    "output": {
+                        "action": "generate_cover_letter",
+                        "job_posting_result": {"title": "Engineer"},
+                    }
+                },
+            },
+            source_agent_label="_xrouter_xplanner",
+        )
+
+        self.assertEqual(result, "Routing to _xworker")
+        self.assertIsInstance(route, dict)
+        self.assertEqual(route.get("agent_label"), "_xworker")
+        self.assertEqual(
+            agents_factory.AGENT_EXECUTION_SELECTION_SERVICE.load_job_name(route),
+            "cover_letter_writer",
+        )
 
     def test_route_to_agent_rejects_async_without_max_agents(self) -> None:
         result, route = agents_factory.execute_route_to_agent(

@@ -66,7 +66,8 @@ Ich würde das System nicht als “Chatbot mit Tools”, sondern als verteiltes 
 7. `State and Memory`
    `Postgres` für Workflow-, Audit- und Objektzustand
    `Redis` für kurzlebigen Runtime-State
-   `Vector Store` nur als Zusatz, nicht als Primärspeicher
+   `Repo Index / AgentDB Retrieval` als Primärspeicher für Kontextabfragen
+   `Vector Store` nur als expliziter Legacy-Zusatz, nicht als Primärspeicher
 
 8. `Policy and Approval Layer`
    Kritische Aktionen wie Deployment, Mailversand, Löschen, Schreiben in Drittsysteme laufen durch Regeln und optional menschliche Freigabe.
@@ -111,7 +112,8 @@ flowchart TB
     Temporal[Workflow Engine Temporal]
     Postgres[(Postgres)]
     Redis[(Redis)]
-    VectorStore[(FAISS / Vector Store)]
+   RepoIndex[(Repo Index / AgentDB Retrieval)]
+   LegacyVectorStore[(Legacy Vector Store Optional)]
     Observability[OpenTelemetry / Langfuse / Grafana]
 
     UI --> Coordinator
@@ -121,7 +123,8 @@ flowchart TB
     Specialists --> ToolGateway
     ToolGateway --> MCPServer
     ToolGateway --> Retrieval
-    Retrieval --> VectorStore
+   Retrieval --> RepoIndex
+   Retrieval -. explicit legacy opt-in .-> LegacyVectorStore
 
     Specialists --> Learning
     Retrieval --> Learning

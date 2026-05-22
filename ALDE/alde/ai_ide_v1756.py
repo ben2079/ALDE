@@ -4290,6 +4290,7 @@ from PySide6.QtCore import (
 class ControlPlaneWidget(QWidget):
     snapshotChanged = Signal(dict)
     _operator_async_result_ready = Signal(object)
+    _refresh_async_result_ready = Signal(object)
     _OPERATOR_FILTER_SETTINGS_PREFIX = "ControlPlane/OperatorFilters"
     _RUNTIME_LAYOUT_SETTINGS_PATH_KEY = "controlPlaneRuntimeLayoutPath"
     _RUNTIME_LAYOUT_DEFAULT_REL_PATH = "AppData/control_plane_runtime_tabs.json"
@@ -4319,6 +4320,10 @@ class ControlPlaneWidget(QWidget):
         self._runtime_state_save_timer.setInterval(900)
         self._runtime_state_save_timer.timeout.connect(self.persist_runtime_tabs_state)
         self._operator_async_result_ready.connect(self._handle_operator_async_result)
+        self._refresh_async_result_ready.connect(self._handle_refresh_async_result)
+        self._refresh_inflight = False
+        self._refresh_pending = False
+        self._refresh_pending_include_drilldown = False
         self._build_ui()
         self.update_scheme(accent, base)
 
@@ -7003,30 +7008,81 @@ class ControlPlaneWidget(QWidget):
             """
         )
 
-    def refresh_view(self) -> None:
+    def _load_refresh_payload(self) -> dict[str, Any]:
+        configuration_snapshot = self._load_configuration_snapshot()
+        monitoring_snapshot = self._load_monitoring_snapshot()
+        operator_snapshot = self._load_operator_snapshot_with_context(
+            previous_operations=dict(self._last_snapshot.get("operations") or {}),
+            recent_action_entries=list(self._operator_log_entries),
+        )
+        return {
+            "configuration": configuration_snapshot,
+            "monitoring": monitoring_snapshot,
+            "operations": operator_snapshot,
+        }
+
+    def refresh_view(self, include_drilldown: bool = False) -> None:
+        if self._refresh_inflight:
+            self._refresh_pending = True
+            self._refresh_pending_include_drilldown = self._refresh_pending_include_drilldown or bool(include_drilldown)
+            return
+
+        self._refresh_inflight = True
+        self._last_refresh_label.setText("Updating...")
+        do_drilldown = bool(include_drilldown)
+
+        def _invoke_worker() -> None:
+            try:
+                snapshot_payload = self._load_refresh_payload()
+                payload: dict[str, Any] = {
+                    "ok": True,
+                    "snapshot": snapshot_payload,
+                    "include_drilldown": do_drilldown,
+                }
+            except Exception as exc:
+                payload = {
+                    "ok": False,
+                    "error": f"{type(exc).__name__}: {exc}",
+                    "include_drilldown": do_drilldown,
+                }
+            self._refresh_async_result_ready.emit(payload)
+
+        Thread(target=_invoke_worker, daemon=True).start()
+
+    @Slot(object)
+    def _handle_refresh_async_result(self, payload: object) -> None:
+        self._refresh_inflight = False
         try:
-            configuration_snapshot = self._load_configuration_snapshot()
-            monitoring_snapshot = self._load_monitoring_snapshot()
-            operator_snapshot = self._load_operator_snapshot()
-            self._populate_trace_filter_selectors(monitoring_snapshot)
-            self._populate_operator_filter_selectors(operator_snapshot)
-            self._render_configuration_snapshot(configuration_snapshot)
-            self._render_monitoring_snapshot(monitoring_snapshot)
-            self._render_operator_snapshot(operator_snapshot)
-            self._populate_drilldown_selectors(configuration_snapshot)
-            self._refresh_drilldown_views()
-            self._last_snapshot = {
-                "configuration": configuration_snapshot,
-                "monitoring": monitoring_snapshot,
-                "operations": operator_snapshot,
-            }
-            self._render_operator_log()
-            self._last_refresh_label.setText(
-                f"Updated {datetime.now().strftime('%H:%M:%S')}"
-            )
-            self.snapshotChanged.emit(dict(self._last_snapshot))
-        except Exception as exc:
-            error_text = html.escape(f"{type(exc).__name__}: {exc}")
+            if not isinstance(payload, dict):
+                return
+
+            if bool(payload.get("ok")):
+                snapshot_payload = payload.get("snapshot") if isinstance(payload.get("snapshot"), dict) else {}
+                configuration_snapshot = dict(snapshot_payload.get("configuration") or {})
+                monitoring_snapshot = dict(snapshot_payload.get("monitoring") or {})
+                operator_snapshot = dict(snapshot_payload.get("operations") or {})
+
+                self._populate_trace_filter_selectors(monitoring_snapshot)
+                self._populate_operator_filter_selectors(operator_snapshot)
+                self._render_configuration_snapshot(configuration_snapshot)
+                self._render_monitoring_snapshot(monitoring_snapshot)
+                self._render_operator_snapshot(operator_snapshot)
+                self._populate_drilldown_selectors(configuration_snapshot)
+                if bool(payload.get("include_drilldown")):
+                    self._refresh_drilldown_views()
+                self._last_snapshot = {
+                    "configuration": configuration_snapshot,
+                    "monitoring": monitoring_snapshot,
+                    "operations": operator_snapshot,
+                }
+                self._render_operator_log()
+                self._last_refresh_label.setText(
+                    f"Updated {datetime.now().strftime('%H:%M:%S')}"
+                )
+                self.snapshotChanged.emit(dict(self._last_snapshot))
+                return
+
+            error_text = html.escape(str(payload.get("error") or "Unknown refresh error"))
             self.config_summary_view.setHtml(f"<h3>Configuration unavailable</h3><p>{error_text}</p>")
             self.config_manifest_view.setHtml(
                 "<h3>Manifest projection failed</h3><p>Check agents_config.py imports and runtime state.</p>"
@@ -7055,19 +7111,26 @@ class ControlPlaneWidget(QWidget):
                 "monitoring": {"session_count": 0, "failure_count": 0},
                 "operations": {"queue_backend": "n/a", "queue_healthy": False},
             }
+            self._last_refresh_label.setText("Update failed")
             self._render_operator_log()
             self.snapshotChanged.emit(dict(self._last_snapshot))
+        finally:
+            if self._refresh_pending:
+                self._refresh_pending = False
+                include_drilldown = self._refresh_pending_include_drilldown
+                self._refresh_pending_include_drilldown = False
+                self.refresh_view(include_drilldown=include_drilldown)
 
     @Slot()
     def _refresh_from_panel(self) -> None:
-        self.refresh_view()
+        self.refresh_view(include_drilldown=True)
         try:
             window = self.window()
             status_getter = getattr(window, "statusBar", None)
             if callable(status_getter):
                 status_bar = status_getter()
                 if status_bar is not None:
-                    status_bar.showMessage("Control Plane refreshed", 2500)
+                    status_bar.showMessage("Control Plane refresh requested", 2500)
         except Exception:
             pass
 

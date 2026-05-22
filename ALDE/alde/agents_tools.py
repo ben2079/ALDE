@@ -4572,8 +4572,8 @@ AGENTS_DB_STRUCTURE_CONFIGS: dict[str, dict[str, Any]] = {
             {
                 "name": "retrieval_run_sync",
                 "entry_functions": [
-                    "memorydb",
-                    "vectordb",
+                    "repo_knowledge_query",
+                    "load_context",
                     "sync_retrieval_run_to_mongodb_knowledge",
                 ],
                 "from_module": "tools.py",
@@ -7388,9 +7388,13 @@ _TOOL_RUNTIME_REFS: dict[str, Any] = {
 }
 
 try:
-    from .repo_code_splitter import adb_worker, adb_query
+    from .repo_code_splitter import adb_worker, adb_query, load_context, load_repo_context_for_ide_agent
 except ImportError:
-    from alde.repo_code_splitter import adb_worker, adb_query
+    from alde.repo_code_splitter import adb_worker, adb_query, load_context, load_repo_context_for_ide_agent
+
+# Backward-compatible public aliases used by tests and legacy callers.
+repo_knowledge_worker = adb_worker
+repo_knowledge_query = adb_query
 
 _TOOL_IMPLEMENTATIONS: dict[str, Callable | None] = {
     "memorydb": memorydb,
@@ -7402,6 +7406,8 @@ _TOOL_IMPLEMENTATIONS: dict[str, Callable | None] = {
     "adb_knowledge_query": adb_query,
     "repo_knowledge_worker": adb_worker,
     "repo_knowledge_query": adb_query,
+    "load_context": load_context,
+    "load_repo_context_for_ide_agent": load_context,
     "build_agent_system_configs": build_agent_system_configs_tool,
     "execute_action_request": ACTION_REQUEST_SERVICE.execute_request_tool,
     "store_object_result": DOCUMENT_OBJECT_SERVICE.store_result,

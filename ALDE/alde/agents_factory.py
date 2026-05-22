@@ -88,6 +88,7 @@ try:
         get_tool_spec,
         memorydb,
         md_to_pdf,
+        repo_knowledge_query,
         vectordb,
         write_document,
     )
@@ -104,6 +105,7 @@ except ImportError as e:
             get_tool_spec,
             memorydb,
             md_to_pdf,
+            repo_knowledge_query,
             vectordb,
             write_document,
         )
@@ -1741,24 +1743,57 @@ def execute_vectordb(args: dict, tool_call_id: str = None) -> tuple[str, dict | 
 
 
 class VectorSearchDispatcher:
+    def _is_explicit_true(self, value: Any) -> bool:
+        if isinstance(value, bool):
+            return value
+        normalized = str(value or "").strip().lower()
+        return normalized in {"1", "true", "yes", "on"}
+
+    def _resolve_query_text(self, args: dict[str, Any]) -> str:
+        query_text = str(args.get('Query') or args.get('query') or '').strip()
+        # Query rewrites are allowed only on explicit opt-in.
+        if not self._is_explicit_true(args.get('rewrite_query')):
+            return query_text
+        rewritten_query_text = str(
+            args.get('rewritten_query')
+            or args.get('query_rewrite')
+            or args.get('rewrite')
+            or ''
+        ).strip()
+        return rewritten_query_text or query_text
+
+    def _use_legacy_vector_tools(self, args: dict[str, Any]) -> bool:
+        return self._is_explicit_true(args.get('use_legacy_vector_tools'))
+
     def resolve_object_name(self, args: dict[str, Any]) -> str:
         return str(args.get('vector_tools', 'VectorDB') or 'VectorDB')
 
     def dispatch_object(self, args: dict[str, Any], tool_call_id: str = None) -> tuple[str, dict | None]:
-        query = (args.get('Query') or args.get('query') or '').strip()
+        query = self._resolve_query_text(args)
         object_name = self.resolve_object_name(args)
-        cache_key = f"{object_name}:{query.lower()}"
+        use_legacy_vector_tools = self._use_legacy_vector_tools(args)
+        mode_name = "legacy" if use_legacy_vector_tools else "repo_index"
+        cache_key = f"{mode_name}:{object_name}:{query.lower()}"
 
         if cache_key in _TOOL_CACHE:
             result = _TOOL_CACHE[cache_key]
         else:
-            if object_name == 'VectorDB':
-                result = vectordb(query, k=3)
+            if use_legacy_vector_tools:
+                if object_name == 'VectorDB':
+                    result = vectordb(query, k=3)
+                else:
+                    result = memorydb(query, k=3)
             else:
-                result = memorydb(query, k=3)
+                result = repo_knowledge_query(
+                    query=query,
+                    owner_types=args.get('owner_types'),
+                    limit=int(args.get('k') or 10),
+                    use_vector=True,
+                )
             _TOOL_CACHE[cache_key] = result
 
-        _default_on_result(object_name, result, tool_call_id)
+        result_tool_name = object_name if use_legacy_vector_tools else 'repo_knowledge_query'
+        _default_on_result(result_tool_name, result, tool_call_id)
         return result, None
 
 
@@ -2367,6 +2402,46 @@ class AgentRoutingDispatcher:
         target = normalize_agent_label(
             str(args.get('target_agent') or object_name or '').strip()
         ) if str(args.get('target_agent') or object_name or '').strip() else ""
+
+        if target == '_xworker' and not job_name:
+            promoted_job_name = ""
+            job_hint_candidates: list[str] = []
+            if tool_name:
+                job_hint_candidates.append(str(tool_name).strip())
+            job_hint_candidates.extend(
+                str(value).strip()
+                for value in explicit_tools
+                if isinstance(value, str) and str(value).strip()
+            )
+            for job_hint in job_hint_candidates:
+                normalized_job_hint = self._load_canonical_job_name(job_hint) or str(job_hint).strip()
+                if not normalized_job_hint:
+                    continue
+                candidate_job_config = get_job_config(normalized_job_hint)
+                if not isinstance(candidate_job_config, dict) or not candidate_job_config:
+                    continue
+                candidate_runtime_agent = normalize_agent_label(
+                    str(candidate_job_config.get("runtime_agent") or "").strip()
+                )
+                if candidate_runtime_agent and candidate_runtime_agent != '_xworker':
+                    continue
+                promoted_job_name = normalized_job_hint
+                break
+
+            if promoted_job_name:
+                job_name = promoted_job_name
+                args['job_name'] = promoted_job_name
+                if tool_name and normalize_tool_name(str(tool_name)) == normalize_tool_name(promoted_job_name):
+                    tool_name = None
+                    args.pop('tool_name', None)
+                if isinstance(handoff_metadata, dict):
+                    promoted_handoff_metadata = deepcopy(handoff_metadata)
+                    promoted_handoff_metadata.setdefault('job_name', promoted_job_name)
+                    metadata_tool_name = normalize_tool_name(str(promoted_handoff_metadata.get('tool_name') or ''))
+                    if metadata_tool_name and metadata_tool_name == normalize_tool_name(promoted_job_name):
+                        promoted_handoff_metadata.pop('tool_name', None)
+                    handoff_metadata = promoted_handoff_metadata
+                    args['handoff_metadata'] = deepcopy(promoted_handoff_metadata)
 
         tool_name, explicit_tools, handoff_metadata = self._sanitize_route_tool_selection(
             target=target,
@@ -5967,6 +6042,20 @@ class AssistantResponseService:
             event_name=completion_event_name,
             payload=completion_payload,
         )
+        _sync_runtime_learning_signal(
+            tool_name="runtime_assistant_response",
+            model_result={
+                "content": str(text),
+                "response_agent_label": response_agent_label,
+            },
+            routing_request=routing_request,
+            context_payload={
+                "completion_payload": deepcopy(completion_payload),
+            },
+            agent_label=response_agent_label,
+            event_name=completion_event_name,
+            tool_results=tool_results,
+        )
         WORKFLOW_HISTORY_LOG_SERVICE.log_assistant_response(
             history,
             text=text,
@@ -6060,6 +6149,57 @@ def _maybe_apply_routing_result_postprocess(
         succeeded=succeeded,
     )
 
+
+def _sync_runtime_learning_signal(
+    *,
+    tool_name: str,
+    model_result: Any = None,
+    routing_request: dict[str, Any] | None = None,
+    context_payload: dict[str, Any] | None = None,
+    agent_label: str | None = None,
+    event_name: str | None = None,
+    tool_results: list[str] | None = None,
+) -> None:
+    user_prompt = _latest_user_message("")
+    if not str(user_prompt or "").strip():
+        return
+
+    correlation_id = ROUTING_HANDOFF_VIEW_SERVICE.load_correlation_id(routing_request)
+    compact_tool_results = [
+        str(item or "")[:2000]
+        for item in (tool_results or [])
+        if str(item or "").strip()
+    ][:5]
+    payload = {
+        "agent_label": normalize_agent_label(str(agent_label or "")) if agent_label else "",
+        "event_name": str(event_name or "").strip() or None,
+        "routing_target": ROUTING_REQUEST_VIEW_SERVICE.load_target_agent(routing_request) or None,
+        "tool_results": compact_tool_results,
+    }
+    if isinstance(context_payload, dict):
+        payload.update(context_payload)
+
+    try:
+        try:
+            from .agents_db import sync_learning_interaction_to_agentsdb_knowledge
+        except ImportError:
+            from alde.agents_db import sync_learning_interaction_to_agentsdb_knowledge
+
+        sync_learning_interaction_to_agentsdb_knowledge(
+            tool_name=str(tool_name or "runtime_assistant_response"),
+            user_prompt=str(user_prompt),
+            model_result=deepcopy(model_result),
+            context_payload=deepcopy(payload),
+            pattern_signal={
+                "source": "agents_factory",
+                "kind": "runtime_response",
+                "event": str(event_name or "").strip() or None,
+            },
+            correlation_id=str(correlation_id or "").strip() or None,
+        )
+    except Exception:
+        return
+
 # ============================================================================
 # Handle Tool Calls - uses execute_tool with bound callbacks
 # ============================================================================
@@ -6098,6 +6238,21 @@ def _handle_tool_calls(agent_msg, depth: int = 0,
     agent_label = agent_label or '_xplaner_xrouter'
 
     if terminal_tool_result is not None and next_routing_request is None:
+        _sync_runtime_learning_signal(
+            tool_name="runtime_tool_terminal",
+            model_result={
+                "content": str(terminal_tool_result),
+                "tool_name": terminal_tool_name,
+                "direct_tool_result": True,
+            },
+            routing_request=next_routing_request,
+            context_payload={
+                "terminal_tool_name": terminal_tool_name,
+            },
+            agent_label=agent_label,
+            event_name="tool_result_final",
+            tool_results=tool_results,
+        )
         WORKFLOW_HISTORY_LOG_SERVICE.log_assistant_response(
             history,
             text=str(terminal_tool_result),
