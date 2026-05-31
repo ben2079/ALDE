@@ -21,18 +21,7 @@ from PySide6.QtWidgets import (
 	QWidget,
 )
 
-try:
-	if __package__:
-		from ..agents_db import AgentRelationGraphService  # type: ignore
-	else:
-		from agents_db import AgentRelationGraphService  # type: ignore
-except ImportError as e:
-	msg = str(e)
-	if "attempted relative import" in msg or "no known parent package" in msg:
-		from alde.agents_db import AgentRelationGraphService  # type: ignore  # noqa: E402
-	else:
-		raise
-
+from ..artifact_backends import GraphViewBackendService, load_default_graph_backend_service
 
 class RelationGraphView(QGraphicsView):
 	graphItemActivated = Signal(object)
@@ -114,14 +103,14 @@ class RuntimeWidget(QWidget):
 		*,
 		object_name: str,
 		source_uri: str,
-		graph_service: AgentRelationGraphService,
+		graph_service: GraphViewBackendService,
 		scheme: Mapping[str, str] | None = None,
 		parent: QWidget | None = None,
 	) -> None:
 		super().__init__(parent)
-		self._object_name = str(object_name or "agent_relation_graph").strip() or "agent_relation_graph"
+		self._object_name = str(object_name or "graph_view").strip() or "graph_view"
 		self._source_uri = str(source_uri or "").strip()
-		self._graph_service = graph_service
+		self._backend_service = graph_service
 		self._scheme: dict[str, str] = dict(scheme or {})
 
 		self._graph_snapshot: dict[str, Any] = {}
@@ -135,7 +124,7 @@ class RuntimeWidget(QWidget):
 	def _build_object_ui(self) -> None:
 		root_layout = QVBoxLayout(self)
 		root_layout.setContentsMargins(0, 0, 0, 0)
-		root_layout.setSpacing(0)
+		root_layout.setSpacing(0)		
 
 		self._content_stack = QStackedWidget(self)
 		root_layout.addWidget(self._content_stack, 1)
@@ -153,7 +142,7 @@ class RuntimeWidget(QWidget):
 		graph_panel_layout.setSpacing(0)
 
 		self._graph_scene = QGraphicsScene(self)
-		self._graph_view = RelationGraphView(self._graph_panel)
+		self._graph_view = RelationGraphView(self._graph_panel) 
 		self._graph_view.setScene(self._graph_scene)
 		graph_panel_layout.addWidget(self._graph_view, 1)
 
@@ -269,7 +258,7 @@ class RuntimeWidget(QWidget):
 
 	def refresh_object(self, *, fit_view: bool) -> None:
 		try:
-			snapshot_payload = self._graph_service.load_widget_snapshot(
+			snapshot_payload = self._backend_service.load_widget_snapshot(
 				tool_id=self._object_name,
 				source_uri=self._source_uri,
 			)
@@ -303,7 +292,7 @@ class RuntimeWidget(QWidget):
 			self._content_stack.setCurrentWidget(self._detail_page)
 			return
 
-		graph_view_state = self._graph_service.load_graph_view_state(
+		graph_view_state = self._backend_service.load_graph_view_state(
 			snapshot_payload,
 			layout_spread=float(self._graph_layout_spread),
 			selected_kind=str(self._graph_view_state.get("selected_kind") or ""),
@@ -318,6 +307,7 @@ class RuntimeWidget(QWidget):
 		*,
 		fit_view: bool,
 		center_selected: bool = False,
+		
 	) -> None:
 		view_state = dict(graph_view_state or {})
 		self._graph_view_state = view_state
@@ -441,7 +431,7 @@ class RuntimeWidget(QWidget):
 
 	@Slot(object)
 	def _handle_graph_item_activated(self, payload: object) -> None:
-		graph_view_state = self._graph_service.load_graph_view_state_from_payload(
+		graph_view_state = self._backend_service.load_graph_view_state_from_payload(
 			self._graph_snapshot,
 			payload if isinstance(payload, dict) else {},
 			layout_spread=float(self._graph_layout_spread),
@@ -452,7 +442,7 @@ class RuntimeWidget(QWidget):
 		self.widgetStateChanged.emit()
 
 	def _handle_graph_link_clicked(self, url: object) -> None:
-		graph_view_state = self._graph_service.load_graph_view_state_from_link(
+		graph_view_state = self._backend_service.load_graph_view_state_from_link(
 			self._graph_snapshot,
 			url,
 			layout_spread=float(self._graph_layout_spread),
@@ -465,7 +455,7 @@ class RuntimeWidget(QWidget):
 	@Slot(float)
 	def _handle_graph_spread_requested(self, factor: float) -> None:
 		self._graph_layout_spread = max(0.35, min(3.5, float(self._graph_layout_spread) * float(factor or 1.0)))
-		graph_view_state = self._graph_service.load_graph_view_state(
+		graph_view_state = self._backend_service.load_graph_view_state(
 			self._graph_snapshot,
 			layout_spread=float(self._graph_layout_spread),
 			selected_kind=str(self._graph_view_state.get("selected_kind") or ""),
@@ -479,7 +469,7 @@ class RuntimeWidget(QWidget):
 		selected_object_id = str(self._graph_view_state.get("selected_object_id") or "")
 		if not selected_kind or not selected_object_id:
 			return
-		center = self._graph_service.load_graph_item_center(
+		center = self._backend_service.load_graph_item_center(
 			self._graph_view_state,
 			kind=selected_kind,
 			object_id=selected_object_id,
@@ -582,9 +572,8 @@ QLabel {{
 
 
 class RelationGraphWidgetArtifactFactory:
-	def __init__(self, graph_service: AgentRelationGraphService | None = None) -> None:
-		self._graph_service = graph_service or AgentRelationGraphService()
-
+	def __init__(self, graph_service: GraphViewBackendService | None = None) -> None:
+		self._backend_service = graph_service or load_default_graph_backend_service()
 	def load_object_widget(
 		self,
 		*,
@@ -596,7 +585,7 @@ class RelationGraphWidgetArtifactFactory:
 		return RuntimeWidget(
 			object_name=object_name,
 			source_uri=source_uri,
-			graph_service=self._graph_service,
+			graph_service=self._backend_service,
 			scheme=scheme,
 			parent=parent,
 		)

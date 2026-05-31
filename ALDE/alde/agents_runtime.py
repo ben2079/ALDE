@@ -53,7 +53,7 @@ SYSTEM_PROMPT: dict[str, dict[str, Any]] = {
             - Execute delegated jobs from planner or worker handoffs with deterministic boundaries.
             - Resolve the skill profile from tool_name first when configured, then fall back to job_name.
             - Respect explicit routed tool constraints when tools are provided as task options.
-            - When the request names a concrete filesystem path to read, open, or load, use read_document; use repo_knowledge_query or load_context for indexed retrieval, not file loading.
+            - When the request names a concrete filesystem path to read, open, or load, use read_document; use adb_query or load_context for indexed retrieval, not file loading.
             - Keep outputs stable, explicit, and task-bounded.
             - Do not invent unsupported claims or runtime results.
             - Delegate further to sub-agents when async or parallel execution branches are explicitly required.
@@ -576,6 +576,174 @@ JOB_PROMPTS: dict[str, dict[str, Any]] = {
             "results": [],
         },
     },
+    "relation_graph_view": {
+        "prompt": _text(
+            """
+            === Job: relation_graph_view ===
+            Description: Deterministic GraphToolService execution and diagnostics job for AgentDB relation-graph analysis.
+            Goal: Execute relation_graph_view with an explicit request envelope, preserve source-grounded graph payloads, and return the tool result unchanged.
+
+            Rules:
+            - Use only the relation_graph_view tool for this job.
+            - Accept only these request fields: source_uri, tool_id, include_view_state, layout_spread, selected_kind, selected_object_id, include_connection_preview.
+            - Pass parameters only when provided by the request payload.
+            - Keep selected_kind constrained to node or edge when a selection is requested; otherwise omit it.
+            - Treat layout_spread as a rendering hint and keep it numeric.
+            - Prefer include_view_state=true when the user asks for rendering payloads.
+            - Use include_connection_preview=true only when connection diagnostics are explicitly requested.
+            - Preserve tool-reported diagnostics and modeling guidance exactly as returned.
+            - Return the tool result payload unchanged.
+            - Do not invent nodes, edges, diagnostics, view-state fields, or connection-preview metadata.
+            - Do not post-process or rewrite the returned analysis metrics.
+            """
+        ),
+        "task": {
+            "mode": "tool_execution",
+            "tool_name": "relation_graph_view",
+            "input_contract": {
+                "required": [],
+                "optional": [
+                    "source_uri",
+                    "tool_id",
+                    "include_view_state",
+                    "layout_spread",
+                    "selected_kind",
+                    "selected_object_id",
+                    "include_connection_preview",
+                ],
+                "constraints": {
+                    "selected_kind": ["node", "edge"],
+                    "layout_spread": "float",
+                },
+            },
+            "workflow": [
+                "Validate the request envelope and keep only supported fields.",
+                "Call relation_graph_view with explicit parameters from the request.",
+                "Return the tool payload unchanged, including graph_snapshot, analysis, and optional view_state/connection_preview.",
+            ],
+        },
+        "output_schema": {
+            "ok": True,
+            "tool": "relation_graph_view",
+            "tool_id": "relation_graph_view",
+            "source_uri": "agentsdb://127.0.0.1:2331/tools:relation_graph_view",
+            "status_text": "",
+            "message": "",
+            "graph_snapshot": {
+                "view_kind": "relations_graph",
+                "metadata": {},
+                "nodes": [],
+                "edges": [],
+            },
+            "analysis": {
+                "node_count": 0,
+                "edge_count": 0,
+                "kind_counts": {},
+                "relation_type_counts": {},
+                "average_degree": 0.0,
+                "directed_density": 0.0,
+                "top_hubs": [],
+                "modeling_guidance": [],
+            },
+            "view_state": {
+                "has_graph": False,
+                "message": "",
+                "overview_html": "",
+                "detail_html": "",
+                "node_draw_objects": [],
+                "edge_draw_objects": [],
+                "render_commands": [],
+                "selected_kind": "",
+                "selected_object_id": "",
+            },
+            "connection_preview": {},
+        },
+    },
+    "relation_graph_analysis": {
+        "prompt": _text(
+            """
+            === Job: relation_graph_analysis ===
+            Description: Deterministic GraphToolService analysis job for relation-graph quality diagnostics.
+            Goal: Execute relation_graph_analysis with explicit analysis settings and return the tool payload unchanged for downstream graph reasoning.
+
+            Rules:
+            - Use only the relation_graph_analysis tool for this job.
+            - Keep source_uri and tool_id explicit when provided.
+            - Prefer include_view_state=true unless the user explicitly disables view rendering payloads.
+            - Use include_connection_preview=true only when connection-level diagnostics are requested.
+            - Keep selected_kind constrained to node or edge.
+            - Keep selected_object_id unchanged when provided.
+            - Preserve analysis fields exactly as returned, especially modeling_guidance, relation_type_counts, and top_hubs.
+            - Return the tool result payload unchanged.
+            - Do not invent graph topology, diagnostics, or recommendations beyond tool output.
+            """
+        ),
+        "task": {
+            "mode": "tool_execution",
+            "tool_name": "relation_graph_analysis",
+            "input_contract": {
+                "required": [],
+                "optional": [
+                    "source_uri",
+                    "tool_id",
+                    "include_view_state",
+                    "layout_spread",
+                    "selected_kind",
+                    "selected_object_id",
+                    "include_connection_preview",
+                ],
+                "constraints": {
+                    "selected_kind": ["node", "edge"],
+                    "layout_spread": "float",
+                },
+                "defaults": {
+                    "include_view_state": True,
+                    "include_connection_preview": False,
+                },
+            },
+            "workflow": [
+                "Normalize and validate analysis-focused graph request fields.",
+                "Execute relation_graph_analysis with explicit parameters.",
+                "Return the full tool payload unchanged for deterministic downstream analysis.",
+            ],
+        },
+        "output_schema": {
+            "ok": True,
+            "tool": "relation_graph_analysis",
+            "tool_id": "relation_graph_analysis",
+            "source_uri": "agentsdb://127.0.0.1:2331/tools:relation_graph_view",
+            "status_text": "",
+            "message": "",
+            "graph_snapshot": {
+                "view_kind": "relations_graph",
+                "metadata": {},
+                "nodes": [],
+                "edges": [],
+            },
+            "analysis": {
+                "node_count": 0,
+                "edge_count": 0,
+                "kind_counts": {},
+                "relation_type_counts": {},
+                "average_degree": 0.0,
+                "directed_density": 0.0,
+                "top_hubs": [],
+                "modeling_guidance": [],
+            },
+            "view_state": {
+                "has_graph": False,
+                "message": "",
+                "overview_html": "",
+                "detail_html": "",
+                "node_draw_objects": [],
+                "edge_draw_objects": [],
+                "render_commands": [],
+                "selected_kind": "",
+                "selected_object_id": "",
+            },
+            "connection_preview": {},
+        },
+    },
     "adb_worker": {
         "prompt": _text(
             """
@@ -751,11 +919,19 @@ JOB_CONFIGS: dict[str, dict[str, Any]] = {
         "workflow_name": "xworker_adb_operation_leaf",
         "default_tool_names": ["adb_operation"],
     },
-    "agent_relation_graph_analysis": {
+    "relation_graph_view": {
         "runtime_agent": "_xworker",
-        "skill_profile": "xworker_core",
+        "skill_profile": "xworker_graph_view_service",
         "default_object_name": "agents_db_graph",
-        "default_tool_names": ["agent_relation_graph"],
+        "workflow_name": "xworker_relation_graph_view_leaf",
+        "default_tool_names": ["relation_graph_view"],
+    },
+    "relation_graph_analysis": {
+        "runtime_agent": "_xworker",
+        "skill_profile": "xworker_graph_analysis_service",
+        "default_object_name": "agents_db_graph",
+        "workflow_name": "xworker_relation_graph_analysis_leaf",
+        "default_tool_names": ["relation_graph_analysis"],
     },
     "adb_worker": {
         "runtime_agent": "_xworker",
@@ -769,7 +945,7 @@ JOB_CONFIGS: dict[str, dict[str, Any]] = {
         "skill_profile": "xworker_core",
         "default_object_name": "repo_knowledge",
         "workflow_name": "xworker_adb_query_leaf",
-        "default_tool_names": ["repo_knowledge_query"],
+        "default_tool_names": ["adb_query"],
     },
     "router_planner_repo_knowledge_async": {
         "runtime_agent": "_xrouter_xplanner",
@@ -900,11 +1076,14 @@ def _tool_skill_profiles_for_agent(agent_label: str) -> dict[str, str]:
         "ingest_object": "xworker_dispatch",
         "store_object_result": "xworker_dispatch",
         "adb_operation": "xworker_core",
-        "agent_relation_graph": "xworker_core",
+        "relation_graph_view": "xworker_graph_view_service",
+        "relation_graph_analysis": "xworker_graph_analysis_service",
+        "adb_relation_graph": "xworker_graph_view_service",
+        "agent_relation_graph": "xworker_graph_view_service",
         "run_mail_agent": "xworker_mail_agent_runtime",
         "vdb_worker": "xworker_core",
         "repo_knowledge_worker": "xworker_core",
-        "repo_knowledge_query": "xworker_core",
+        "adb_query": "xworker_core",
         "load_context": "xworker_core",
         "load_repo_context_for_ide_agent": "xworker_core",
         "dispatch_documents": "xworker_dispatch",
@@ -954,14 +1133,21 @@ AGENT_RUNTIME: dict[str, dict[str, Any]] = {
             "route_to_agent",
             "execute_action_request",
             "upsert_object_record",
-            "load_context",
+            "ingest_object",
+            "store_object_result",
+            "adb_operation",
+            "relation_graph_view",
+            "relation_graph_analysis",
+            "run_mail_agent",
+            "repo_knowledge_worker",
+            "adb_query",
             "@dispatcher",
+            "@doc_ro",
             "@doc_rw",
         ],
         "defaults": {
             "job_name": _default_job_name_for_agent("_xrouter_xplanner"),
-            "skill": "",
-            "profile": "xplaner_xrouter_core",
+            "skill_profile": "xplaner_xrouter_core",
         },
         "workflow": {"definition": "xplaner_xrouter_router"},
     },
@@ -975,19 +1161,18 @@ AGENT_RUNTIME: dict[str, dict[str, Any]] = {
             "ingest_object",
             "store_object_result",
             "adb_operation",
-            "agent_relation_graph",
+            "relation_graph_view",
+            "relation_graph_analysis",
             "run_mail_agent",
-            "vdb_worker",
             "repo_knowledge_worker",
-            "repo_knowledge_query",
+            "adb_query",
             "@dispatcher",
             "@doc_ro",
             "@doc_rw",
         ],
         "defaults": {
             "job_name": _default_job_name_for_agent("_xworker"),
-            "skill": "",
-            "profile": "xworker_core",
+            "skill_profile": "xworker_core",
         },
         "workflow": {"definition": "xworker_leaf"},
     },
@@ -1507,6 +1692,18 @@ AGENT_SKILLS: dict[str, dict[str, Any]] = {
         "description": "Worker profile for cover-letter generation.",
         "job_name": "cover_letter_writer",
     },
+    "xworker_graph_view_service": {
+        "role": "xworker",
+        "prompt_fragments": ["source_grounding", "json_output", "deterministic_workflow"],
+        "description": "Worker profile for deterministic GraphToolService relation-graph execution, diagnostics, and view-state analysis.",
+        "job_name": "relation_graph_view",
+    },
+    "xworker_graph_analysis_service": {
+        "role": "xworker",
+        "prompt_fragments": ["source_grounding", "json_output", "deterministic_workflow"],
+        "description": "Worker profile for deterministic GraphToolService analysis-focused relation-graph diagnostics.",
+        "job_name": "relation_graph_analysis",
+    },
   
     "xworker_mail_agent_runtime": {
         "role": "xworker",
@@ -1633,12 +1830,26 @@ TOOL_CONFIGS: list[dict[str, Any]] = [
         ],
     },
     {
-        "name": "adb_relation_graph",
+        "name": "relation_graph_view",
         "description": "Load and analyze the AgentsDB relation graph for visualization and AI/ML data-model exploration.",
         "implementation_name": "adb_relation_graph",
         "parameters": [
             {"name": "source_uri", "type": "string", "description": "Optional AgentsDB tool endpoint URI. Example: agentsdb://127.0.0.1:2331/tools:adb_relation_graph.", "required": False},
-            {"name": "tool_id", "type": "string", "description": "Graphic tool id to resolve. Default: adb_relation_graph.", "required": False, "enum": ["adb_relation_graph", "workflow_diagram", "sequence_diagram"], "default": "adb_relation_graph"},
+            {"name": "tool_id", "type": "string", "description": "Graphic tool id to resolve. Default: relation_graph_view.", "required": False, "enum": ["relation_graph_view", "workflow_diagram", "sequence_diagram"], "default": "relation_graph_view"},
+            {"name": "include_view_state", "type": "boolean", "description": "When true, include render-oriented node/edge draw objects.", "required": False, "default": True},
+            {"name": "layout_spread", "type": "number", "description": "Optional graph layout spread factor used for view_state generation.", "required": False, "default": 1.0},
+            {"name": "selected_kind", "type": "string", "description": "Optional focus selector kind for the graph view state.", "required": False, "enum": ["", "node", "edge"], "default": ""},
+            {"name": "selected_object_id", "type": "string", "description": "Optional focused node_id or edge_id used with selected_kind.", "required": False},
+            {"name": "include_connection_preview", "type": "boolean", "description": "When true, include connection/tool preview metadata from the graph control plane.", "required": False, "default": False},
+        ],
+    },
+    {
+        "name": "relation_graph_analysis",
+        "description": "Analyze relation graph quality signals and return deterministic diagnostics for modeling decisions.",
+        "implementation_name": "adb_relation_graph",
+        "parameters": [
+            {"name": "source_uri", "type": "string", "description": "Optional AgentsDB tool endpoint URI. Example: agentsdb://127.0.0.1:2331/tools:relation_graph_view.", "required": False},
+            {"name": "tool_id", "type": "string", "description": "Graphic tool id to resolve. Default: relation_graph_view.", "required": False, "enum": ["relation_graph_view", "workflow_diagram", "sequence_diagram"], "default": "relation_graph_view"},
             {"name": "include_view_state", "type": "boolean", "description": "When true, include render-oriented node/edge draw objects.", "required": False, "default": True},
             {"name": "layout_spread", "type": "number", "description": "Optional graph layout spread factor used for view_state generation.", "required": False, "default": 1.0},
             {"name": "selected_kind", "type": "string", "description": "Optional focus selector kind for the graph view state.", "required": False, "enum": ["", "node", "edge"], "default": ""},
@@ -1950,10 +2161,14 @@ TOOL_NAMES: dict[str, str] = {
     "adb_operation": "adb_operation",
     "agentdb_operation": "adb_operation",
     "agentsdb_operation": "adb_operation",
-    "agent_relation_graph": "adb_relation_graph",
-    "agentdb_relation_graph": "adb_relation_graph",
-    "agentsdb_relation_graph": "adb_relation_graph",
-    "agentsdb://127.0.0.1:2331/tools:agent_relation_graph": "adb_relation_graph",
+    "relation_graph_view": "relation_graph_view",
+    "relation_graph_analysis": "relation_graph_analysis",
+    "agent_relation_graph": "relation_graph_view",
+    "agentdb_relation_graph": "relation_graph_view",
+    "agentsdb_relation_graph": "relation_graph_view",
+    "adb_relation_graph": "relation_graph_view",
+    "agentsdb://127.0.0.1:2331/tools:agent_relation_graph": "relation_graph_view",
+    "agentsdb://127.0.0.1:2331/tools:relation_graph_view": "relation_graph_view",
     "dispatch_docs": "dispatch_documents",
     "dispatch_documents": "dispatch_documents",
     "data_dispatcher/dispatch_documents": "dispatch_documents",
@@ -2040,8 +2255,8 @@ TOOL_GROUPS: dict[str, list[str]] = {
     "comms": ["send_mail", "run_mail_agent", "calendar", "call", "accept_call", "reject_call"],
     "code": ["code_tool", "iter_documents"],
     "dispatcher": ["dispatch_documents", "execute_action_request", "upsert_object_record", "ingest_object", "store_object_result", "vdb_worker", "repo_knowledge_worker"],
-    "agentdb": ["adb_operation", "agent_relation_graph", "repo_knowledge_worker", "repo_knowledge_query"],
-    "repo_knowledge": ["adb_operation", "agent_relation_graph", "repo_knowledge_worker", "repo_knowledge_query", "load_context"],
+    "agentdb": ["adb_operation", "relation_graph_view", "relation_graph_analysis", "repo_knowledge_worker", "adb_query"],
+    "repo_knowledge": ["adb_operation", "relation_graph_view", "relation_graph_analysis", "repo_knowledge_worker", "adb_query", "load_context"],
 }
 
 

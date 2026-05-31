@@ -3121,6 +3121,160 @@ def execute_tool(
         source_agent_label=source_agent_label,
     )
 
+
+def execute_tool_payload(
+    name: str,
+    args: dict,
+    tool_call_id: str = None,
+    *,
+    source_agent_label: str | None = None,
+) -> dict[str, Any]:
+    """Execute a tool via engine dispatch and return a parsed dict payload."""
+    try:
+        result, request = execute_tool(
+            name,
+            dict(args or {}),
+            tool_call_id,
+            source_agent_label=source_agent_label,
+        )
+    except Exception as exc:
+        return {
+            "ok": False,
+            "tool": str(name or ""),
+            "error": "engine_tool_dispatch_failed",
+            "detail": f"{type(exc).__name__}: {exc}",
+        }
+
+    if isinstance(result, dict):
+        payload = dict(result)
+    elif isinstance(result, str):
+        try:
+            parsed = json.loads(result)
+            if isinstance(parsed, dict):
+                payload = dict(parsed)
+            else:
+                payload = {
+                    "ok": False,
+                    "tool": str(name or ""),
+                    "error": "engine_tool_invalid_payload",
+                    "detail": f"parsed_payload_type={type(parsed).__name__}",
+                    "result": parsed,
+                }
+        except Exception as exc:
+            payload = {
+                "ok": False,
+                "tool": str(name or ""),
+                "error": "engine_tool_parse_failed",
+                "detail": f"{type(exc).__name__}: {exc}",
+                "raw_result": str(result),
+            }
+    else:
+        payload = {
+            "ok": False,
+            "tool": str(name or ""),
+            "error": "engine_tool_invalid_payload",
+            "detail": f"result_type={type(result).__name__}",
+        }
+
+    if isinstance(request, dict) and request:
+        payload.setdefault("routing_request", dict(request))
+    payload.setdefault("tool", str(name or ""))
+    return payload
+
+
+def execute_relation_graph_tool_payload(
+    *,
+    source_uri: str | None = None,
+    tool_id: str | None = None,
+    include_view_state: bool = True,
+    layout_spread: float = 1.0,
+    selected_kind: str = "",
+    selected_object_id: str = "",
+    include_connection_preview: bool = True,
+    source_agent_label: str | None = None,
+) -> dict[str, Any]:
+    """Engine-routed relation graph payload loader.
+
+    GUI and other clients should call this helper instead of invoking tool
+    implementations directly.
+    """
+    args = {
+        "source_uri": source_uri,
+        "tool_id": tool_id or "relation_graph_view",
+        "include_view_state": bool(include_view_state),
+        "layout_spread": float(layout_spread),
+        "selected_kind": str(selected_kind or ""),
+        "selected_object_id": str(selected_object_id or ""),
+        "include_connection_preview": bool(include_connection_preview),
+    }
+    return execute_tool_payload(
+        "relation_graph_view",
+        args,
+        source_agent_label=source_agent_label,
+    )
+
+
+def execute_adb_relation_graph_service(
+    *,
+    backend_call: dict[str, Any] | None = None,
+    include_view_state: bool = True,
+    include_connection_preview: bool = True,
+    layout_spread: float = 1.0,
+    selected_kind: str = "",
+    selected_object_id: str = "",
+    source_agent_label: str | None = None,
+) -> dict[str, Any]:
+    """Engine entrypoint for relation graph artifact initialization.
+
+    Expected backend_call shape:
+    {
+        "tool": "/tools:<tool_id>",
+        "source_uri": "agentsdb://.../tools:<tool_id>"
+    }
+    """
+
+    call_payload = dict(backend_call or {})
+    tool_path = str(
+        call_payload.get("tool")
+        or call_payload.get("tool_path")
+        or call_payload.get("tool_uri")
+        or ""
+    ).strip()
+    source_uri = str(call_payload.get("source_uri") or "").strip()
+
+    resolved_tool_id = "relation_graph_view"
+    if tool_path:
+        normalized_path = tool_path.strip()
+        if ":" in normalized_path:
+            resolved_tool_id = str(normalized_path.split(":")[-1] or resolved_tool_id).strip() or resolved_tool_id
+        elif "/" in normalized_path:
+            resolved_tool_id = str(normalized_path.split("/")[-1] or resolved_tool_id).strip() or resolved_tool_id
+        else:
+            resolved_tool_id = normalized_path or resolved_tool_id
+
+    if not source_uri:
+        source_uri = f"agentsdb://127.0.0.1:2331/tools:{resolved_tool_id}"
+
+    payload = execute_tool_payload(
+        "adb_graph_service",
+        {
+            "backend_call": {
+                "tool": tool_path or f"/tools:{resolved_tool_id}",
+                "source_uri": source_uri,
+            },
+            "include_view_state": bool(include_view_state),
+            "layout_spread": float(layout_spread),
+            "selected_kind": str(selected_kind or ""),
+            "selected_object_id": str(selected_object_id or ""),
+            "include_connection_preview": bool(include_connection_preview),
+        },
+        source_agent_label=source_agent_label or "_xworker",
+    )
+    payload.setdefault("backend_call", call_payload)
+    payload.setdefault("tool_id", resolved_tool_id)
+    payload.setdefault("source_uri", source_uri)
+    return payload
+
 # ============================================================================
 # Serialize Tool Calls for Logging
 # ============================================================================

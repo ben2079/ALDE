@@ -124,3 +124,37 @@ For orientation:
 - Request and handoff flow reference: `ALDE/REQUEST_RESPONSE_HANDOFF_FLOW.md`
 - Future learning/runtime evolution: `ALDE/AUTONOMOUS_MULTI_AGENT_ROADMAP.md`
 - Historical cleanup note: `ALDE/WORKFLOW_FIXES.md`
+
+## Retrieval Glossary
+
+- `repo_knowledge_query`: Primary low-level retrieval tool for indexed repository knowledge (chunk/result oriented output).
+- `load_context`: Primary high-level retrieval tool for IDE/runtime context attachment (returns normalized context entries).
+- `load_repo_context_for_ide_agent`: Backward-compatible alias to `load_context`.
+- `memorydb`/`vectordb`: Legacy retrieval path. Not default in runtime routing; only used on explicit opt-in (for example via `use_legacy_vector_tools=true`).
+- Query rewrites: Applied only when explicitly enabled (`rewrite_query=true`). Without this flag the original user query is used unchanged.
+
+## Retrieval Call Sequence
+
+```mermaid
+sequenceDiagram
+	participant U as User Prompt
+	participant M as Model
+	participant F as agents_factory.execute_tool
+	participant T as ToolSpec(load_context)
+	participant L as repo_code_splitter.load_context
+	participant P as LoadContextPromptParser
+	participant Q as adb_query(repo_knowledge_query)
+
+	U->>M: Request repo context
+	M->>F: Tool call name=load_context(query, ...)
+	F->>T: Resolve tool spec and execute
+	T->>L: Call load_context(query, limit, owner_types, ...)
+	L->>P: parse_with_signal_object(query, owner_types)
+	Note over P: Automatic prompt parsing is always run in load_context
+	P-->>L: parsed_query, parsed_owner_types, pattern_signal
+	L->>Q: adb_query(parsed_query, parsed_owner_types, ...)
+	Q-->>L: retrieval result chunks
+	L-->>T: context entries (title, language, content, source_path)
+	T-->>F: tool result
+	F-->>M: tool payload
+```

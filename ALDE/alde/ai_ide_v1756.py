@@ -1,6 +1,7 @@
 from __future__ import annotations    ## ai_ide_v1756.py
 
 # Maintainer contact: see repository README.
+from PySide6.QtCore import QObject, QEvent
 
 import os
 import sys
@@ -319,13 +320,13 @@ except ImportError as e:
 
 try:
     if __package__:
-        from .agents_db import AgentRelationGraphService  # type: ignore
+        from .agents_db import GraphViewService  # type: ignore
     else:
-        from agents_db import AgentRelationGraphService  # type: ignore
+        from agents_db import GraphViewService  # type: ignore
 except ImportError as e:
     msg = str(e)
     if "attempted relative import" in msg or "no known parent package" in msg:
-        from alde.agents_db import AgentRelationGraphService  # type: ignore  # noqa: E402
+        from alde.agents_db import GraphViewService  # type: ignore  # noqa: E402
     else:
         raise
 
@@ -772,7 +773,6 @@ def _apply_style(widget: QWidget, scheme: dict) -> None:
 # (i.e. before the first call to `_apply_style`).
 
 import string                                  # already imported once – harmless
-from PySide6.QtWidgets import QWidget          # dito
 
 # --- 2.  apply also to the QApplication so that QMenu benefits --------------
 
@@ -902,6 +902,28 @@ def _icon(name: str) -> QIcon:
 
     # ----------------------------------------------------- 4.  painted pixmap
     return _draw_fallback("+" if "plus" in name else "x")
+
+
+def _icon_with_opacity(name: str, opacity: float = 0.72, size: int = 18) -> QIcon:
+    """Return a dimmed icon variant for quieter idle toolbar/action visuals."""
+    base_icon = _icon(name)
+    if base_icon.isNull() or QApplication.instance() is None:
+        return base_icon
+
+    icon_size = QSize(size, size)
+    source = base_icon.pixmap(icon_size)
+    if source.isNull():
+        return base_icon
+
+    target = QPixmap(source.size())
+    target.fill(Qt.transparent)
+
+    painter = QPainter(target)
+    painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
+    painter.setOpacity(max(0.0, min(1.0, float(opacity))))
+    painter.drawPixmap(0, 0, source)
+    painter.end()
+    return QIcon(target)
 
 
 # <– 09.07.2025 –– 269 - 296 –––––––––––––––––––––––––––––––––––––––––––––––
@@ -3406,32 +3428,82 @@ class ChatEditorPanel(QWidget):
         self._file_path = str(segment.file_path or "")
         self._save_handler = save_handler
         self._scheme = dict(scheme or {})
+        self._expanded = True
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(4)
+        layout.setSpacing(0)
 
-        self._controls = QWidget(self)
-        controls_layout = QHBoxLayout(self._controls)
-        controls_layout.setContentsMargins(0, 0, 0, 0)
-        controls_layout.setSpacing(6)
-        controls_layout.addStretch(1)
+        self._panel = QFrame(self)
+        self._panel.setObjectName("runtimeWidgetPanel")
+        panel_layout = QVBoxLayout(self._panel)
+        panel_layout.setContentsMargins(3, 3, 3, 3)
+        panel_layout.setSpacing(6)
 
-        self._save_btn: QToolButton | None = None
+        header = QHBoxLayout()
+        header.setContentsMargins(0, 0, 0, 0)
+        header.setSpacing(6)
+
+        header.addStretch(1)
+
+        def _add_header_action(icon_name: str, tooltip: str, slot_callable, *, checkable: bool = False, checked: bool = False) -> QToolButton:
+            action_btn = QToolButton(self._panel)
+            action_btn.setObjectName("runtimeWidgetActionButton")
+            action_btn.setIcon(_icon(icon_name))
+            action_btn.setIconSize(QSize(14, 14))
+            action_btn.setToolTip(tooltip)
+            action_btn.setCursor(Qt.PointingHandCursor)
+            action_btn.setAutoRaise(True)
+            action_btn.setCheckable(bool(checkable))
+            if checkable:
+                action_btn.setChecked(bool(checked))
+            if slot_callable is not None:
+                action_btn.clicked.connect(slot_callable)
+            header.addWidget(action_btn, 0)
+            return action_btn
+
+        self._copy_btn = _add_header_action(
+            "file_export_24dp_666666_FILL0_wght400_GRAD0_opsz24.svg",
+            "Block in Zwischenablage kopieren",
+            lambda _checked=False: self._copy_block(),
+        )
+
+        self._expand_btn = _add_header_action(
+            "expand_content_24dp_666666_FILL0_wght400_GRAD0_opsz24.svg",
+            "Block einklappen",
+            lambda checked: self._toggle_expanded(checked),
+            checkable=True,
+            checked=True,
+        )
+
+        self._edit_btn = _add_header_action(
+            "edit_26dp_999999_FILL0_wght500_GRAD0_opsz24.svg",
+            "Block bearbeiten",
+            self.set_edit_mode,
+            checkable=True,
+            checked=False,
+        )
+
+        self._open_tab_btn: QToolButton | None = None
         if self._file_path:
-            self._save_btn = QToolButton(self._controls)
-            self._save_btn.setText("Save to source")
-            self._save_btn.setToolTip(self._file_path)
-            self._save_btn.setEnabled(False)
-            controls_layout.addWidget(self._save_btn)
+            self._open_tab_btn = _add_header_action(
+                "open_in_new_dock.svg",
+                "In neuem Tab oeffnen",
+                lambda _checked=False: self._open_in_new_tab(),
+            )
 
-        self._done_btn = QToolButton(self._controls)
-        self._done_btn.setText("Done")
-        controls_layout.addWidget(self._done_btn)
+        self._save_btn: QToolButton | None = _add_header_action(
+            "send.svg",
+            "Erneut senden",
+            lambda _checked=False: self._save_to_source(),
+        )
+        if self._file_path:
+            self._save_btn.setEnabled(False)
+            self._save_btn.setToolTip(f"Erneut senden: {self._file_path}")
 
         self.viewer = CodeViewer(
             segment.block.rstrip("\n"),
-            self,
+            self._panel,
             language=segment.language,
             editable=False,
             accent_color=self._scheme.get("col1", "#3a5fff"),
@@ -3441,32 +3513,131 @@ class ChatEditorPanel(QWidget):
         )
         self.viewer.setProperty("file_path", self._file_path)
 
-        layout.addWidget(self._controls)
-        layout.addWidget(self.viewer)
+        panel_layout.addLayout(header)
+        panel_layout.addWidget(self.viewer)
+        layout.addWidget(self._panel)
 
-        self._controls.hide()
+        panel_bg = self._scheme.get("col7", "#191f2f")
+        panel_border = self._scheme.get("col10", "#33406a")
+        panel_fg = self._scheme.get("col6", "#e7eeff")
+        self._panel.setStyleSheet(
+            f"""
+            QFrame#runtimeWidgetPanel {{
+                background: {panel_bg};
+                border: 1px solid {panel_border};
+                border-radius: 10px;
+            }}
+            QLabel#runtimeWidgetTitle {{
+                color: {panel_fg};
+                font-weight: 600;
+            }}
+            QToolButton#runtimeWidgetActionButton {{
+                color: {panel_fg};
+                background: {panel_bg};
+                border: 1px solid transparent;
+                border-radius: 6px;
+                padding: 2px;
+            }}
+            QToolButton#runtimeWidgetActionButton:hover {{
+                background: {panel_bg};
+                border: 1px solid transparent;
+            }}
+            """
+        )
+
         self.viewer.editRequested.connect(self._enter_edit_mode)
-        self._done_btn.clicked.connect(lambda _checked=False: self.set_edit_mode(False))
 
         if self._save_btn is not None:
             self.viewer.document().modificationChanged.connect(self._save_btn.setEnabled)
-            self._save_btn.clicked.connect(self._save_to_source)
 
     def _enter_edit_mode(self) -> None:
-        self.set_edit_mode(True)
+        if not self._expanded:
+            self._set_expanded(True)
+        self._edit_btn.setChecked(True)
+
+    def _toggle_expanded(self, expanded: bool) -> None:
+        self._set_expanded(bool(expanded))
+
+    def _set_expanded(self, expanded: bool) -> None:
+        self._expanded = bool(expanded)
+        self.viewer.setVisible(self._expanded)
+        self._expand_btn.setToolTip("Block einklappen" if self._expanded else "Block ausklappen")
 
     def set_edit_mode(self, active: bool) -> None:
-        self._controls.setVisible(bool(active))
-        self.viewer.set_edit_mode(active)
+        active_flag = bool(active)
+        if active_flag and not self._expanded:
+            self._set_expanded(True)
+            if not self._expand_btn.isChecked():
+                self._expand_btn.setChecked(True)
+        self.viewer.set_edit_mode(active_flag)
+        self._edit_btn.setIcon(
+            _icon("edit_note_26dp_999999_FILL0_wght500_GRAD0_opsz24.svg")
+            if active_flag
+            else _icon("edit_26dp_999999_FILL0_wght500_GRAD0_opsz24.svg")
+        )
+        self._edit_btn.setToolTip("Bearbeiten beenden" if active_flag else "Block bearbeiten")
         if active:
             self.viewer.setFocus(Qt.MouseFocusReason)
         else:
             self.viewer.clearFocus()
 
-    def _save_to_source(self) -> None:
-        if self._save_handler is None or not self._file_path:
+    def _open_in_new_tab(self) -> None:
+        if not self._file_path:
             return
-        self._save_handler(self.viewer, self._file_path)
+        window = self.window()
+        opener = getattr(window, "_open_path_in_focused_tab", None)
+        if not callable(opener):
+            return
+        try:
+            opener(Path(self._file_path), title=Path(self._file_path).name)
+        except Exception:
+            return
+
+    def _copy_block(self) -> None:
+        try:
+            QApplication.clipboard().setText(self.viewer.toPlainText())
+        except Exception:
+            return
+
+    def _save_to_source(self) -> None:
+        if self._save_handler is not None and self._file_path:
+            self._save_handler(self.viewer, self._file_path)
+            return
+
+        block_text = str(self.viewer.toPlainText() or "").strip("\n")
+        if not block_text.strip():
+            return
+
+        language = str(getattr(self.viewer, "_language", "") or "").strip().lower()
+        if not language:
+            probe = block_text.lstrip()
+            python_markers = (
+                "#!/usr/bin/env python",
+                "#!/usr/bin/python",
+                "import ",
+                "from ",
+                "def ",
+                "class ",
+                "if __name__ ==",
+            )
+            if probe.startswith(python_markers):
+                language = "python"
+
+        payload = f"```{language}\n{block_text}\n```" if language else block_text
+
+        dispatcher = self.window()
+        append_callable = getattr(dispatcher, "_append", None)
+        if not callable(append_callable):
+            probe_parent = self.parent()
+            while probe_parent is not None and not callable(append_callable):
+                append_callable = getattr(probe_parent, "_append", None)
+                probe_parent = probe_parent.parent()
+
+        if callable(append_callable):
+            try:
+                append_callable("You", payload)
+            except Exception:
+                return
 
 
 class MsgWidget(QWidget):
@@ -4059,6 +4230,7 @@ class ChatWindow(QWidget):
                 segments.append(
                     ChatSegment(
                         kind="editor",
+                        
                         language=file_context.language,
                         block=body,
                         file_path=file_context.file_path,
@@ -4282,6 +4454,7 @@ from PySide6.QtCore import (
      QSettings,
      QByteArray,
      QRegularExpression,
+     
      QRegularExpressionMatch,
  )
 
@@ -4455,7 +4628,11 @@ class ControlPlaneWidget(QWidget):
                     "error": f"{type(exc).__name__}: {exc}",
                 }
             payload.setdefault("kind", kind)
-            self._operator_async_result_ready.emit(payload)
+            try:
+                self._operator_async_result_ready.emit(payload)
+            except RuntimeError:
+                # Widget already gone during shutdown; ignore late worker result.
+                return
 
         Thread(target=_invoke_worker, daemon=True).start()
 
@@ -4729,9 +4906,11 @@ class ControlPlaneWidget(QWidget):
         )
 
     def _collect_runtime_widget_text(self, panel: QWidget) -> str:
-        graph_widget = panel.findChild(ExtensionsWorkspaceWidget)
-        if isinstance(graph_widget, ExtensionsWorkspaceWidget):
-            return graph_widget.current_widget_uri()
+        widget_kind = str(panel.property("runtime_widget_kind") or "").strip().lower()
+        if widget_kind == "agent_relation_graph":
+            source_hint = str(panel.property("runtime_source_path") or "").strip()
+            if source_hint:
+                return source_hint
         code_editor = panel.findChild(CodeViewer)
         if isinstance(code_editor, CodeViewer):
             return code_editor.toPlainText()
@@ -4745,8 +4924,6 @@ class ControlPlaneWidget(QWidget):
         title = str(panel.property("runtime_widget_title") or "runtime_widget")
         source_path = str(panel.property("runtime_source_path") or "").strip()
         content = self._collect_runtime_widget_text(panel)
-        if widget_kind.strip().lower() == "agent_relation_graph" and content:
-            source_path = content
 
         payload: dict[str, Any] = {
             "kind": widget_kind,
@@ -5899,15 +6076,21 @@ class ControlPlaneWidget(QWidget):
 
         if kind == "agent_relation_graph":
             graph_source_uri = resolved_source_path or str(content or "").strip()
-            graph_widget = ExtensionsWorkspaceWidget(
-                self._accent,
-                self._base,
-                parent=panel,
-                source_uri=graph_source_uri or None,
-            )
-            graph_widget.setProperty("runtime_source_path", graph_source_uri)
-            graph_widget.widgetStateChanged.connect(self._schedule_runtime_state_save)
-            root.addWidget(graph_widget, 1)
+            if not graph_source_uri:
+                graph_source_uri = "agentsdb://127.0.0.1:2331/tools:relation_graph_view"
+            panel.setProperty("runtime_source_path", graph_source_uri)
+            panel.setProperty("runtime_graph_tool_id", "relation_graph_view")
+            panel.setProperty("runtime_graph_tool_path", "/tools:relation_graph_view")
+            panel.setProperty("runtime_graph_initialized", False)
+
+            artifact_container = QFrame(panel)
+            artifact_container.setObjectName("runtimeArtifactContainer")
+            artifact_layout = QVBoxLayout(artifact_container)
+            artifact_layout.setContentsMargins(0, 0, 0, 0)
+            artifact_layout.setSpacing(0)
+            artifact_layout.addStretch(1)
+            panel.setProperty("runtime_artifact_container", artifact_container)
+            root.addWidget(artifact_container, 1)
         elif kind == "builder_panel":
             builder_panel = self._create_agent_system_builder_config_panel(
                 initial_payload=self._build_agent_system_template("agent_system", "/create agents"),
@@ -5971,6 +6154,153 @@ class ControlPlaneWidget(QWidget):
             root.addWidget(text_view, 1)
 
         return panel
+
+    def _find_runtime_widget_panel(
+        self,
+        *,
+        tab_name: str,
+        widget_kind: str,
+    ) -> QWidget | None:
+        normalized_tab_name = str(tab_name or "").strip().lower()
+        normalized_kind = str(widget_kind or "").strip().lower()
+        if not normalized_tab_name or not normalized_kind:
+            return None
+
+        target_tab = None
+        for index in range(self.tabs.count()):
+            candidate_tab = self.tabs.widget(index)
+            if candidate_tab not in self._runtime_tab_records:
+                continue
+            if self.tabs.tabText(index).strip().lower() == normalized_tab_name:
+                target_tab = candidate_tab
+                break
+        if target_tab is None:
+            return None
+
+        record = self._runtime_tab_records.get(target_tab) or {}
+        splitter = record.get("splitter") if isinstance(record, dict) else None
+        if not isinstance(splitter, QSplitter):
+            return None
+
+        for idx in range(splitter.count()):
+            panel = splitter.widget(idx)
+            if isinstance(panel, QWidget) and str(panel.property("runtime_widget_kind") or "").strip().lower() == normalized_kind:
+                return panel
+        return None
+
+    def initialize_runtime_artifact_from_prompt(
+        self,
+        *,
+        tab_name: str,
+        widget_kind: str = "agent_relation_graph",
+        backend_call: dict[str, Any] | None = None,
+    ) -> bool:
+        panel = self._find_runtime_widget_panel(tab_name=tab_name, widget_kind=widget_kind)
+        if panel is None:
+            return False
+        if str(widget_kind or "").strip().lower() == "agent_relation_graph":
+            self._initialize_runtime_relation_graph_panel(panel, backend_call=backend_call)
+            return True
+        return False
+
+    def _initialize_runtime_relation_graph_panel(
+        self,
+        panel: QWidget,
+        *,
+        backend_call: dict[str, Any] | None = None,
+    ) -> None:
+        if not isinstance(panel, QWidget):
+            return
+
+        artifact_container = panel.property("runtime_artifact_container")
+        if not isinstance(artifact_container, QWidget):
+            return
+
+        source_uri = str(panel.property("runtime_source_path") or "").strip()
+        if not source_uri:
+            source_uri = "agentsdb://127.0.0.1:2331/tools:relation_graph_view"
+            panel.setProperty("runtime_source_path", source_uri)
+
+        tool_id = str(panel.property("runtime_graph_tool_id") or "relation_graph_view").strip() or "relation_graph_view"
+        tool_path = str(panel.property("runtime_graph_tool_path") or f"/tools:{tool_id}").strip() or f"/tools:{tool_id}"
+        resolved_backend_call = dict(backend_call or {})
+        if not resolved_backend_call:
+            resolved_backend_call = {
+                "tool": tool_path,
+                "source_uri": source_uri,
+            }
+        else:
+            resolved_backend_call.setdefault("tool", tool_path)
+            resolved_backend_call.setdefault("source_uri", source_uri)
+
+        engine_callable = self._load_runtime_relation_graph_engine_callable()
+        if not callable(engine_callable):
+            payload = {
+                "ok": False,
+                "error": "engine_tool_import_failed",
+                "detail": "execute_adb_relation_graph_service unavailable",
+            }
+        else:
+            try:
+                payload = engine_callable(
+                    backend_call=resolved_backend_call,
+                    include_view_state=True,
+                    include_connection_preview=True,
+                )
+            except Exception as exc:
+                payload = {
+                    "ok": False,
+                    "error": "engine_tool_execute_failed",
+                    "detail": f"{type(exc).__name__}: {exc}",
+                }
+
+        panel.setProperty("runtime_graph_payload", json.dumps(payload, ensure_ascii=False))
+
+        while artifact_container.layout() and artifact_container.layout().count() > 0:
+            item = artifact_container.layout().takeAt(0)
+            widget = item.widget()
+            if isinstance(widget, QWidget):
+                widget.setParent(None)
+                widget.deleteLater()
+
+        artifact_service = ExtensionArtifactService()
+        if not bool(payload.get("ok")):
+            error_widget = self._render_runtime_artifact_error_widget(
+                artifact_container,
+                "Artifact initialization failed",
+                str(payload.get("detail") or payload.get("error") or "unknown_error"),
+            )
+            artifact_container.layout().addWidget(error_widget, 1)
+            panel.setProperty("runtime_graph_initialized", False)
+            self._schedule_runtime_state_save()
+            return
+
+        resolved_tool_id = str(payload.get("tool_id") or tool_id).strip() or tool_id
+        resolved_source_uri = str(payload.get("source_uri") or source_uri).strip() or source_uri
+        panel.setProperty("runtime_source_path", resolved_source_uri)
+
+        try:
+            artifact_widget = artifact_service.load_object_widget(
+                object_name=resolved_tool_id,
+                source_uri=resolved_source_uri,
+                parent=artifact_container,
+                scheme=self.scheme,
+            )
+        except Exception as exc:
+            artifact_widget = self._render_runtime_artifact_error_widget(
+                artifact_container,
+                "Artifact install failed",
+                f"{type(exc).__name__}: {exc}",
+            )
+
+        artifact_widget.setProperty("runtime_source_path", resolved_source_uri)
+        artifact_widget.setProperty("runtime_graph_tool_id", resolved_tool_id)
+        widget_signal = getattr(artifact_widget, "widgetStateChanged", None)
+        if widget_signal is not None and hasattr(widget_signal, "connect"):
+            widget_signal.connect(self._schedule_runtime_state_save)
+        artifact_container.layout().addWidget(artifact_widget, 1)
+        panel.setProperty("runtime_graph_initialized", True)
+        self._schedule_runtime_state_save()
 
     def _add_widget_to_runtime_tab(
         self,
@@ -6401,11 +6731,11 @@ class ControlPlaneWidget(QWidget):
             if __package__:
                 from .agents_config import AgentSystemBuilderRequestObject  # type: ignore
             else:
-                from ALDE_Projekt.ALDE.alde.agents_config import AgentSystemBuilderRequestObject  # type: ignore
+                from alde.agents_config import AgentSystemBuilderRequestObject  # type: ignore
         except ImportError as exc:
             msg = str(exc)
             if "attempted relative import" in msg or "no known parent package" in msg:
-                from ALDE_Projekt.ALDE.alde.agents_config import AgentSystemBuilderRequestObject  # type: ignore
+                from alde.agents_config import AgentSystemBuilderRequestObject  # type: ignore
             else:
                 raise
 
@@ -6544,8 +6874,7 @@ class ControlPlaneWidget(QWidget):
         return self._run_agent_system_builder_sync(
             system_name=system_name,
             request_payload=request_payload,
-            write_file=write_file,
-            persist_path=persist_path,
+             persist_path=persist_path,
         )
 
     def _resolve_ai_widget(self) -> AIWidget | None:
@@ -7045,7 +7374,11 @@ class ControlPlaneWidget(QWidget):
                     "error": f"{type(exc).__name__}: {exc}",
                     "include_drilldown": do_drilldown,
                 }
-            self._refresh_async_result_ready.emit(payload)
+            try:
+                self._refresh_async_result_ready.emit(payload)
+            except RuntimeError:
+                # Widget already gone during shutdown; ignore late worker result.
+                return
 
         Thread(target=_invoke_worker, daemon=True).start()
 
@@ -8502,19 +8835,32 @@ class EnvConfigDomainService:
 
 
 
+try:
+    if __package__:
+        from .artifact_backends import ExtensionArtifactBackendService, load_default_graph_backend_service
+    else:
+        from artifact_backends import ExtensionArtifactBackendService, load_default_graph_backend_service
+except ImportError as e:
+    msg = str(e)
+    if "attempted relative import" in msg or "no known parent package" in msg:
+        from alde.artifact_backends import ExtensionArtifactBackendService, load_default_graph_backend_service  # type: ignore  # noqa: E402
+    else:
+        raise
+
+
 class ExtensionArtifactService:
-    def __init__(self, graph_service: AgentRelationGraphService | None = None) -> None:
-        self._graph_service = graph_service or AgentRelationGraphService()
+    def __init__(self, graph_service: ExtensionArtifactBackendService | None = None) -> None:
+        self._backend_service = graph_service or load_default_graph_backend_service()
 
     def load_connection_preview(self, *, source_uri: str | None = None) -> dict[str, Any]:
-        preview_payload = dict(self._graph_service.load_connection_preview(source_uri=source_uri) or {})
+        preview_payload = dict(self._backend_service.load_connection_preview(source_uri=source_uri) or {})
         tool_rows = [dict(item) for item in (preview_payload.get("tools") or []) if isinstance(item, dict)]
 
         enriched_rows: list[dict[str, Any]] = []
         for tool_row in tool_rows:
             next_tool_row = dict(tool_row)
             tool_id = str(next_tool_row.get("tool_id") or "").strip()
-            manifest_payload = self._graph_service.load_tool_runtime_manifest(tool_id=tool_id, source_uri=source_uri)
+            manifest_payload = self._backend_service.load_tool_runtime_manifest(tool_id=tool_id, source_uri=source_uri)
             next_tool_row["runtime_manifest"] = dict(manifest_payload or {})
             artifact_payload = manifest_payload.get("runtime_artifact")
             if isinstance(artifact_payload, dict):
@@ -8534,7 +8880,7 @@ class ExtensionArtifactService:
         parent: QWidget | None = None,
         scheme: Mapping[str, str] | None = None,
     ) -> QWidget:
-        manifest_payload = self._graph_service.load_tool_runtime_manifest(tool_id=object_name, source_uri=source_uri)
+        manifest_payload = self._backend_service.load_tool_runtime_manifest(tool_id=object_name, source_uri=source_uri)
         try:
             return self._load_widget_from_manifest(
                 object_name=object_name,
@@ -8576,7 +8922,7 @@ class ExtensionArtifactService:
 
         if isinstance(entry_object, type):
             try:
-                artifact_instance = entry_object(graph_service=self._graph_service)
+                artifact_instance = entry_object(graph_service=self._backend_service)
             except TypeError:
                 artifact_instance = entry_object()
         else:
@@ -8640,6 +8986,7 @@ class ExtensionArtifactService:
 class ExtensionsWorkspaceWidget(QWidget):
     widgetStateChanged = Signal()
     _LOCAL_WIDGET_STATE_REL_PATH = "AppData/runtime_extensions_workspace.json"
+    _START_TAB_TITLE = "Loadable Extensions"
 
     def __init__(
         self,
@@ -8670,6 +9017,7 @@ class ExtensionsWorkspaceWidget(QWidget):
             source_uri=initial_source_uri,
             tool_id=str(restored_state.get("selected_tool") or ""),
             keep_local=bool(restored_state.get("keep_local")),
+            catalog_only=True,
             activate=True,
         )
         self.update_scheme(self._accent, self._base)
@@ -8682,7 +9030,7 @@ class ExtensionsWorkspaceWidget(QWidget):
 
     def _load_local_widget_state(self) -> dict[str, Any]:
         state_path = self._local_widget_state_path()
-        default_uri = "agentsdb://127.0.0.1:2331/tools:agentdb_relation_graph"
+        default_uri = "agentsdb://127.0.0.1:2331/tools:graph_view"
         default_state = {
             "uri": default_uri,
             "selected_tool": "",
@@ -8721,25 +9069,18 @@ class ExtensionsWorkspaceWidget(QWidget):
 
     def _persist_local_widget_state(self, session_state: Mapping[str, Any] | None = None) -> None:
         state = dict(session_state or self._active_session_state() or {})
-        keep_local_checkbox = state.get("keep_local_checkbox")
-        if not isinstance(keep_local_checkbox, QCheckBox):
-            return
-        if not keep_local_checkbox.isChecked():
-            return
-
         uri_input = state.get("uri_input")
-        tool_selector = state.get("tool_selector")
-        status_label = state.get("control_status_label")
 
         selected_tool_id = ""
-        if isinstance(tool_selector, QComboBox):
-            selected_tool_id = str(tool_selector.currentData() or tool_selector.currentText() or selected_tool_id).strip() or selected_tool_id
+        selected_payload = state.get("selected_tool_payload")
+        if isinstance(selected_payload, dict):
+            selected_tool_id = str(selected_payload.get("tool_id") or "").strip()
 
         payload = {
             "uri": str(uri_input.text() if isinstance(uri_input, QLineEdit) else "").strip(),
             "selected_tool": selected_tool_id,
             "keep_local": True,
-            "last_status": str(status_label.text() if isinstance(status_label, QLabel) else "").strip(),
+            "last_status": "",
             "last_widget_summary": self._loaded_widget_summary(state),
         }
 
@@ -8771,11 +9112,11 @@ class ExtensionsWorkspaceWidget(QWidget):
     def current_tool_id(self) -> str:
         active_state = self._active_session_state()
         if not active_state:
-            return "agentdb_relation_graph"
-        tool_selector = active_state.get("tool_selector")
-        if isinstance(tool_selector, QComboBox):
-            return str(tool_selector.currentData() or tool_selector.currentText() or "agentdb_relation_graph").strip() or "agentdb_relation_graph"
-        return "agentdb_relation_graph"
+            return "graph_view"
+        selected_payload = active_state.get("selected_tool_payload")
+        if isinstance(selected_payload, dict):
+            return str(selected_payload.get("tool_id") or "graph_view").strip() or "graph_view"
+        return "graph_view"
 
     def refresh_graph(self) -> None:
         active_state = self._active_session_state()
@@ -8793,10 +9134,20 @@ class ExtensionsWorkspaceWidget(QWidget):
         self.extensions_tabs.setDocumentMode(True)
         self.extensions_tabs.setMovable(True)
         self.extensions_tabs.setTabsClosable(True)
+        self.extensions_tabs.setUsesScrollButtons(True)
         self.extensions_tabs.tabCloseRequested.connect(self._close_extension_tab)
         self.extensions_tabs.currentChanged.connect(self._handle_active_tab_changed)
 
-        self.add_tab_button = None
+        self.add_tab_button = QToolButton(self.extensions_tabs)
+        self.add_tab_button.setObjectName("extensionsAddTabButton")
+        self.add_tab_button.setText("+")
+        self.add_tab_button.setToolButtonStyle(Qt.ToolButtonTextOnly)
+        self.add_tab_button.setCursor(Qt.PointingHandCursor)
+        self.add_tab_button.setToolTip("Neue Extension-Verbindung")
+        self.add_tab_button.setAutoRaise(True)
+        self.add_tab_button.setFixedSize(20, 20)
+        self.add_tab_button.clicked.connect(lambda _checked=False: self.open_new_connection_tab(activate=True))
+        self.extensions_tabs.setCornerWidget(self.add_tab_button, Qt.TopRightCorner)
 
         root_layout.addWidget(self.extensions_tabs, 1)
 
@@ -8810,7 +9161,7 @@ class ExtensionsWorkspaceWidget(QWidget):
         
         if internal_tabs is None or not isinstance(internal_tabs, QTabWidget):
             return
-        
+         
         # Copy all Control Plane tabs (Configuration, Monitoring, Operations) to extensions_tabs
         tabs_to_copy = []
         for i in range(internal_tabs.count()):
@@ -8851,6 +9202,11 @@ class ExtensionsWorkspaceWidget(QWidget):
         if tab_index < 0:
             return
 
+        session_state = self._session_state_by_tab.get(tab_widget)
+        if isinstance(session_state, dict) and bool(session_state.get("catalog_only")):
+            self.extensions_tabs.tabBar().setTabButton(tab_index, QTabBar.RightSide, None)
+            return
+
         tab_bar = self.extensions_tabs.tabBar()
         existing_button = tab_bar.tabButton(tab_index, QTabBar.RightSide)
         if isinstance(existing_button, QToolButton) and bool(existing_button.property("extensions_close_button")):
@@ -8880,8 +9236,9 @@ class ExtensionsWorkspaceWidget(QWidget):
         source_uri: str = "",
         tool_id: str = "",
         keep_local: bool = True,
+        catalog_only: bool = False,
         activate: bool = True,
-    ) -> None:
+    ) -> dict[str, Any]:
         self._session_counter += 1
         session_id = self._session_counter
 
@@ -8897,6 +9254,7 @@ class ExtensionsWorkspaceWidget(QWidget):
             "session_id": session_id,
             "tab_widget": tab_widget,
             "stack": session_stack,
+            "catalog_only": bool(catalog_only),
             "loaded": False,
             "loaded_widget": None,
         }
@@ -8917,20 +9275,25 @@ class ExtensionsWorkspaceWidget(QWidget):
         session_stack.setCurrentWidget(control_page)
 
         self._session_state_by_tab[tab_widget] = session_state
-        tab_index = self.extensions_tabs.addTab(tab_widget, f"Connection {session_id}")
+        default_title = self._START_TAB_TITLE if bool(catalog_only) else f"Connection {session_id}"
+        tab_index = self.extensions_tabs.addTab(tab_widget, default_title)
         self._set_tab_close_button(tab_widget)
 
         self._refresh_connection_preview(session_state)
         if activate:
             self.extensions_tabs.setCurrentIndex(tab_index)
+        return session_state
 
     def _close_extension_tab(self, tab_index: int) -> None:
         tab_widget = self.extensions_tabs.widget(tab_index)
         if tab_widget is None:
             return
 
+        session_state = self._session_state_by_tab.get(tab_widget)
+        if isinstance(session_state, dict) and bool(session_state.get("catalog_only")):
+            return
+
         if self.extensions_tabs.count() <= 1:
-            session_state = self._session_state_by_tab.get(tab_widget)
             if not isinstance(session_state, dict):
                 return
             stack_widget = session_state.get("stack")
@@ -8979,149 +9342,66 @@ class ExtensionsWorkspaceWidget(QWidget):
         control_layout = QVBoxLayout(control_page)
         control_layout.setContentsMargins(14, 14, 14, 14)
         control_layout.setSpacing(10)
-
-        title_label = QLabel("Connection / Control Plane", control_page)
-        title_label.setObjectName("extensionsControlTitle")
-        control_layout.addWidget(title_label)
-
-        description_label = QLabel(
-            "Load tools from established connections. Loaded widgets are provided by backend services.",
-            control_page,
-        )
-        description_label.setWordWrap(True)
-        description_label.setObjectName("extensionsControlDescription")
-        control_layout.addWidget(description_label)
-
-        form_layout = QFormLayout()
-        form_layout.setLabelAlignment(Qt.AlignLeft | Qt.AlignVCenter)
-        form_layout.setFormAlignment(Qt.AlignLeft | Qt.AlignTop)
-        form_layout.setHorizontalSpacing(10)
-        form_layout.setVerticalSpacing(8)
+        control_layout.setAlignment(Qt.AlignTop)
 
         uri_input = QLineEdit(control_page)
         uri_input.setObjectName("extensionsGraphUriInput")
-        uri_input.setPlaceholderText("agentsdb://127.0.0.1:2331/tools:agent_relation_graph")
-        uri_input.setText(str(source_uri or "agentsdb://127.0.0.1:2331/tools:agent_relation_graph"))
-        form_layout.addRow("Source URI:", uri_input)
+        uri_input.setMinimumHeight(30)
+        uri_input.setPlaceholderText("agentsdb://127.0.0.1:2331/tools:graph_view")
+        uri_input.setText(str(source_uri or "agentsdb://127.0.0.1:2331/tools:graph_view"))
+        load_icon_idle = _icon_with_opacity("load_content.svg", opacity=0.72)
+        load_icon_active = _icon_with_opacity("load_content.svg", opacity=1.0)
+        load_action = uri_input.addAction(load_icon_idle, QLineEdit.TrailingPosition)
+        load_action.setObjectName("extensionsGraphLoadAction")
+        load_action.setToolTip("Widget laden")
 
-        presets_container = QWidget(control_page)
-        presets_layout = QHBoxLayout(presets_container)
-        presets_layout.setContentsMargins(0, 0, 0, 0)
-        presets_layout.setSpacing(6)
+        selection_menu = QMenu(control_page)
+        selection_menu.setObjectName("extensionsGraphSelectionMenu")
+        selection_menu.setToolTipsVisible(True)
 
-        preset_relations_button = QToolButton(presets_container)
-        preset_relations_button.setObjectName("extensionsUriPresetButton")
-        preset_relations_button.setText("Relations")
-        preset_relations_button.setToolButtonStyle(Qt.ToolButtonTextOnly)
-        preset_relations_button.setCursor(Qt.PointingHandCursor)
-        preset_relations_button.setAutoRaise(False)
-        preset_relations_button.setToolTip("Graph relation projection")
-        presets_layout.addWidget(preset_relations_button)
+        class _UriMenuEventFilter(QObject):
+            def __init__(self, menu: QMenu, parent: QObject) -> None:
+                super().__init__(parent)
+                self._menu = menu
 
-        preset_catalog_button = QToolButton(presets_container)
-        preset_catalog_button.setObjectName("extensionsUriPresetButton")
-        preset_catalog_button.setText("Catalog")
-        preset_catalog_button.setToolButtonStyle(Qt.ToolButtonTextOnly)
-        preset_catalog_button.setCursor(Qt.PointingHandCursor)
-        preset_catalog_button.setAutoRaise(False)
-        preset_catalog_button.setToolTip("ADB catalog projection (collections, entities, relations, docs, blocks, seeds, embeddings)")
-        presets_layout.addWidget(preset_catalog_button)
+            def eventFilter(self, obj, event):  # noqa: N802
+                if obj is uri_input and event.type() == QEvent.MouseButtonPress:
+                    self._menu.popup(uri_input.mapToGlobal(QPoint(0, uri_input.height())))
+                return super().eventFilter(obj, event)
 
-        preset_catalog_light_button = QToolButton(presets_container)
-        preset_catalog_light_button.setObjectName("extensionsUriPresetButton")
-        preset_catalog_light_button.setText("Catalog Light")
-        preset_catalog_light_button.setToolButtonStyle(Qt.ToolButtonTextOnly)
-        preset_catalog_light_button.setCursor(Qt.PointingHandCursor)
-        preset_catalog_light_button.setAutoRaise(False)
-        preset_catalog_light_button.setToolTip("Catalog projection without embeddings")
-        presets_layout.addWidget(preset_catalog_light_button)
-
-        presets_layout.addStretch(1)
-        form_layout.addRow("Presets:", presets_container)
-
-        tool_selector = QComboBox(control_page)
-        tool_selector.setObjectName("extensionsGraphToolSelector")
+        uri_filter = _UriMenuEventFilter(selection_menu, uri_input)
+        uri_input.installEventFilter(uri_filter)
         session_state["requested_tool_id"] = str(tool_id or "").strip()
-        form_layout.addRow("Tool / Extension:", tool_selector)
 
-        keep_local_checkbox = QCheckBox("Remember source and tool for this workspace", control_page)
-        keep_local_checkbox.setObjectName("extensionsKeepLocalCheckBox")
-        keep_local_checkbox.setChecked(bool(keep_local))
-        form_layout.addRow("", keep_local_checkbox)
-
-        control_layout.addLayout(form_layout)
-
-        control_status_label = QLabel("", control_page)
-        control_status_label.setObjectName("extensionsGraphStatusLabel")
-        control_status_label.setWordWrap(True)
-        control_layout.addWidget(control_status_label)
-
-        preview_browser = QTextBrowser(control_page)
-        preview_browser.setObjectName("extensionsConnectionsPreviewBrowser")
-        preview_browser.setOpenExternalLinks(False)
-        preview_browser.setOpenLinks(False)
-        control_layout.addWidget(preview_browser, 1)
-
-        actions_layout = QHBoxLayout()
-        actions_layout.setContentsMargins(0, 0, 0, 0)
-        actions_layout.setSpacing(8)
-        actions_layout.addStretch(1)
-
-        preview_button = QToolButton(control_page)
-        preview_button.setObjectName("extensionsGraphControlButton")
-        preview_button.setIcon(_icon("reload_.svg"))
-        preview_button.setText("")
-        preview_button.setToolButtonStyle(Qt.ToolButtonIconOnly)
-        preview_button.setToolTip("Vorschau aktualisieren")
-        preview_button.setAutoRaise(True)
-        preview_button.setFixedSize(30, 30)
-        preview_button.setCursor(Qt.PointingHandCursor)
-        actions_layout.addWidget(preview_button)
-
-        load_button = QToolButton(control_page)
-        load_button.setObjectName("extensionsGraphControlButton")
-        load_button.setIcon(_icon("load_content.svg"))
-        load_button.setText("")
-        load_button.setToolButtonStyle(Qt.ToolButtonIconOnly)
-        load_button.setToolTip("Widget laden")
-        load_button.setAutoRaise(True)
-        load_button.setFixedSize(30, 30)
-        load_button.setCursor(Qt.PointingHandCursor)
-        actions_layout.addWidget(load_button)
-        control_layout.addLayout(actions_layout)
+        control_layout.addWidget(uri_input, 0, Qt.AlignTop)
+        control_layout.addStretch(1)
 
         session_state["uri_input"] = uri_input
-        session_state["tool_selector"] = tool_selector
-        session_state["keep_local_checkbox"] = keep_local_checkbox
-        session_state["control_status_label"] = control_status_label
-        session_state["preview_browser"] = preview_browser
+        session_state["load_action"] = load_action
+        session_state["selection_menu"] = selection_menu
+        session_state["uri_input_filter"] = uri_filter
+        session_state["keep_local"] = bool(keep_local)
 
-        uri_input.textChanged.connect(lambda _text: self._handle_session_control_change(session_state, refresh_preview=False))
-        tool_selector.currentIndexChanged.connect(lambda _index: self._handle_session_control_change(session_state, refresh_preview=False))
-        keep_local_checkbox.stateChanged.connect(lambda _state: self._handle_session_control_change(session_state, refresh_preview=False))
-        preview_button.clicked.connect(lambda: self._refresh_connection_preview(session_state))
-        load_button.clicked.connect(lambda: self._load_extension_into_session(session_state, fit_view=True))
-        preset_relations_button.clicked.connect(
-            lambda: self._apply_session_source_uri_preset(
-                session_state,
-                mode_value="relations",
-                include_embeddings=True,
-            )
-        )
-        preset_catalog_button.clicked.connect(
-            lambda: self._apply_session_source_uri_preset(
-                session_state,
-                mode_value="catalog",
-                include_embeddings=True,
-            )
-        )
-        preset_catalog_light_button.clicked.connect(
-            lambda: self._apply_session_source_uri_preset(
-                session_state,
-                mode_value="catalog",
-                include_embeddings=False,
-            )
-        )
+        def _apply_selector_choice(triggered_action: QAction | None) -> None:
+            selected_payload = triggered_action.data() if triggered_action is not None else None
+            if isinstance(selected_payload, dict):
+                selected_uri = str(
+                    selected_payload.get("uri")
+                    or selected_payload.get("source_uri")
+                    or uri_input.text()
+                    or ""
+                ).strip()
+                requested_tool_id = str(selected_payload.get("tool_id") or "").strip()
+                blocker = QtCore.QSignalBlocker(uri_input)
+                uri_input.setText(selected_uri)
+                del blocker
+                session_state["selected_tool_payload"] = dict(selected_payload)
+                session_state["requested_tool_id"] = requested_tool_id
+            self._handle_session_control_change(session_state, refresh_preview=True)
+
+        uri_input.textChanged.connect(lambda _text: self._handle_session_control_change(session_state, refresh_preview=True))
+        selection_menu.triggered.connect(_apply_selector_choice)
+        load_action.triggered.connect(lambda: self._load_extension_into_session(session_state, fit_view=True))
 
         return control_page
 
@@ -9184,7 +9464,7 @@ class ExtensionsWorkspaceWidget(QWidget):
             return
         base_uri = str(uri_input.text() or "").strip()
         if not base_uri:
-            base_uri = "agentsdb://127.0.0.1:2331/tools:agent_relation_graph"
+            base_uri = "agentsdb://127.0.0.1:2331/tools:graph_view"
 
         resolved_uri = self._build_session_source_uri_with_mode(
             base_uri,
@@ -9207,7 +9487,7 @@ class ExtensionsWorkspaceWidget(QWidget):
     ) -> str:
         uri_text = str(source_uri or "").strip()
         if not uri_text:
-            uri_text = "agentsdb://127.0.0.1:2331/tools:agent_relation_graph"
+            uri_text = "agentsdb://127.0.0.1:2331/tools:graph_view"
 
         parsed_uri = urlparse(uri_text)
         query_pairs = [(str(key), str(value)) for key, value in parse_qsl(str(parsed_uri.query or ""), keep_blank_values=False)]
@@ -9230,16 +9510,36 @@ class ExtensionsWorkspaceWidget(QWidget):
         return rebuilt_uri
 
     def _session_tool_id(self, session_state: Mapping[str, Any]) -> str:
-        tool_selector = session_state.get("tool_selector")
-        if isinstance(tool_selector, QComboBox):
-            return str(tool_selector.currentData() or tool_selector.currentText() or "").strip()
+        selected_payload = session_state.get("selected_tool_payload")
+        if isinstance(selected_payload, dict):
+            return str(selected_payload.get("tool_id") or "").strip()
         return ""
 
     def _session_tool_label(self, session_state: Mapping[str, Any]) -> str:
-        tool_selector = session_state.get("tool_selector")
-        if isinstance(tool_selector, QComboBox):
-            return str(tool_selector.currentText() or self._session_tool_id(session_state) or "Extension")
+        selected_payload = session_state.get("selected_tool_payload")
+        if isinstance(selected_payload, dict):
+            return str(selected_payload.get("label") or selected_payload.get("tool_id") or "Extension")
         return str(self._session_tool_id(session_state) or "Extension")
+
+    def _runtime_artifact_payload_from_tool_row(self, tool_row: Mapping[str, Any]) -> dict[str, Any]:
+        runtime_artifact = tool_row.get("runtime_artifact")
+        if isinstance(runtime_artifact, Mapping):
+            return dict(runtime_artifact)
+        runtime_manifest = tool_row.get("runtime_manifest")
+        if isinstance(runtime_manifest, Mapping):
+            manifest_runtime_artifact = runtime_manifest.get("runtime_artifact")
+            if isinstance(manifest_runtime_artifact, Mapping):
+                return dict(manifest_runtime_artifact)
+        return {}
+
+    def _is_tool_row_loadable(self, tool_row: Mapping[str, Any]) -> bool:
+        tool_id = str(tool_row.get("tool_id") or "").strip()
+        if not tool_id:
+            return False
+        runtime_artifact = self._runtime_artifact_payload_from_tool_row(tool_row)
+        entry_module = str(runtime_artifact.get("entry_module") or "").strip()
+        entry_class = str(runtime_artifact.get("entry_class") or "").strip()
+        return bool(entry_module and entry_class)
 
     def _set_session_tab_title(self, session_state: Mapping[str, Any], *, loaded: bool) -> None:
         tab_widget = session_state.get("tab_widget")
@@ -9247,6 +9547,10 @@ class ExtensionsWorkspaceWidget(QWidget):
             return
         tab_index = self.extensions_tabs.indexOf(tab_widget)
         if tab_index < 0:
+            return
+        if bool(session_state.get("catalog_only")) and not loaded:
+            self.extensions_tabs.setTabText(tab_index, self._START_TAB_TITLE)
+            self._set_tab_close_button(tab_widget)
             return
         session_id = int(session_state.get("session_id") or 0)
         if loaded:
@@ -9260,75 +9564,69 @@ class ExtensionsWorkspaceWidget(QWidget):
         source_uri = self._session_source_uri(session_state)
         preview_payload = self._backend_service.load_connection_preview(source_uri=source_uri)
 
-        tool_selector = session_state.get("tool_selector")
         selected_tool_id = self._session_tool_id(session_state)
         requested_tool_id = str(session_state.get("requested_tool_id") or "").strip()
-        tool_rows = [dict(item) for item in (preview_payload.get("tools") or []) if isinstance(item, dict)]
-        if isinstance(tool_selector, QComboBox) and tool_rows:
-            blocker = QtCore.QSignalBlocker(tool_selector)
-            tool_selector.clear()
-            for tool_row in tool_rows:
-                tool_id = str(tool_row.get("tool_id") or "").strip()
-                tool_label = str(tool_row.get("label") or tool_id or "Extension").strip()
-                if tool_id:
-                    tool_selector.addItem(tool_label, tool_id)
-            preferred_tool_id = requested_tool_id or selected_tool_id
-            preferred_tool_index = tool_selector.findData(preferred_tool_id) if preferred_tool_id else -1
-            if preferred_tool_index >= 0:
-                tool_selector.setCurrentIndex(preferred_tool_index)
-            elif tool_selector.count() > 0:
-                tool_selector.setCurrentIndex(0)
-        session_state["requested_tool_id"] = ""
-
-        connection_items = []
-        for connection_row in (preview_payload.get("connections") or []):
-            if not isinstance(connection_row, dict):
-                continue
-            row_label = html.escape(str(connection_row.get("label") or "Connection"))
-            row_uri = html.escape(str(connection_row.get("uri") or ""))
-            row_status = html.escape(str(connection_row.get("status") or "configured"))
-            connection_items.append(f"<li><b>{row_label}</b>: <code>{row_uri}</code> <i>({row_status})</i></li>")
-
-        tool_items = []
-        selected_tool_id = self._session_tool_id(session_state)
-        for tool_row in tool_rows:
-            tool_id = str(tool_row.get("tool_id") or "").strip()
-            tool_label = html.escape(str(tool_row.get("label") or tool_id or "Extension"))
-            transport = html.escape(str(tool_row.get("transport") or ""))
-            class_rows = [
-                html.escape(str(class_name or "").strip())
-                for class_name in (tool_row.get("runtime_classes") or [])
-                if str(class_name or "").strip()
-            ]
-            class_info = (
-                f"<br><small>classes: <code>{', '.join(class_rows)}</code></small>"
-                if class_rows
-                else ""
-            )
-            selected_marker = " <b>[selected]</b>" if tool_id == selected_tool_id else ""
-            if tool_id:
-                tool_items.append(
-                    f"<li><b>{tool_label}</b> <code>{html.escape(tool_id)}</code> <i>{transport}</i>{selected_marker}{class_info}</li>"
+        advertised_tool_rows = [dict(item) for item in (preview_payload.get("tools") or []) if isinstance(item, dict)]
+        tool_rows = [tool_row for tool_row in advertised_tool_rows if self._is_tool_row_loadable(tool_row)]
+        selection_menu = session_state.get("selection_menu")
+        if isinstance(selection_menu, QMenu):
+            blocker = QtCore.QSignalBlocker(selection_menu)
+            selection_menu.clear()
+            selection_menu.setEnabled(True)
+            display_rows: list[dict[str, Any]] = []
+            for connection_row in (preview_payload.get("connections") or []):
+                if not isinstance(connection_row, dict):
+                    continue
+                display_rows.append(
+                    {
+                        "kind": "connection",
+                        "label": str(connection_row.get("label") or "Connection").strip(),
+                        "uri": str(connection_row.get("uri") or "").strip(),
+                        "tool_id": "",
+                    }
                 )
+            if display_rows and tool_rows:
+                display_rows.append({"kind": "separator"})
+            for tool_row in tool_rows:
+                display_rows.append(
+                    {
+                        "kind": "extension",
+                        "label": str(tool_row.get("label") or tool_row.get("tool_id") or "Extension").strip(),
+                        "uri": str(tool_row.get("source_uri") or tool_row.get("uri") or source_uri or "").strip(),
+                        "tool_id": str(tool_row.get("tool_id") or "").strip(),
+                        "transport": str(tool_row.get("transport") or "").strip(),
+                    }
+                )
+            for display_row in display_rows:
+                if display_row.get("kind") == "separator":
+                    selection_menu.addSeparator()
+                    continue
+                label_text = str(display_row.get("label") or "").strip()
+                if display_row.get("kind") == "extension":
+                    transport = str(display_row.get("transport") or "").strip()
+                    if transport:
+                        label_text = f"Extension: {label_text}"
+                else:
+                    label_text = f"Connection: {label_text}"
+                action = selection_menu.addAction(label_text)
+                action.setData(dict(display_row))
 
-        preview_html = "".join(
-            [
-                "<h3>Established Connections</h3>",
-                f"<ul>{''.join(connection_items) or '<li>No configured connections detected.</li>'}</ul>",
-                "<h3>Available Widgets</h3>",
-                f"<ul>{''.join(tool_items) or '<li>No widgets advertised.</li>'}</ul>",
-                "<p>Load attaches the backend-provided widget into this tab.</p>",
-            ]
-        )
-
-        preview_browser = session_state.get("preview_browser")
-        if isinstance(preview_browser, QTextBrowser):
-            preview_browser.setHtml(preview_html)
-
-        status_text = str(preview_payload.get("status_text") or "Connection control plane ready")
-        control_status_label = session_state.get("control_status_label")
-        if isinstance(control_status_label, QLabel):
-            control_status_label.setText(status_text)
+            preferred_tool_id = requested_tool_id or selected_tool_id
+            preferred_action: QAction | None = None
+            if preferred_tool_id:
+                for action in selection_menu.actions():
+                    action_payload = action.data()
+                    if isinstance(action_payload, dict) and str(action_payload.get("tool_id") or "").strip() == preferred_tool_id:
+                        preferred_action = action
+                        break
+            if preferred_action is None and selection_menu.actions():
+                preferred_action = next((action for action in selection_menu.actions() if isinstance(action.data(), dict)), None)
+            if isinstance(preferred_action, QAction):
+                session_state["selected_tool_payload"] = dict(preferred_action.data() or {})
+            elif "selected_tool_payload" in session_state:
+                session_state.pop("selected_tool_payload", None)
+            del blocker
+        session_state["requested_tool_id"] = ""
 
         self._set_session_tab_title(session_state, loaded=bool(session_state.get("loaded")))
         self._persist_local_widget_state(session_state)
@@ -9338,10 +9636,10 @@ class ExtensionsWorkspaceWidget(QWidget):
         tool_id = self._session_tool_id(session_state)
 
         if not tool_id:
-            control_status_label = session_state.get("control_status_label")
-            if isinstance(control_status_label, QLabel):
-                control_status_label.setText("No backend widget advertised for this connection.")
             return
+
+        if bool(session_state.get("catalog_only")):
+            session_state["catalog_only"] = False
 
         tab_widget = session_state.get("tab_widget")
         if isinstance(tab_widget, QWidget):
@@ -9379,7 +9677,7 @@ class ExtensionsWorkspaceWidget(QWidget):
         summary_payload = self._loaded_widget_summary(session_state)
         status_text = str(summary_payload.get("status_text") or "")
         control_status_label = session_state.get("control_status_label")
-        if status_text and isinstance(control_status_label, QLabel):
+        if status_text and isinstance(control_status_label, (QLabel, QLineEdit)):
             control_status_label.setText(status_text)
 
         self._set_session_tab_title(session_state, loaded=True)
@@ -9390,7 +9688,7 @@ class ExtensionsWorkspaceWidget(QWidget):
         summary_payload = self._loaded_widget_summary(session_state)
         status_text = str(summary_payload.get("status_text") or "")
         control_status_label = session_state.get("control_status_label")
-        if status_text and isinstance(control_status_label, QLabel):
+        if status_text and isinstance(control_status_label, (QLabel, QLineEdit)):
             control_status_label.setText(status_text)
         self._persist_local_widget_state(session_state)
         self.widgetStateChanged.emit()
@@ -9465,23 +9763,45 @@ QToolButton#extensionsTabCloseButton:hover {{
     background: {self.scheme.get('col9', '#22345c')};
     border-radius: 8px;
 }}
-QLineEdit#extensionsGraphUriInput,
-QComboBox#extensionsGraphToolSelector {{
+QToolButton#extensionsAddTabButton {{
+    color: {self.scheme.get('col8', '#a8afc7')};
+    background: transparent;
+    border: 1px solid {self.scheme.get('col10', '#33406a')};
+    border-radius: 8px;
+    font-size: 13px;
+    font-weight: 700;
+}}
+QToolButton#extensionsAddTabButton:hover {{
+    color: {self.scheme.get('col6', '#f0f4ff')};
+    background: {self.scheme.get('col9', '#22345c')};
+    border-color: {self.scheme.get('col2', '#6280ff')};
+}}
+QLineEdit#extensionsGraphUriInput {{
     color: {self.scheme.get('col6', '#e7eeff')};
     background: {self.scheme.get('col9', '#22345c')};
     border: 1px solid {self.scheme.get('col10', '#33406a')};
     border-radius: 8px;
-    padding: 6px 8px;
+    padding: 4px 8px;
+    min-height: 30px;
+}}
+QLineEdit#extensionsGraphUriInput:hover {{
+    border-color: {self.scheme.get('col2', '#6280ff')};
+}}
+QLineEdit#extensionsGraphUriInput:focus {{
+    border-color: {self.scheme.get('col1', '#3a5fff')};
 }}
 QToolButton#extensionsUriPresetButton {{
-    color: {self.scheme.get('col6', '#e7eeff')};
-    background: {self.scheme.get('col9', '#22345c')};
+    color: {self.scheme.get('col8', '#a8afc7')};
+    background: transparent;
     border: 1px solid {self.scheme.get('col10', '#33406a')};
     border-radius: 7px;
-    padding: 4px 10px;
+    padding: 2px 8px;
+    font-size: 12px;
+    min-height: 24px;
 }}
 QToolButton#extensionsUriPresetButton:hover {{
-    background: {self.scheme.get('col10', '#33406a')};
+    color: {self.scheme.get('col6', '#e7eeff')};
+    background: {self.scheme.get('col9', '#22345c')};
 }}
 QTextBrowser#extensionsConnectionsPreviewBrowser {{
     color: {self.scheme.get('col6', '#e7eeff')};
@@ -9547,8 +9867,19 @@ QToolButton#extensionsGraphControlButton {{
 QToolButton#extensionsGraphControlButton:hover {{
     background: {self.scheme.get('col9', '#22345c')};
 }}
-QLabel#extensionsGraphStatusLabel {{
+QLineEdit#extensionsGraphStatusLabel {{
     color: {self.scheme.get('col8', '#a8afc7')};
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: 8px;
+    padding: 4px 8px;
+    min-height: 30px;
+}}
+QLineEdit#extensionsGraphStatusLabel:hover {{
+    border-color: {self.scheme.get('col10', '#33406a')};
+}}
+QLineEdit#extensionsGraphStatusLabel:focus {{
+    border-color: {self.scheme.get('col2', '#6280ff')};
 }}
 """
         )

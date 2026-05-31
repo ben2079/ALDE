@@ -14,7 +14,7 @@ import threading
 import time
 from contextlib import contextmanager, nullcontext
 from dataclasses import asdict, dataclass, field
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Protocol, Sequence
 from urllib.parse import parse_qs, quote, unquote, urlparse
@@ -24,6 +24,7 @@ _AGENTSDB_SOCKET_SERVER_LOCK = threading.RLock()
 _AGENTSDB_SOCKET_SERVER_STATE: dict[tuple[str, int], dict[str, Any]] = {}
 _LOGGER = logging.getLogger(__name__)
 _AGENTSDB_CONNECTION_CONFIG_CACHE: dict[str, Any] | None = None
+UTC = timezone.utc
 _AGENTSDB_SOCKET_URI_PATTERN = re.compile(
     r"^(?:agents?db)(?:://|::)?(?P<host>\[[^\]]+\]|:::+1|::1|[A-Za-z0-9._-]+)?(?::(?P<port>\d+))?(?::*)?$",
     re.IGNORECASE,
@@ -571,7 +572,7 @@ def _build_namespace_object_from_runtime_config(
 
 
 def _demo_dataset_timestamp() -> datetime:
-    return datetime.now( tzinfo=UTC)
+    return datetime.now(tz=UTC)
 
 
 def _demo_embedding_vector(seed: str, dimension: int = 8) -> list[float]:
@@ -7000,16 +7001,17 @@ AGENT_MEMORY_ATTACHMENT_SERVICE = OBJECT_MEMORY_ATTACHMENT_SERVICE
 
 # Backward-compatibility exports for legacy imports.
 ObjectMemoryAttachmentService = AgentMemoryAttachmentService
+MemoryAttachmentService = AgentMemoryAttachmentService
 
 
 import html
 
-class AgentRelationGraphService:
-    _RELATION_LIMIT = 48
-    _CATALOG_LIMIT = 120
+class GraphViewService:
+    _RELATION_LIMIT = None
+    _CATALOG_LIMIT = None
     _WIDGET_PATH_ALIASES = {"adbgraphview"}
-    _DEFAULT_WIDGET_KIND = "agent_relation_graph"
-    _DEFAULT_TOOL_ID = "agent_relation_graph"
+    _DEFAULT_WIDGET_KIND = "graph_view" 
+    _DEFAULT_TOOL_ID = "graph_view"
     _RELATIONS_VIEW_KIND = "relations_graph"
     _CATALOG_VIEW_KIND = "catalog_graph"
     _WORKFLOW_VIEW_KIND = "workflow_diagram"
@@ -7018,6 +7020,7 @@ class AgentRelationGraphService:
     _GRAPH_LINK_HOST = "graph"
     _TOOL_ITEMS: tuple[tuple[str, str, str], ...] = (
         ("agent_relation_graph", "Agent Relation Graph", "agentsdb"),
+        ("web_app", "Web App Artifact", "native/web"),
         ("workflow_diagram", "Workflow Diagram", "agentsdb/mcp"),
         ("sequence_diagram", "Sequence Diagram", "agentsdb/mcp"),
   
@@ -7033,6 +7036,7 @@ class AgentRelationGraphService:
             "RelationGraphWidgetArtifactFactory",
             "RuntimeWidget",
         ),
+   
         "workflow_diagram": (
             "AgentRelationGraphService",
             "RelationGraphWidgetArtifactFactory",
@@ -7053,6 +7057,7 @@ class AgentRelationGraphService:
             "entry_class": "RelationGraphWidgetArtifactFactory",
             "build_method": "load_object_widget",
         },
+      
         "workflow_diagram": {
             "artifact_kind": "native_qwidget",
             "entry_module": "alde.widget_artifacts.relation_graph_artifact",
@@ -7213,7 +7218,7 @@ class AgentRelationGraphService:
                 message="Sequence diagram projection is reserved for remote runtime tooling.",
                 detail_html=(
                     "<h3>Sequence Diagram</h3>"
-                    "<p>This extension tab is reserved for a future sequence projection.</p>"
+                    "<p>This extension tab is reserved for a futurea sequence projection.</p>"
                     "<ul>"
                     "<li>Source plan: chat/tool/handoff traces from the monitoring surface.</li>"
                     "<li>Target output: chronological agent-to-agent and tool-call swimlanes.</li>"
@@ -7582,6 +7587,16 @@ class AgentRelationGraphService:
             )
 
         relation_objects = self._load_relation_objects(repository, str(getattr(runtime_config, "namespace_id", "") or ""))
+        if not relation_objects:
+            fallback_repository = self._load_memory_fallback_repository(runtime_config)
+            if fallback_repository is not None:
+                fallback_relations = self._load_relation_objects(
+                    fallback_repository,
+                    str(getattr(runtime_config, "namespace_id", "") or ""),
+                )
+                if fallback_relations:
+                    repository = fallback_repository
+                    relation_objects = fallback_relations
         if not relation_objects:
             namespace_id = html.escape(str(getattr(runtime_config, "namespace_id", "") or "n/a"))
             database_name = html.escape(str(getattr(runtime_config, "database_name", "") or "n/a"))
@@ -8411,6 +8426,7 @@ class AgentRelationGraphService:
 
     def _load_repository(self, runtime_config: Any) -> Any:
         repository_factory_class, repository_factory_config_class, _ = self._load_agentsdb_dependencies()
+
         project_root = Path(__file__).resolve().parents[2]
         memory_image_path = project_root / "AppData" / "agentsdb.json"
         repository_factory = repository_factory_class(
@@ -8423,27 +8439,70 @@ class AgentRelationGraphService:
         )
         return repository_factory.load_repository(str(getattr(runtime_config, "database_name", "alde_knowledge") or "alde_knowledge"))
 
+    def _load_memory_fallback_repository(self, runtime_config: Any) -> Any | None:
+        repository_factory_class, repository_factory_config_class, _ = self._load_agentsdb_dependencies()
+        project_root = Path(__file__).resolve().parents[2]
+        memory_image_path = project_root / "AppData" / "agentsdb.json"
+        if not memory_image_path.exists():
+            return None
+        try:
+            repository_factory = repository_factory_class(
+                repository_factory_config_class(
+                    backend_uri="agentsmem://local",
+                    default_database_name=str(getattr(runtime_config, "database_name", "alde_knowledge") or "alde_knowledge").strip() or "alde_knowledge",
+                    memory_image_path=str(memory_image_path),
+                    prefer_explicit_inmemory=True,
+                )
+            )
+            return repository_factory.load_repository(
+                str(getattr(runtime_config, "database_name", "alde_knowledge") or "alde_knowledge")
+            )
+        except Exception:
+            return None
+
     def _load_relation_objects(self, repository: Any, namespace_id: str) -> list[dict[str, Any]]:
         load_objects = getattr(repository, "load_objects", None)
         if not callable(load_objects):
             return []
 
-        relation_objects: Any = []
         relation_filter = {"namespace_id": namespace_id} if namespace_id else None
-        try:
-            relation_objects = load_objects("relation", relation_filter, limit=self._RELATION_LIMIT)
-        except TypeError:
-            relation_objects = load_objects("relation", relation_filter)
-        except Exception:
-            relation_objects = []
+        relation_objects: Any = []
+        for object_name in ("relation", "entity_relations", "relations"):
+            try:
+                relation_objects = load_objects(object_name, relation_filter, limit=self._RELATION_LIMIT)
+            except TypeError:
+                try:
+                    relation_objects = load_objects(object_name, relation_filter)
+                except Exception:
+                    relation_objects = []
+            except Exception:
+                relation_objects = []
+            if relation_objects:
+                break
 
         if not relation_objects:
             try:
                 relation_objects = load_objects("relation", None, limit=self._RELATION_LIMIT)
             except TypeError:
-                relation_objects = load_objects("relation", None)
+                try:
+                    relation_objects = load_objects("relation", None)
+                except Exception:
+                    relation_objects = []
             except Exception:
                 relation_objects = []
+        if not relation_objects:
+            for object_name in ("entity_relations", "relations"):
+                try:
+                    relation_objects = load_objects(object_name, None, limit=self._RELATION_LIMIT)
+                except TypeError:
+                    try:
+                        relation_objects = load_objects(object_name, None)
+                    except Exception:
+                        relation_objects = []
+                except Exception:
+                    relation_objects = []
+                if relation_objects:
+                    break
 
         return [dict(item) for item in (relation_objects or []) if isinstance(item, dict)]
 
@@ -8464,11 +8523,16 @@ class AgentRelationGraphService:
                     entity_id_list.append(entity_id)
 
         node_payload_by_id: dict[str, dict[str, Any]] = {}
-        for entity_id in entity_id_list[: self._RELATION_LIMIT * 2]:
-            try:
-                entity_payload = load_object("entity", entity_id)
-            except Exception:
-                entity_payload = None
+        relation_limit = self._RELATION_LIMIT if isinstance(self._RELATION_LIMIT, int) and self._RELATION_LIMIT > 0 else len(entity_id_list)
+        for entity_id in entity_id_list[: relation_limit * 2]:
+            entity_payload = None
+            for object_name in ("entity", "entities"):
+                try:
+                    entity_payload = load_object(object_name, entity_id)
+                except Exception:
+                    entity_payload = None
+                if entity_payload is not None:
+                    break
             node_payload_by_id[entity_id] = dict(entity_payload) if isinstance(entity_payload, dict) else {}
         return node_payload_by_id
 
@@ -8513,8 +8577,14 @@ class AgentRelationGraphService:
                 f"<li><b>{html.escape(str(edge_object.get('label') or 'related_to'))}</b>: "
                 f"{html.escape(str(edge_object.get('source') or 'n/a'))} -> "
                 f"{html.escape(str(edge_object.get('target') or 'n/a'))}"
-                f"{'<br><span style=\"opacity:0.78;\">' + html.escape(str(edge_object.get('description') or '')) + '</span>' if str(edge_object.get('description') or '').strip() else ''}"
-                "</li>"
+                + (
+                    "<br><span style=\"opacity:0.78;\">"
+                    + html.escape(str(edge_object.get('description') or ''))
+                    + "</span>"
+                )
+                if str(edge_object.get('description') or '').strip()
+                else ""
+                + "</li>"
             )
             for edge_object in edge_objects[:8]
         )
@@ -8523,9 +8593,9 @@ class AgentRelationGraphService:
 
         return "".join(
             [
-                "<h3>Relations Graph</h3>",
-                "<p>Graph projection of AgentDB relation objects for the active namespace.</p>",
-                "<ul>",
+                "<h3>Graph View</h3>",
+                "<p>Graph projection of AgentDB objects for the active namespace.</p>",
+                "<ul>",   
                 f"<li><b>Database:</b> {html.escape(str(getattr(runtime_config, 'database_name', 'n/a') or 'n/a'))}</li>",
                 f"<li><b>Namespace:</b> {html.escape(str(getattr(runtime_config, 'namespace_id', 'n/a') or 'n/a'))}</li>",
                 f"<li><b>Backend:</b> {html.escape(str(getattr(runtime_config, 'agents_db_uri', 'n/a') or 'n/a'))}</li>",

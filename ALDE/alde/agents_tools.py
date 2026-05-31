@@ -8,6 +8,7 @@ except ImportError as e:
         raise
 import os
 import hashlib
+import math
 from datetime import datetime, timezone
 import json
 import glob
@@ -95,7 +96,7 @@ def _noop_sync_parser_result_to_agentsdb_knowledge(**_: Any) -> None:
 
 try:
     from .agents_db import (
-        AgentRelationGraphService,
+        GraphViewService,
         AgentDbRepositoryFactory,
         AgentDbRepositoryFactoryConfig,
         AgentDbSocketRepository,
@@ -106,7 +107,7 @@ try:
 except Exception:
     try:
         from alde.agents_db import (  # type: ignore
-            AgentRelationGraphService,
+            GraphViewService,
             AgentDbRepositoryFactory,
             AgentDbRepositoryFactoryConfig,
             AgentDbSocketRepository,
@@ -115,7 +116,7 @@ except Exception:
             sync_retrieval_run_to_agentsdb_knowledge,
         )
     except Exception:
-        AgentRelationGraphService = None  # type: ignore[assignment]
+        GraphViewService = None  # type: ignore[assignment]
         AgentDbRepositoryFactory = None  # type: ignore[assignment]
         AgentDbRepositoryFactoryConfig = None  # type: ignore[assignment]
         AgentDbSocketRepository = None  # type: ignore[assignment]
@@ -2407,9 +2408,9 @@ def adb_operation(
     )
 
 
-class AgentRelationGraphToolService:
-    _DEFAULT_TOOL_ID = "agent_relation_graph"
-    _DEFAULT_SOURCE_URI = "agentsdb://127.0.0.1:2331/tools:agent_relation_graph"
+class GraphToolService():
+    _DEFAULT_TOOL_ID = "graph_view"
+    _DEFAULT_SOURCE_URI = "agentsdb://127.0.0.1:2331/tools:graph_view"
 
     def _json_result(self, payload: dict[str, Any]) -> str:
         return json.dumps(payload, ensure_ascii=False, default=str)
@@ -2418,16 +2419,16 @@ class AgentRelationGraphToolService:
         payload: dict[str, Any] = {
             "ok": False,
             "tool": self._DEFAULT_TOOL_ID,
-            "error": str(error_code or "agent_relation_graph_failed"),
+            "error": str(error_code or "graph_view_failed"),
         }
         if detail:
             payload["detail"] = str(detail)
         return self._json_result(payload)
 
     def _load_graph_service(self) -> Any:
-        if AgentRelationGraphService is None:
-            raise RuntimeError("agent_relation_graph_service_unavailable")
-        return AgentRelationGraphService()
+        if GraphViewService is None:
+            raise RuntimeError("graph_view_service_unavailable")
+        return GraphViewService()
 
     def _load_source_uri(self, *, source_uri: str | None, tool_id: str) -> str:
         normalized_source_uri = str(source_uri or "").strip()
@@ -2448,14 +2449,10 @@ class AgentRelationGraphToolService:
         node_objects: Sequence[typing.Mapping[str, Any]],
         edge_objects: Sequence[typing.Mapping[str, Any]],
     ) -> dict[str, int]:
-        degree_by_node_id: dict[str, int] = {
-            str(node_object.get("node_id") or "").strip(): 0
-            for node_object in node_objects
-            if str(node_object.get("node_id") or "").strip()
-        }
+        degree_by_node_id: dict[str, int] = {}
         for edge_object in edge_objects:
-            source_node_id = str(edge_object.get("source") or "").strip()
-            target_node_id = str(edge_object.get("target") or "").strip()
+            source_node_id = str(edge_object.get("source_node_id") or "").strip()
+            target_node_id = str(edge_object.get("target_node_id") or "").strip()
             if source_node_id:
                 degree_by_node_id[source_node_id] = degree_by_node_id.get(source_node_id, 0) + 1
             if target_node_id:
@@ -2469,10 +2466,10 @@ class AgentRelationGraphToolService:
     ) -> dict[str, int]:
         relation_type_counts: dict[str, int] = {}
         for edge_object in edge_objects:
-            relation_type = str(edge_object.get("label") or "related_to").strip() or "related_to"
+            relation_type = str(edge_object.get("relation_type") or "related_to").strip() or "related_to"
             relation_type_counts[relation_type] = relation_type_counts.get(relation_type, 0) + 1
         return relation_type_counts
-
+    
     def _load_kind_counts(
         self,
         *,
@@ -2510,6 +2507,55 @@ class AgentRelationGraphToolService:
         hub_rows.sort(key=lambda item: (-int(item.get("degree") or 0), str(item.get("label") or "").lower()))
         return hub_rows[: max(1, int(limit or 8))]
 
+    def _load_relation_entropy_score(self, *, relation_type_counts: dict[str, int], edge_count: int) -> float:
+        relation_type_total = max(0, int(edge_count))
+        if relation_type_total <= 0:
+            return 1.0
+        relation_type_count = max(0, len(relation_type_counts))
+        if relation_type_count <= 1:
+            return 0.0
+
+        entropy = 0.0
+        for count in relation_type_counts.values():
+            relation_count = int(count or 0)
+            if relation_count <= 0:
+                continue
+            probability = float(relation_count) / float(relation_type_total)
+            entropy -= probability * math.log(probability)
+
+        normalizer = math.log(float(relation_type_count)) if relation_type_count > 1 else 1.0
+        if normalizer <= 0:
+            return 0.0
+        return max(0.0, min(1.0, entropy / normalizer))
+
+    def _load_degree_gini(self, *, top_hub_rows: Sequence[typing.Mapping[str, Any]]) -> float:
+        degree_values = [
+            max(0, int(row.get("degree") or 0))
+            for row in top_hub_rows
+            if isinstance(row, typing.Mapping)
+        ]
+        if len(degree_values) <= 1:
+            return 0.0
+        degree_values.sort()
+        value_total = float(sum(degree_values))
+        if value_total <= 0:
+            return 0.0
+
+        weighted_sum = 0.0
+        value_count = len(degree_values)
+        for index, value in enumerate(degree_values, start=1):
+            weighted_sum += float(index) * float(value)
+        return max(0.0, min(1.0, (2.0 * weighted_sum) / (float(value_count) * value_total) - (float(value_count) + 1.0) / float(value_count)))
+
+    def _load_density_thresholds(self, *, node_count: int) -> tuple[float, float]:
+        if node_count <= 1:
+            return 0.0, 1.0
+        min_signal_density = max(2.0 / float(node_count - 1), 0.005)
+        sparse_threshold = min_signal_density
+        dense_threshold = min(0.45, 0.12 + (40.0 / float(node_count)))
+        dense_threshold = max(dense_threshold, sparse_threshold + 0.05)
+        return sparse_threshold, min(0.95, dense_threshold)
+
     def _load_modeling_guidance(
         self,
         *,
@@ -2524,25 +2570,44 @@ class AgentRelationGraphToolService:
         if node_count <= 0:
             return ["No graph nodes are available yet. Ingest entities and relations first."]
 
-        if len(relation_type_counts) <= 1 and edge_count > 0:
+        relation_type_count = len(relation_type_counts)
+        relation_entropy_score = self._load_relation_entropy_score(
+            relation_type_counts=relation_type_counts,
+            edge_count=edge_count,
+        )
+        if edge_count > 0 and relation_type_count <= 1:
             guidance_rows.append(
                 "Relation semantics are coarse-grained. Add more typed relation labels to improve AI/ML feature quality."
             )
-
-        if node_count >= 12 and directed_density < 0.03:
+        elif edge_count > 0 and relation_entropy_score < 0.45:
             guidance_rows.append(
-                "Graph is sparse. Consider multi-hop relation generation or ontology expansion for better neighborhood signals."
+                "Relation distribution is imbalanced "
+                f"(normalized_entropy={relation_entropy_score:.3f}). Add or rebalance relation types so one label does not dominate embeddings."
             )
-        elif node_count >= 10 and directed_density > 0.35:
+
+        sparse_threshold, dense_threshold = self._load_density_thresholds(node_count=node_count)
+        if node_count >= 12 and directed_density < sparse_threshold:
             guidance_rows.append(
-                "Graph is dense. Consider relation pruning or confidence thresholds to reduce noise for downstream models."
+                "Graph is sparse "
+                f"(density={directed_density:.4f}, threshold={sparse_threshold:.4f}). "
+                "Consider multi-hop relation generation or ontology expansion for better neighborhood signals."
+            )
+        elif node_count >= 10 and directed_density > dense_threshold:
+            guidance_rows.append(
+                "Graph is dense "
+                f"(density={directed_density:.4f}, threshold={dense_threshold:.4f}). "
+                "Consider relation pruning or confidence thresholds to reduce noise for downstream models."
             )
 
         if top_hub_rows:
             top_degree = int(top_hub_rows[0].get("degree") or 0)
-            if top_degree >= max(6, int(edge_count * 0.35)):
+            top_degree_share = float(top_degree) / float(max(1, edge_count))
+            degree_gini = self._load_degree_gini(top_hub_rows=top_hub_rows)
+            if top_degree_share >= 0.30 or (degree_gini >= 0.60 and top_degree >= 6):
                 guidance_rows.append(
-                    "Hub-dominant topology detected. Use hub-aware weighting to avoid central-node bias in model training."
+                    "Hub-dominant topology detected "
+                    f"(top_share={top_degree_share:.3f}, gini={degree_gini:.3f}). "
+                    "Use hub-aware weighting to avoid central-node bias in model training."
                 )
 
         if not guidance_rows:
@@ -2618,7 +2683,7 @@ class AgentRelationGraphToolService:
             "source_uri": str(snapshot_payload.get("source_uri") or resolved_source_uri),
             "status_text": str(snapshot_payload.get("status_text") or ""),
             "message": str(snapshot_payload.get("message") or ""),
-            "graph_snapshot": {
+            "graph_snapshot":  {
                 "view_kind": str(snapshot_payload.get("view_kind") or "relations_graph"),
                 "metadata": dict(snapshot_payload.get("metadata") or {}),
                 "nodes": node_objects,
@@ -2690,7 +2755,7 @@ class AgentRelationGraphToolService:
         return self._json_result(result_payload)
 
 
-AGENT_RELATION_GRAPH_TOOL_SERVICE = AgentRelationGraphToolService()
+GRAPH_TOOL_SERVICE = GraphToolService()
 
 
 def adb_relation_graph(
@@ -2702,7 +2767,7 @@ def adb_relation_graph(
     selected_object_id: str | None = None,
     include_connection_preview: bool | None = False,
 ) -> str:
-    return AGENT_RELATION_GRAPH_TOOL_SERVICE.execute_tool(
+    return GRAPH_TOOL_SERVICE.execute_tool(
         source_uri=source_uri,
         tool_id=tool_id,
         include_view_state=include_view_state,
@@ -2711,6 +2776,117 @@ def adb_relation_graph(
         selected_object_id=selected_object_id,
         include_connection_preview=include_connection_preview,
     )
+
+
+def adb_graph_service(
+    backend_call: dict[str, Any] | None = None,
+    include_view_state: bool | None = True,
+    layout_spread: float | None = 1.0,
+    selected_kind: str | None = None,
+    selected_object_id: str | None = None,
+    include_connection_preview: bool | None = False,
+) -> str:
+    """Backend-facing graph service wrapper used by engine tool calls.
+
+    Expected backend_call shape:
+    {
+        "tool": "/tools:<tool_id>",
+        "source_uri": "agentsdb://.../tools:<tool_id>"
+    }
+    """
+
+    backend_payload = dict(backend_call or {})
+    tool_path = str(
+        backend_payload.get("tool")
+        or backend_payload.get("tool_path")
+        or backend_payload.get("tool_uri")
+        or ""
+    ).strip()
+    resolved_source_uri = str(backend_payload.get("source_uri") or "").strip() or None
+
+    resolved_tool_id = "relation_graph_view"
+    if tool_path:
+        normalized_path = tool_path.strip()
+        if ":" in normalized_path:
+            resolved_tool_id = str(normalized_path.split(":")[-1] or resolved_tool_id).strip() or resolved_tool_id
+        elif "/" in normalized_path:
+            resolved_tool_id = str(normalized_path.split("/")[-1] or resolved_tool_id).strip() or resolved_tool_id
+        else:
+            resolved_tool_id = normalized_path or resolved_tool_id
+
+    return GRAPH_TOOL_SERVICE.execute_tool(
+        source_uri=resolved_source_uri,
+        tool_id=resolved_tool_id,
+        include_view_state=include_view_state,
+        layout_spread=layout_spread,
+        selected_kind=selected_kind,
+        selected_object_id=selected_object_id,
+        include_connection_preview=include_connection_preview,
+    )
+
+
+def adb_relation_graph_payload(
+    source_uri: str | None = None,
+    tool_id: str | None = None,
+    include_view_state: bool | None = True,
+    layout_spread: float | None = 1.0,
+    selected_kind: str | None = None,
+    selected_object_id: str | None = None,
+    include_connection_preview: bool | None = False,
+) -> dict[str, Any]:
+    """Return the parsed dict payload for the relation graph tool.
+
+    This centralizes GRAPH_TOOL_SERVICE.execute_tool(...) usage so UI modules
+    can consume a stable dict payload without implementing loader/parsing logic.
+    """
+
+    try:
+        raw_payload = GRAPH_TOOL_SERVICE.execute_tool(
+            source_uri=source_uri,
+            tool_id=tool_id,
+            include_view_state=include_view_state,
+            layout_spread=layout_spread,
+            selected_kind=selected_kind,
+            selected_object_id=selected_object_id,
+            include_connection_preview=include_connection_preview,
+        )
+    except Exception as exc:
+        return {
+            "ok": False,
+            "tool": "relation_graph_view",
+            "error": "graph_tool_execute_failed",
+            "detail": f"{type(exc).__name__}: {exc}",
+        }
+
+    if isinstance(raw_payload, dict):
+        return dict(raw_payload)
+
+    if isinstance(raw_payload, str):
+        try:
+            parsed_payload = json.loads(raw_payload)
+            if isinstance(parsed_payload, dict):
+                return parsed_payload
+            return {
+                "ok": False,
+                "tool": "relation_graph_view",
+                "error": "graph_tool_invalid_payload",
+                "detail": f"parsed_payload_type={type(parsed_payload).__name__}",
+            }
+        except Exception as exc:
+            return {
+                "ok": False,
+                "tool": "relation_graph_view",
+                "error": "graph_tool_parse_failed",
+                "detail": f"{type(exc).__name__}: {exc}",
+                "raw_payload": str(raw_payload),
+            }
+
+    return {
+        "ok": False,
+        "tool": "relation_graph_view",
+        "error": "graph_tool_invalid_payload",
+        "detail": f"payload_type={type(raw_payload).__name__}",
+    }
 
 
 def diagnose_dispatch_backend(*, db_path: str | None = None, emit: bool = False) -> dict[str, Any]:
@@ -7402,6 +7578,7 @@ _TOOL_IMPLEMENTATIONS: dict[str, Callable | None] = {
     "vdb_worker": vdb_worker,
     "adb_operation": adb_operation,
     "adb_relation_graph": adb_relation_graph,
+    "adb_graph_service": adb_graph_service,
     "adb_knowledge_worker": adb_worker,
     "adb_knowledge_query": adb_query,
     "repo_knowledge_worker": adb_worker,
@@ -7481,7 +7658,26 @@ def _tool_spec_from_config(config: dict[str, Any]) -> ToolSpec:
 
 
 def _build_unified_tools() -> list[ToolSpec]:
-    return [_tool_spec_from_config(tool_config) for tool_config in get_tool_configs()]
+    unified_tool_specs = [_tool_spec_from_config(tool_config) for tool_config in get_tool_configs()]
+    if not any(spec.name == "adb_graph_service" for spec in unified_tool_specs):
+        unified_tool_specs.append(
+            ToolSpec(
+                name="adb_graph_service",
+                description="Backend graph artifact service entrypoint used by engine-driven UI initialization.",
+                parameters=[
+                    ParamSpec(name="backend_call", type="object", description="Backend call descriptor with tool path and source_uri.", required=False),
+                    ParamSpec(name="include_view_state", type="boolean", description="Include render-oriented node/edge draw objects.", required=False, default=True),
+                    ParamSpec(name="layout_spread", type="number", description="Optional graph layout spread factor.", required=False, default=1.0),
+                    ParamSpec(name="selected_kind", type="string", description="Optional selection kind for view focus.", required=False, default=""),
+                    ParamSpec(name="selected_object_id", type="string", description="Optional selected node_id or edge_id.", required=False, default=""),
+                    ParamSpec(name="include_connection_preview", type="boolean", description="Include connection/tool preview metadata.", required=False, default=True),
+                ],
+                implementation=adb_graph_service,
+                final_result=False,
+                tool_response_required=True,
+            )
+        )
+    return unified_tool_specs
 
 
 def create_tool_registry(specs: list[ToolSpec]) -> dict[str, dict]:
