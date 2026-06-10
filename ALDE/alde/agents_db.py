@@ -115,8 +115,8 @@ def _env_or_config_int_value(
 
 
 def _compose_agentsdb_socket_uri(host: str, port: int) -> str:
-    normalized_host = str(host or "").strip().strip("[]") or "127.0.0.1"
-    resolved_port = max(1, int(port or 2331))
+    normalized_host = str(host or "").strip().strip("[]") or ""
+    resolved_port = max(1, int(port or 0))
     if ":" in normalized_host:
         normalized_host = f"[{normalized_host}]"
     return f"agentsdb://{normalized_host}:{resolved_port}"
@@ -125,8 +125,8 @@ def _compose_agentsdb_socket_uri(host: str, port: int) -> str:
 def normalize_agentsdb_socket_uri(
     uri: Any,
     *,
-    default_host: str = "127.0.0.1",
-    default_port: int = 2331,
+    default_host: str = "",
+    default_port: int = "",
     default_on_empty: bool = True,
 ) -> str:
     normalized_uri = str(uri or "").strip()
@@ -141,8 +141,8 @@ def normalize_agentsdb_socket_uri(
             resolved_port = int(resolved_port_text or default_port)
         except Exception:
             resolved_port = int(default_port)
-        if resolved_host in {"", "localhost", "127.0.0.1", "::1", ":::1"}:
-            resolved_host = str(default_host or "127.0.0.1").strip().strip("[]") or "127.0.0.1"
+        if resolved_host in {"", "", "", "::1", ":::1"}:
+            resolved_host = str(default_host or "").strip().strip("[]") or ""
         return _compose_agentsdb_socket_uri(resolved_host or default_host, resolved_port)
 
     parsed_uri = urlparse(normalized_uri)
@@ -153,16 +153,16 @@ def normalize_agentsdb_socket_uri(
     except Exception:
         return _compose_agentsdb_socket_uri(default_host, default_port)
     resolved_host = str(parsed_uri.hostname or "").strip().strip("[]").lower()
-    if resolved_host in {"", "localhost", "127.0.0.1", "::1", ":::1"}:
-        resolved_host = str(default_host or "127.0.0.1").strip().strip("[]") or "127.0.0.1"
+    if resolved_host in {"", "", "", "::1", ":::1"}:
+        resolved_host = str(default_host or "").strip().strip("[]") or ""
     return _compose_agentsdb_socket_uri(resolved_host or default_host, resolved_port)
 
 
 def _load_agentsdb_socket_endpoint(
     uri: Any,
     *,
-    default_host: str = "127.0.0.1",
-    default_port: int = 2331,
+    default_host: str = "",
+    default_port: int = "",
 ) -> tuple[str, str, int] | None:
     normalized_uri = normalize_agentsdb_socket_uri(
         uri,
@@ -186,8 +186,8 @@ def _load_agentsdb_uri_from_connection_config(config_payload: Mapping[str, Any])
     configured_uri = _connection_config_value(config_payload, ("agents_db_uri", "agentsdb_uri", "uri", "socket_uri"))
     if configured_uri:
         return normalize_agentsdb_socket_uri(configured_uri, default_on_empty=False) or configured_uri
-    host_value = _connection_config_value(config_payload, ("host", "hostname")) or "localhost"
-    port_value = _connection_config_value(config_payload, ("port",)) or "2331"
+    host_value = _connection_config_value(config_payload, ("host", "hostname")) or ""
+    port_value = _connection_config_value(config_payload, ("port",)) or ""
     try:
         resolved_port = int(port_value)
     except Exception:

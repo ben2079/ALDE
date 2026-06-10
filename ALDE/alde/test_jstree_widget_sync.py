@@ -1009,6 +1009,21 @@ def test_json_tree_widget_defaults_to_manual_sync_runtime(
     widget.deleteLater()
 
 
+def test_json_tree_widget_uses_compact_tree_spacing(
+    monkeypatch: pytest.MonkeyPatch,
+    qapp: QApplication,
+) -> None:
+    monkeypatch.setattr(TreeDataPersistenceService, "load_data", lambda self: ({}, "json", "stub"))
+    monkeypatch.setattr(TreeDataPersistenceService, "live_sync_enabled", lambda self: False)
+
+    widget = JsonTreeWidget()
+
+    assert widget.indentation() == JsonTreeWidget._TREE_INDENTATION
+    assert widget.iconSize() == JsonTreeWidget._TREE_ICON_SIZE
+
+    widget.deleteLater()
+
+
 def test_json_tree_widget_context_adds_agentsdb_repository_record(
     monkeypatch: pytest.MonkeyPatch,
     qapp: QApplication,

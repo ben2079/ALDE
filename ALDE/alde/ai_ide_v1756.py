@@ -213,7 +213,7 @@ except Exception:
         return False
 
 from PySide6.QtCore import( Qt, QSize, Signal, Slot, QTimer, QEvent,
-                            QSettings, QByteArray )            # >>>  NEU ai_ide_v1.7.5.py
+                            QSettings, QByteArray, QPoint )            # >>>  NEU ai_ide_v1.7.5.py
 from PySide6 import QtCore
 
 from PySide6.QtGui import (
@@ -371,16 +371,27 @@ def _maybe_flush_history(chat_obj=None) -> None:
 
 # ═══════════════════════  Farben / Style  ══════════════════════════════════
 
-SCHEME_BLUE  = {"col1": "#3a5fff", "col2": "#6280ff",
-                "menu_bg": "#000000",
-                "menu_sel": "rgba(58,95,255,72)"
-               }
+SCHEME_BLUE = {
+    "col1": "#3a5fff",
+    "col2": "#6280ff",
+    "menu_bg": "#000000",
+    "menu_sel": "rgba(58,95,255,72)",
+    "col11": "#3a5fff",
+    "col12": "rgba(58,95,255,48)",
+}
 
 
-SCHEME_GREEN = {"col1": "#0fe913", "col2": "#58ed5b",
-                "menu_bg": "#000000",
-                "menu_sel": "rgba(88,237,91,72)"
-               }
+SCHEME_GREEN = {
+    "col1": "#0fe913",
+    "col2": "#58ed5b",
+    "menu_bg": "#000000",
+    "menu_sel": "rgba(88,237,91,72)",
+    "col11": "#0fe913",
+    "col12": "rgba(88,237,91,48)",
+}
+
+
+ACCENT_ORDER: tuple[str, ...] = ("green", "blue", "system")
 
 
 SCHEME_GREY = {
@@ -391,8 +402,8 @@ SCHEME_GREY = {
     "col9": "#101010",
     "col10":"#1f1f1f",
     "col11":"#4a4a4a",
-    "px1": "6px",
-    "col12": "rgba(58,95,255,48)"
+    "px1": "4px",
+    "col12": "rgba(88,237,91,48)"
 }
 
 
@@ -403,10 +414,53 @@ SCHEME_DARK = {
     "col8": "#E3E3DED6",
     "col9": "#101010",
     "col10":"#1f1f1f",
-    "col11":"#3a5fff",
-    "px1": "6px",
-    "col12": "rgba(58,95,255,48)",
+    "col11":"#0fe913",
+    "px1": "4px",
+    "col12": "rgba(88,237,91,48)",
 }
+
+
+def _rgba_from_qcolor(color: QColor, alpha: int) -> str:
+    alpha_clamped = max(0, min(255, int(alpha)))
+    return f"rgba({color.red()},{color.green()},{color.blue()},{alpha_clamped})"
+
+
+def _system_accent_scheme() -> dict[str, str]:
+    """Build an accent scheme from the current Qt/system highlight color."""
+    app = QApplication.instance()
+    color = QColor()
+    if app is not None:
+        try:
+            color = app.palette().color(QPalette.Highlight)
+        except Exception:
+            color = QColor()
+    if not color.isValid():
+        color = QColor("#9a9a9a")
+    secondary = color.lighter(125)
+    primary_name = color.name(QColor.HexRgb)
+    secondary_name = secondary.name(QColor.HexRgb)
+    return {
+        "col1": primary_name,
+        "col2": secondary_name,
+        "menu_bg": "#000000",
+        "menu_sel": _rgba_from_qcolor(color, 72),
+        "col11": primary_name,
+        "col12": _rgba_from_qcolor(color, 48),
+    }
+
+
+def _accent_from_name(name: str | None) -> dict[str, str]:
+    normalized = str(name or "green").strip().lower()
+    if normalized == "blue":
+        return SCHEME_BLUE
+    if normalized == "system":
+        return _system_accent_scheme()
+    return SCHEME_GREEN
+
+
+def _normalize_accent_name(name: str | None) -> str:
+    normalized = str(name or "green").strip().lower()
+    return normalized if normalized in ACCENT_ORDER else "green"
 
 # Traffic-light palette aligned with the agency docs visuals.
 SIGNAL_RED = "#ff6b7d"
@@ -472,35 +526,102 @@ QToolButton:checked {{
 
 QTabWidget::pane {{
     background: {col9};
-    border: 1px solid {col10};
-    border-radius: 14px;
-    margin: 4px;
+    border-left: 1px solid {col10};
+    border-right: 1px solid {col10};
+    border-bottom: 1px solid {col10};
+    border-top: none;
+    border-top-left-radius: 0px;
+    border-top-right-radius: 0px;
+    border-bottom-left-radius: 14px;
+    border-bottom-right-radius: 14px;
+    margin: 0px;
+    }}
+
+QTabBar {{
+    background: {col7};
+    border: none;
     }}
 
 QTabBar::tab {{
     background: {col7};
     color: {col6};
-    border: 1px solid {col10};
+    border-top: 1px solid {col10};
+    border-left: none;
+    border-right: none;
     border-bottom: none;
-    border-top-left-radius: 8px;
-    border-top-right-radius: 8px;
+    border-top-left-radius: 0px;
+    border-top-right-radius: 0px;
     padding: 5px 10px;
     min-height: 20px;
     }}
 
+QTabBar::tab:first {{
+    border-left: 1px solid {col10};
+    border-top-left-radius: 14px;
+    }}
+
+QTabBar::tab:last {{
+    border-right: 1px solid {col10};
+    border-top-right-radius: 14px;
+    }}
+
+QTabBar::tab:only-one {{
+    border-left: 1px solid {col10};
+    border-right: 1px solid {col10};
+    border-top-left-radius: 14px;
+    border-top-right-radius: 14px;
+    }}
+
 QTabBar::tab:hover {{ 
     background: {col7};
-    border-color: {col10};
+    border-top: 1px solid {col10};
+    border-left: none;
+    border-right: none;
+    border-bottom: none;
     }}
 
 QTabBar::tab:selected {{ 
     background: {col7};
     color: {col1};
-    border-color: {col1};
+    border: 1px solid {col1};
+    border-left: 1px solid {col7};
+    border-bottom: none;
+    }}
+
+QTabBar::tab:first:hover {{
+    border-left: 1px solid {col10};
+    border-top-left-radius: 14px;
+    }}
+
+QTabBar::tab:last:hover {{
+    border-right: 1px solid {col10};
+    border-top-right-radius: 14px;
+    }}
+
+QTabBar::tab:only-one:hover {{
+    border-left: 1px solid {col10};
+    border-right: 1px solid {col10};
+    border-top-left-radius: 14px;
+    border-top-right-radius: 14px;
+    }}
+
+QTabBar::tab:first:selected {{
+    border-left: 1px solid {col7};
+    border-top-left-radius: 14px;
+    }}
+
+QTabBar::tab:last:selected {{
+    border-top-right-radius: 14px;
+    }}
+
+QTabBar::tab:only-one:selected {{
+    border-left: 1px solid {col7};
+    border-top-left-radius: 14px;
+    border-top-right-radius: 14px;
     }}
 
 QSplitter::handle:horizontal {{
-    margin: 0px 10px;
+    margin: 0px {_SPLITTER_SIDE_INSET_PX}px;
     border-top: 2px solid transparent;
     border-radius: 999px;
     }}
@@ -513,8 +634,8 @@ QSplitter::handle:vertical {{
 
 QSplitter::handle:hover,
 QSplitter::handle:pressed {{
-    border-color: {col1};
-    background: {col12};
+    border-color: transparent;
+    background: transparent;
     }}
 
 QPushButton {{
@@ -567,7 +688,7 @@ QDockWidget::separator {{
     }}
 
 QDockWidget::separator:hover {{ 
-    background: {col12} 
+    background: {col5} 
     }}
 
 QTreeView, QListView {{
@@ -621,9 +742,9 @@ QListView::item:selected {{
 
 _SEP_QSS = """
 /*  MainWindow-Splitter: unsichtbar, aber weiter greifbar  */
-QMainWindow::separator              {{ background: {col5};      width: 3px; }}
+QMainWindow::separator              {{ background: {col5};      width: 4px; }}
 QMainWindow::separator:horizontal   {{ background: {col5};      height: 6px;}}
-QMainWindow::separator:hover        {{ background: {col1}; }}
+QMainWindow::separator:hover        {{ background: {col2}; }}
 """
 
 # ─── Tooltip-QSS  (schwarz, opacity 230, weiße Schrift, runde Ecken) ──────
@@ -702,11 +823,17 @@ def _color_with_alpha(color_value: str, alpha: int, *, fallback: str) -> str:
 def _splitter_handle_palette(scheme: dict[str, str]) -> tuple[str, str, str]:
     """Return (idle, hover, pressed) colors for splitter handles."""
     base_color = str(scheme.get("col10") or "#404040")
-    accent_color = str(scheme.get("col2") or scheme.get("col1") or "#6280ff")
+    accent_color = str(scheme.get("col2") or scheme.get("col1") or "#58ed5b")
     idle = _color_with_alpha(base_color, 96, fallback="rgba(64,64,64,96)")
-    hover = _color_with_alpha(accent_color, 170, fallback="rgba(98,128,255,170)")
-    pressed = _color_with_alpha(accent_color, 210, fallback="rgba(98,128,255,210)")
+    hover = accent_color
+    pressed = accent_color
     return idle, hover, pressed
+
+
+_SURFACE_INSET_PX = 8
+_SURFACE_BORDER_RADIUS_PX = 14
+_SURFACE_BORDER_WIDTH_PX = 1
+_SPLITTER_SIDE_INSET_PX = 8
 
 # ─── helper zum Aufbringen des Stylesheets  ───────────────────────────────
 
@@ -734,12 +861,22 @@ def _apply_style(widget, scheme, *, _qapp_apply=True):             # patched
     template = _STYLE + _MENU_STYLE + _SEP_QSS + _TT_QSS
     fmt = string.Formatter()
 
+    substitutions = dict(scheme)
+    substitutions.update(
+        {
+            "_SURFACE_INSET_PX": _SURFACE_INSET_PX,
+            "_SURFACE_BORDER_RADIUS_PX": _SURFACE_BORDER_RADIUS_PX,
+            "_SURFACE_BORDER_WIDTH_PX": _SURFACE_BORDER_WIDTH_PX,
+            "_SPLITTER_SIDE_INSET_PX": _SPLITTER_SIDE_INSET_PX,
+        }
+    )
+
     pieces: list[str] = []
     for txt, key, spec, conv in fmt.parse(template):
         pieces.append(txt)
         if key is None:
             continue
-        pieces.append(str(scheme.get(key, "{"+key+"}")))
+        pieces.append(str(substitutions.get(key, "{"+key+"}")))
 
     qss = "".join(pieces)
 
@@ -859,6 +996,43 @@ def _draw_circle_icon() -> QIcon:
     p.setBrush(Qt.NoBrush)
     p.drawEllipse(6, 6, size - 12, size - 12)
     p.end()
+    return QIcon(pm)
+
+
+def _draw_window_control_icon(kind: str, *, size: int = 12, color: str = "#E3E3DED6") -> QIcon:
+    """Paint minimalist window control icons (minimize, maximize, restore, close)."""
+    size_px = max(10, int(size))
+    pm = QPixmap(size_px, size_px)
+    pm.fill(Qt.transparent)
+
+    pad = max(1, size_px // 4)
+    stroke = max(1, size_px // 7)
+
+    painter = QPainter(pm)
+    painter.setRenderHint(QPainter.Antialiasing, True)
+    pen = QPen(QColor(color))
+    pen.setWidth(stroke)
+    pen.setCapStyle(Qt.RoundCap)
+    pen.setJoinStyle(Qt.RoundJoin)
+    painter.setPen(pen)
+    painter.setBrush(Qt.NoBrush)
+
+    if kind == "minimize":
+        y = size_px - pad - 1
+        painter.drawLine(pad, y, size_px - pad, y)
+    elif kind == "maximize":
+        painter.drawRect(pad, pad, max(1, size_px - (2 * pad)), max(1, size_px - (2 * pad)))
+    elif kind == "restore":
+        inset = max(1, size_px // 5)
+        w = max(1, size_px - (2 * pad) - inset)
+        h = max(1, size_px - (2 * pad) - inset)
+        painter.drawRect(pad + inset, pad, w, h)
+        painter.drawRect(pad, pad + inset, w, h)
+    else:
+        painter.drawLine(pad, pad, size_px - pad, size_px - pad)
+        painter.drawLine(pad, size_px - pad, size_px - pad, pad)
+
+    painter.end()
     return QIcon(pm)
 
 
@@ -2059,9 +2233,12 @@ class ChatDock(QDockWidget):
         self.setFeatures(QDockWidget.NoDockWidgetFeatures)
         self.setAllowedAreas(Qt.LeftDockWidgetArea | Qt.RightDockWidgetArea)
         self.scheme = _build_scheme(accent, base)                # Farbschema mergen
+        self._apply_dock_style()
 
-        #self.setWidgetResizable(True)
-        # ---- Stylesheet ----------------------------------------------------
+        # ---- eigentlicher Inhalt ------------------------------------------
+        self.setWidget(AIWidget(accent, base))
+
+    def _apply_dock_style(self) -> None:
         self.setStyleSheet(f"""
             /* feste 1-px-Linie links */
             QDockWidget#ChatDock {{
@@ -2071,15 +2248,20 @@ class ChatDock(QDockWidget):
             /* Split-Handle: unsichtbar aber greifbar */
             QDockWidget::separator {{
                 background : {self.scheme['col5']};
-                width      : 6px;
+                width      : 4px;
             }}
             QDockWidget::separator:hover {{
-                background : {self.scheme['col12']};
+                background : {self.scheme['col2']};
             }}
         """)
 
-        # ---- eigentlicher Inhalt ------------------------------------------
-        self.setWidget(AIWidget(accent, base))
+    def update_scheme(self, accent: dict[str, str], base: dict[str, str]) -> None:
+        self.scheme = _build_scheme(accent, base)
+        self._apply_dock_style()
+        chat_widget = self.widget()
+        updater = getattr(chat_widget, "update_scheme", None)
+        if callable(updater):
+            updater(accent, base)
 
 # ═══════════════════════  AI chat dock  ═══════════════════════════════════
 
@@ -2110,6 +2292,7 @@ class AIWidget(QWidget):
         self._runtime_context_entries: list[dict[str, str]] = []
         self.scheme = _build_scheme(accent, base)                # Farbschema mergen
         self._build_ui()
+        self._apply_scheme_styles()
         self._wire()
         self._async_result_ready.connect(self._handle_async_result)
 
@@ -2125,20 +2308,54 @@ class AIWidget(QWidget):
             except Exception:
                 pass
         
-        # Hover-Events aktivieren
         self.setAttribute(QtCore.Qt.WA_Hover, True)
-        # ScrollBar stylen (Pfeile ausblenden)
-        css = """
-            QScrollBar:vertical {
-                background: {col9};  /* unsichtbar bis Hover */
-            width: 4px;
-        }
-        QScrollBar::add-line, QScrollBar::sub-line { height:0px; }  /* Pfeile */
-        QScrollBar:hover { background: rgba(0,0,0,0.12); }          /* bei Hover */
-        QScrollBar::handle:hover { background: #7a7a7a; }
 
-        """
-        self.setStyleSheet(css)
+    def update_scheme(self, accent: dict[str, str], base: dict[str, str]) -> None:
+        self.scheme = _build_scheme(accent, base)
+        self._apply_scheme_styles()
+        if hasattr(self, "chat_view") and isinstance(self.chat_view, ChatWindow):
+            self.chat_view.update_scheme(self.scheme)
+
+    def _apply_scheme_styles(self) -> None:
+        col6 = self.scheme.get("col6", "#E3E3DED6")
+        col9 = self.scheme.get("col9", "#101010")
+        col10 = self.scheme.get("col10", "#1f1f1f")
+        menu_sel = self.scheme.get("menu_sel", self.scheme.get("col12", "rgba(88,237,91,48)"))
+        self.setStyleSheet(
+            f"""
+            AIWidget {{
+                background: {self.scheme.get('col7', '#0b0b0b')};
+                color: {col6};
+            }}
+            QScrollBar:vertical {{
+                background: {col9};
+                width: 4px;
+            }}
+            QScrollBar::add-line,
+            QScrollBar::sub-line {{
+                height: 0px;
+            }}
+            QScrollBar:hover {{
+                background: {col9};
+            }}
+            QScrollBar::handle:hover {{
+                background: {col10};
+            }}
+            """
+        )
+        prompt_edit = getattr(self, "prompt_edit", None)
+        if isinstance(prompt_edit, QTextEdit):
+            prompt_edit.setStyleSheet(
+                f"""
+                QTextEdit#aiInput {{
+                    font-size: 15px;
+                    background: transparent;
+                    color: {col6};
+                    border: none;
+                    selection-background-color: {menu_sel};
+                }}
+                """
+            )
         
     # ---------------------------------------------------------------- ENV
     @staticmethod
@@ -3044,10 +3261,12 @@ class AIWidget(QWidget):
             language="json",
             editable=True,
             auto_fit=False,
-            accent_color=self.scheme.get("col1", "#3a5fff"),
-            accent_selection_color=self.scheme.get("col2", "#6280ff"),
+            accent_color=self.scheme.get("col1", "#0fe913"),
+            accent_selection_color=self.scheme.get("col2", "#58ed5b"),
             surface_color=self.scheme.get("col9", "#101010"),
             font_size_px=17,
+            edit_border_radius_px=15,
+            draw_border=False,
         )
         editor.setMinimumHeight(260)
         editor.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
@@ -3168,6 +3387,15 @@ Hilfsklassen (FileDropTextEdit, ToolButton, ChatCom …) aus deinem Projekt.'''
 # ────────────────────────────────────────────────────────────────────────────
 #  2)  NEUER  CodeViewer  –  editierbare Chat-Bloecke mit Highlighting
 # ────────────────────────────────────────────────────────────────────────────
+def _clear_frame_chrome(frame: QFrame) -> None:
+    """Disable native QFrame chrome so only stylesheet geometry remains visible."""
+
+    frame.setFrameShape(QFrame.NoFrame)
+    frame.setFrameStyle(0)
+    frame.setLineWidth(0)
+    frame.setMidLineWidth(0)
+
+
 class CodeViewer(QPlainTextEdit):
     """Editierbarer Chat-Block fuer Code, Konfiguration und Dateiinhalt."""
 
@@ -3203,25 +3431,38 @@ class CodeViewer(QPlainTextEdit):
         language: str = "",
         editable: bool = True,
         auto_fit: bool = True,
-        accent_color: str = "#3a5fff",
-        accent_selection_color: str = "#6280ff",
+        accent_color: str = "#0fe913",
+        accent_selection_color: str = "#58ed5b",
+        background_color: str | None = None,
         surface_color: str = "#404040",
         font_size_px: int | None = None,
+        edit_border_radius_px: int | None = None,
+        edit_border_width_px: int | None = None,
+        edit_border_left_width_px: int | None = None,
+        edit_border_right_width_px: int | None = None,
+        top_left_radius_px: int | None = None,
+        top_right_radius_px: int | None = None,
+        bottom_left_radius_px: int | None = None,
+        bottom_right_radius_px: int | None = None,
+        draw_border: bool = True,
     ) -> None:
         super().__init__(parent=parent)
         self._language = self._normalize_language(language)
         self._highlighter = None
         self._edit_mode = False
-        self._accent_color = str(accent_color or "#3a5fff")
+        self._accent_color = str(accent_color or "#0fe913")
         self._accent_selection_color = str(accent_selection_color or self._accent_color)
+        self._background_color = str(background_color or self._BACKGROUND_COLOR)
         self._surface_color = str(surface_color or "#404040")
         self._font_size_px = int(font_size_px) if font_size_px is not None else None
+        self._draw_border = bool(draw_border)
         self._uses_wrapped_layout = self._language in {"markdown", "text"}
         self._auto_fit = bool(auto_fit)
 
         self.setAttribute(Qt.WA_StyledBackground, True)
+        self.viewport().setAttribute(Qt.WA_StyledBackground, True)
         self.setUndoRedoEnabled(True)
-        self.setFrameShape(QFrame.NoFrame)
+        _clear_frame_chrome(self)
         self.setFocusPolicy(Qt.StrongFocus)
         self.setSizePolicy(
             QSizePolicy.Expanding,
@@ -3233,6 +3474,18 @@ class CodeViewer(QPlainTextEdit):
         self.setWordWrapMode(QTextOption.WrapAtWordBoundaryOrAnywhere if self._uses_wrapped_layout else QTextOption.NoWrap)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff if self._uses_wrapped_layout else Qt.ScrollBarAsNeeded)
         self.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff if self._uses_wrapped_layout else Qt.ScrollBarAsNeeded)
+        self._edit_border_radius_px = max(0, int(edit_border_radius_px)) if edit_border_radius_px is not None else 15
+        self._edit_border_width_px = max(0, int(edit_border_width_px)) if edit_border_width_px is not None else 1
+        self._edit_border_left_width_px = (
+            max(0, int(edit_border_left_width_px)) if edit_border_left_width_px is not None else None
+        )
+        self._edit_border_right_width_px = (
+            max(0, int(edit_border_right_width_px)) if edit_border_right_width_px is not None else None
+        )
+        self._top_left_radius_px = max(0, int(top_left_radius_px)) if top_left_radius_px is not None else None
+        self._top_right_radius_px = max(0, int(top_right_radius_px)) if top_right_radius_px is not None else None
+        self._bottom_left_radius_px = max(0, int(bottom_left_radius_px)) if bottom_left_radius_px is not None else None
+        self._bottom_right_radius_px = max(0, int(bottom_right_radius_px)) if bottom_right_radius_px is not None else None
         self.viewport().installEventFilter(self)
         self.setPlainText(code.rstrip("\n"))
         self._install_highlighter()
@@ -3248,6 +3501,25 @@ class CodeViewer(QPlainTextEdit):
         else:
             self.setMinimumHeight(max(220, self._MIN_HEIGHT))
             self.setMaximumHeight(16777215)
+
+    def set_theme_colors(
+        self,
+        *,
+        accent_color: str | None = None,
+        accent_selection_color: str | None = None,
+        background_color: str | None = None,
+        surface_color: str | None = None,
+    ) -> None:
+        if accent_color:
+            self._accent_color = str(accent_color)
+        if accent_selection_color:
+            self._accent_selection_color = str(accent_selection_color)
+        if background_color:
+            self._background_color = str(background_color)
+        if surface_color:
+            self._surface_color = str(surface_color)
+        self.setStyleSheet(self._build_style(edit_mode=self._edit_mode))
+        self.viewport().update()
 
     @classmethod
     def _normalize_language(cls, language: str | None) -> str:
@@ -3277,6 +3549,7 @@ class CodeViewer(QPlainTextEdit):
             else Qt.TextSelectableByMouse | Qt.TextSelectableByKeyboard
         )
         self.setObjectName("aiInput" if self._edit_mode else "chatCodeViewer")
+        self.viewport().setObjectName(f"{self.objectName()}Viewport")
         self.setStyleSheet(self._build_style(edit_mode=self._edit_mode))
 
         style = self.style()
@@ -3290,22 +3563,62 @@ class CodeViewer(QPlainTextEdit):
 
     def _build_style(self, *, edit_mode: bool) -> str:
         border_color = self._accent_color if edit_mode else self._VIEW_BORDER_COLOR
-        border_radius = 15 if edit_mode else 8
-        selection_color = self._accent_selection_color if edit_mode else "#264f78"
+        border_radius = self._edit_border_radius_px if edit_mode else 8
+        border_width = self._edit_border_width_px if edit_mode else 1
+        border_top_width = border_width
+        border_left_width = (
+            self._edit_border_left_width_px
+            if edit_mode and self._edit_border_left_width_px is not None
+            else border_width
+        )
+        border_right_width = (
+            self._edit_border_right_width_px
+            if edit_mode and self._edit_border_right_width_px is not None
+            else border_width
+        )
+        top_left_radius = self._top_left_radius_px if self._top_left_radius_px is not None else border_radius
+        top_right_radius = self._top_right_radius_px if self._top_right_radius_px is not None else border_radius
+        bottom_left_radius = self._bottom_left_radius_px if self._bottom_left_radius_px is not None else border_radius
+        bottom_right_radius = self._bottom_right_radius_px if self._bottom_right_radius_px is not None else border_radius
+        if not self._draw_border:
+            border_width = 0
+            border_top_width = 0
+            border_left_width = 0
+            border_right_width = 0
+        else:
+            border_top_width = 0
+        selection_color = self._accent_selection_color if edit_mode else "rgba(120,120,120,96)"
         scrollbar_hover_color = self._surface_color
         scrollbar_pressed_color = self._accent_selection_color
         scrollbar_idle_color = "rgba(180, 180, 180, 0.45)" if edit_mode else "rgba(135, 135, 135, 0.40)"
         font_size_rule = f" font-size:{self._font_size_px}px;" if self._font_size_px is not None else ""
+        viewport_object_name = f"{self.objectName()}Viewport"
         return (
             f"QPlainTextEdit#{self.objectName()} {{"
-            f" background:{self._BACKGROUND_COLOR};"
+            f" background:{self._background_color};"
             f" color:{self._TEXT_COLOR};"
             " padding:12px;"
-            f" border:1px solid {border_color};"
-            f" border-radius:{border_radius}px;"
+            f" border-style:solid;"
+            f" border-color:{border_color};"
+            f" border-top-width:{border_top_width}px;"
+            f" border-left-width:{border_left_width}px;"
+            f" border-bottom-width:{border_width}px;"
+            f" border-right-width:{border_right_width}px;"
+            f" border-top-left-radius:{top_left_radius}px;"
+            f" border-top-right-radius:{top_right_radius}px;"
+            f" border-bottom-left-radius:{bottom_left_radius}px;"
+            f" border-bottom-right-radius:{bottom_right_radius}px;"
             f" selection-background-color:{selection_color};"
             f"{font_size_rule}"
             " font-family:'Fira Code','DejaVu Sans Mono','Liberation Mono',monospace;"
+            "}"
+            f"QWidget#{viewport_object_name} {{"
+            f" background:{self._background_color};"
+            " border:none;"
+            f" border-top-left-radius:{top_left_radius}px;"
+            f" border-top-right-radius:{top_right_radius}px;"
+            f" border-bottom-left-radius:{bottom_left_radius}px;"
+            f" border-bottom-right-radius:{bottom_right_radius}px;"
             "}"
             f"QPlainTextEdit#{self.objectName()} QScrollBar:vertical {{"
             " background:transparent;"
@@ -3436,12 +3749,13 @@ class ChatEditorPanel(QWidget):
 
         self._panel = QFrame(self)
         self._panel.setObjectName("runtimeWidgetPanel")
+        _clear_frame_chrome(self._panel)
         panel_layout = QVBoxLayout(self._panel)
-        panel_layout.setContentsMargins(3, 3, 3, 3)
+        panel_layout.setContentsMargins(0, 0, 0, 0)
         panel_layout.setSpacing(6)
 
         header = QHBoxLayout()
-        header.setContentsMargins(0, 0, 0, 0)
+        header.setContentsMargins(_SURFACE_INSET_PX, _SURFACE_INSET_PX, _SURFACE_INSET_PX, 0)
         header.setSpacing(6)
 
         header.addStretch(1)
@@ -3506,10 +3820,15 @@ class ChatEditorPanel(QWidget):
             self._panel,
             language=segment.language,
             editable=False,
-            accent_color=self._scheme.get("col1", "#3a5fff"),
-            accent_selection_color=self._scheme.get("col2", self._scheme.get("col1", "#6280ff")),
+            accent_color=self._scheme.get("col1", "#0fe913"),
+            accent_selection_color=self._scheme.get("col2", self._scheme.get("col1", "#58ed5b")),
             surface_color=self._scheme.get("col10", "#404040"),
             font_size_px=14,
+            top_left_radius_px=0,
+            top_right_radius_px=0,
+            bottom_left_radius_px=_SURFACE_BORDER_RADIUS_PX,
+            bottom_right_radius_px=_SURFACE_BORDER_RADIUS_PX,
+            draw_border=False,
         )
         self.viewer.setProperty("file_path", self._file_path)
 
@@ -3517,15 +3836,15 @@ class ChatEditorPanel(QWidget):
         panel_layout.addWidget(self.viewer)
         layout.addWidget(self._panel)
 
-        panel_bg = self._scheme.get("col7", "#191f2f")
-        panel_border = self._scheme.get("col10", "#33406a")
-        panel_fg = self._scheme.get("col6", "#e7eeff")
+        panel_bg = self._scheme.get("col7", "#0b0b0b")
+        panel_border = self._scheme.get("col10", "#1f1f1f")
+        panel_fg = self._scheme.get("col6", "#E3E3DE")
         self._panel.setStyleSheet(
             f"""
             QFrame#runtimeWidgetPanel {{
                 background: {panel_bg};
-                border: 1px solid {panel_border};
-                border-radius: 10px;
+                border: {_SURFACE_BORDER_WIDTH_PX}px solid {panel_border};
+                border-radius: {_SURFACE_BORDER_RADIUS_PX}px;
             }}
             QLabel#runtimeWidgetTitle {{
                 color: {panel_fg};
@@ -3553,7 +3872,9 @@ class ChatEditorPanel(QWidget):
     def _enter_edit_mode(self) -> None:
         if not self._expanded:
             self._set_expanded(True)
-        self._edit_btn.setChecked(True)
+        if not self._edit_btn.isChecked():
+            self._edit_btn.setChecked(True)
+        self.set_edit_mode(True)
 
     def _toggle_expanded(self, expanded: bool) -> None:
         self._set_expanded(bool(expanded))
@@ -3871,7 +4192,7 @@ class ChatInlinePanelSlot(QFrame):
         self.splitter = QSplitter(Qt.Vertical, self)
         self.splitter.setObjectName("chatInlineSlotSplitter")
         self.splitter.setChildrenCollapsible(True)
-        self.splitter.setHandleWidth(7)
+        self.splitter.setHandleWidth(4)
         self.splitter.setOpaqueResize(True)
 
         self.content_host = QWidget(self.splitter)
@@ -3958,6 +4279,11 @@ class ChatWindow(QWidget):
 
         self._apply_history_style()
 
+    def update_scheme(self, scheme: dict[str, str] | None) -> None:
+        self._scheme = dict(scheme or {})
+        self._apply_history_style()
+        self.update()
+
     def set_prompt_widget(self, prompt_widget: QWidget, *, snap_height: int = 90) -> None:
         if prompt_widget is None:
             return
@@ -4000,10 +4326,10 @@ class ChatWindow(QWidget):
         footer_widget.show()
 
     def _apply_history_style(self) -> None:
-        history_bg = self._scheme.get("col9", "#181818")
+        history_bg = self._scheme.get("col7", "#0b0b0b")
         prompt_bg = history_bg
         history_border = self._scheme.get("col10", "#404040")
-        history_accent = self._scheme.get("col2", self._scheme.get("col1", "#6280ff"))
+        history_accent = self._scheme.get("col2", self._scheme.get("col1", "#58ed5b"))
         slot_handle_idle, slot_handle_hover, slot_handle_pressed = _splitter_handle_palette(self._scheme)
         self.setStyleSheet(
             f"""
@@ -4029,7 +4355,7 @@ class ChatWindow(QWidget):
             }}
             QFrame#chatPromptContainer {{
                 background: {prompt_bg};
-                border-top: 1px solid {history_border};
+                border-top: none;
                 border-bottom-left-radius: 12px;
                 border-bottom-right-radius: 12px;
             }}
@@ -4123,8 +4449,8 @@ class ChatWindow(QWidget):
             }}
             QSplitter#chatInlineSlotSplitter::handle:vertical {{
                 background: {slot_handle_idle};
-                margin: 0px;
-                min-width: 7px;
+                margin: 10px 0px;
+                min-width: 4px;
                 border-radius: 999px;
             }}
             QSplitter#chatInlineSlotSplitter::handle:hover {{
@@ -4460,6 +4786,58 @@ from PySide6.QtCore import (
 
 # -----------------------------------------------------------
 
+class _SplitterToggleGlyph(QLabel):
+    clicked = Signal()
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._expanded = False
+        self._hovered = False
+        self._idle_color = "#9a9a9a"
+        self._active_color = "#35ff8a"
+        self.setAlignment(Qt.AlignCenter)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setFocusPolicy(Qt.NoFocus)
+        self.setFixedSize(16, 16)
+        self.setAttribute(Qt.WA_Hover, True)
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
+        self.setAutoFillBackground(False)
+        self.setExpanded(False)
+
+    def setColors(self, idle_color: str, active_color: str) -> None:
+        if idle_color:
+            self._idle_color = str(idle_color)
+        if active_color:
+            self._active_color = str(active_color)
+        self._apply_style()
+
+    def setExpanded(self, expanded: bool) -> None:
+        self._expanded = bool(expanded)
+        self.setText("▾" if self._expanded else "▸")
+        self._apply_style()
+
+    def enterEvent(self, event) -> None:  # noqa: N802
+        self._hovered = False
+        super().enterEvent(event)
+
+    def leaveEvent(self, event) -> None:  # noqa: N802
+        self._hovered = False
+        super().leaveEvent(event)
+
+    def mousePressEvent(self, event) -> None:  # noqa: N802
+        if event.button() == Qt.LeftButton:
+            self.clicked.emit()
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def _apply_style(self) -> None:
+        active = self._expanded
+        color = self._active_color if active else self._idle_color
+        self.setStyleSheet(
+            f"background: transparent; border: none; color: {color}; font-size: 13px; font-weight: 700;"
+        )
+
 class ControlPlaneWidget(QWidget):
     snapshotChanged = Signal(dict)
     _operator_async_result_ready = Signal(object)
@@ -4497,6 +4875,13 @@ class ControlPlaneWidget(QWidget):
         self._refresh_inflight = False
         self._refresh_pending = False
         self._refresh_pending_include_drilldown = False
+        self._tab_bar_label_max_chars = 10
+        self._control_tab_hover_index = -1
+        self._control_tab_hover_base_text = ""
+        self._control_tab_hover_phase = 0
+        self._control_tab_hover_marquee_timer = QTimer(self)
+        self._control_tab_hover_marquee_timer.setInterval(160)
+        self._control_tab_hover_marquee_timer.timeout.connect(self._tick_control_plane_tab_hover_marquee)
         self._build_ui()
         self.update_scheme(accent, base)
 
@@ -4516,9 +4901,140 @@ class ControlPlaneWidget(QWidget):
         if tabs_widget is None or not isinstance(tabs_widget, QTabWidget):
             return
         
+        self._stop_control_plane_tab_hover_marquee()
+
         # Replace the internal tabs with the external one
         # We don't need to remove the old tabs - they'll be replaced
         self.tabs = tabs_widget
+        self._apply_control_plane_tab_text_limits()
+        self._setup_control_plane_tab_bar_interactions()
+
+    def _format_control_plane_tab_text(self, value: str) -> str:
+        text = str(value or "")
+        max_chars_raw = getattr(self, "_tab_bar_label_max_chars", 10)
+        try:
+            max_chars = int(max_chars_raw)
+        except Exception:
+            max_chars = 10
+
+        if max_chars <= 0 or len(text) <= max_chars:
+            return text
+        return text[:max_chars]
+
+    def _control_plane_tab_full_text(self, index: int) -> str:
+        if not hasattr(self, "tabs"):
+            return ""
+        if index < 0 or index >= self.tabs.count():
+            return ""
+
+        tab_bar = self.tabs.tabBar()
+        tab_data = tab_bar.tabData(index) if isinstance(tab_bar, QTabBar) else None
+        if isinstance(tab_data, str) and tab_data:
+            return tab_data
+        return self.tabs.tabText(index)
+
+    def _set_control_plane_tab_text(self, index: int, value: str) -> None:
+        if not hasattr(self, "tabs"):
+            return
+        if index < 0 or index >= self.tabs.count():
+            return
+
+        full_text = str(value or "")
+        tab_bar = self.tabs.tabBar()
+        if isinstance(tab_bar, QTabBar):
+            tab_bar.setTabData(index, full_text)
+
+        self.tabs.setTabToolTip(index, "")
+        self.tabs.setTabText(index, self._format_control_plane_tab_text(full_text))
+
+    def _apply_control_plane_tab_text_limits(self) -> None:
+        if not hasattr(self, "tabs"):
+            return
+        for index in range(self.tabs.count()):
+            self._set_control_plane_tab_text(index, self._control_plane_tab_full_text(index))
+
+    def _setup_control_plane_tab_bar_interactions(self) -> None:
+        if not hasattr(self, "tabs"):
+            return
+        tab_bar = self.tabs.tabBar()
+        if not isinstance(tab_bar, QTabBar):
+            return
+        tab_bar.setMouseTracking(True)
+        tab_bar.installEventFilter(self)
+
+    def _start_control_plane_tab_hover_marquee(self, tab_index: int) -> None:
+        self._stop_control_plane_tab_hover_marquee()
+        if not hasattr(self, "tabs"):
+            return
+        tab_bar = self.tabs.tabBar()
+        if tab_index < 0 or tab_index >= tab_bar.count():
+            self._stop_control_plane_tab_hover_marquee()
+            return
+        if tab_index == self._control_tab_hover_index:
+            return
+
+        self._stop_control_plane_tab_hover_marquee()
+
+        base_text = self._control_plane_tab_full_text(tab_index)
+        if not base_text:
+            return
+
+        tab_rect = tab_bar.tabRect(tab_index)
+        available_width = max(tab_rect.width() - 20, 18)
+        text_width = tab_bar.fontMetrics().horizontalAdvance(base_text)
+        if text_width <= available_width:
+            return
+
+        self._control_tab_hover_index = tab_index
+        self._control_tab_hover_base_text = base_text
+        self._control_tab_hover_phase = 0
+        self._control_tab_hover_marquee_timer.start()
+
+    def _tick_control_plane_tab_hover_marquee(self) -> None:
+        if not hasattr(self, "tabs"):
+            self._stop_control_plane_tab_hover_marquee()
+            return
+        tab_bar = self.tabs.tabBar()
+        tab_index = self._control_tab_hover_index
+        if tab_index < 0 or tab_index >= tab_bar.count():
+            self._stop_control_plane_tab_hover_marquee()
+            return
+        if not self._control_tab_hover_base_text:
+            self._stop_control_plane_tab_hover_marquee()
+            return
+
+        cycle_text = f"{self._control_tab_hover_base_text}   "
+        if len(cycle_text) <= 1:
+            return
+
+        self._control_tab_hover_phase = (self._control_tab_hover_phase + 1) % len(cycle_text)
+        shift = self._control_tab_hover_phase
+        tab_bar.setTabText(tab_index, f"{cycle_text[shift:]}{cycle_text[:shift]}")
+
+    def _stop_control_plane_tab_hover_marquee(self) -> None:
+        if self._control_tab_hover_marquee_timer.isActive():
+            self._control_tab_hover_marquee_timer.stop()
+
+        tab_index = self._control_tab_hover_index
+        if tab_index >= 0 and self._control_tab_hover_base_text:
+            self._set_control_plane_tab_text(tab_index, self._control_tab_hover_base_text)
+
+        self._control_tab_hover_index = -1
+        self._control_tab_hover_base_text = ""
+        self._control_tab_hover_phase = 0
+
+    def eventFilter(self, obj, event):  # noqa: N802
+        if hasattr(self, "tabs") and obj is self.tabs.tabBar():
+            event_type = event.type()
+            if event_type == QEvent.MouseMove:
+                if hasattr(event, "position"):
+                    pos = event.position().toPoint()
+                else:
+                    pos = event.pos()
+                self._start_control_plane_tab_hover_marquee(self.tabs.tabBar().tabAt(pos))
+            elif event_type in (QEvent.Leave, QEvent.MouseButtonPress):
+                self._stop_control_plane_tab_hover_marquee()
+        return super().eventFilter(obj, event)
 
     def _control_plane_settings(self) -> QSettings:
         try:
@@ -4959,7 +5475,7 @@ class ControlPlaneWidget(QWidget):
 
             serialized_tabs.append(
                 {
-                    "name": self.tabs.tabText(index),
+                    "name": self._control_plane_tab_full_text(index),
                     "default_widget_kind": default_widget_kind,
                     "widgets": widget_payloads,
                 }
@@ -4970,7 +5486,7 @@ class ControlPlaneWidget(QWidget):
                 serialized_tabs[-1]["role"] = role_value
 
             if self.tabs.currentWidget() is tab_widget:
-                active_runtime_tab = self.tabs.tabText(index)
+                active_runtime_tab = self._control_plane_tab_full_text(index)
 
         return {
             "schema": self._RUNTIME_LAYOUT_SCHEMA,
@@ -5110,7 +5626,7 @@ class ControlPlaneWidget(QWidget):
             if active_name:
                 for index in range(self.tabs.count()):
                     tab_widget = self.tabs.widget(index)
-                    if tab_widget in self._runtime_tab_records and self.tabs.tabText(index).strip().lower() == active_name:
+                    if tab_widget in self._runtime_tab_records and self._control_plane_tab_full_text(index).strip().lower() == active_name:
                         self.tabs.setCurrentIndex(index)
                         break
         finally:
@@ -5230,6 +5746,7 @@ class ControlPlaneWidget(QWidget):
         self.tabs.setUsesScrollButtons(True)
         self.tabs.tabBar().setElideMode(Qt.ElideRight)
         self.tabs.tabBar().setExpanding(False)
+        self._setup_control_plane_tab_bar_interactions()
 
         config_tab = QWidget(self.tabs)
         self._config_tab = config_tab
@@ -5251,28 +5768,13 @@ class ControlPlaneWidget(QWidget):
         self.config_manifest_view.setMinimumHeight(0)
         self.config_manifest_view.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
 
-        self.config_splitter = self._create_viewport_splitter(config_tab)
-        self.config_splitter.addWidget(self.config_summary_view)
-        self.config_splitter.addWidget(self.config_manifest_view)
-        self.config_splitter.setSizes([140, 280])
-        self.config_splitter.setStretchFactor(0, 1)
-        self.config_splitter.setStretchFactor(1, 2)
-        config_layout.addWidget(self.config_splitter, 1)
-
-        monitor_tab = QWidget(self.tabs)
-        monitor_tab.setMinimumSize(0, 0)
-        monitor_tab.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
-        monitor_layout = QVBoxLayout(monitor_tab)
-        monitor_layout.setContentsMargins(0, 0, 0, 0)
-        monitor_layout.setSpacing(8)
-
-        self.monitor_summary_view = QTextBrowser(monitor_tab)
+        self.monitor_summary_view = QTextBrowser(config_tab)
         self.monitor_summary_view.setObjectName("controlBrowser")
         self.monitor_summary_view.setOpenExternalLinks(False)
         self.monitor_summary_view.setMinimumHeight(0)
         self.monitor_summary_view.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
 
-        self.monitor_filter_panel = QWidget(monitor_tab)
+        self.monitor_filter_panel = QWidget(config_tab)
         self.monitor_filter_panel.setMinimumSize(0, 0)
         self.monitor_filter_panel.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
 
@@ -5285,10 +5787,10 @@ class ControlPlaneWidget(QWidget):
         drilldown_form.setSpacing(8)
         drilldown_form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
 
-        agent_label = QLabel("Agent", monitor_tab)
+        agent_label = QLabel("Agent", config_tab)
         agent_label.setObjectName("controlMeta")
 
-        self.agent_selector = QComboBox(monitor_tab)
+        self.agent_selector = QComboBox(config_tab)
         self.agent_selector.setObjectName("controlSelector")
         self.agent_selector.setMinimumContentsLength(10)
         self.agent_selector.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
@@ -5296,10 +5798,10 @@ class ControlPlaneWidget(QWidget):
         self.agent_selector.currentTextChanged.connect(self._refresh_drilldown_views)
         drilldown_form.addRow(agent_label, self.agent_selector)
 
-        workflow_label = QLabel("Workflow", monitor_tab)
+        workflow_label = QLabel("Workflow", config_tab)
         workflow_label.setObjectName("controlMeta")
 
-        self.workflow_selector = QComboBox(monitor_tab)
+        self.workflow_selector = QComboBox(config_tab)
         self.workflow_selector.setObjectName("controlSelector")
         self.workflow_selector.setMinimumContentsLength(10)
         self.workflow_selector.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
@@ -5314,9 +5816,9 @@ class ControlPlaneWidget(QWidget):
         trace_filter_form.setSpacing(8)
         trace_filter_form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
 
-        trace_agent_label = QLabel("Trace Agent", monitor_tab)
+        trace_agent_label = QLabel("Trace Agent", config_tab)
         trace_agent_label.setObjectName("controlMeta")
-        self.trace_agent_selector = QComboBox(monitor_tab)
+        self.trace_agent_selector = QComboBox(config_tab)
         self.trace_agent_selector.setObjectName("controlSelector")
         self.trace_agent_selector.setMinimumContentsLength(10)
         self.trace_agent_selector.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
@@ -5324,9 +5826,9 @@ class ControlPlaneWidget(QWidget):
         self.trace_agent_selector.currentTextChanged.connect(self._refresh_monitoring_views)
         trace_filter_form.addRow(trace_agent_label, self.trace_agent_selector)
 
-        trace_workflow_label = QLabel("Trace Workflow", monitor_tab)
+        trace_workflow_label = QLabel("Trace Workflow", config_tab)
         trace_workflow_label.setObjectName("controlMeta")
-        self.trace_workflow_selector = QComboBox(monitor_tab)
+        self.trace_workflow_selector = QComboBox(config_tab)
         self.trace_workflow_selector.setObjectName("controlSelector")
         self.trace_workflow_selector.setMinimumContentsLength(10)
         self.trace_workflow_selector.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
@@ -5334,9 +5836,9 @@ class ControlPlaneWidget(QWidget):
         self.trace_workflow_selector.currentTextChanged.connect(self._refresh_monitoring_views)
         trace_filter_form.addRow(trace_workflow_label, self.trace_workflow_selector)
 
-        trace_tool_label = QLabel("Trace Tool", monitor_tab)
+        trace_tool_label = QLabel("Trace Tool", config_tab)
         trace_tool_label.setObjectName("controlMeta")
-        self.trace_tool_selector = QComboBox(monitor_tab)
+        self.trace_tool_selector = QComboBox(config_tab)
         self.trace_tool_selector.setObjectName("controlSelector")
         self.trace_tool_selector.setMinimumContentsLength(10)
         self.trace_tool_selector.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
@@ -5344,9 +5846,9 @@ class ControlPlaneWidget(QWidget):
         self.trace_tool_selector.currentTextChanged.connect(self._refresh_monitoring_views)
         trace_filter_form.addRow(trace_tool_label, self.trace_tool_selector)
 
-        trace_handoff_label = QLabel("Trace Handoff", monitor_tab)
+        trace_handoff_label = QLabel("Trace Handoff", config_tab)
         trace_handoff_label.setObjectName("controlMeta")
-        self.trace_handoff_selector = QComboBox(monitor_tab)
+        self.trace_handoff_selector = QComboBox(config_tab)
         self.trace_handoff_selector.setObjectName("controlSelector")
         self.trace_handoff_selector.setMinimumContentsLength(10)
         self.trace_handoff_selector.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
@@ -5356,7 +5858,7 @@ class ControlPlaneWidget(QWidget):
 
         drilldown_layout.addLayout(trace_filter_form)
 
-        self.tree_stream_panel = QFrame(monitor_tab)
+        self.tree_stream_panel = QFrame(config_tab)
         self.tree_stream_panel.setObjectName("controlMetricCard")
         self.tree_stream_panel.setMinimumSize(0, 0)
         self.tree_stream_panel.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
@@ -5427,43 +5929,107 @@ class ControlPlaneWidget(QWidget):
             "reload_.svg",
             "Monitor-Detail aktualisieren",
             slot=self._refresh_drilldown_views,
-            parent=monitor_tab,
+            parent=config_tab,
         )
         self.btn_refresh_detail.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
         detail_action_row.addWidget(self.btn_refresh_detail, 0)
         detail_action_row.addStretch(1)
         drilldown_layout.addLayout(detail_action_row)
 
-        self.monitor_detail_view = QTextBrowser(monitor_tab)
+        self.monitor_detail_view = QTextBrowser(config_tab)
         self.monitor_detail_view.setObjectName("controlBrowser")
         self.monitor_detail_view.setOpenExternalLinks(False)
         self.monitor_detail_view.setMinimumHeight(0)
         self.monitor_detail_view.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
 
-        self.monitor_timeline_view = QTextBrowser(monitor_tab)
+        self.monitor_timeline_view = QTextBrowser(config_tab)
         self.monitor_timeline_view.setObjectName("controlBrowser")
         self.monitor_timeline_view.setOpenExternalLinks(False)
         self.monitor_timeline_view.setMinimumHeight(0)
         self.monitor_timeline_view.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
 
-        self.monitor_trace_view = QTextBrowser(monitor_tab)
+        self.monitor_trace_view = QTextBrowser(config_tab)
         self.monitor_trace_view.setObjectName("controlBrowser")
         self.monitor_trace_view.setOpenExternalLinks(False)
         self.monitor_trace_view.setMinimumHeight(0)
         self.monitor_trace_view.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
 
-        self.monitor_header_splitter = self._create_viewport_splitter(monitor_tab)
-        self.monitor_header_splitter.addWidget(self.monitor_summary_view)
-        self.monitor_header_splitter.addWidget(self.monitor_filter_panel)
-        self.monitor_header_splitter.setSizes([130, 170])
+        # Keep host-level scaling separate from section-level splitter resizing.
+        self.config_monitor_host_splitter = self._create_viewport_splitter(config_tab)
 
-        self.monitor_splitter = self._create_viewport_splitter(monitor_tab)
-        self.monitor_splitter.addWidget(self.monitor_header_splitter)
-        self.monitor_splitter.addWidget(self.monitor_detail_view)
-        self.monitor_splitter.addWidget(self.monitor_timeline_view)
-        self.monitor_splitter.addWidget(self.monitor_trace_view)
-        self.monitor_splitter.setSizes([300, 200, 170, 280])
-        monitor_layout.addWidget(self.monitor_splitter, 1)
+        self.config_monitor_host_widget = QWidget(config_tab)
+        self.config_monitor_host_widget.setMinimumSize(0, 0)
+        self.config_monitor_host_widget.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Expanding)
+        config_monitor_host_layout = QVBoxLayout(self.config_monitor_host_widget)
+        config_monitor_host_layout.setContentsMargins(0, 0, 0, 0)
+        config_monitor_host_layout.setSpacing(0)
+
+        self.config_monitor_splitter = self._create_viewport_splitter(self.config_monitor_host_widget)
+        self.config_monitor_splitter_anchor = QWidget(self.config_monitor_splitter)
+        self.config_monitor_splitter_anchor.setObjectName("controlSplitterAnchor")
+        self.config_monitor_splitter_anchor.setMinimumHeight(0)
+        self.config_monitor_splitter_anchor.setMaximumHeight(0)
+        self.config_monitor_splitter_anchor.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+        self.config_monitor_splitter.addWidget(self.config_monitor_splitter_anchor)
+
+        self.config_monitor_sections: list[QFrame] = []
+        self._config_monitor_section_state: dict[QFrame, dict[str, Any]] = {}
+        self._config_monitor_splitter_handle_controls: dict[int, dict[str, Any]] = {}
+        for section_title, section_widget, section_expanded in (
+            ("Monitoring Summary", self.monitor_summary_view, False),
+            ("Monitoring Filters", self.monitor_filter_panel, False),
+            ("Monitoring Drilldown", self.monitor_detail_view, False),
+            ("Trace Detail", self.monitor_trace_view, False),
+            ("Event Timeline", self.monitor_timeline_view, False),
+            ("Configuration Summary", self.config_summary_view, False),
+            ("Configuration Manifest", self.config_manifest_view, False),
+        ):
+            section = self._create_splitter_dropdown_section(
+                parent=self.config_monitor_splitter,
+                title=section_title,
+                content_widget=section_widget,
+                expanded=section_expanded,
+            )
+            self.config_monitor_sections.append(section)
+            self.config_monitor_splitter.addWidget(section)
+
+        self.config_monitor_splitter.setSizes([1, 240, 220, 280, 260, 220, 220, 240])
+        self.config_monitor_splitter.setStretchFactor(0, 0)
+        for section_index in range(len(self.config_monitor_sections)):
+            self.config_monitor_splitter.setStretchFactor(section_index + 1, 1)
+        self._setup_config_monitor_splitter_handles()
+        self._sync_config_monitor_splitter_handle_states()
+        config_monitor_host_layout.addWidget(self.config_monitor_splitter, 1)
+
+        self.config_monitor_threat_flow_panel = QFrame(config_tab)
+        self.config_monitor_threat_flow_panel.setObjectName("controlMetricCard")
+        self.config_monitor_threat_flow_panel.setMinimumSize(0, 0)
+        self.config_monitor_threat_flow_panel.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Expanding)
+
+        threat_flow_layout = QVBoxLayout(self.config_monitor_threat_flow_panel)
+        threat_flow_layout.setContentsMargins(10, 10, 10, 10)
+        threat_flow_layout.setSpacing(6)
+
+        self.config_monitor_threat_flow_view = QTextBrowser(self.config_monitor_threat_flow_panel)
+        self.config_monitor_threat_flow_view.setObjectName("controlBrowser")
+        self.config_monitor_threat_flow_view.setOpenExternalLinks(False)
+        self.config_monitor_threat_flow_view.setMinimumHeight(0)
+        self.config_monitor_threat_flow_view.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Expanding)
+        self.config_monitor_threat_flow_view.setHtml(
+            "<p>Waiting for monitoring snapshot...</p>"
+        )
+        threat_flow_layout.addWidget(self.config_monitor_threat_flow_view, 1)
+
+        self.config_monitor_host_splitter.addWidget(self.config_monitor_host_widget)
+        self.config_monitor_host_splitter.addWidget(self.config_monitor_threat_flow_panel)
+        self.config_monitor_host_splitter.setSizes([860, 240])
+        self.config_monitor_host_splitter.setStretchFactor(0, 5)
+        self.config_monitor_host_splitter.setStretchFactor(1, 2)
+        self._config_monitor_host_threat_flow_size = 240
+        self._setup_config_monitor_host_splitter_handle()
+        self._sync_config_monitor_host_splitter_handle_state()
+
+        config_layout.addWidget(self.config_monitor_host_splitter, 1)
 
         operations_tab = QWidget(self.tabs)
         operations_tab.setMinimumSize(0, 0)
@@ -5562,9 +6128,10 @@ class ControlPlaneWidget(QWidget):
         self.operations_splitter.setSizes([220, 160])
         operations_layout.addWidget(self.operations_splitter, 1)
 
-        self.tabs.addTab(config_tab, "Configuration")
-        self.tabs.addTab(monitor_tab, "Monitoring")
-        self.tabs.addTab(operations_tab, "Operations")
+        config_tab_index = self.tabs.addTab(config_tab, "Monitoring")
+        self._set_control_plane_tab_text(config_tab_index, "Monitoring")
+        operations_tab_index = self.tabs.addTab(operations_tab, "Operations")
+        self._set_control_plane_tab_text(operations_tab_index, "Operations")
 
         # Builder-tab symbol button removed per UX request.
         self._code_tab_new_button = None
@@ -5643,7 +6210,7 @@ class ControlPlaneWidget(QWidget):
                 if candidate not in self._runtime_tab_records:
                     continue
                 role = str(candidate.property("runtime_role") or "").strip().lower()
-                tab_name = self.tabs.tabText(i).strip().lower()
+                tab_name = self._control_plane_tab_full_text(i).strip().lower()
                 if role == "builder" or tab_name in {
                     self._LEGACY_BUILD_RUNTIME_TAB_LABEL.strip().lower(),
                     self._BUILD_RUNTIME_TAB_LABEL.strip().lower(),
@@ -5667,7 +6234,7 @@ class ControlPlaneWidget(QWidget):
             return None
         for i in range(self.tabs.count()):
             candidate = self.tabs.widget(i)
-            if candidate in self._runtime_tab_records and self.tabs.tabText(i).strip().lower() == normalized:
+            if candidate in self._runtime_tab_records and self._control_plane_tab_full_text(i).strip().lower() == normalized:
                 return candidate
         return None
 
@@ -5730,7 +6297,7 @@ class ControlPlaneWidget(QWidget):
 
         builder_index = self.tabs.indexOf(builder_tab)
         if builder_index >= 0:
-            self.tabs.setTabText(builder_index, self._BUILD_RUNTIME_TAB_LABEL)
+            self._set_control_plane_tab_text(builder_index, self._BUILD_RUNTIME_TAB_LABEL)
             self.tabs.setTabIcon(builder_index, QIcon())
 
         has_builder_widget = False
@@ -5823,7 +6390,7 @@ class ControlPlaneWidget(QWidget):
 
     def _next_runtime_tab_name(self, requested_name: str) -> str:
         base_name = str(requested_name or "").strip() or f"Runtime {self._runtime_tab_counter + 1}"
-        existing = {self.tabs.tabText(i).strip().lower() for i in range(self.tabs.count())}
+        existing = {self._control_plane_tab_full_text(i).strip().lower() for i in range(self.tabs.count())}
         if base_name.lower() not in existing:
             return base_name
 
@@ -5940,6 +6507,169 @@ class ControlPlaneWidget(QWidget):
             return "text", "Runtime notes\n"
         return "json", "{\n  \"runtime\": {\n    \"agents\": [],\n    \"workflows\": []\n  }\n}\n"
 
+    def _apply_runtime_widget_panel_scheme(self, panel: QWidget) -> None:
+        if not isinstance(panel, QWidget):
+            return
+        widget_kind = str(panel.property("runtime_widget_kind") or "").strip().lower()
+        is_runtime_tab_panel = bool(panel.property("runtime_tab_panel"))
+        is_builder_panel = widget_kind == "builder_panel"
+        viewer_surface_kinds = {"code_json", "code_yaml", "code_python", "code_markdown", "code_toml", "text_view"}
+        if is_runtime_tab_panel and widget_kind in viewer_surface_kinds:
+            chrome_bg = CodeViewer._BACKGROUND_COLOR
+        else:
+            chrome_bg = self.scheme["col7"]
+        panel_bg = chrome_bg
+        panel_border = "transparent" if is_runtime_tab_panel else self.scheme["col10"]
+        top_border_rule = "border-top: none;" if is_runtime_tab_panel else ""
+        top_left_radius_rule = "border-top-left-radius: 0px;" if is_runtime_tab_panel else f"border-top-left-radius: {_SURFACE_BORDER_RADIUS_PX}px;"
+        top_right_radius_rule = "border-top-right-radius: 0px;" if is_runtime_tab_panel else f"border-top-right-radius: {_SURFACE_BORDER_RADIUS_PX}px;"
+        bottom_left_radius_rule = f"border-bottom-left-radius: {_SURFACE_BORDER_RADIUS_PX}px;"
+        bottom_right_radius_rule = f"border-bottom-right-radius: {_SURFACE_BORDER_RADIUS_PX}px;"
+        panel.setStyleSheet(
+            f"""
+            QFrame#runtimeWidgetPanel {{
+                background: {panel_bg};
+                border: {_SURFACE_BORDER_WIDTH_PX}px solid {panel_border};
+                {top_border_rule}
+                {top_left_radius_rule}
+                {top_right_radius_rule}
+                {bottom_left_radius_rule}
+                {bottom_right_radius_rule}
+            }}
+            QLabel#runtimeWidgetTitle {{
+                color: {self.scheme['col6']};
+                font-weight: 600;
+            }}
+            QToolButton#runtimeWidgetActionButton {{
+                background: {chrome_bg};
+                border: 1px solid transparent;
+                border-radius: 6px;
+                padding: 2px;
+            }}
+            QToolButton#runtimeWidgetActionButton:hover {{
+                background: {chrome_bg};
+                border: 1px solid transparent;
+            }}
+            QToolButton#runtimeWidgetRemoveButton {{
+                background: {chrome_bg};
+                border: 1px solid transparent;
+                border-radius: 6px;
+                padding: 2px;
+            }}
+            QToolButton#runtimeWidgetRemoveButton:hover {{
+                background: {chrome_bg};
+                border: 1px solid transparent;
+            }}
+            """
+        )
+
+    def _apply_builder_panel_scheme(self, panel: QWidget, *, show_toolbar: bool | None = None) -> None:
+        if not isinstance(panel, QWidget):
+            return
+        if show_toolbar is None:
+            show_toolbar = bool(panel.property("_builder_show_toolbar"))
+        panel_bg = self.scheme["col7"]
+        button_bg = panel_bg
+        panel_border = f"1px solid {self.scheme['col10']}" if bool(show_toolbar) else "none"
+        panel_radius = "10px" if bool(show_toolbar) else "0px"
+        panel.setStyleSheet(
+            f"""
+            QFrame#controlBuilderPanel {{
+                background: {panel_bg};
+                border: {panel_border};
+                border-radius: {panel_radius};
+            }}
+            QPushButton#builderTemplateButton,
+            QPushButton#builderBuildButton,
+            QPushButton#builderPostButton,
+            QPushButton#builderCopyButton {{
+                background: {button_bg};
+                border: 1px solid transparent;
+                border-radius: 8px;
+                padding: 1px;
+                min-width: 22px;
+                min-height: 22px;
+            }}
+            QPushButton#builderTemplateButton:hover,
+            QPushButton#builderBuildButton:hover,
+            QPushButton#builderPostButton:hover,
+            QPushButton#builderCopyButton:hover {{
+                background: {button_bg};
+                border-color: transparent;
+            }}
+            """
+        )
+        for viewer in panel.findChildren(CodeViewer):
+            viewer.set_theme_colors(
+                accent_color=self.scheme.get("col10", "#1f1f1f"),
+                accent_selection_color=self.scheme.get("col2", "#6280ff"),
+                background_color=panel_bg,
+                surface_color=panel_bg,
+            )
+
+    def _runtime_tab_panels(self, tab_widget: QWidget | None) -> list[QWidget]:
+        if not isinstance(tab_widget, QWidget):
+            return []
+        record = self._runtime_tab_records.get(tab_widget) or {}
+        splitter = record.get("splitter") if isinstance(record, dict) else None
+        if not isinstance(splitter, QSplitter):
+            return []
+        panels: list[QWidget] = []
+        for idx in range(splitter.count()):
+            panel = splitter.widget(idx)
+            if isinstance(panel, QWidget) and panel.objectName() == "runtimeWidgetPanel":
+                panels.append(panel)
+        return panels
+
+    def _runtime_tab_page_background_color(self, tab_widget: QWidget | None) -> str:
+        if not isinstance(tab_widget, QWidget):
+            return self.scheme.get("col9", "#101010")
+
+        runtime_role = str(tab_widget.property("runtime_role") or "").strip().lower()
+        if runtime_role == "builder":
+            return self.scheme.get("col7", "#0b0b0b")
+
+        record = self._runtime_tab_records.get(tab_widget) or {}
+        default_kind = str(record.get("default_widget_kind") or "").strip().lower() if isinstance(record, dict) else ""
+        if default_kind == "builder_panel":
+            return self.scheme.get("col7", "#0b0b0b")
+        return self.scheme.get("col9", "#101010")
+
+    def _apply_runtime_tab_page_scheme(self, tab_widget: QWidget | None) -> None:
+        if not isinstance(tab_widget, QWidget):
+            return
+        page_bg = self._runtime_tab_page_background_color(tab_widget)
+        tab_widget.setStyleSheet(
+            f"""
+            QWidget#controlRuntimeTabPage {{
+                background: {page_bg};
+                border: none;
+                border-radius: 0px;
+            }}
+            QWidget#controlRuntimeTabPage > QSplitter#controlViewportSplitter {{
+                background: {page_bg};
+                border: none;
+            }}
+            """
+        )
+
+    def _refresh_runtime_panel_schemes(self) -> None:
+        for tab_widget in self._runtime_tab_records:
+            self._apply_runtime_tab_page_scheme(tab_widget)
+        for panel in self.findChildren(QFrame, "runtimeWidgetPanel"):
+            self._apply_runtime_widget_panel_scheme(panel)
+        for panel in self.findChildren(QFrame, "controlBuilderPanel"):
+            self._apply_builder_panel_scheme(panel)
+        for viewer in self.findChildren(CodeViewer):
+            parent_widget = viewer.parentWidget()
+            if isinstance(parent_widget, QFrame) and parent_widget.objectName() == "controlBuilderPanel":
+                continue
+            viewer.set_theme_colors(
+                accent_color=self.scheme.get("col1", "#3a5fff"),
+                accent_selection_color=self.scheme.get("col2", "#6280ff"),
+                surface_color=self.scheme.get("col9", "#101010"),
+            )
+
     def _locate_runtime_tab_for_panel(self, panel: QWidget) -> tuple[QWidget | None, QSplitter | None]:
         for tab_widget, record in self._runtime_tab_records.items():
             splitter = record.get("splitter") if isinstance(record, dict) else None
@@ -5972,6 +6702,9 @@ class ControlPlaneWidget(QWidget):
                 self._dispose_runtime_tab(tab_widget, persist=True)
                 return
 
+            self._apply_runtime_tab_page_scheme(tab_widget)
+            for remaining_panel in self._runtime_tab_panels(tab_widget):
+                self._apply_runtime_widget_panel_scheme(remaining_panel)
             self._schedule_runtime_state_save()
 
         QTimer.singleShot(0, _finalize_removal)
@@ -5987,46 +6720,16 @@ class ControlPlaneWidget(QWidget):
     ) -> QWidget:
         panel = QFrame(tab_widget)
         panel.setObjectName("runtimeWidgetPanel")
-        panel.setStyleSheet(
-            f"""
-            QFrame#runtimeWidgetPanel {{
-                background: {self.scheme['col7']};
-                border: 1px solid {self.scheme['col10']};
-                border-radius: 10px;
-            }}
-            QLabel#runtimeWidgetTitle {{
-                color: {self.scheme['col6']};
-                font-weight: 600;
-            }}
-            QToolButton#runtimeWidgetActionButton {{
-                background: {self.scheme['col7']};
-                border: 1px solid transparent;
-                border-radius: 6px;
-                padding: 2px;
-            }}
-            QToolButton#runtimeWidgetActionButton:hover {{
-                background: {self.scheme['col7']};
-                border: 1px solid transparent;
-            }}
-            QToolButton#runtimeWidgetRemoveButton {{
-                background: {self.scheme['col7']};
-                border: 1px solid transparent;
-                border-radius: 6px;
-                padding: 2px;
-            }}
-            QToolButton#runtimeWidgetRemoveButton:hover {{
-                background: {self.scheme['col7']};
-                border: 1px solid transparent;
-            }}
-            """
-        )
+        _clear_frame_chrome(panel)
+        panel.setProperty("runtime_tab_panel", True)
+        kind = str(widget_kind or "code_json").strip().lower()
 
         root = QVBoxLayout(panel)
-        root.setContentsMargins(8, 8, 8, 8)
+        root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(6)
 
         header = QHBoxLayout()
-        header.setContentsMargins(0, 0, 0, 0)
+        header.setContentsMargins(_SURFACE_INSET_PX, _SURFACE_INSET_PX, _SURFACE_INSET_PX, 0)
         header.setSpacing(6)
         title_label = QLabel(title, panel)
         title_label.setObjectName("runtimeWidgetTitle")
@@ -6064,7 +6767,6 @@ class ControlPlaneWidget(QWidget):
 
         root.addLayout(header)
 
-        kind = str(widget_kind or "code_json").strip().lower()
         language, default_text = self._runtime_widget_template(kind)
         resolved_source_path = str(source_path or "").strip()
         path_text = self._read_runtime_source_text(resolved_source_path)
@@ -6073,6 +6775,7 @@ class ControlPlaneWidget(QWidget):
         panel.setProperty("runtime_widget_kind", kind)
         panel.setProperty("runtime_widget_title", str(title))
         panel.setProperty("runtime_source_path", resolved_source_path)
+        self._apply_runtime_widget_panel_scheme(panel)
 
         if kind == "agent_relation_graph":
             graph_source_uri = resolved_source_path or str(content or "").strip()
@@ -6132,10 +6835,15 @@ class ControlPlaneWidget(QWidget):
                 language=language,
                 editable=True,
                 auto_fit=False,
-                accent_color=self.scheme.get("col1", "#3a5fff"),
-                accent_selection_color=self.scheme.get("col2", "#6280ff"),
+                accent_color=self.scheme.get("col1", "#0fe913"),
+                accent_selection_color=self.scheme.get("col2", "#58ed5b"),
                 surface_color=self.scheme.get("col9", "#101010"),
                 font_size_px=14,
+                top_left_radius_px=0,
+                top_right_radius_px=0,
+                bottom_left_radius_px=_SURFACE_BORDER_RADIUS_PX,
+                bottom_right_radius_px=_SURFACE_BORDER_RADIUS_PX,
+                draw_border=False,
             )
             editor.setMinimumHeight(96)
             editor.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
@@ -6146,10 +6854,25 @@ class ControlPlaneWidget(QWidget):
         else:
             text_view = QPlainTextEdit(panel)
             text_view.setPlainText(resolved_text)
+            _clear_frame_chrome(text_view)
             text_view.setLineWrapMode(QPlainTextEdit.NoWrap)
             text_view.setMinimumHeight(96)
             text_view.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
             text_view.setProperty("runtime_source_path", resolved_source_path)
+            text_view.setStyleSheet(
+                f"""
+                QPlainTextEdit {{
+                    background: {self.scheme.get('col9', '#101010')};
+                    color: {self.scheme.get('col6', '#E3E3DE')};
+                    border: none;
+                    border-top-left-radius: 0px;
+                    border-top-right-radius: 0px;
+                    border-bottom-left-radius: {_SURFACE_BORDER_RADIUS_PX}px;
+                    border-bottom-right-radius: {_SURFACE_BORDER_RADIUS_PX}px;
+                    padding: 12px;
+                }}
+                """
+            )
             text_view.textChanged.connect(self._schedule_runtime_state_save)
             root.addWidget(text_view, 1)
 
@@ -6171,7 +6894,7 @@ class ControlPlaneWidget(QWidget):
             candidate_tab = self.tabs.widget(index)
             if candidate_tab not in self._runtime_tab_records:
                 continue
-            if self.tabs.tabText(index).strip().lower() == normalized_tab_name:
+            if self._control_plane_tab_full_text(index).strip().lower() == normalized_tab_name:
                 target_tab = candidate_tab
                 break
         if target_tab is None:
@@ -6351,6 +7074,9 @@ class ControlPlaneWidget(QWidget):
             panel_index = splitter.indexOf(panel)
             if panel_index >= 0:
                 splitter.setCollapsible(panel_index, True)
+        self._apply_runtime_tab_page_scheme(tab_widget)
+        for runtime_panel in self._runtime_tab_panels(tab_widget):
+            self._apply_runtime_widget_panel_scheme(runtime_panel)
         if persist:
             self._schedule_runtime_state_save()
         return panel
@@ -6372,6 +7098,8 @@ class ControlPlaneWidget(QWidget):
             resolved_default_kind = "code_json"
 
         tab_widget = QWidget(self.tabs)
+        tab_widget.setObjectName("controlRuntimeTabPage")
+        tab_widget.setAttribute(Qt.WA_StyledBackground, True)
         tab_layout = QVBoxLayout(tab_widget)
         tab_layout.setContentsMargins(0, 0, 0, 0)
         tab_layout.setSpacing(0)
@@ -6387,12 +7115,14 @@ class ControlPlaneWidget(QWidget):
             "splitter": workspace_splitter,
             "widget_count": 0,
         }
+        self._apply_runtime_tab_page_scheme(tab_widget)
         self._set_runtime_tab_default_widget_kind(tab_widget, resolved_default_kind, persist=False)
 
         if add_default_widget:
             self._add_widget_to_runtime_tab(tab_widget, widget_kind=resolved_default_kind, persist=False)
 
         tab_index = self.tabs.addTab(tab_widget, resolved_name)
+        self._set_control_plane_tab_text(tab_index, resolved_name)
         if activate:
             self.tabs.setCurrentIndex(tab_index)
         self._runtime_tab_counter += 1
@@ -6428,7 +7158,7 @@ class ControlPlaneWidget(QWidget):
         normalized_name = str(tab_name or "").strip().lower()
         for i in range(self.tabs.count()):
             candidate = self.tabs.widget(i)
-            if candidate in self._runtime_tab_records and self.tabs.tabText(i).strip().lower() == normalized_name:
+            if candidate in self._runtime_tab_records and self._control_plane_tab_full_text(i).strip().lower() == normalized_name:
                 target_tab = candidate
                 break
         if target_tab is None:
@@ -6479,11 +7209,384 @@ class ControlPlaneWidget(QWidget):
         splitter = QSplitter(Qt.Vertical, parent)
         splitter.setObjectName("controlViewportSplitter")
         splitter.setChildrenCollapsible(True)
-        splitter.setHandleWidth(7)
+        splitter.setHandleWidth(4)
         splitter.setOpaqueResize(True)
         splitter.setMinimumSize(0, 0)
         splitter.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Expanding)
         return splitter
+
+    def _is_config_monitor_host_threat_flow_expanded(self) -> bool:
+        splitter = getattr(self, "config_monitor_host_splitter", None)
+        if not isinstance(splitter, QSplitter):
+            return False
+        sizes = splitter.sizes()
+        return len(sizes) >= 2 and int(sizes[1]) > 0
+
+    def _set_config_monitor_host_threat_flow_expanded(self, expanded: bool) -> None:
+        splitter = getattr(self, "config_monitor_host_splitter", None)
+        if not isinstance(splitter, QSplitter):
+            return
+
+        sizes = splitter.sizes()
+        if len(sizes) < 2:
+            return
+
+        total_size = max(1, int(sizes[0]) + int(sizes[1]))
+        if expanded:
+            remembered_size = max(140, int(getattr(self, "_config_monitor_host_threat_flow_size", 240) or 240))
+            target_second = min(remembered_size, max(120, total_size - 120))
+        else:
+            current_second = int(sizes[1])
+            if current_second > 0:
+                self._config_monitor_host_threat_flow_size = max(140, current_second)
+            target_second = 0
+
+        splitter.setSizes([max(1, total_size - target_second), target_second])
+        self._sync_config_monitor_host_splitter_handle_state()
+
+    def _toggle_config_monitor_host_threat_flow(self) -> None:
+        self._set_config_monitor_host_threat_flow_expanded(
+            not self._is_config_monitor_host_threat_flow_expanded()
+        )
+
+    def _sync_config_monitor_host_splitter_handle_state(self, *_args: Any) -> None:
+        splitter = getattr(self, "config_monitor_host_splitter", None)
+        if not isinstance(splitter, QSplitter):
+            return
+
+        toggle_button = getattr(self, "config_monitor_host_splitter_toggle", None)
+        expanded = self._is_config_monitor_host_threat_flow_expanded()
+
+        sizes = splitter.sizes()
+        if len(sizes) >= 2 and int(sizes[1]) > 0:
+            self._config_monitor_host_threat_flow_size = max(140, int(sizes[1]))
+
+        if isinstance(toggle_button, _SplitterToggleGlyph):
+            toggle_button.blockSignals(True)
+            self._set_control_splitter_toggle_glyph(toggle_button, expanded)
+            toggle_button.setToolTip(
+                "Threat Flow einklappen" if expanded else "Threat Flow ausklappen"
+            )
+            toggle_button.blockSignals(False)
+
+    def _setup_config_monitor_host_splitter_handle(self) -> None:
+        splitter = getattr(self, "config_monitor_host_splitter", None)
+        if not isinstance(splitter, QSplitter):
+            return
+
+        splitter.setHandleWidth(22)
+        handle = splitter.handle(1)
+        if handle is None:
+            return
+        handle.setObjectName("controlHostSplitterHandle")
+
+        handle_layout = QHBoxLayout(handle)
+        handle_layout.setContentsMargins(6, 0, 6, 0)
+        handle_layout.setSpacing(6)
+
+        host_label_text = "Thread Flow Splitter"
+        handle_label = QLabel(host_label_text, handle)
+        handle_label.setObjectName("controlHostSplitterHandleLabel")
+        handle_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        handle_label.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        handle_label.setToolTip(host_label_text)
+
+        toggle_button = _SplitterToggleGlyph(handle)
+        toggle_button.setObjectName("controlHostSplitterHandleToggle")
+        toggle_button.clicked.connect(self._toggle_config_monitor_host_threat_flow)
+
+        handle_layout.addWidget(toggle_button, 0)
+        handle_layout.addWidget(handle_label, 1)
+
+        self.config_monitor_host_splitter_toggle = toggle_button
+        splitter.splitterMoved.connect(self._sync_config_monitor_host_splitter_handle_state)
+        self._apply_control_splitter_handle_styles()
+
+    def _config_monitor_section_state_for(self, section: QFrame) -> dict[str, Any] | None:
+        state_map = getattr(self, "_config_monitor_section_state", None)
+        if not isinstance(state_map, dict):
+            return None
+        state = state_map.get(section)
+        if isinstance(state, dict):
+            return state
+        return None
+
+    def _is_config_monitor_section_expanded(self, section: QFrame) -> bool:
+        state = self._config_monitor_section_state_for(section)
+        if not isinstance(state, dict):
+            return False
+        return bool(state.get("expanded", False))
+
+    def _set_config_monitor_section_expanded(self, section: QFrame, expanded: bool) -> None:
+        state = self._config_monitor_section_state_for(section)
+        if not isinstance(state, dict):
+            return
+
+        content_widget = state.get("content_widget")
+        remember_size = state.get("remember_size")
+        if not isinstance(content_widget, QWidget):
+            return
+        if not isinstance(remember_size, dict):
+            return
+
+        self._set_splitter_dropdown_expanded(
+            section=section,
+            content_widget=content_widget,
+            expanded=bool(expanded),
+            remember_size=remember_size,
+            apply_splitter_sizes=True,
+        )
+
+    def _toggle_config_monitor_section_from_handle(self, section: QFrame) -> None:
+        self._set_config_monitor_section_expanded(
+            section,
+            not self._is_config_monitor_section_expanded(section),
+        )
+
+    def _sync_config_monitor_splitter_handle_states(self, *_args: Any) -> None:
+        splitter = getattr(self, "config_monitor_splitter", None)
+        controls = getattr(self, "_config_monitor_splitter_handle_controls", None)
+        if not isinstance(splitter, QSplitter) or not isinstance(controls, dict):
+            return
+
+        for _handle_index, control in controls.items():
+            if not isinstance(control, dict):
+                continue
+
+            section = control.get("section")
+            toggle_button = control.get("toggle_button")
+            handle_label = control.get("label")
+            if not isinstance(section, QFrame) or not isinstance(toggle_button, _SplitterToggleGlyph):
+                continue
+
+            section_title = str(section.property("control_dropdown_title") or control.get("title") or "Widget").strip() or "Widget"
+            expanded = self._is_config_monitor_section_expanded(section)
+
+            toggle_button.blockSignals(True)
+            self._set_control_splitter_toggle_glyph(toggle_button, expanded)
+            toggle_button.setToolTip(
+                f"{section_title} einklappen" if expanded else f"{section_title} ausklappen"
+            )
+            toggle_button.blockSignals(False)
+
+            if isinstance(handle_label, QLabel):
+                full_label_text = f"{section_title} Splitter"
+                handle_label.setText(full_label_text)
+                handle_label.setToolTip(full_label_text)
+
+    def _setup_config_monitor_splitter_handles(self) -> None:
+        splitter = getattr(self, "config_monitor_splitter", None)
+        if not isinstance(splitter, QSplitter):
+            return
+
+        splitter.setHandleWidth(22)
+        self._config_monitor_splitter_handle_controls = {}
+
+        for handle_index in range(1, splitter.count()):
+            handle = splitter.handle(handle_index)
+            if handle is None:
+                continue
+            handle.setObjectName("controlSectionSplitterHandle")
+
+            section = splitter.widget(handle_index)
+            if not isinstance(section, QFrame):
+                continue
+
+            section_title = str(section.property("control_dropdown_title") or f"Widget {handle_index + 1}").strip() or f"Widget {handle_index + 1}"
+
+            handle_layout = handle.layout()
+            if not isinstance(handle_layout, QHBoxLayout):
+                handle_layout = QHBoxLayout(handle)
+            handle_layout.setContentsMargins(6, 0, 6, 0)
+            handle_layout.setSpacing(6)
+
+            while handle_layout.count() > 0:
+                item = handle_layout.takeAt(0)
+                widget = item.widget()
+                if isinstance(widget, QWidget):
+                    widget.deleteLater()
+
+            toggle_button = _SplitterToggleGlyph(handle)
+            toggle_button.setObjectName("controlSectionSplitterHandleToggle")
+            toggle_button.clicked.connect(
+                lambda sec=section: self._toggle_config_monitor_section_from_handle(sec)
+            )
+
+            full_label_text = f"{section_title} Splitter"
+            handle_label = QLabel(full_label_text, handle)
+            handle_label.setObjectName("controlSectionSplitterHandleLabel")
+            handle_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+            handle_label.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+            handle_label.setToolTip(full_label_text)
+
+            handle_layout.addWidget(toggle_button, 0)
+            handle_layout.addWidget(handle_label, 1)
+
+            self._config_monitor_splitter_handle_controls[handle_index] = {
+                "section": section,
+                "title": section_title,
+                "toggle_button": toggle_button,
+                "label": handle_label,
+            }
+
+        try:
+            splitter.splitterMoved.disconnect(self._sync_config_monitor_splitter_handle_states)
+        except Exception:
+            pass
+        splitter.splitterMoved.connect(self._sync_config_monitor_splitter_handle_states)
+        self._apply_control_splitter_handle_styles()
+
+    def _set_control_splitter_toggle_glyph(self, toggle_button: _SplitterToggleGlyph, expanded: bool) -> None:
+        toggle_button.setExpanded(expanded)
+
+    def _apply_control_splitter_toggle_button_style(self, toggle_button: _SplitterToggleGlyph | None) -> None:
+        if not isinstance(toggle_button, _SplitterToggleGlyph):
+            return
+
+        idle_icon_color = str(self.scheme.get("col8") or "#9a9a9a")
+        active_icon_color = str(self.scheme.get("col1") or "#35ff8a")
+        toggle_button.setColors(idle_icon_color, active_icon_color)
+
+    def _apply_control_splitter_handle_styles(self) -> None:
+        handle_style = (
+            "QSplitterHandle {"
+            " background-color: transparent;"
+            " border: none;"
+            " border-left: 2px solid transparent;"
+            "}"
+            "QSplitterHandle:hover { border-left: 2px solid transparent; }"
+            "QSplitterHandle:pressed { border-left: 2px solid transparent; }"
+        )
+
+        host_splitter = getattr(self, "config_monitor_host_splitter", None)
+        if isinstance(host_splitter, QSplitter):
+            host_handle = host_splitter.handle(1)
+            if isinstance(host_handle, QWidget):
+                host_handle.setStyleSheet(handle_style)
+
+        section_splitter = getattr(self, "config_monitor_splitter", None)
+        if isinstance(section_splitter, QSplitter):
+            for handle_index in range(1, section_splitter.count()):
+                section_handle = section_splitter.handle(handle_index)
+                if isinstance(section_handle, QWidget):
+                    section_handle.setStyleSheet(handle_style)
+
+        self._apply_control_splitter_toggle_button_style(
+            getattr(self, "config_monitor_host_splitter_toggle", None)
+        )
+
+        controls = getattr(self, "_config_monitor_splitter_handle_controls", None)
+        if isinstance(controls, dict):
+            for control in controls.values():
+                if not isinstance(control, dict):
+                    continue
+                self._apply_control_splitter_toggle_button_style(
+                    control.get("toggle_button") if isinstance(control.get("toggle_button"), _SplitterToggleGlyph) else None
+                )
+
+    def _set_splitter_dropdown_expanded(
+        self,
+        *,
+        section: QFrame,
+        content_widget: QWidget,
+        expanded: bool,
+        remember_size: dict[str, int],
+        apply_splitter_sizes: bool = True,
+    ) -> None:
+        splitter_parent = section.parentWidget()
+        splitter_handle_extent = 22
+        if isinstance(splitter_parent, QSplitter):
+            splitter_handle_extent = max(12, int(splitter_parent.handleWidth()))
+
+        section_state = self._config_monitor_section_state_for(section)
+        if isinstance(section_state, dict):
+            section_state["expanded"] = bool(expanded)
+
+        content_widget.setVisible(bool(expanded))
+
+        if expanded:
+            section.setMinimumHeight(0)
+            section.setMaximumHeight(16777215)
+            section.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Expanding)
+        else:
+            if isinstance(splitter_parent, QSplitter):
+                section_index = splitter_parent.indexOf(section)
+                splitter_sizes = splitter_parent.sizes()
+                if 0 <= section_index < len(splitter_sizes):
+                    remember_size["expanded_size"] = max(
+                        int(remember_size.get("expanded_size", 0)),
+                        int(splitter_sizes[section_index]),
+                    )
+
+            section.setMinimumHeight(0)
+            section.setMaximumHeight(0)
+            section.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+
+        section.updateGeometry()
+
+        if not apply_splitter_sizes:
+            return
+
+        if isinstance(splitter_parent, QSplitter):
+            section_index = splitter_parent.indexOf(section)
+            splitter_sizes = splitter_parent.sizes()
+            if 0 <= section_index < len(splitter_sizes):
+                target_size = (
+                    max(int(remember_size.get("expanded_size", 180)), splitter_handle_extent * 6)
+                    if expanded
+                    else 0
+                )
+                splitter_sizes[section_index] = target_size
+                splitter_parent.setSizes(splitter_sizes)
+
+            if splitter_parent is getattr(self, "config_monitor_splitter", None):
+                self._sync_config_monitor_splitter_handle_states()
+
+    def _create_splitter_dropdown_section(
+        self,
+        *,
+        parent: QSplitter,
+        title: str,
+        content_widget: QWidget,
+        expanded: bool = True,
+    ) -> QFrame:
+        section = QFrame(parent)
+        section.setObjectName("controlDropdownSection")
+        section.setFrameShape(QFrame.NoFrame)
+        section.setMinimumSize(0, 0)
+        section.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Expanding)
+
+        section_layout = QVBoxLayout(section)
+        section_layout.setContentsMargins(6, 6, 6, 6)
+        section_layout.setSpacing(6)
+
+        section_title = str(title or "Widget")
+
+        content_widget.setParent(section)
+        content_widget.setMinimumSize(0, 0)
+        content_widget.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Expanding)
+        section_layout.addWidget(content_widget, 1)
+
+        remember_size = {"expanded_size": max(160, int(content_widget.sizeHint().height()) + 36)}
+        section.setProperty("control_dropdown_title", section_title)
+
+        state_map = getattr(self, "_config_monitor_section_state", None)
+        if isinstance(state_map, dict):
+            state_map[section] = {
+                "title": section_title,
+                "content_widget": content_widget,
+                "remember_size": remember_size,
+                "expanded": bool(expanded),
+            }
+
+        self._set_splitter_dropdown_expanded(
+            section=section,
+            content_widget=content_widget,
+            expanded=bool(expanded),
+            remember_size=remember_size,
+            apply_splitter_sizes=False,
+        )
+        return section
 
     def _create_operator_action_tile(
         self,
@@ -6550,37 +7653,9 @@ class ControlPlaneWidget(QWidget):
         panel_parent = parent_container if isinstance(parent_container, QWidget) else self
         panel = QFrame(panel_parent)
         panel.setObjectName("controlBuilderPanel")
-        panel_bg = self.scheme["col7"] if show_toolbar else "transparent"
-        button_bg = panel_bg
-        panel_border = f"1px solid {self.scheme['col10']}" if show_toolbar else "none"
-        panel_radius = "10px" if show_toolbar else "0px"
-        panel.setStyleSheet(
-            f"""
-            QFrame#controlBuilderPanel {{
-                background: {panel_bg};
-                border: {panel_border};
-                border-radius: {panel_radius};
-            }}
-            QPushButton#builderTemplateButton,
-            QPushButton#builderBuildButton,
-            QPushButton#builderPostButton,
-            QPushButton#builderCopyButton {{
-                background: {button_bg};
-                border: 1px solid transparent;
-                border-radius: 8px;
-                padding: 1px;
-                min-width: 22px;
-                min-height: 22px;
-            }}
-            QPushButton#builderTemplateButton:hover,
-            QPushButton#builderBuildButton:hover,
-            QPushButton#builderPostButton:hover,
-            QPushButton#builderCopyButton:hover {{
-                background: {button_bg};
-                border-color: transparent;
-            }}
-            """
-        )
+        _clear_frame_chrome(panel)
+        panel.setProperty("_builder_show_toolbar", bool(show_toolbar))
+        self._apply_builder_panel_scheme(panel, show_toolbar=show_toolbar)
 
         panel_layout = QVBoxLayout(panel)
         if show_toolbar:
@@ -6633,10 +7708,17 @@ class ControlPlaneWidget(QWidget):
             language="json",
             editable=True,
             auto_fit=False,
-            accent_color=self.scheme.get("col1", "#3a5fff"),
-            accent_selection_color=self.scheme.get("col2", "#6280ff"),
-            surface_color=self.scheme.get("col9", "#101010"),
+            accent_color=self.scheme.get("col10", "#1f1f1f"),
+            accent_selection_color=self.scheme.get("col2", "#58ed5b"),
+            background_color=self.scheme.get("col7", "#0b0b0b"),
+            surface_color=self.scheme.get("col7", "#0b0b0b"),
             font_size_px=14,
+            edit_border_radius_px=15,
+            top_left_radius_px=0,
+            top_right_radius_px=0,
+            bottom_left_radius_px=_SURFACE_BORDER_RADIUS_PX if not show_toolbar else 0,
+            bottom_right_radius_px=_SURFACE_BORDER_RADIUS_PX if not show_toolbar else 0,
+            draw_border=False,
         )
         editor.setMinimumHeight(96)
         editor.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
@@ -7160,33 +8242,164 @@ class ControlPlaneWidget(QWidget):
                 border: 1px solid {self.scheme['col10']};
                 border-radius: 14px;
             }}
+            QFrame#controlDropdownSection {{
+                background: {self.scheme['col5']};
+                border: 1px solid {self.scheme['col10']};
+                border-radius: 12px;
+            }}
+            QSplitterHandle#controlHostSplitterHandle,
+            QSplitterHandle#controlSectionSplitterHandle {{
+                background: transparent;
+                border: none;
+                border-left: 2px solid transparent;
+            }}
+            QSplitterHandle#controlHostSplitterHandle:hover,
+            QSplitterHandle#controlSectionSplitterHandle:hover {{
+                border-left: 2px solid transparent;
+            }}
+            QSplitterHandle#controlHostSplitterHandle:pressed,
+            QSplitterHandle#controlSectionSplitterHandle:pressed {{
+                border-left: 2px solid transparent;
+            }}
+            QToolButton#controlHostSplitterHandleToggle {{
+                background: transparent;
+                border: none;
+                color: {self.scheme['col8']};
+                padding: 0px;
+                min-width: 16px;
+                min-height: 16px;
+            }}
+            QToolButton#controlHostSplitterHandleToggle:hover {{
+                background: transparent;
+                border: none;
+                color: {self.scheme['col8']};
+            }}
+            QToolButton#controlHostSplitterHandleToggle:pressed,
+            QToolButton#controlHostSplitterHandleToggle:checked {{
+                background: transparent;
+                border: none;
+                color: {self.scheme['col1']};
+            }}
+            QLabel#controlHostSplitterHandleLabel {{
+                color: {self.scheme['col8']};
+                font-size: 11px;
+                font-weight: 600;
+                background: transparent;
+            }}
+            QToolButton#controlSectionSplitterHandleToggle {{
+                background: transparent;
+                border: none;
+                color: {self.scheme['col8']};
+                padding: 0px;
+                min-width: 16px;
+                min-height: 16px;
+            }}
+            QToolButton#controlSectionSplitterHandleToggle:hover {{
+                background: transparent;
+                border: none;
+                color: {self.scheme['col8']};
+            }}
+            QToolButton#controlSectionSplitterHandleToggle:pressed,
+            QToolButton#controlSectionSplitterHandleToggle:checked {{
+                background: transparent;
+                border: none;
+                color: {self.scheme['col1']};
+            }}
+            QLabel#controlSectionSplitterHandleLabel {{
+                color: {self.scheme['col8']};
+                font-size: 10px;
+                font-weight: 600;
+                background: transparent;
+            }}
             QFrame#controlBuilderContainer {{
                 background: {self.scheme['col7']};
                 border: none;
             }}
             QTabWidget#controlPlaneTabs::pane {{
-                background: transparent;
-                border: none;
+                background: {self.scheme['col7']};
+                border-left: 1px solid {self.scheme['col10']};
+                border-right: 1px solid {self.scheme['col10']};
+                border-bottom: 1px solid {self.scheme['col10']};
+                border-top: none;
+                border-top-left-radius: 0px;
+                border-top-right-radius: 0px;
+                border-bottom-left-radius: 14px;
+                border-bottom-right-radius: 14px;
                 margin: 0px;
+            }}
+            QTabWidget#controlPlaneTabs > QStackedWidget#qt_tabwidget_stackedwidget {{
+                background: {self.scheme['col7']};
+                border: none;
+            }}
+            QTabWidget#controlPlaneTabs QTabBar {{
+                background: {self.scheme['col7']};
+                border: none;
             }}
             QTabWidget#controlPlaneTabs QTabBar::tab {{
                 background: {self.scheme['col7']};
                 color: {self.scheme['col6']};
-                border: 1px solid {self.scheme['col10']};
+                border-top: 1px solid {self.scheme['col10']};
+                border-left: none;
+                border-right: none;
                 border-bottom: none;
-                border-top-left-radius: 8px;
-                border-top-right-radius: 8px;
+                border-top-left-radius: 0px;
+                border-top-right-radius: 0px;
                 padding: 5px 10px;
                 min-height: 20px;
             }}
+            QTabWidget#controlPlaneTabs QTabBar::tab:first {{
+                border-left: 1px solid {self.scheme['col10']};
+                border-top-left-radius: 14px;
+            }}
+            QTabWidget#controlPlaneTabs QTabBar::tab:last {{
+                border-right: 1px solid {self.scheme['col10']};
+                border-top-right-radius: 14px;
+            }}
+            QTabWidget#controlPlaneTabs QTabBar::tab:only-one {{
+                border-left: 1px solid {self.scheme['col10']};
+                border-right: 1px solid {self.scheme['col10']};
+                border-top-left-radius: 14px;
+                border-top-right-radius: 14px;
+            }}
             QTabWidget#controlPlaneTabs QTabBar::tab:hover {{
                 background: {self.scheme['col7']};
-                border-color: {self.scheme['col10']};
+                border-top: 1px solid {self.scheme['col10']};
+                border-left: none;
+                border-right: none;
+                border-bottom: none;
             }}
             QTabWidget#controlPlaneTabs QTabBar::tab:selected {{
-                background: {self.scheme['col7']};
+                background: {self.scheme['col9']};
                 color: {self.scheme['col1']};
-                border-color: {self.scheme['col1']};
+                border: 1px solid {self.scheme['col1']};
+                border-left: 1px solid {self.scheme['col1']};
+                border-bottom: none;
+            }}
+            QTabWidget#controlPlaneTabs QTabBar::tab:first:hover {{
+                border-left: 1px solid {self.scheme['col10']};
+                border-top-left-radius: 14px;
+            }}
+            QTabWidget#controlPlaneTabs QTabBar::tab:last:hover {{
+                border-right: 1px solid {self.scheme['col10']};
+                border-top-right-radius: 14px;
+            }}
+            QTabWidget#controlPlaneTabs QTabBar::tab:only-one:hover {{
+                border-left: 1px solid {self.scheme['col10']};
+                border-right: 1px solid {self.scheme['col10']};
+                border-top-left-radius: 14px;
+                border-top-right-radius: 14px;
+            }}
+            QTabWidget#controlPlaneTabs QTabBar::tab:first:selected {{
+                border-left: 1px solid {self.scheme['col1']};
+                border-top-left-radius: 14px;
+            }}
+            QTabWidget#controlPlaneTabs QTabBar::tab:last:selected {{
+                border-top-right-radius: 14px;
+            }}
+            QTabWidget#controlPlaneTabs QTabBar::tab:only-one:selected {{
+                border-left: 1px solid {self.scheme['col1']};
+                border-top-left-radius: 14px;
+                border-top-right-radius: 14px;
             }}
             QLabel#controlTitle {{
                 color: {self.scheme['col6']};
@@ -7255,15 +8468,15 @@ class ControlPlaneWidget(QWidget):
                 height: 0px;
             }}
             QSplitter#controlViewportSplitter::handle:horizontal {{
-                background: {handle_idle};
-                margin: 0px 12px;
+                background: transparent;
+                margin: 0px {_SPLITTER_SIDE_INSET_PX}px;
                 min-height: 7px;
                 border-radius: 999px;
             }}
             QSplitter#controlViewportSplitter::handle:vertical {{
                 background: {handle_idle};
-                margin: 0px;
-                min-width: 7px;
+                margin: {_SURFACE_INSET_PX}px 0px;
+                min-width: 4px;
                 border-radius: 999px;
             }}
             QSplitter#controlViewportSplitter::handle:hover {{
@@ -7273,15 +8486,15 @@ class ControlPlaneWidget(QWidget):
                 background: {handle_pressed};
             }}
             QSplitter#controlPrimarySplitter::handle:horizontal {{
-                background: {handle_idle};
-                margin: 0px 12px;
+                background: transparent;
+                margin: 0px {_SPLITTER_SIDE_INSET_PX}px;
                 min-height: 7px;
                 border-radius: 999px;
             }}
             QSplitter#controlPrimarySplitter::handle:vertical {{
                 background: {handle_idle};
-                margin: 0px;
-                min-width: 7px;
+                margin: 12px 0px;
+                min-width: 4px;
                 border-radius: 999px;
             }}
             QSplitter#controlPrimarySplitter::handle:hover {{
@@ -7336,6 +8549,8 @@ class ControlPlaneWidget(QWidget):
             }}
             """
         )
+        self._refresh_runtime_panel_schemes()
+        self._apply_control_splitter_handle_styles()
 
     def _load_refresh_payload(self) -> dict[str, Any]:
         configuration_snapshot = self._load_configuration_snapshot()
@@ -7430,6 +8645,10 @@ class ControlPlaneWidget(QWidget):
             self.monitor_trace_view.setHtml(
                 "<h3>Trace unavailable</h3><p>Detailed chat/tool/handoff projection could not be loaded.</p>"
             )
+            if isinstance(getattr(self, "config_monitor_threat_flow_view", None), QTextBrowser):
+                self.config_monitor_threat_flow_view.setHtml(
+                    f"<p>Threat Flow unavailable: {error_text}</p>"
+                )
             self.trace_agent_selector.clear()
             self.trace_workflow_selector.clear()
             self.trace_tool_selector.clear()
@@ -7773,6 +8992,79 @@ class ControlPlaneWidget(QWidget):
             "<h3>Trace Detail</h3>"
             "<p>Normalized runtime trace across chat messages, tool calls, tool results, handoffs, and workflow payloads.</p>"
             + "".join(trace_rows or ["<p>No trace entries match the active filters.</p>"])
+        )
+        self._render_threat_flow_snapshot(snapshot, filtered_trace_entries)
+
+    def _render_threat_flow_snapshot(
+        self,
+        snapshot: dict[str, Any],
+        filtered_trace_entries: list[dict[str, Any]] | None = None,
+    ) -> None:
+        flow_view = getattr(self, "config_monitor_threat_flow_view", None)
+        if not isinstance(flow_view, QTextBrowser):
+            return
+
+        trace_entries = filtered_trace_entries if filtered_trace_entries is not None else self._filtered_trace_entries(snapshot)
+        events = [event for event in (snapshot.get("events") or []) if isinstance(event, dict)]
+        recent_events = list(reversed(events[-8:]))
+
+        event_rows = [
+            "".join(
+                [
+                    f"<li><b>{html.escape(str(event.get('timestamp') or 'n/a'))}</b> - ",
+                    f"{html.escape(str(event.get('summary') or event.get('event_type') or 'event'))}<br>",
+                    f"<span style=\"color:{self.scheme['col8']};\">",
+                    f"agent={html.escape(str(event.get('agent_label') or 'n/a'))} | ",
+                    f"workflow={html.escape(str(event.get('workflow_name') or 'n/a'))}",
+                    "</span></li>",
+                ]
+            )
+            for event in recent_events
+        ]
+
+        handoff_rows: list[str] = []
+        for trace_entry in reversed(trace_entries):
+            if not isinstance(trace_entry, dict):
+                continue
+            handoff_value = self._trace_entry_handoff_value(trace_entry)
+            if not handoff_value:
+                continue
+            handoff_rows.append(
+                "".join(
+                    [
+                        f"<li><b>{html.escape(str(trace_entry.get('timestamp') or 'n/a'))}</b> - ",
+                        f"{html.escape(self._trace_entry_agent_label(trace_entry))} -> {html.escape(handoff_value)}<br>",
+                        f"<span style=\"color:{self.scheme['col8']};\">workflow={html.escape(self._trace_entry_workflow_name(trace_entry))}</span>",
+                        "</li>",
+                    ]
+                )
+            )
+            if len(handoff_rows) >= 6:
+                break
+
+        alerts_html = "".join(
+            f"<li>{html.escape(str(alert))}</li>"
+            for alert in (snapshot.get("alerts") or [])[:6]
+        )
+        health_chip = self._render_status_chip(
+            "healthy" if bool(snapshot.get("healthy")) else "attention",
+            SIGNAL_GREEN if bool(snapshot.get("healthy")) else SIGNAL_RED,
+        )
+
+        flow_view.setHtml(
+            "".join(
+                [
+                    f"<p><b>Health:</b> {health_chip} | ",
+                    f"<b>Visible trace entries:</b> {len(trace_entries)} | ",
+                    f"<b>Events:</b> {len(events)}</p>",
+                    "<h4>Recent Runtime Events</h4>",
+                    f"<ul>{''.join(event_rows) or '<li>No runtime events available.</li>'}</ul>",
+                    "<h4>Recent Handoffs</h4>",
+                    f"<ul>{''.join(handoff_rows) or '<li>No handoff transitions in visible trace.</li>'}</ul>",
+                    "<h4>Attention</h4>",
+                    f"<ul>{alerts_html or '<li>No active alerts in this projection.</li>'}</ul>",
+                ]
+            )
         )
 
     def _render_tree_stream_diagnostic(self, diagnostic: dict[str, Any]) -> None:
@@ -9006,6 +10298,12 @@ class ExtensionsWorkspaceWidget(QWidget):
         self._preview_initialized = False
         self._initial_source_uri = str(source_uri or "").strip()
         self._control_plane_widget = control_plane_widget_ref
+        self._hover_tab_index = -1
+        self._hover_tab_base_text = ""
+        self._hover_tab_phase = 0
+        self._hover_tab_marquee_timer = QTimer(self)
+        self._hover_tab_marquee_timer.setInterval(160)
+        self._hover_tab_marquee_timer.timeout.connect(self._tick_tab_hover_marquee)
 
         self._build_ui()
         # Add ControlPlaneWidget as first tab if provided
@@ -9134,22 +10432,87 @@ class ExtensionsWorkspaceWidget(QWidget):
         self.extensions_tabs.setDocumentMode(True)
         self.extensions_tabs.setMovable(True)
         self.extensions_tabs.setTabsClosable(True)
-        self.extensions_tabs.setUsesScrollButtons(True)
+        self.extensions_tabs.setUsesScrollButtons(False)
+        tab_bar = self.extensions_tabs.tabBar()
+        tab_bar.setExpanding(True)
+        tab_bar.setElideMode(Qt.ElideRight)
+        tab_bar.setMouseTracking(True)
+        tab_bar.installEventFilter(self)
         self.extensions_tabs.tabCloseRequested.connect(self._close_extension_tab)
         self.extensions_tabs.currentChanged.connect(self._handle_active_tab_changed)
 
-        self.add_tab_button = QToolButton(self.extensions_tabs)
-        self.add_tab_button.setObjectName("extensionsAddTabButton")
-        self.add_tab_button.setText("+")
-        self.add_tab_button.setToolButtonStyle(Qt.ToolButtonTextOnly)
-        self.add_tab_button.setCursor(Qt.PointingHandCursor)
-        self.add_tab_button.setToolTip("Neue Extension-Verbindung")
-        self.add_tab_button.setAutoRaise(True)
-        self.add_tab_button.setFixedSize(20, 20)
-        self.add_tab_button.clicked.connect(lambda _checked=False: self.open_new_connection_tab(activate=True))
-        self.extensions_tabs.setCornerWidget(self.add_tab_button, Qt.TopRightCorner)
-
         root_layout.addWidget(self.extensions_tabs, 1)
+
+    def _start_tab_hover_marquee(self, tab_index: int) -> None:
+        self._stop_tab_hover_marquee()
+        tab_bar = self.extensions_tabs.tabBar()
+        if tab_index < 0 or tab_index >= tab_bar.count():
+            self._stop_tab_hover_marquee()
+            return
+        if tab_index == self._hover_tab_index:
+            return
+
+        self._stop_tab_hover_marquee()
+
+        base_text = str(tab_bar.tabText(tab_index) or "")
+        if not base_text:
+            return
+
+        tab_rect = tab_bar.tabRect(tab_index)
+        available_width = max(tab_rect.width() - 34, 18)
+        text_width = tab_bar.fontMetrics().horizontalAdvance(base_text)
+        if text_width <= available_width:
+            return
+
+        self._hover_tab_index = tab_index
+        self._hover_tab_base_text = base_text
+        self._hover_tab_phase = 0
+        self._hover_tab_marquee_timer.start()
+
+    def _tick_tab_hover_marquee(self) -> None:
+        tab_bar = self.extensions_tabs.tabBar()
+        tab_index = self._hover_tab_index
+        if tab_index < 0 or tab_index >= tab_bar.count():
+            self._stop_tab_hover_marquee()
+            return
+        if not self._hover_tab_base_text:
+            self._stop_tab_hover_marquee()
+            return
+
+        cycle_text = f"{self._hover_tab_base_text}   "
+        if len(cycle_text) <= 1:
+            return
+
+        self._hover_tab_phase = (self._hover_tab_phase + 1) % len(cycle_text)
+        shift = self._hover_tab_phase
+        tab_bar.setTabText(tab_index, f"{cycle_text[shift:]}{cycle_text[:shift]}")
+
+    def _stop_tab_hover_marquee(self) -> None:
+        if self._hover_tab_marquee_timer.isActive():
+            self._hover_tab_marquee_timer.stop()
+
+        tab_index = self._hover_tab_index
+        if tab_index >= 0 and self._hover_tab_base_text:
+            tab_bar = self.extensions_tabs.tabBar()
+            if tab_index < tab_bar.count():
+                tab_bar.setTabText(tab_index, self._hover_tab_base_text)
+
+        self._hover_tab_index = -1
+        self._hover_tab_base_text = ""
+        self._hover_tab_phase = 0
+
+    def eventFilter(self, obj, event):  # noqa: N802
+        if hasattr(self, "extensions_tabs") and obj is self.extensions_tabs.tabBar():
+            event_type = event.type()
+            if event_type == QEvent.MouseMove:
+                if hasattr(event, "position"):
+                    pos = event.position().toPoint()
+                else:
+                    pos = event.pos()
+                self._start_tab_hover_marquee(self.extensions_tabs.tabBar().tabAt(pos))
+            elif event_type in (QEvent.Leave, QEvent.MouseButtonPress):
+                self._stop_tab_hover_marquee()
+        return super().eventFilter(obj, event)
 
     def _add_control_plane_tab(self) -> None:
         """Integrate ControlPlaneWidget's tabs directly into the main tab row."""
@@ -9285,6 +10648,7 @@ class ExtensionsWorkspaceWidget(QWidget):
         return session_state
 
     def _close_extension_tab(self, tab_index: int) -> None:
+        self._stop_tab_hover_marquee()
         tab_widget = self.extensions_tabs.widget(tab_index)
         if tab_widget is None:
             return
@@ -9326,6 +10690,7 @@ class ExtensionsWorkspaceWidget(QWidget):
         return None
 
     def _handle_active_tab_changed(self, _tab_index: int) -> None:
+        self._stop_tab_hover_marquee()
         self.setProperty("runtime_source_path", self.current_widget_uri())
         self.widgetStateChanged.emit()
 
@@ -9354,6 +10719,10 @@ class ExtensionsWorkspaceWidget(QWidget):
         load_action = uri_input.addAction(load_icon_idle, QLineEdit.TrailingPosition)
         load_action.setObjectName("extensionsGraphLoadAction")
         load_action.setToolTip("Widget laden")
+        add_tab_icon_idle = _icon_with_opacity("plus_custombar_24.svg", opacity=0.72)
+        add_tab_action = uri_input.addAction(add_tab_icon_idle, QLineEdit.TrailingPosition)
+        add_tab_action.setObjectName("extensionsGraphAddTabAction")
+        add_tab_action.setToolTip("Neue Extension-Verbindung")
 
         selection_menu = QMenu(control_page)
         selection_menu.setObjectName("extensionsGraphSelectionMenu")
@@ -9378,6 +10747,7 @@ class ExtensionsWorkspaceWidget(QWidget):
 
         session_state["uri_input"] = uri_input
         session_state["load_action"] = load_action
+        session_state["add_tab_action"] = add_tab_action
         session_state["selection_menu"] = selection_menu
         session_state["uri_input_filter"] = uri_filter
         session_state["keep_local"] = bool(keep_local)
@@ -9402,6 +10772,7 @@ class ExtensionsWorkspaceWidget(QWidget):
         uri_input.textChanged.connect(lambda _text: self._handle_session_control_change(session_state, refresh_preview=True))
         selection_menu.triggered.connect(_apply_selector_choice)
         load_action.triggered.connect(lambda: self._load_extension_into_session(session_state, fit_view=True))
+        add_tab_action.triggered.connect(lambda: self.open_new_connection_tab(activate=True))
 
         return control_page
 
@@ -9549,10 +10920,14 @@ class ExtensionsWorkspaceWidget(QWidget):
         if tab_index < 0:
             return
         if bool(session_state.get("catalog_only")) and not loaded:
+            if tab_index == self._hover_tab_index:
+                self._stop_tab_hover_marquee()
             self.extensions_tabs.setTabText(tab_index, self._START_TAB_TITLE)
             self._set_tab_close_button(tab_widget)
             return
         session_id = int(session_state.get("session_id") or 0)
+        if tab_index == self._hover_tab_index:
+            self._stop_tab_hover_marquee()
         if loaded:
             tool_label = self._session_tool_label(session_state)
             self.extensions_tabs.setTabText(tab_index, f"{tool_label} #{session_id}")
@@ -9716,7 +11091,7 @@ class ExtensionsWorkspaceWidget(QWidget):
             f"""
 QWidget#extensionsSessionControlPage,
 QWidget#extensionsSessionHostPage {{
-    background-color: {self.scheme.get('col7', '#191f2f')};
+    background-color: {self.scheme.get('col7', '#0b0b0b')};
 }}
 QLabel#extensionsControlTitle {{
     color: {self.scheme.get('col6', '#eef3ff')};
@@ -9724,33 +11099,46 @@ QLabel#extensionsControlTitle {{
     font-size: 14px;
 }}
 QLabel#extensionsControlDescription {{
-    color: {self.scheme.get('col8', '#a8afc7')};
+    color: {self.scheme.get('col8', '#9a9a9a')};
 }}
 QLabel#extensionsHostPlaceholder {{
-    color: {self.scheme.get('col8', '#a8afc7')};
+    color: {self.scheme.get('col8', '#9a9a9a')};
     font-size: 13px;
 }}
 QTabWidget#extensionsTabs::pane {{
     border: 1px solid {self.scheme.get('col10', '#2a3350')};
     border-top: 0;
-    background: {self.scheme.get('col7', '#191f2f')};
+    background: {self.scheme.get('col7', '#0b0b0b')};
 }}
 QTabWidget#extensionsTabs QTabBar::tab {{
-    color: {self.scheme.get('col8', '#a8afc7')};
-    background: {self.scheme.get('col7', '#191f2f')};
-    border: 1px solid {self.scheme.get('col10', '#2a3350')};
+    color: {self.scheme.get('col8', '#9a9a9a')};
+    background: {self.scheme.get('col7', '#0b0b0b')};
+    border: 1px solid transparent;
     border-bottom: 0;
-    border-top-left-radius: 8px;
-    border-top-right-radius: 8px;
+    border-top-left-radius: 0px;
+    border-top-right-radius: 0px;
     padding: 8px 13px;
-    min-width: 130px;
+}}
+QTabWidget#extensionsTabs QTabBar::tab:hover {{
+    background: {self.scheme.get('col7', '#0b0b0b')};
+    border: 1px solid transparent;
+    border-bottom: 0;
+    border-top-left-radius: 0px;
+    border-top-right-radius: 0px;
 }}
 QTabWidget#extensionsTabs QTabBar::tab:selected {{
-    color: {self.scheme.get('col6', '#f0f4ff')};
-    background: {self.scheme.get('col9', '#22345c')};
+    color: {self.scheme.get('col6', '#E3E3DE')};
+    background: {self.scheme.get('col9', '#101010')};
+    border: 1px solid {self.scheme.get('col10', '#2a3350')};
+    border-bottom: 0;
+    border-top-left-radius: 0px;
+    border-top-right-radius: 0px;
+}}
+QTabWidget#extensionsTabs QTabBar::scroller {{
+    width: 0px;
 }}
 QToolButton#extensionsTabCloseButton {{
-    color: {self.scheme.get('col8', '#a8afc7')};
+    color: {self.scheme.get('col8', '#9a9a9a')};
     background: transparent;
     border: none;
     font-size: 13px;
@@ -9759,54 +11147,41 @@ QToolButton#extensionsTabCloseButton {{
     margin: 0px;
 }}
 QToolButton#extensionsTabCloseButton:hover {{
-    color: {self.scheme.get('col6', '#f0f4ff')};
-    background: {self.scheme.get('col9', '#22345c')};
+    color: {self.scheme.get('col6', '#E3E3DE')};
+    background: {self.scheme.get('col9', '#101010')};
     border-radius: 8px;
-}}
-QToolButton#extensionsAddTabButton {{
-    color: {self.scheme.get('col8', '#a8afc7')};
-    background: transparent;
-    border: 1px solid {self.scheme.get('col10', '#33406a')};
-    border-radius: 8px;
-    font-size: 13px;
-    font-weight: 700;
-}}
-QToolButton#extensionsAddTabButton:hover {{
-    color: {self.scheme.get('col6', '#f0f4ff')};
-    background: {self.scheme.get('col9', '#22345c')};
-    border-color: {self.scheme.get('col2', '#6280ff')};
 }}
 QLineEdit#extensionsGraphUriInput {{
-    color: {self.scheme.get('col6', '#e7eeff')};
-    background: {self.scheme.get('col9', '#22345c')};
-    border: 1px solid {self.scheme.get('col10', '#33406a')};
+    color: {self.scheme.get('col6', '#E3E3DE')};
+    background: {self.scheme.get('col9', '#101010')};
+    border: 1px solid {self.scheme.get('col10', '#1f1f1f')};
     border-radius: 8px;
     padding: 4px 8px;
     min-height: 30px;
 }}
 QLineEdit#extensionsGraphUriInput:hover {{
-    border-color: {self.scheme.get('col2', '#6280ff')};
+    border-color: {self.scheme.get('col2', '#58ed5b')};
 }}
 QLineEdit#extensionsGraphUriInput:focus {{
-    border-color: {self.scheme.get('col1', '#3a5fff')};
+    border-color: {self.scheme.get('col1', '#0fe913')};
 }}
 QToolButton#extensionsUriPresetButton {{
-    color: {self.scheme.get('col8', '#a8afc7')};
+    color: {self.scheme.get('col8', '#9a9a9a')};
     background: transparent;
-    border: 1px solid {self.scheme.get('col10', '#33406a')};
+    border: 1px solid {self.scheme.get('col10', '#1f1f1f')};
     border-radius: 7px;
     padding: 2px 8px;
     font-size: 12px;
     min-height: 24px;
 }}
 QToolButton#extensionsUriPresetButton:hover {{
-    color: {self.scheme.get('col6', '#e7eeff')};
-    background: {self.scheme.get('col9', '#22345c')};
+    color: {self.scheme.get('col6', '#E3E3DE')};
+    background: {self.scheme.get('col9', '#101010')};
 }}
 QTextBrowser#extensionsConnectionsPreviewBrowser {{
-    color: {self.scheme.get('col6', '#e7eeff')};
-    background: {self.scheme.get('col9', '#22345c')};
-    border: 1px solid {self.scheme.get('col10', '#33406a')};
+    color: {self.scheme.get('col6', '#E3E3DE')};
+    background: {self.scheme.get('col9', '#101010')};
+    border: 1px solid {self.scheme.get('col10', '#1f1f1f')};
     border-radius: 8px;
     padding: 8px;
 }}
@@ -9838,13 +11213,13 @@ QTextBrowser#extensionsConnectionsPreviewBrowser QScrollBar::handle:vertical:hov
 QTextBrowser#extensionsConnectionsPreviewBrowser QScrollBar::handle:horizontal:hover,
 QTextBrowser#extensionsConnectionsPreviewBrowser QScrollBar::handle:hover:vertical,
 QTextBrowser#extensionsConnectionsPreviewBrowser QScrollBar::handle:hover:horizontal {{
-    background: {self.scheme.get('col10', '#33406a')};
+    background: {self.scheme.get('col10', '#1f1f1f')};
 }}
 QTextBrowser#extensionsConnectionsPreviewBrowser QScrollBar::handle:vertical:pressed,
 QTextBrowser#extensionsConnectionsPreviewBrowser QScrollBar::handle:horizontal:pressed,
 QTextBrowser#extensionsConnectionsPreviewBrowser QScrollBar::handle:pressed:vertical,
 QTextBrowser#extensionsConnectionsPreviewBrowser QScrollBar::handle:pressed:horizontal {{
-    background: {self.scheme.get('col2', '#6280ff')};
+    background: {self.scheme.get('col2', '#58ed5b')};
 }}
 QTextBrowser#extensionsConnectionsPreviewBrowser QScrollBar::add-line,
 QTextBrowser#extensionsConnectionsPreviewBrowser QScrollBar::sub-line,
@@ -9856,19 +11231,19 @@ QTextBrowser#extensionsConnectionsPreviewBrowser QScrollBar::sub-page {{
     height: 0px;
 }}
 QToolButton#extensionsGraphControlButton {{
-    color: {self.scheme.get('col6', '#ecf2ff')};
-    background: {self.scheme.get('col7', '#191f2f')};
-    border: 1px solid {self.scheme.get('col10', '#33406a')};
+    color: {self.scheme.get('col6', '#E3E3DE')};
+    background: {self.scheme.get('col7', '#0b0b0b')};
+    border: 1px solid {self.scheme.get('col10', '#1f1f1f')};
     border-radius: 7px;
     padding: 2px;
     min-width: 30px;
     min-height: 30px;
 }}
 QToolButton#extensionsGraphControlButton:hover {{
-    background: {self.scheme.get('col9', '#22345c')};
+    background: {self.scheme.get('col9', '#101010')};
 }}
 QLineEdit#extensionsGraphStatusLabel {{
-    color: {self.scheme.get('col8', '#a8afc7')};
+    color: {self.scheme.get('col8', '#9a9a9a')};
     background: transparent;
     border: 1px solid transparent;
     border-radius: 8px;
@@ -9876,10 +11251,10 @@ QLineEdit#extensionsGraphStatusLabel {{
     min-height: 30px;
 }}
 QLineEdit#extensionsGraphStatusLabel:hover {{
-    border-color: {self.scheme.get('col10', '#33406a')};
+    border-color: {self.scheme.get('col10', '#1f1f1f')};
 }}
 QLineEdit#extensionsGraphStatusLabel:focus {{
-    border-color: {self.scheme.get('col2', '#6280ff')};
+    border-color: {self.scheme.get('col2', '#58ed5b')};
 }}
 """
         )
@@ -10344,6 +11719,7 @@ class EnvConfigWidget(QWidget):
         normalized_value = str(value or "").strip()
         normalized_lower = normalized_value.lower()
         token_pairs = (
+
             ("1", "0"),
             ("true", "false"),
             ("True", "False"),
@@ -10355,6 +11731,7 @@ class EnvConfigWidget(QWidget):
             ("On", "Off"),
             ("ON", "OFF"),
         )
+        
         for true_token, false_token in token_pairs:
             if normalized_value == true_token or normalized_value == false_token:
                 return (true_token, false_token)
@@ -10384,6 +11761,283 @@ class EnvConfigWidget(QWidget):
                 return True
         return False
 
+class CustomWindowTitleBar(QWidget):
+    """Custom frame title bar with menu button and window controls."""
+
+    _HEIGHT = 34
+
+    def __init__(self, window: "MainAIEditor") -> None:
+        super().__init__(window)
+        self._window = window
+        self._drag_active = False
+        self._drag_start_global = QPoint()
+        self._drag_start_window = QPoint()
+
+        self.setObjectName("windowFrameTitleBar")
+        self.setFixedHeight(self._HEIGHT)
+        self.setAttribute(Qt.WA_StyledBackground, True)
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(8, 4, 8, 4)
+        layout.setSpacing(6)
+
+        self._title_label = QLabel(window.windowTitle(), self)
+        self._title_label.setObjectName("windowFrameTitle")
+        self._title_label.setAlignment(Qt.AlignVCenter | Qt.AlignLeft)
+        layout.addWidget(self._title_label, 0, Qt.AlignVCenter)
+
+        self._menu_btn = QToolButton(self)
+        self._menu_btn.setObjectName("windowFrameMenuButton")
+        self._menu_btn.setIcon(_icon("menu_24.svg"))
+        self._menu_btn.setIconSize(QSize(16, 16))
+        self._menu_btn.setAutoRaise(True)
+        self._menu_btn.setFocusPolicy(Qt.NoFocus)
+        self._menu_btn.setFixedSize(22, 22)
+        self._menu_btn.setToolTip("Menue")
+        self._menu_btn.setCursor(Qt.PointingHandCursor)
+        self._menu_btn.clicked.connect(self._open_window_menu)
+        layout.addWidget(self._menu_btn, 0, Qt.AlignLeft | Qt.AlignVCenter)
+
+        layout.addStretch(1)
+
+        self._min_btn = QToolButton(self)
+        self._min_btn.setObjectName("windowFrameButton")
+        self._min_btn.setText("")
+        self._min_btn.setIcon(_draw_window_control_icon("minimize", size=14))
+        self._min_btn.setIconSize(QSize(12, 12))
+        self._min_btn.setFocusPolicy(Qt.NoFocus)
+        self._min_btn.setToolTip("Minimieren")
+        self._min_btn.setCursor(Qt.PointingHandCursor)
+        self._min_btn.clicked.connect(window.showMinimized)
+        layout.addWidget(self._min_btn, 0, Qt.AlignRight | Qt.AlignVCenter)
+
+        self._max_btn = QToolButton(self)
+        self._max_btn.setObjectName("windowFrameButton")
+        self._max_btn.setIcon(_draw_window_control_icon("maximize", size=14))
+        self._max_btn.setIconSize(QSize(12, 12))
+        self._max_btn.setFocusPolicy(Qt.NoFocus)
+        self._max_btn.setCursor(Qt.PointingHandCursor)
+        self._max_btn.clicked.connect(window._toggle_window_maximize_restore)
+        layout.addWidget(self._max_btn, 0, Qt.AlignRight | Qt.AlignVCenter)
+
+        self._fullscreen_btn = QToolButton(self)
+        self._fullscreen_btn.setObjectName("windowFrameButton")
+        self._fullscreen_btn.setIcon(_icon("open_in_full_26dp_999999_FILL0_wght500_GRAD0_opsz24.svg"))
+        self._fullscreen_btn.setIconSize(QSize(12, 12))
+        self._fullscreen_btn.setFocusPolicy(Qt.NoFocus)
+        self._fullscreen_btn.setCheckable(True)
+        self._fullscreen_btn.setToolTip("Echtes Fullscreen (F11)")
+        self._fullscreen_btn.setCursor(Qt.PointingHandCursor)
+        self._fullscreen_btn.clicked.connect(window._toggle_true_fullscreen_mode)
+        layout.addWidget(self._fullscreen_btn, 0, Qt.AlignRight | Qt.AlignVCenter)
+
+        self._close_btn = QToolButton(self)
+        self._close_btn.setObjectName("windowFrameCloseButton")
+        self._close_btn.setIcon(_draw_window_control_icon("close", size=14))
+        self._close_btn.setIconSize(QSize(12, 12))
+        self._close_btn.setFocusPolicy(Qt.NoFocus)
+        self._close_btn.setToolTip("Schliessen")
+        self._close_btn.setCursor(Qt.PointingHandCursor)
+        self._close_btn.clicked.connect(window.close)
+        layout.addWidget(self._close_btn, 0, Qt.AlignRight | Qt.AlignVCenter)
+
+        window.windowTitleChanged.connect(self._title_label.setText)
+        self.apply_scheme(_build_scheme(window._accent, window._base))
+        self.set_maximized(window.isMaximized())
+
+    def set_menu_enabled(self, enabled: bool) -> None:
+        self._menu_btn.setEnabled(bool(enabled))
+
+    def apply_scheme(self, scheme: Mapping[str, str]) -> None:
+        bg = str(scheme.get("col5") or scheme.get("col7") or "#000000")
+        fg = str(scheme.get("col6") or "#E3E3DED6")
+        border = str(scheme.get("col10") or "#242424")
+        hover = "rgba(190,190,190,22)"
+        menu_pressed = "rgba(190,190,190,24)"
+        close_hover = "rgba(190,190,190,26)"
+        self.setStyleSheet(
+            f"""
+            QWidget#windowFrameTitleBar {{
+                background: {bg};
+                border: none;
+            }}
+            QLabel#windowFrameTitle {{
+                color: {fg};
+                font-size: 13px;
+                font-weight: 600;
+                padding-left: 2px;
+            }}
+            QToolButton#windowFrameMenuButton {{
+                background: transparent;
+                color: {fg};
+                border: none;
+                border-radius: 6px;
+                padding: 0px;
+                margin: 0px;
+            }}
+            QToolButton#windowFrameMenuButton:hover {{
+                background: transparent;
+                border: none;
+            }}
+            QToolButton#windowFrameMenuButton:pressed {{
+                background: {menu_pressed};
+                border: none;
+            }}
+            QToolButton#windowFrameMenuButton:focus {{
+                background: transparent;
+                border: none;
+            }}
+            QToolButton#windowFrameButton,
+            QToolButton#windowFrameCloseButton {{
+                background: transparent;
+                color: {fg};
+                border: 1px solid transparent;
+                border-radius: 6px;
+                padding: 2px 7px;
+            }}
+            QToolButton#windowFrameButton:focus,
+            QToolButton#windowFrameCloseButton:focus {{
+                background: transparent;
+                border-color: transparent;
+            }}
+            QToolButton#windowFrameButton:hover {{
+                background: {hover};
+                border-color: {border};
+            }}
+            QToolButton#windowFrameCloseButton:hover {{
+                background: {close_hover};
+                border-color: transparent;
+            }}
+            QToolButton:disabled {{
+                color: {border};
+            }}
+            """
+        )
+        self._min_btn.setIcon(_draw_window_control_icon("minimize", size=14, color=fg))
+        self._close_btn.setIcon(_draw_window_control_icon("close", size=14, color=fg))
+        self._fullscreen_btn.setIcon(_icon("open_in_full_26dp_999999_FILL0_wght500_GRAD0_opsz24.svg"))
+        self._fullscreen_btn.setIconSize(QSize(12, 12))
+        self.set_maximized(self._window.isMaximized())
+
+    def set_maximized(self, maximized: bool) -> None:
+        scheme = _build_scheme(self._window._accent, self._window._base)
+        icon_color = str(scheme.get("col6") or "#E3E3DED6")
+        self._max_btn.setIcon(_draw_window_control_icon("maximize", size=14, color=icon_color))
+        self._max_btn.setToolTip("Wiederherstellen" if maximized else "Maximieren")
+        self._max_btn.setIconSize(QSize(12, 12))
+        is_fullscreen = self._window.isFullScreen()
+        self._fullscreen_btn.setChecked(is_fullscreen)
+        self._fullscreen_btn.setToolTip("Fullscreen beenden (F11)" if is_fullscreen else "Echtes Fullscreen (F11)")
+
+    def _open_window_menu(self) -> None:
+        anchor = self._menu_btn.mapToGlobal(QPoint(0, self._menu_btn.height()))
+        self._window._show_window_menu_popup(anchor)
+
+    def _try_system_move(self) -> bool:
+        handle = self.window().windowHandle()
+        if handle is None or not hasattr(handle, "startSystemMove"):
+            return False
+        try:
+            return bool(handle.startSystemMove())
+        except Exception:
+            return False
+
+    def mousePressEvent(self, event):  # noqa: N802
+        if event.button() == Qt.LeftButton:
+            if self._try_system_move():
+                event.accept()
+                return
+            self._drag_active = True
+            self._drag_start_global = event.globalPosition().toPoint()
+            self._drag_start_window = self.window().frameGeometry().topLeft()
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):  # noqa: N802
+        if self._drag_active and (event.buttons() & Qt.LeftButton):
+            delta = event.globalPosition().toPoint() - self._drag_start_global
+            self.window().move(self._drag_start_window + delta)
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):  # noqa: N802
+        self._drag_active = False
+        super().mouseReleaseEvent(event)
+
+    def mouseDoubleClickEvent(self, event):  # noqa: N802
+        if event.button() == Qt.LeftButton:
+            self._window._toggle_window_maximize_restore()
+            event.accept()
+            return
+        super().mouseDoubleClickEvent(event)
+
+
+class WindowToolbarDragHandle(QWidget):
+    """Drag handle for moving the frameless window."""
+
+    def __init__(self, window: "MainAIEditor", parent: QWidget | None = None) -> None:
+        super().__init__(parent or window)
+        self._window = window
+        self._drag_active = False
+        self._drag_start_global = QPoint()
+        self._drag_start_window = QPoint()
+
+        self.setObjectName("toolbarWindowDragHandle")
+        self.setCursor(Qt.SizeAllCursor)
+        self.setToolTip("Fenster bewegen")
+        self.setAttribute(Qt.WA_StyledBackground, True)
+        self.setMinimumSize(80, 24)
+
+    def _try_system_move(self) -> bool:
+        handle = self._window.windowHandle()
+        if handle is None or not hasattr(handle, "startSystemMove"):
+            return False
+        try:
+            return bool(handle.startSystemMove())
+        except Exception:
+            return False
+
+    def mousePressEvent(self, event):  # noqa: N802
+        if bool(getattr(self._window, "_custom_titlebar_active", False)):
+            super().mousePressEvent(event)
+            return
+        if event.button() == Qt.LeftButton:
+            if self._try_system_move():
+                event.accept()
+                return
+            self._drag_active = True
+            self._drag_start_global = event.globalPosition().toPoint()
+            self._drag_start_window = self._window.frameGeometry().topLeft()
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):  # noqa: N802
+        if self._drag_active and (event.buttons() & Qt.LeftButton):
+            delta = event.globalPosition().toPoint() - self._drag_start_global
+            self._window.move(self._drag_start_window + delta)
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):  # noqa: N802
+        self._drag_active = False
+        super().mouseReleaseEvent(event)
+
+
+class WindowTopFrameBar(WindowToolbarDragHandle):
+    """Thin top frame shown when the custom titlebar is hidden."""
+
+    def __init__(self, window: "MainAIEditor", *, height_px: int, parent: QWidget | None = None) -> None:
+        super().__init__(window, parent or window)
+        self.setObjectName("windowTopFrameBar")
+        self.setToolTip("Fenster bewegen")
+        self.setMinimumSize(1, max(1, int(height_px)))
+        self.setFixedHeight(max(1, int(height_px)))
+
+
 class MainAIEditor(QMainWindow):
     ORG_NAME: Final = "ai.bentu"
 
@@ -10394,11 +12048,31 @@ class MainAIEditor(QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self._accent, self._base = SCHEME_BLUE, SCHEME_DARK
+        self._accent_name = "green"
+        self._accent, self._base = _accent_from_name(self._accent_name), SCHEME_DARK
         self._tab_docks: List[QDockWidget] = []          # store all tab docks
         self._workspace_column_widths: list[int] = [280, 760, 460, 340]
         self._explorer_splitter_sizes: list[int] = [380, 130]
         self._explorer_database_panel_visible: bool = False
+        self._window_menu_bar: QMenuBar | None = None
+        self._title_bar_widget: CustomWindowTitleBar | None = None
+        self._title_menu_popup: QMenu | None = None
+        self._tb_left_chrome_widget: QWidget | None = None
+        self._tb_left_title_label: QLabel | None = None
+        self._tb_left_menu_button: QToolButton | None = None
+        self._tb_right_min_btn: QToolButton | None = None
+        self._tb_right_max_btn: QToolButton | None = None
+        self._tb_right_fullscreen_btn: QToolButton | None = None
+        self._tb_right_close_btn: QToolButton | None = None
+        self._tb_left_chrome_action: QAction | None = None
+        self._tb_right_min_action: QAction | None = None
+        self._tb_right_max_action: QAction | None = None
+        self._tb_right_fullscreen_action: QAction | None = None
+        self._tb_right_close_action: QAction | None = None
+        self._tb_left_drag_handle: WindowToolbarDragHandle | None = None
+        self._window_top_frame_widget: WindowTopFrameBar | None = None
+        self._custom_titlebar_active = False
+        self._was_maximized_before_fullscreen = False
 
         # Crash-isolation helper: progressively enable init steps.
         # Default is "full" (999). Smaller numbers build less UI.
@@ -10426,6 +12100,8 @@ class MainAIEditor(QMainWindow):
             self._create_toolbars()
         if init_level >= 5:
             self._create_menu()
+        if not _env_truthy("AI_IDE_DISABLE_CUSTOM_WINDOW_FRAME", "0"):
+            self._install_custom_window_frame()
         if init_level >= 6:
             self._create_status()
         if init_level >= 7:
@@ -10437,6 +12113,8 @@ class MainAIEditor(QMainWindow):
 
         if init_level >= 9:
             self._load_ui_state()
+        self._sync_window_chrome_toolbar_visibility()
+        self._sync_fullscreen_action_state()
 
         # -----------------------------------------------------------------
         # <- changes 31.07.2025
@@ -10451,6 +12129,352 @@ class MainAIEditor(QMainWindow):
         # ~> loaded = True !
         
         # ~> object = chat 
+
+    def _get_live_title_bar_widget(self) -> CustomWindowTitleBar | None:
+        widget = self._title_bar_widget
+        if widget is None:
+            return None
+        try:
+            _ = widget.objectName()
+        except RuntimeError:
+            self._title_bar_widget = None
+            return None
+        return widget
+
+    def _get_live_top_frame_widget(self) -> WindowTopFrameBar | None:
+        widget = self._window_top_frame_widget
+        if widget is None:
+            return None
+        try:
+            _ = widget.objectName()
+        except RuntimeError:
+            self._window_top_frame_widget = None
+            return None
+        return widget
+
+    def _top_frame_height_px(self) -> int:
+        try:
+            dpi_y = float(self.logicalDpiY() or 96.0)
+        except Exception:
+            dpi_y = 96.0
+        # 2 mm in device pixels.
+        return max(1, int(round((dpi_y * 2.0) / 25.4)))
+
+    def _get_or_create_top_frame_widget(self) -> WindowTopFrameBar:
+        widget = self._get_live_top_frame_widget()
+        height_px = self._top_frame_height_px()
+        if widget is None:
+            widget = WindowTopFrameBar(self, height_px=height_px, parent=self)
+            self._window_top_frame_widget = widget
+        else:
+            widget.setFixedHeight(height_px)
+        return widget
+
+    def _install_custom_window_frame(self) -> None:
+        if self._get_live_title_bar_widget() is not None:
+            return
+
+        self.setWindowFlag(Qt.FramelessWindowHint, True)
+        self._title_bar_widget = CustomWindowTitleBar(self)
+        self._title_bar_widget.set_menu_enabled(bool(self._window_menu_bar and self._window_menu_bar.actions()))
+        self.setMenuWidget(self._title_bar_widget)
+        self._custom_titlebar_active = True
+        self._sync_window_titlebar_scheme()
+        self._refresh_window_titlebar_state()
+
+        menu_toggle_action = getattr(self, "menu_visible_action", None)
+        if isinstance(menu_toggle_action, QAction):
+            menu_toggle_action.setChecked(False)
+            menu_toggle_action.setEnabled(False)
+            menu_toggle_action.setToolTip("Menue ist ueber das Titlebar-Icon erreichbar.")
+
+        custom_titlebar_action = getattr(self, "act_toggle_custom_titlebar", None)
+        if isinstance(custom_titlebar_action, QAction):
+            blocker = QtCore.QSignalBlocker(custom_titlebar_action)
+            custom_titlebar_action.setChecked(True)
+            del blocker
+
+        self._sync_window_chrome_toolbar_visibility()
+
+    @Slot(bool)
+    def _set_custom_titlebar_visible(self, visible: bool) -> None:
+        if _env_truthy("AI_IDE_DISABLE_CUSTOM_WINDOW_FRAME", "0"):
+            self._custom_titlebar_active = False
+            return
+
+        titlebar_widget = self._get_live_title_bar_widget()
+
+        if visible:
+            if titlebar_widget is None:
+                self._install_custom_window_frame()
+            else:
+                self.setMenuWidget(titlebar_widget)
+                self._custom_titlebar_active = True
+                titlebar_widget.set_menu_enabled(bool(self._window_menu_bar and self._window_menu_bar.actions()))
+                self._sync_window_titlebar_scheme()
+                self._refresh_window_titlebar_state()
+        else:
+            top_frame_widget = self._get_or_create_top_frame_widget()
+            try:
+                self.setMenuWidget(top_frame_widget)
+            except RuntimeError:
+                self._title_bar_widget = None
+                self._window_top_frame_widget = None
+            self._custom_titlebar_active = False
+
+        self._sync_window_chrome_toolbar_visibility()
+        self._sync_window_chrome_toolbar_scheme()
+
+    def _sync_toolbar_window_title(self, title: str | None = None) -> None:
+        label = self._tb_left_title_label
+        if not isinstance(label, QLabel):
+            return
+        resolved_title = str(title if title is not None else self.windowTitle() or "").strip() or self.APP_NAME
+        label.setText(resolved_title)
+
+    def _sync_toolbar_window_controls(self) -> None:
+        scheme = _build_scheme(self._accent, self._base)
+        icon_color = str(scheme.get("col6") or "#E3E3DED6")
+
+        min_btn = self._tb_right_min_btn
+        if isinstance(min_btn, QToolButton):
+            min_btn.setText("")
+            min_btn.setIcon(_draw_window_control_icon("minimize", size=14, color=icon_color))
+            min_btn.setIconSize(QSize(12, 12))
+
+        close_btn = self._tb_right_close_btn
+        if isinstance(close_btn, QToolButton):
+            close_btn.setIcon(_draw_window_control_icon("close", size=14, color=icon_color))
+            close_btn.setIconSize(QSize(12, 12))
+
+        max_btn = self._tb_right_max_btn
+        if isinstance(max_btn, QToolButton):
+            max_btn.setIcon(_draw_window_control_icon("maximize", size=14, color=icon_color))
+            max_btn.setToolTip("Wiederherstellen" if self.isMaximized() else "Maximieren")
+            max_btn.setIconSize(QSize(12, 12))
+
+        fullscreen_btn = self._tb_right_fullscreen_btn
+        if isinstance(fullscreen_btn, QToolButton):
+            fullscreen_btn.setIcon(_icon("open_in_full_26dp_999999_FILL0_wght500_GRAD0_opsz24.svg"))
+            fullscreen_btn.setIconSize(QSize(12, 12))
+            fullscreen_btn.setChecked(self.isFullScreen())
+            fullscreen_btn.setToolTip("Fullscreen beenden (F11)" if self.isFullScreen() else "Echtes Fullscreen (F11)")
+
+    def _sync_window_chrome_toolbar_scheme(self) -> None:
+        scheme = _build_scheme(self._accent, self._base)
+        chrome_bg = str(scheme.get("col5") or "#000000")
+        fg = str(scheme.get("col6") or "#E3E3DED6")
+        border = str(scheme.get("col10") or "#242424")
+        drag_bg = str(scheme.get("col7") or "#0b0b0b")
+        chrome_widget = self._tb_left_chrome_widget
+        if isinstance(chrome_widget, QWidget):
+            chrome_widget.setStyleSheet(
+                f"background: {chrome_bg};"
+                "border: none;"
+            )
+        title_label = self._tb_left_title_label
+        if isinstance(title_label, QLabel):
+            title_label.setStyleSheet(
+                f"background: {chrome_bg};"
+                f"color: {fg};"
+                "font-size: 10px;"
+                "font-weight: 700;"
+                "padding: 0px;"
+                "margin: 0px;"
+            )
+        drag_handle = self._tb_left_drag_handle
+        if isinstance(drag_handle, QWidget):
+            drag_handle.setStyleSheet(
+                f"background: {drag_bg};"
+                f"border: 1px dashed {border};"
+                "border-radius: 6px;"
+            )
+        top_frame_widget = self._get_live_top_frame_widget()
+        if isinstance(top_frame_widget, QWidget):
+            top_frame_widget.setFixedHeight(self._top_frame_height_px())
+            frame_bg = str(scheme.get('col5') or '#000000')
+            top_frame_widget.setStyleSheet(
+                f"background: {frame_bg};"
+                f"border-bottom: 1px solid {frame_bg};"
+            )
+        self._sync_toolbar_window_controls()
+
+    def _set_toolbar_window_menu_enabled(self, enabled: bool) -> None:
+        menu_btn = self._tb_left_menu_button
+        if isinstance(menu_btn, QToolButton):
+            menu_btn.setEnabled(bool(enabled))
+
+    def _sync_window_chrome_toolbar_visibility(self) -> None:
+        if self._custom_titlebar_active and self._get_live_title_bar_widget() is None:
+            self._custom_titlebar_active = False
+        if _env_truthy("AI_IDE_DISABLE_CUSTOM_WINDOW_FRAME", "0"):
+            toolbar_chrome_visible = False
+        else:
+            toolbar_chrome_visible = not bool(self._custom_titlebar_active)
+        for action in (
+            self._tb_left_chrome_action,
+            self._tb_right_min_action,
+            self._tb_right_max_action,
+            self._tb_right_fullscreen_action,
+            self._tb_right_close_action,
+        ):
+            if isinstance(action, QAction):
+                action.setVisible(toolbar_chrome_visible)
+        for widget in (
+            self._tb_left_chrome_widget,
+            self._tb_right_min_btn,
+            self._tb_right_max_btn,
+            self._tb_right_fullscreen_btn,
+            self._tb_right_close_btn,
+            self._tb_left_drag_handle,
+        ):
+            if isinstance(widget, QWidget):
+                widget.setVisible(toolbar_chrome_visible)
+        self._set_toolbar_window_menu_enabled(bool(self._window_menu_bar and self._window_menu_bar.actions()))
+
+    def _sync_window_titlebar_scheme(self) -> None:
+        titlebar_widget = self._get_live_title_bar_widget()
+        if titlebar_widget is not None:
+            titlebar_widget.apply_scheme(_build_scheme(self._accent, self._base))
+        self._sync_window_chrome_toolbar_scheme()
+
+    def _refresh_window_titlebar_state(self) -> None:
+        titlebar_widget = self._get_live_title_bar_widget()
+        if titlebar_widget is not None:
+            titlebar_widget.set_maximized(self.isMaximized())
+        self._sync_toolbar_window_controls()
+
+    def _open_toolbar_window_menu(self) -> None:
+        menu_btn = self._tb_left_menu_button
+        if isinstance(menu_btn, QToolButton):
+            anchor = menu_btn.mapToGlobal(QPoint(0, menu_btn.height()))
+            self._show_window_menu_popup(anchor)
+            return
+        self._show_window_menu_popup(None)
+
+    def _toggle_window_maximize_restore(self) -> None:
+        if self.isFullScreen():
+            self._set_fullscreen_enabled(False)
+            return
+        if self.isMaximized():
+            self.showNormal()
+        else:
+            self.showMaximized()
+        self._refresh_window_titlebar_state()
+
+    def _toggle_true_fullscreen_mode(self) -> None:
+        self._set_fullscreen_enabled(not self.isFullScreen())
+
+    @Slot(bool)
+    def _set_fullscreen_enabled(self, enabled: bool) -> None:
+        if enabled:
+            self._was_maximized_before_fullscreen = self.isMaximized()
+            self.showFullScreen()
+        else:
+            if self._was_maximized_before_fullscreen:
+                self.showMaximized()
+            else:
+                self.showNormal()
+        self._refresh_window_titlebar_state()
+        self._sync_fullscreen_action_state()
+
+    def _sync_fullscreen_action_state(self) -> None:
+        action = getattr(self, "act_toggle_fullscreen", None)
+        if not isinstance(action, QAction):
+            return
+        blocker = QtCore.QSignalBlocker(action)
+        action.setChecked(self.isFullScreen())
+        del blocker
+
+    def _show_window_menu_popup(self, anchor: QPoint | None = None) -> None:
+        menu_bar = self._window_menu_bar
+        if not isinstance(menu_bar, QMenuBar):
+            status_bar = self.statusBar() if hasattr(self, "statusBar") else None
+            if isinstance(status_bar, QStatusBar):
+                status_bar.showMessage("Menue ist nicht initialisiert.", 2600)
+            return
+
+        try:
+            top_level_actions = list(menu_bar.actions())
+        except RuntimeError:
+            self._window_menu_bar = None
+            status_bar = self.statusBar() if hasattr(self, "statusBar") else None
+            if isinstance(status_bar, QStatusBar):
+                status_bar.showMessage("Menuemodell wurde invalidiert.", 2600)
+            return
+
+        if not top_level_actions:
+            status_bar = self.statusBar() if hasattr(self, "statusBar") else None
+            if isinstance(status_bar, QStatusBar):
+                status_bar.showMessage("Menue enthaelt keine Eintraege.", 2600)
+            return
+
+        scheme = _build_scheme(self._accent, self._base)
+        popup_bg = str(scheme.get("col5") or scheme.get("col7") or "#000000")
+        popup_fg = str(scheme.get("col6") or "#E3E3DED6")
+        popup_border = str(scheme.get("col10") or "#242424")
+        popup_sel = "rgba(190,190,190,24)"
+        popup_style = (
+            "QMenu {"
+            f" background: {popup_bg};"
+            f" color: {popup_fg};"
+            f" border: 1px solid {popup_border};"
+            " border-radius: 6px;"
+            " padding: 4px;"
+            " }"
+            "QMenu::item {"
+            f" color: {popup_fg};"
+            " border-radius: 6px;"
+            " padding: 5px 16px;"
+            " margin: 1px 0px;"
+            " }"
+            "QMenu::item:selected {"
+            f" background: {popup_sel};"
+            f" color: {popup_fg};"
+            " }"
+            "QMenu::separator {"
+            f" background: {popup_border};"
+            " height: 1px;"
+            " margin: 4px 8px;"
+            " }"
+        )
+
+        popup = QMenu(self)
+        popup.setStyleSheet(popup_style)
+        has_entries = False
+        for top_action in top_level_actions:
+            if top_action.isSeparator():
+                popup.addSeparator()
+                continue
+
+            source_menu = top_action.menu()
+            if isinstance(source_menu, QMenu):
+                top_popup = popup.addMenu(source_menu.title())
+                top_popup.setStyleSheet(popup_style)
+                if not source_menu.icon().isNull():
+                    top_popup.setIcon(source_menu.icon())
+                top_popup.addActions(source_menu.actions())
+                has_entries = True
+            else:
+                popup.addAction(top_action)
+                has_entries = True
+
+        if not has_entries:
+            return
+
+        self._title_menu_popup = popup
+        if anchor is None:
+            toolbar_menu_btn = self._tb_left_menu_button
+            if isinstance(toolbar_menu_btn, QToolButton) and toolbar_menu_btn.isVisible():
+                anchor = toolbar_menu_btn.mapToGlobal(QPoint(0, toolbar_menu_btn.height()))
+            else:
+                titlebar_widget = self._get_live_title_bar_widget()
+                if isinstance(titlebar_widget, QWidget) and titlebar_widget.isVisible():
+                    anchor = titlebar_widget.mapToGlobal(QPoint(8, titlebar_widget.height()))
+                else:
+                    anchor = self.mapToGlobal(QPoint(8, 8))
+        popup.exec(anchor)
+        self._title_menu_popup = None
     
     # ====================== helper: remove title-bars & buttons ============
 
@@ -11014,8 +13038,8 @@ class MainAIEditor(QMainWindow):
                 scheme = _build_scheme(self._accent, self._base)
                 # Keep explorer palette aligned with the active app scheme.
                 self.explorer.set_text_color(scheme.get("col6", "#E3E3DED6"))
-                self.explorer.set_background_color(scheme.get("col9", "#1D1D1D"))
-                self.explorer.set_accent_color(scheme.get("col1", "#3a5fff"))
+                self.explorer.set_background_color(scheme.get("col7", "#0b0b0b"))
+                self.explorer.set_accent_color(scheme.get("col1", "#0fe913"))
 
         disable_control_plane = _env_truthy("AI_IDE_DISABLE_CONTROL_PLANE", "0")
         # Create ControlPlaneWidget and pass it to ExtensionsWorkspaceWidget
@@ -11191,7 +13215,7 @@ class MainAIEditor(QMainWindow):
         self.main_split = QSplitter(Qt.Horizontal, self)
         self.main_split.setObjectName("mainHorizontalSplitter")
         self.main_split.setChildrenCollapsible(True)
-        self.main_split.setHandleWidth(7)
+        self.main_split.setHandleWidth(4)
         self.main_split.setOpaqueResize(True)
         self.main_split.addWidget(self.files_dock)       # links
         self.main_split.addWidget(self.chat_dock)        # mitte
@@ -11241,9 +13265,7 @@ class MainAIEditor(QMainWindow):
 
     def _apply_main_splitter_style(self) -> None:
         scheme = _build_scheme(self._accent, self._base)
-        handle_idle, _, _ = _splitter_handle_palette(scheme)
-        handle_hover = str(scheme.get("col2") or scheme.get("col1") or "#6280ff")
-        handle_pressed = str(scheme.get("col2") or scheme.get("col1") or "#6280ff")
+        handle_idle, handle_hover, handle_pressed = _splitter_handle_palette(scheme)
         splitter_bg = str(scheme.get("col5") or "#000000")
         main_splitter = getattr(self, "main_split", None)
         if isinstance(main_splitter, QSplitter):
@@ -11254,12 +13276,12 @@ class MainAIEditor(QMainWindow):
                 }}
                 QSplitter#mainHorizontalSplitter::handle:vertical {{
                     background: {handle_idle};
-                    margin: 0px;
-                    min-width: 7px;
+                    margin: 12px 0px;
+                    min-width: 4px;
                     border-radius: 999px;
               }}
                 QSplitter#mainHorizontalSplitter::handle:horizontal {{
-                    background: {handle_idle};
+                    background: transparent;
                     margin: 0px 12px;
                     min-height: 7px;
                     border-radius: 999px;
@@ -11282,12 +13304,12 @@ class MainAIEditor(QMainWindow):
                 }}
                 QSplitter#ExplorerDockSplitter::handle:vertical {{
                     background: {handle_idle};
-                    margin: 0px;
-                    min-width: 7px;
+                    margin: 12px 0px;
+                    min-width: 4px;
                     border-radius: 999px;
               }}
                 QSplitter#ExplorerDockSplitter::handle:horizontal {{
-                    background: {handle_idle};
+                    background: transparent;
                     margin: 0px 12px;
                     min-height: 7px;
                     border-radius: 999px;
@@ -11355,7 +13377,18 @@ class MainAIEditor(QMainWindow):
             _toggle_accent
             )
 
-        self.act_toggle_accent.setToolTip("Farbschema wechseln")
+        self.act_toggle_accent.setToolTip(
+            f"Farbschema wechseln (aktuell: {_normalize_accent_name(getattr(self, '_accent_name', 'green'))})"
+        )
+
+        self.act_toggle_fullscreen = QAction(
+            "Fullscreen",
+            self,
+            checkable=True,
+            shortcut=QKeySequence("F11"),
+            toggled=self._set_fullscreen_enabled,
+        )
+        self.act_toggle_fullscreen.setToolTip("Echtes Fullscreen (F11)")
 
         # ---------- NEU: Chat-Toggle --------------- # <– 10.07.2025 ---------
 
@@ -11581,6 +13614,7 @@ class MainAIEditor(QMainWindow):
         self.tb_right = QToolBar(self, orientation=Qt.Vertical)
         self.tb_right.setObjectName("ToolbarRight")
         side_toolbar_width = 56
+        right_toolbar_width = 56
 
         # auch hier die größere Icongröße übernehmen
 
@@ -11590,15 +13624,15 @@ class MainAIEditor(QMainWindow):
             bar.setMovable(False)
             bar.setFloatable(False)
             bar.setContextMenuPolicy(Qt.PreventContextMenu)
-            bar.setFixedWidth(side_toolbar_width)
+            bar.setFixedWidth(right_toolbar_width)
             bar.setLayoutDirection(Qt.RightToLeft)
-            bar.setContentsMargins(8, 8, 8, 8)
+            bar.setContentsMargins(0, 8, 0, 8)
             bar.setStyleSheet(
                 f"QToolBar {{"
                 f" background: {chrome_bg};"
                 " border: none;"
                 " border-radius: 0px;"
-                " padding: 6px 0px 6px 6px;"
+                " padding: 6px 0px 6px 0px;"
                 " spacing: 8px;"
                 " }"
                 "QToolBar::handle {"
@@ -11625,12 +13659,97 @@ class MainAIEditor(QMainWindow):
                 " border: 1px solid transparent;"
                 " border-radius: 6px;"
                 " }"
+                "QToolButton#toolbarWindowCloseButton, QToolButton#toolbarWindowMinButton, QToolButton#toolbarWindowMaxButton, QToolButton#toolbarWindowFullscreenButton {"
+                " min-width: 16px;"
+                " min-height: 16px;"
+                " max-width: 16px;"
+                " max-height: 16px;"
+                " padding: 0px;"
+                " margin: 0px;"
+                " border-radius: 3px;"
+                " }"
                 f"QToolButton:hover, QToolButton:pressed, QToolButton:checked {{"
                 f" background: {chrome_hover};"
                 " border: 1px solid transparent;"
                 " }"
             )
             self.addToolBar(Qt.RightToolBarArea, bar)
+
+        tb_right_mini_host = QWidget(self.tb_right)
+        tb_right_mini_host.setObjectName("toolbarWindowMiniControlsHost")
+        tb_right_mini_host.setStyleSheet("background: transparent; border: none;")
+        tb_right_mini_host.setFixedWidth(right_toolbar_width)
+        tb_right_mini_host_layout = QHBoxLayout(tb_right_mini_host)
+        tb_right_mini_host_layout.setContentsMargins(0, 0, 0, 0)
+        tb_right_mini_host_layout.setSpacing(0)
+        tb_right_mini_host_layout.addStretch(1)
+
+        tb_right_mini_controls = QWidget(tb_right_mini_host)
+        tb_right_mini_controls.setObjectName("toolbarWindowMiniControls")
+        tb_right_mini_controls.setStyleSheet("background: transparent; border: none;")
+        tb_right_mini_controls.setLayoutDirection(Qt.LeftToRight)
+        tb_right_mini_controls.setFixedSize(33, 33)
+        tb_right_mini_layout = QGridLayout(tb_right_mini_controls)
+        tb_right_mini_layout.setContentsMargins(0, 0, 0, 0)
+        tb_right_mini_layout.setSpacing(1)
+
+        self._tb_right_max_btn = QToolButton(tb_right_mini_controls)
+        self._tb_right_max_btn.setObjectName("toolbarWindowMaxButton")
+        self._tb_right_max_btn.setIcon(_draw_window_control_icon("maximize", size=14))
+        self._tb_right_max_btn.setIconSize(QSize(12, 12))
+        self._tb_right_max_btn.setToolTip("Maximieren")
+        self._tb_right_max_btn.setCursor(Qt.PointingHandCursor)
+        self._tb_right_max_btn.setFocusPolicy(Qt.NoFocus)
+        self._tb_right_max_btn.setAutoRaise(True)
+        self._tb_right_max_btn.setFixedSize(16, 16)
+        self._tb_right_max_btn.clicked.connect(self._toggle_window_maximize_restore)
+        tb_right_mini_layout.addWidget(self._tb_right_max_btn, 0, 0)
+
+        self._tb_right_min_btn = QToolButton(tb_right_mini_controls)
+        self._tb_right_min_btn.setObjectName("toolbarWindowMinButton")
+        self._tb_right_min_btn.setText("")
+        self._tb_right_min_btn.setIcon(_draw_window_control_icon("minimize", size=14))
+        self._tb_right_min_btn.setIconSize(QSize(12, 12))
+        self._tb_right_min_btn.setToolTip("Minimieren")
+        self._tb_right_min_btn.setCursor(Qt.PointingHandCursor)
+        self._tb_right_min_btn.setFocusPolicy(Qt.NoFocus)
+        self._tb_right_min_btn.setAutoRaise(True)
+        self._tb_right_min_btn.setFixedSize(16, 16)
+        self._tb_right_min_btn.clicked.connect(self.showMinimized)
+        tb_right_mini_layout.addWidget(self._tb_right_min_btn, 1, 0)
+
+        self._tb_right_fullscreen_btn = QToolButton(tb_right_mini_controls)
+        self._tb_right_fullscreen_btn.setObjectName("toolbarWindowFullscreenButton")
+        self._tb_right_fullscreen_btn.setIcon(_icon("open_in_full_26dp_999999_FILL0_wght500_GRAD0_opsz24.svg"))
+        self._tb_right_fullscreen_btn.setIconSize(QSize(12, 12))
+        self._tb_right_fullscreen_btn.setToolTip("Echtes Fullscreen (F11)")
+        self._tb_right_fullscreen_btn.setCursor(Qt.PointingHandCursor)
+        self._tb_right_fullscreen_btn.setFocusPolicy(Qt.NoFocus)
+        self._tb_right_fullscreen_btn.setAutoRaise(True)
+        self._tb_right_fullscreen_btn.setCheckable(True)
+        self._tb_right_fullscreen_btn.setFixedSize(16, 16)
+        self._tb_right_fullscreen_btn.clicked.connect(self._toggle_true_fullscreen_mode)
+        tb_right_mini_layout.addWidget(self._tb_right_fullscreen_btn, 0, 1)
+
+        self._tb_right_close_btn = QToolButton(tb_right_mini_controls)
+        self._tb_right_close_btn.setObjectName("toolbarWindowCloseButton")
+        self._tb_right_close_btn.setIcon(_draw_window_control_icon("close", size=14))
+        self._tb_right_close_btn.setIconSize(QSize(12, 12))
+        self._tb_right_close_btn.setToolTip("Schliessen")
+        self._tb_right_close_btn.setCursor(Qt.PointingHandCursor)
+        self._tb_right_close_btn.setFocusPolicy(Qt.NoFocus)
+        self._tb_right_close_btn.setAutoRaise(True)
+        self._tb_right_close_btn.setFixedSize(16, 16)
+        self._tb_right_close_btn.clicked.connect(self.close)
+        tb_right_mini_layout.addWidget(self._tb_right_close_btn, 1, 1)
+
+        tb_right_mini_host_layout.addWidget(tb_right_mini_controls, 0, Qt.AlignCenter)
+        tb_right_mini_host_layout.addStretch(1)
+
+        self._tb_right_close_action = self.tb_right.addWidget(tb_right_mini_host)
+        self._tb_right_min_action = self._tb_right_close_action
+        self._tb_right_max_action = self._tb_right_close_action
+        self._tb_right_fullscreen_action = self._tb_right_close_action
 
         self._tb_right_spacer = QWidget(self.tb_right)
         self._tb_right_spacer.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
@@ -11686,6 +13805,32 @@ class MainAIEditor(QMainWindow):
         )
         self.addToolBar(Qt.LeftToolBarArea, self.tb_left)
 
+        self._tb_left_chrome_widget = QWidget(self.tb_left)
+        self._tb_left_chrome_widget.setObjectName("toolbarWindowChromeWidget")
+        tb_left_chrome_layout = QVBoxLayout(self._tb_left_chrome_widget)
+        tb_left_chrome_layout.setContentsMargins(0, 0, 0, 0)
+        tb_left_chrome_layout.setSpacing(6)
+
+        self._tb_left_title_label = QLabel(self.windowTitle(), self._tb_left_chrome_widget)
+        self._tb_left_title_label.setObjectName("toolbarWindowTitleLabel")
+        self._tb_left_title_label.setAlignment(Qt.AlignCenter)
+        self._tb_left_title_label.setWordWrap(True)
+        self._tb_left_title_label.setFixedWidth(max(side_toolbar_width - 14, 36))
+        tb_left_chrome_layout.addWidget(self._tb_left_title_label, 0, Qt.AlignCenter)
+
+        self._tb_left_menu_button = QToolButton(self._tb_left_chrome_widget)
+        self._tb_left_menu_button.setObjectName("toolbarWindowMenuButton")
+        self._tb_left_menu_button.setIcon(_icon("menu_24.svg"))
+        self._tb_left_menu_button.setIconSize(QSize(16, 16))
+        self._tb_left_menu_button.setToolTip("Menue")
+        self._tb_left_menu_button.setCursor(Qt.PointingHandCursor)
+        self._tb_left_menu_button.setFocusPolicy(Qt.NoFocus)
+        self._tb_left_menu_button.setAutoRaise(True)
+        self._tb_left_menu_button.setFixedSize(42, 42)
+        self._tb_left_menu_button.clicked.connect(self._open_toolbar_window_menu)
+        tb_left_chrome_layout.addWidget(self._tb_left_menu_button, 0, Qt.AlignCenter)
+        self._tb_left_chrome_action = self.tb_left.addWidget(self._tb_left_chrome_widget)
+
         if hasattr(self, "act_toggle_explorer"):
             self.tb_left.addAction(self.act_toggle_explorer)
         if hasattr(self, "act_toggle_control_plane_left"):
@@ -11698,6 +13843,13 @@ class MainAIEditor(QMainWindow):
         self._tb_left_spacer.setStyleSheet(f"background: {chrome_bg}; border: none;")
         self._tb_left_spacer.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
         self.tb_left.addWidget(self._tb_left_spacer)
+
+        self.windowTitleChanged.connect(self._sync_toolbar_window_title)
+        self._sync_toolbar_window_title(self.windowTitle())
+        self._sync_window_titlebar_scheme()
+        self._refresh_window_titlebar_state()
+        self._set_toolbar_window_menu_enabled(bool(self._window_menu_bar and self._window_menu_bar.actions()))
+        self._sync_window_chrome_toolbar_visibility()
 
     def _normalize_toolbar_layout(self) -> None:
         """Keep the fixed toolbars pinned to their intended window areas."""
@@ -11722,6 +13874,7 @@ class MainAIEditor(QMainWindow):
     
     def _create_menu(self) -> None:
         # ------------------------------------------------------------------ ui
+        custom_frame_enabled = not _env_truthy("AI_IDE_DISABLE_CUSTOM_WINDOW_FRAME", "0")
         scheme = _build_scheme(self._accent, self._base)
         chrome_bg = str(scheme.get("col5") or "#000000")
         chrome_hover = str(scheme.get("col9") or chrome_bg)
@@ -11738,7 +13891,11 @@ class MainAIEditor(QMainWindow):
             f" background: {chrome_hover};"
             " }"
         )
-        self.setMenuBar(mbar)                         # make it the window bar
+        if custom_frame_enabled:
+            mbar.setVisible(False)
+        else:
+            self.setMenuBar(mbar)                     # make it the window bar
+        self._window_menu_bar = mbar
         # -------------- FILE ------------------------------------------------
         filem = mbar.addMenu("File")
 
@@ -11851,6 +14008,17 @@ class MainAIEditor(QMainWindow):
                                            toggled = mbar
                                            .setVisible
                                            )
+        self.act_toggle_custom_titlebar = QAction(
+            "Custom Titlebar",
+            self,
+            checkable=True,
+            checked=custom_frame_enabled,
+            toggled=self._set_custom_titlebar_visible,
+        )
+        self.act_toggle_custom_titlebar.setToolTip("Custom Titlebar ein-/ausblenden")
+        if not custom_frame_enabled:
+            self.act_toggle_custom_titlebar.setEnabled(False)
+            self.act_toggle_custom_titlebar.setToolTip("Custom Titlebar ist via Environment deaktiviert")
         # helper to insert action + separator (except after the last one)
         action_list: list = \
             [
@@ -11858,7 +14026,9 @@ class MainAIEditor(QMainWindow):
              self.act_toggle_control_plane,
              self.act_toggle_explorer,
              self.act_graph_placeholder,
+             self.act_toggle_fullscreen,
              self.act_toggle_accent,
+             self.act_toggle_custom_titlebar,
              self.menu_visible_action,
              self.act_grey
             ]
@@ -11883,6 +14053,12 @@ class MainAIEditor(QMainWindow):
         if self._editor_surface_enabled():
             tools.addSeparator()
             tools.addAction(self.act_clone_tabdock)
+
+        titlebar_widget = self._get_live_title_bar_widget()
+        if titlebar_widget is not None:
+            titlebar_widget.set_menu_enabled(bool(mbar.actions()))
+        self._set_toolbar_window_menu_enabled(bool(mbar.actions()))
+        self._sync_window_chrome_toolbar_visibility()
    
     # ================================================= status =============
     
@@ -13049,21 +15225,34 @@ class MainAIEditor(QMainWindow):
 
     @Slot()
     def _toggle_accent(self):
-        self._accent = SCHEME_GREEN if self._accent is SCHEME_BLUE else SCHEME_BLUE
+        current_name = _normalize_accent_name(getattr(self, "_accent_name", "green"))
+        try:
+            current_index = ACCENT_ORDER.index(current_name)
+        except ValueError:
+            current_index = 0
+        self._accent_name = ACCENT_ORDER[(current_index + 1) % len(ACCENT_ORDER)]
+        self._accent = _accent_from_name(self._accent_name)
         _apply_style(self, _build_scheme(self._accent, self._base))
         self._apply_main_splitter_style()
         self._sync_explorer_scheme()
+        self._sync_chat_scheme()
         self._sync_control_plane_scheme()
         self._sync_extensions_scheme()
+        self._sync_window_titlebar_scheme()
+        if hasattr(self, "act_toggle_accent"):
+            self.act_toggle_accent.setToolTip(f"Farbschema wechseln (aktuell: {self._accent_name})")
 
     @Slot(bool)
     def _toggle_grey(self, on: bool):
         self._base = SCHEME_GREY if on else SCHEME_DARK
+        self._accent = _accent_from_name(getattr(self, "_accent_name", "green"))
         _apply_style(self, _build_scheme(self._accent, self._base))
         self._apply_main_splitter_style()
         self._sync_explorer_scheme()
+        self._sync_chat_scheme()
         self._sync_control_plane_scheme()
         self._sync_extensions_scheme()
+        self._sync_window_titlebar_scheme()
 
     def _sync_explorer_scheme(self) -> None:
         """Keep explorer colors/icons synced after scheme changes."""
@@ -13072,8 +15261,23 @@ class MainAIEditor(QMainWindow):
                 return
             scheme = _build_scheme(self._accent, self._base)
             self.explorer.set_text_color(scheme.get("col6", "#E3E3DED6"))
-            self.explorer.set_background_color(scheme.get("col9", "#1D1D1D"))
-            self.explorer.set_accent_color(scheme.get("col1", "#3a5fff"))
+            self.explorer.set_background_color(scheme.get("col7", "#0b0b0b"))
+            self.explorer.set_accent_color(scheme.get("col1", "#0fe913"))
+        except Exception:
+            pass
+
+    def _sync_chat_scheme(self) -> None:
+        """Keep AI chat dock, prompt frame and history synced after scheme changes."""
+        try:
+            chat_dock = getattr(self, "chat_dock", None)
+            updater = getattr(chat_dock, "update_scheme", None)
+            if callable(updater):
+                updater(self._accent, self._base)
+                return
+            chat_widget = chat_dock.widget() if isinstance(chat_dock, QDockWidget) else None
+            widget_updater = getattr(chat_widget, "update_scheme", None)
+            if callable(widget_updater):
+                widget_updater(self._accent, self._base)
         except Exception:
             pass
 
@@ -13118,11 +15322,14 @@ class MainAIEditor(QMainWindow):
 
         # eigene Felder ---------------------------------------------------
 
-        self._accent = SCHEME_GREEN if s.value("accent") == "green" else SCHEME_BLUE
+        self._accent_name = _normalize_accent_name(s.value("accent", "green"))
+        self._accent = _accent_from_name(self._accent_name)
         self._base   = SCHEME_GREY  if s.value("base")   == "grey"  else SCHEME_DARK
         _apply_style(self, _build_scheme(self._accent, self._base))
         self._apply_main_splitter_style()
         self._sync_explorer_scheme()
+        self._sync_chat_scheme()
+        self._sync_window_titlebar_scheme()
 
         stored_widths = s.value("workspaceColumnWidths", [280, 760, 460, 340])
         if isinstance(stored_widths, (list, tuple)):
@@ -13176,6 +15383,8 @@ class MainAIEditor(QMainWindow):
                 tabs.addTab(QTextEdit(f"# {name}\n"), name)
             tabs.setCurrentIndex(0)
 
+        self._refresh_window_titlebar_state()
+
     # ---------------------------------------------------------------- save
     
     def _save_ui_state(self):         
@@ -13189,7 +15398,7 @@ class MainAIEditor(QMainWindow):
             s.setValue("geometry", self.saveGeometry())
             s.setValue("state",    self.saveState())
 
-        s.setValue("accent", "green" if self._accent is SCHEME_GREEN else "blue")
+        s.setValue("accent", _normalize_accent_name(getattr(self, "_accent_name", "green")))
         s.setValue("base",   "grey"  if self._base   is SCHEME_GREY  else "dark")
         s.setValue("showExplorer", self.files_dock.isVisible())
         s.setValue("showConsole",  False)
@@ -13227,6 +15436,12 @@ class MainAIEditor(QMainWindow):
             pass
 
     # -- <- changes 27.07.2025 ------------------------------------- closeEvent
+
+    def changeEvent(self, event):  # noqa: N802
+        super().changeEvent(event)
+        if event.type() == QEvent.WindowStateChange:
+            self._refresh_window_titlebar_state()
+            self._sync_fullscreen_action_state()
 
     def closeEvent(self, ev):        # >>>
         # 1) save chat history to disk

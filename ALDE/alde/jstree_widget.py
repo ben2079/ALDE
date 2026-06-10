@@ -2622,7 +2622,7 @@ class JsonTreeWidgetWithToolbar(QWidget):
         self._toolbar = toolbar
         toolbar.setFixedHeight(28)
         toolbar.setObjectName("JsonTreeToolbar")
-        self._bg_color = "#1D1D1D"
+        self._bg_color = "#0b0b0b"
         self._accent_color = "#3a5fff"
         self._toolbar_style_template = """
             QFrame#JsonTreeToolbar {{
@@ -2655,7 +2655,7 @@ class JsonTreeWidgetWithToolbar(QWidget):
         
         # Create toolbar layout
         toolbar_layout = QHBoxLayout(toolbar)
-        toolbar_layout.setContentsMargins(4, 2, 4, 2)
+        toolbar_layout.setContentsMargins(8, 2, 8, 2)
         toolbar_layout.setSpacing(2)
         
         # Create tree widget
@@ -2753,7 +2753,7 @@ class JsonTreeWidgetWithToolbar(QWidget):
     
     def _apply_wrapper_style(self) -> None:
         self.setStyleSheet(
-            f"QWidget#JsonTreeWidgetWithToolbar {{ background: transparent; border-radius: 14px; }}"
+            f"QWidget#JsonTreeWidgetWithToolbar {{ background: {self._bg_color}; border-radius: 14px; }}"
         )
 
     def _apply_toolbar_style(self, toolbar: QFrame) -> None:
@@ -2833,6 +2833,8 @@ class JsonTreeWidget(QTreeWidget):
     )
     _SMALL_FONT_SECTION_NAMES: set[str] = {"PROJECTS", "CHAT_HISTORY", "HISTORY"}
     _HISTORY_SECTION_NAMES: set[str] = {"CHAT_HISTORY", "HISTORY"}
+    _TREE_ICON_SIZE = QSize(18, 18)
+    _TREE_INDENTATION = 12
 
     def minimumSizeHint(self) -> QSize:
         return QSize(0, 0)
@@ -2847,6 +2849,9 @@ class JsonTreeWidget(QTreeWidget):
         self.setHeaderHidden(True)
         self.setUniformRowHeights(True)
         self.setAnimated(True)
+        self.setIconSize(self._TREE_ICON_SIZE)
+        # Keep labels readable in narrow docks by reducing the default branch gap.
+        self.setIndentation(self._TREE_INDENTATION)
 
         # Guards / caches for persistence.
         self._initializing = True
@@ -2914,7 +2919,7 @@ class JsonTreeWidget(QTreeWidget):
                """
         self._branch_color = "#2d8cf0"
         self._text_color = "#d4d4d4"
-        self._bg_color = "#1D1D1D"
+        self._bg_color = "#0b0b0b"
         self._accent_color = "#3a5fff"
 
         # Typography
