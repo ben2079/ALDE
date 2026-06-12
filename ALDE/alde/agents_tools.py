@@ -2018,6 +2018,34 @@ class AgentDbOperationService:
     _DEFAULT_AGENTS_DB_URI = "agentsdb://localhost:2331"
     _DEFAULT_BACKEND_URI = "agentsmem://local"
     _DEFAULT_DATABASE_NAME = "alde_knowledge"
+    _ENTITY_OBJECT_NAME_MAP = {
+        "skill": "skill",
+        "skills": "skill",
+        "hard_skill": "skill",
+        "hard_skills": "skill",
+        "technical_skill": "skill",
+        "technical_skills": "skill",
+        "tool": "tool",
+        "tools": "tool",
+        "technology": "tool",
+        "technologies": "tool",
+        "framework": "framework",
+        "frameworks": "framework",
+        "methodology": "framework",
+        "methodologies": "framework",
+        "database": "database",
+        "databases": "database",
+        "db": "database",
+        "protocol": "protocol",
+        "protocols": "protocol",
+        "competency": "competency",
+        "competencies": "competency",
+        "soft_skill": "competency",
+        "soft_skills": "competency",
+        "language": "language",
+        "languages": "language",
+        "lang": "language",
+    }
     _SUPPORTED_OPERATION_NAMES = (
         "health",
         "ensure_index_objects",
@@ -2105,6 +2133,167 @@ class AgentDbOperationService:
             "database_name": str(config.get("database_name") or "").strip(),
             "memory_image_path": str(config.get("memory_image_path") or "").strip() or None,
         }
+
+    def _resolve_entity_object_name(self, object_name: str | None) -> str:
+        return self._ENTITY_OBJECT_NAME_MAP.get(str(object_name or "").strip().lower(), "")
+
+    def _normalize_entity_lookup_text(self, value: Any) -> str:
+        return "".join(ch for ch in str(value or "").strip().lower() if ch.isalnum())
+
+    def _entity_lookup_values(self, object_payload: typing.Mapping[str, Any]) -> set[str]:
+        values: set[str] = set()
+        for key in ("id", "_id", "canonical_name", "external_key", "correlation_id", "summary"):
+            normalized = self._normalize_entity_lookup_text(object_payload.get(key))
+            if normalized:
+                values.add(normalized)
+        aliases = object_payload.get("aliases")
+        if isinstance(aliases, list):
+            for alias_entry in aliases:
+                if isinstance(alias_entry, typing.Mapping):
+                    normalized = self._normalize_entity_lookup_text(alias_entry.get("alias"))
+                else:
+                    normalized = self._normalize_entity_lookup_text(alias_entry)
+                if normalized:
+                    values.add(normalized)
+        return values
+
+    def _resolve_entity_alias_object(
+        self,
+        repository: Any,
+        *,
+        object_name: str,
+        object_id: str,
+        namespace_id: str | None = None,
+    ) -> dict[str, Any] | None:
+        entity_type = self._resolve_entity_object_name(object_name)
+        normalized_object_id = str(object_id or "").strip()
+        if not entity_type or not normalized_object_id:
+            return None
+
+        direct_payload = repository.load_object("entity", normalized_object_id)
+        if isinstance(direct_payload, typing.Mapping):
+            if str(direct_payload.get("entity_type") or "").strip().lower() == entity_type:
+                return dict(direct_payload)
+
+        entity_filter: dict[str, Any] = {"entity_type": entity_type}
+        normalized_namespace = str(namespace_id or "").strip()
+        if normalized_namespace:
+            entity_filter["namespace_id"] = normalized_namespace
+        candidate_payload_list = repository.load_objects("entity", entity_filter, 500)
+        lookup_key = self._normalize_entity_lookup_text(normalized_object_id)
+        if not lookup_key:
+            return None
+        for candidate_payload in candidate_payload_list:
+            if not isinstance(candidate_payload, typing.Mapping):
+                continue
+            if lookup_key in self._entity_lookup_values(candidate_payload):
+                return dict(candidate_payload)
+        return None
+
+    def _load_entity_alias_objects(
+        self,
+        repository: Any,
+        *,
+        object_name: str,
+        object_filter: dict[str, Any] | None = None,
+        limit: int = 50,
+        namespace_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        entity_type = self._resolve_entity_object_name(object_name)
+        if not entity_type:
+            return []
+        entity_filter = dict(object_filter or {})
+        entity_filter["entity_type"] = entity_type
+        normalized_namespace = str(namespace_id or entity_filter.get("namespace_id") or "").strip()
+        if normalized_namespace:
+            entity_filter["namespace_id"] = normalized_namespace
+        object_payload_list = repository.load_objects("entity", entity_filter, max(1, int(limit or 50)))
+        return [
+            dict(item)
+            for item in object_payload_list
+            if isinstance(item, typing.Mapping)
+        ]
+
+    def _resolve_default_namespace_id(self, repository: Any) -> str:
+        try:
+            namespace_payload_list = repository.load_objects("namespace", {}, 100)
+        except Exception:
+            return ""
+        normalized_payload_list = [
+            dict(item)
+            for item in namespace_payload_list
+            if isinstance(item, typing.Mapping)
+        ]
+        preferred_tokens = {"ns_alde_default", "alde-default", "alde default knowledge"}
+        for payload in normalized_payload_list:
+            for key in ("id", "slug", "name"):
+                value = str(payload.get(key) or "").strip().lower()
+                if value in preferred_tokens:
+                    return str(payload.get("id") or "").strip()
+        if len(normalized_payload_list) == 1:
+            return str(normalized_payload_list[0].get("id") or "").strip()
+        return ""
+
+    def _resolve_find_objects_request(
+        self,
+        repository: Any,
+        *,
+        namespace_id: str | None,
+        query_text: str | None,
+        object_id: str | None,
+        source_entity_id: str | None,
+        object_filter: dict[str, Any] | None,
+    ) -> tuple[str, str]:
+        normalized_filter = dict(object_filter or {})
+        resolved_namespace_id = str(
+            namespace_id
+            or normalized_filter.get("namespace_id")
+            or ""
+        ).strip()
+        if not resolved_namespace_id:
+            resolved_namespace_id = self._resolve_default_namespace_id(repository)
+
+        resolved_query_text = str(
+            query_text
+            or object_id
+            or normalized_filter.get("query_text")
+            or normalized_filter.get("canonical_name")
+            or normalized_filter.get("external_key")
+            or normalized_filter.get("summary")
+            or source_entity_id
+            or ""
+        ).strip()
+        return resolved_namespace_id, resolved_query_text
+
+    def _find_entity_alias_objects(
+        self,
+        repository: Any,
+        *,
+        object_name: str,
+        query_text: str,
+        namespace_id: str | None = None,
+        limit: int = 10,
+    ) -> list[dict[str, Any]]:
+        candidate_payload_list = self._load_entity_alias_objects(
+            repository,
+            object_name=object_name,
+            object_filter={"namespace_id": str(namespace_id or "").strip()} if str(namespace_id or "").strip() else {},
+            limit=500,
+            namespace_id=namespace_id,
+        )
+        lookup_key = self._normalize_entity_lookup_text(query_text)
+        if not lookup_key:
+            return candidate_payload_list[: max(1, int(limit or 10))]
+
+        matched_payload_list: list[dict[str, Any]] = []
+        for candidate_payload in candidate_payload_list:
+            candidate_values = self._entity_lookup_values(candidate_payload)
+            if lookup_key in candidate_values:
+                matched_payload_list.append(dict(candidate_payload))
+                continue
+            if any(lookup_key in candidate_value for candidate_value in candidate_values):
+                matched_payload_list.append(dict(candidate_payload))
+        return matched_payload_list[: max(1, int(limit or 10))]
 
     def _json_result(self, payload: dict[str, Any]) -> str:
         return json.dumps(payload, ensure_ascii=False, default=str)
@@ -2300,7 +2489,16 @@ class AgentDbOperationService:
                 normalized_object_id = str(object_id or "").strip()
                 if not normalized_object_name or not normalized_object_id:
                     return self._error_result(normalized_operation, "invalid_load_object_request")
-                loaded_payload = repository.load_object(normalized_object_name, normalized_object_id)
+                entity_alias_name = self._resolve_entity_object_name(normalized_object_name)
+                if entity_alias_name:
+                    loaded_payload = self._resolve_entity_alias_object(
+                        repository,
+                        object_name=normalized_object_name,
+                        object_id=normalized_object_id,
+                        namespace_id=namespace_id,
+                    )
+                else:
+                    loaded_payload = repository.load_object(normalized_object_name, normalized_object_id)
                 result_payload = {
                     "ok": True,
                     "object_payload": self._normalize_result_object_payload(
@@ -2314,7 +2512,17 @@ class AgentDbOperationService:
                     return self._error_result(normalized_operation, "invalid_load_objects_request")
                 if object_filter is not None and not isinstance(object_filter, dict):
                     return self._error_result(normalized_operation, "invalid_object_filter")
-                object_payload_list = repository.load_objects(normalized_object_name, dict(object_filter or {}), max(1, int(limit or 50)))
+                entity_alias_name = self._resolve_entity_object_name(normalized_object_name)
+                if entity_alias_name:
+                    object_payload_list = self._load_entity_alias_objects(
+                        repository,
+                        object_name=normalized_object_name,
+                        object_filter=dict(object_filter or {}),
+                        limit=max(1, int(limit or 50)),
+                        namespace_id=namespace_id,
+                    )
+                else:
+                    object_payload_list = repository.load_objects(normalized_object_name, dict(object_filter or {}), max(1, int(limit or 50)))
                 result_payload = {
                     "ok": True,
                     "object_payload_list": self._normalize_result_object_payload_list(
@@ -2323,15 +2531,32 @@ class AgentDbOperationService:
                     ),
                 }
             elif normalized_operation == "find_objects":
-                normalized_namespace_id = str(namespace_id or "").strip()
-                normalized_query_text = str(query_text or "").strip()
+                normalized_object_name = str(object_name or "").strip()
+                normalized_namespace_id, normalized_query_text = self._resolve_find_objects_request(
+                    repository,
+                    namespace_id=namespace_id,
+                    query_text=query_text,
+                    object_id=object_id,
+                    source_entity_id=source_entity_id,
+                    object_filter=object_filter,
+                )
                 if not normalized_namespace_id or not normalized_query_text:
                     return self._error_result(normalized_operation, "invalid_find_objects_request")
-                object_payload_list = repository.find_objects(
-                    namespace_id=normalized_namespace_id,
-                    query_text=normalized_query_text,
-                    limit=max(1, int(limit or 10)),
-                )
+                entity_alias_name = self._resolve_entity_object_name(object_name)
+                if entity_alias_name:
+                    object_payload_list = self._find_entity_alias_objects(
+                        repository,
+                        object_name=normalized_object_name or entity_alias_name,
+                        query_text=normalized_query_text,
+                        namespace_id=normalized_namespace_id,
+                        limit=max(1, int(limit or 10)),
+                    )
+                else:
+                    object_payload_list = repository.find_objects(
+                        namespace_id=normalized_namespace_id,
+                        query_text=normalized_query_text,
+                        limit=max(1, int(limit or 10)),
+                    )
                 result_payload = {
                     "ok": True,
                     "object_payload_list": [dict(item) if isinstance(item, typing.Mapping) else item for item in object_payload_list],

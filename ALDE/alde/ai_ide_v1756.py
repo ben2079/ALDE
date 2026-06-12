@@ -15,6 +15,7 @@ import re
 import time
 import subprocess
 import shutil
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from threading import Thread
@@ -1098,6 +1099,34 @@ def _icon_with_opacity(name: str, opacity: float = 0.72, size: int = 18) -> QIco
     painter.drawPixmap(0, 0, source)
     painter.end()
     return QIcon(target)
+
+
+def _content_resize_icon(reset: bool = False, size: int = 18, color: str = "#666666") -> QIcon:
+    pm = QPixmap(size, size)
+    pm.fill(Qt.transparent)
+
+    painter = QPainter(pm)
+    painter.setRenderHint(QPainter.Antialiasing, True)
+    painter.setPen(QPen(QColor(color), 1.8, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+
+    pad = max(3, int(size * 0.22))
+    span = max(4, int(size * 0.28))
+    max_x = size - pad
+    max_y = size - pad
+
+    if reset:
+        painter.drawLine(pad, pad + span, pad, pad)
+        painter.drawLine(pad, pad, pad + span, pad)
+        painter.drawLine(max_x - span, max_y, max_x, max_y)
+        painter.drawLine(max_x, max_y, max_x, max_y - span)
+    else:
+        painter.drawLine(pad, max_y - span, pad, max_y)
+        painter.drawLine(pad, max_y, pad + span, max_y)
+        painter.drawLine(max_x - span, pad, max_x, pad)
+        painter.drawLine(max_x, pad, max_x, pad + span)
+
+    painter.end()
+    return QIcon(pm)
 
 
 # <– 09.07.2025 –– 269 - 296 –––––––––––––––––––––––––––––––––––––––––––––––
@@ -4846,7 +4875,12 @@ class ControlPlaneWidget(QWidget):
     _RUNTIME_LAYOUT_SETTINGS_PATH_KEY = "controlPlaneRuntimeLayoutPath"
     _RUNTIME_LAYOUT_DEFAULT_REL_PATH = "AppData/control_plane_runtime_tabs.json"
     _RUNTIME_LAYOUT_SCHEMA = 1
-    _BUILD_RUNTIME_TAB_LABEL = "</Build>"
+    _PRIMARY_BOARD_TAB_LABEL = "Board 1"
+    _BOARD_ITEM_WIDGET_KIND = "board_item"
+    _EXTENSIONS_WORKSPACE_WIDGET_KIND = "extensions_workspace"
+    _EXTENSIONS_RUNTIME_TOOL_ID = "web_app"
+    _BUILD_RUNTIME_TAB_LABEL = "<Build>"
+    _LEGACY_BUILD_RUNTIME_SLASH_LABEL = "</Build>"
     _LEGACY_BUILD_RUNTIME_TAB_LABEL = "Builder"
 
     def __init__(self, accent: dict[str, str], base: dict[str, str], parent: QWidget | None = None) -> None:
@@ -4862,6 +4896,9 @@ class ControlPlaneWidget(QWidget):
         self._agent_rows_by_label: dict[str, dict[str, Any]] = {}
         self._runtime_tab_counter = 0
         self._runtime_tab_records: dict[QWidget, dict[str, Any]] = {}
+        self._board_contexts: list[dict[str, Any]] = []
+        self._board_context_by_tab: dict[QWidget, dict[str, Any]] = {}
+        self._primary_board_context: dict[str, Any] | None = None
         self._builder_runtime_tab: QWidget | None = None
         self._runtime_restore_active = False
         self._runtime_state_last_saved_payload = ""
@@ -4882,6 +4919,10 @@ class ControlPlaneWidget(QWidget):
         self._control_tab_hover_marquee_timer = QTimer(self)
         self._control_tab_hover_marquee_timer.setInterval(160)
         self._control_tab_hover_marquee_timer.timeout.connect(self._tick_control_plane_tab_hover_marquee)
+        self._last_selected_board_item_title = ""
+        self._control_tab_corner_widget: QWidget | None = None
+        self._control_tab_corner_add_button: QToolButton | None = None
+        self._control_tab_corner_menu: QMenu | None = None
         self._build_ui()
         self.update_scheme(accent, base)
 
@@ -4908,6 +4949,135 @@ class ControlPlaneWidget(QWidget):
         self.tabs = tabs_widget
         self._apply_control_plane_tab_text_limits()
         self._setup_control_plane_tab_bar_interactions()
+
+    def _board_context_attribute_names(self) -> tuple[str, ...]:
+        return (
+            "config_summary_view",
+            "config_manifest_view",
+            "monitor_summary_view",
+            "monitor_filter_panel",
+            "agent_selector",
+            "workflow_selector",
+            "trace_agent_selector",
+            "trace_workflow_selector",
+            "trace_tool_selector",
+            "trace_handoff_selector",
+            "tree_stream_panel",
+            "tree_stream_transport_value",
+            "tree_stream_state_value",
+            "tree_stream_event_value",
+            "tree_stream_retry_value",
+            "tree_stream_updated_value",
+            "tree_stream_error_value",
+            "btn_refresh_detail",
+            "monitor_detail_view",
+            "monitor_timeline_view",
+            "monitor_trace_view",
+            "config_monitor_scroll_area",
+            "config_monitor_scroll_content",
+            "config_monitor_host_widget",
+            "config_monitor_host_splitter",
+            "config_monitor_host_splitter_toggle",
+            "config_monitor_host_splitter_label",
+            "config_monitor_splitter",
+            "config_monitor_splitter_anchor",
+            "config_monitor_sections",
+            "_config_monitor_section_state",
+            "_config_monitor_splitter_handle_controls",
+            "config_monitor_threat_flow_panel",
+            "config_monitor_threat_flow_view",
+            "_config_monitor_host_threat_flow_size",
+            "operator_actions_panel",
+            "btn_refresh_health",
+            "btn_probe_queue",
+            "btn_probe_agentsdb",
+            "btn_probe_dispatcher",
+            "btn_repair_dispatcher",
+            "btn_probe_mcp",
+            "btn_export_runtime",
+            "operator_filters_panel",
+            "operator_status_selector",
+            "operator_audit_selector",
+            "operator_group_selector",
+            "operator_source_selector",
+            "operator_summary_view",
+            "operator_log_view",
+            "build_section_panel",
+            "extensions_section_panel",
+            "extensions_section_workspace",
+        )
+
+    def _capture_current_board_context(self, tab_widget: QWidget) -> dict[str, Any]:
+        context = {
+            name: getattr(self, name, None)
+            for name in self._board_context_attribute_names()
+        }
+        context["tab_widget"] = tab_widget
+        return context
+
+    @contextmanager
+    def _board_context_scope(self, board_context: dict[str, Any] | None):
+        if not isinstance(board_context, dict):
+            yield
+            return
+
+        marker = object()
+        saved: dict[str, Any] = {}
+        for name in self._board_context_attribute_names():
+            saved[name] = getattr(self, name, marker)
+            setattr(self, name, board_context.get(name))
+        try:
+            yield
+        finally:
+            for name, value in saved.items():
+                if value is marker:
+                    try:
+                        delattr(self, name)
+                    except AttributeError:
+                        pass
+                else:
+                    setattr(self, name, value)
+
+    def _register_board_context(self, tab_widget: QWidget, board_context: dict[str, Any], *, primary: bool = False) -> None:
+        board_context["tab_widget"] = tab_widget
+        self._board_context_by_tab[tab_widget] = board_context
+        if board_context not in self._board_contexts:
+            self._board_contexts.append(board_context)
+        if primary or self._primary_board_context is None:
+            self._primary_board_context = board_context
+
+    def _unregister_board_context(self, tab_widget: QWidget) -> None:
+        board_context = self._board_context_by_tab.pop(tab_widget, None)
+        if board_context is None:
+            return
+        if board_context in self._board_contexts:
+            self._board_contexts.remove(board_context)
+        if self._primary_board_context is board_context:
+            self._primary_board_context = self._board_contexts[0] if self._board_contexts else None
+
+    def _board_contexts_in_display_order(self) -> list[dict[str, Any]]:
+        ordered_contexts: list[dict[str, Any]] = []
+        for index in range(self.tabs.count()):
+            tab_widget = self.tabs.widget(index)
+            board_context = self._board_context_by_tab.get(tab_widget)
+            if board_context is not None:
+                ordered_contexts.append(board_context)
+        return ordered_contexts
+
+    def _active_board_context(self) -> dict[str, Any] | None:
+        board_context = self._board_context_by_tab.get(self.tabs.currentWidget())
+        if board_context is not None:
+            return board_context
+        return self._primary_board_context
+
+    def _board_context_from_object(self, widget: Any) -> dict[str, Any] | None:
+        current = widget if isinstance(widget, QWidget) else None
+        while current is not None:
+            board_context = self._board_context_by_tab.get(current)
+            if board_context is not None:
+                return board_context
+            current = current.parentWidget()
+        return None
 
     def _format_control_plane_tab_text(self, value: str) -> str:
         text = str(value or "")
@@ -4961,6 +5131,7 @@ class ControlPlaneWidget(QWidget):
             return
         tab_bar.setMouseTracking(True)
         tab_bar.installEventFilter(self)
+        self._clear_control_plane_tab_corner_widget()
 
     def _start_control_plane_tab_hover_marquee(self, tab_index: int) -> None:
         self._stop_control_plane_tab_hover_marquee()
@@ -5023,6 +5194,875 @@ class ControlPlaneWidget(QWidget):
         self._control_tab_hover_base_text = ""
         self._control_tab_hover_phase = 0
 
+    def _apply_control_plane_tab_corner_widget_style(self) -> None:
+        button = getattr(self, "_control_tab_corner_add_button", None)
+        if not isinstance(button, QToolButton):
+            return
+        button.setStyleSheet(
+            f"""
+            QToolButton#controlTabCornerAddButton {{
+                background: transparent;
+                border: none;
+                border-radius: 8px;
+                padding: 3px 5px;
+                color: {self.scheme.get('col6', '#E3E3DE')};
+            }}
+            QToolButton#controlTabCornerAddButton:hover {{
+                background: rgba(255, 255, 255, 0.08);
+                border: none;
+            }}
+            QToolButton#controlTabCornerAddButton:pressed {{
+                background: rgba(255, 255, 255, 0.12);
+                border: none;
+            }}
+            """
+        )
+
+    def _clear_control_plane_tab_corner_widget(self) -> None:
+        tabs_widget = getattr(self, "tabs", None)
+        corner_widget = getattr(self, "_control_tab_corner_widget", None)
+        parent_tabs = corner_widget.parentWidget() if isinstance(corner_widget, QWidget) else None
+        if isinstance(parent_tabs, QTabWidget):
+            parent_tabs.setCornerWidget(None, Qt.TopRightCorner)
+        elif isinstance(tabs_widget, QTabWidget):
+            tabs_widget.setCornerWidget(None, Qt.TopRightCorner)
+
+        if isinstance(corner_widget, QWidget):
+            corner_widget.setParent(None)
+            corner_widget.deleteLater()
+
+        self._control_tab_corner_widget = None
+        self._control_tab_corner_add_button = None
+        self._control_tab_corner_menu = None
+
+    def _primary_board_item_titles(self) -> list[str]:
+        primary_board = self._primary_board_context
+        if not isinstance(primary_board, dict):
+            return []
+        with self._board_context_scope(primary_board):
+            sections = getattr(self, "config_monitor_sections", None)
+            if not isinstance(sections, list):
+                return []
+
+            titles: list[str] = []
+            seen: set[str] = set()
+            for section in sections:
+                state = self._config_monitor_section_state_for(section)
+                if not isinstance(state, dict):
+                    continue
+                title = str(state.get("title") or "").strip()
+                normalized = title.lower()
+                if not title or normalized in seen:
+                    continue
+                seen.add(normalized)
+                titles.append(title)
+            return titles
+
+    def _board_section_for_title(self, item_title: str) -> QFrame | None:
+        normalized_title = str(item_title or "").strip().lower()
+        if not normalized_title:
+            return None
+
+        sections = getattr(self, "config_monitor_sections", None)
+        if not isinstance(sections, list):
+            return None
+
+        for section in sections:
+            state = self._config_monitor_section_state_for(section)
+            if not isinstance(state, dict):
+                continue
+            if str(state.get("title") or "").strip().lower() == normalized_title and isinstance(section, QFrame):
+                return section
+        return None
+
+    def _primary_board_section_for_title(self, item_title: str) -> QFrame | None:
+        primary_board = self._primary_board_context
+        if not isinstance(primary_board, dict):
+            return None
+        with self._board_context_scope(primary_board):
+            return self._board_section_for_title(item_title)
+
+    def _primary_board_source_widget_for_title(self, item_title: str) -> QWidget | None:
+        section = self._primary_board_section_for_title(item_title)
+        if section is None:
+            return None
+        state = self._config_monitor_section_state_for(section)
+        if not isinstance(state, dict):
+            return None
+        content_widget = state.get("content_widget")
+        if isinstance(content_widget, QWidget):
+            return content_widget
+        return None
+
+    def _board_item_preview_text(self, item_title: str) -> str:
+        source_widget = self._primary_board_source_widget_for_title(item_title)
+        preview_browser = None
+        if isinstance(source_widget, QTextBrowser):
+            preview_browser = source_widget
+        elif isinstance(source_widget, QWidget):
+            preview_browser = source_widget.findChild(QTextBrowser)
+
+        if isinstance(preview_browser, QTextBrowser):
+            preview_text = " ".join(preview_browser.toPlainText().split())
+            if preview_text:
+                if len(preview_text) > 220:
+                    return preview_text[:217].rstrip() + "..."
+                return preview_text
+
+        fallback_previews = {
+            "Monitoring Filters": "Agent, workflow, trace, and handoff filters from the master board.",
+            "Operator Actions": "Shortcut to the operator actions panel on the master board.",
+            "Operator Filters": "Shortcut to the operator filters on the master board.",
+            "Build": "Independent build surface added to this board.",
+            "Extensions": "Independent extensions workspace added to this board.",
+        }
+        return fallback_previews.get(
+            str(item_title or "").strip(),
+            f"Board-owned snapshot copied from {self._PRIMARY_BOARD_TAB_LABEL}.",
+        )
+
+    def _board_item_snapshot_html(self, item_title: str) -> str:
+        source_widget = self._primary_board_source_widget_for_title(item_title)
+        if isinstance(source_widget, QTextBrowser):
+            html_text = str(source_widget.toHtml() or "").strip()
+            if html_text:
+                return html_text
+
+        lines = [
+            f"<h3>{html.escape(str(item_title or 'Item'))}</h3>",
+            f"<p>Snapshot copied from <b>{html.escape(self._PRIMARY_BOARD_TAB_LABEL)}</b>.</p>",
+        ]
+
+        if isinstance(source_widget, QWidget):
+            combo_values = []
+            for combo in source_widget.findChildren(QComboBox):
+                combo_text = str(combo.currentText() or "").strip()
+                if combo_text:
+                    combo_values.append(combo_text)
+            if combo_values:
+                lines.append("<p><b>Current selections</b></p><ul>")
+                lines.extend(f"<li>{html.escape(value)}</li>" for value in combo_values)
+                lines.append("</ul>")
+
+            button_values = []
+            button_widgets = list(source_widget.findChildren(QPushButton))
+            button_widgets.extend(source_widget.findChildren(QToolButton))
+            for button in button_widgets:
+                label = str(button.toolTip() or button.text() or "").strip()
+                if label:
+                    button_values.append(label)
+            if button_values:
+                lines.append("<p><b>Available actions</b></p><ul>")
+                lines.extend(f"<li>{html.escape(value)}</li>" for value in button_values[:8])
+                lines.append("</ul>")
+
+        preview_text = self._board_item_preview_text(item_title)
+        if preview_text:
+            lines.append(f"<p>{html.escape(preview_text)}</p>")
+        return "".join(lines)
+
+    def _focus_primary_board_item(self, item_title: str) -> None:
+        if not hasattr(self, "tabs"):
+            return
+
+        config_tab = getattr(self, "_config_tab", None)
+        if isinstance(config_tab, QWidget):
+            config_index = self.tabs.indexOf(config_tab)
+            if config_index >= 0:
+                self.tabs.setCurrentIndex(config_index)
+
+        primary_board = self._primary_board_context
+        if not isinstance(primary_board, dict):
+            return
+        with self._board_context_scope(primary_board):
+            section = self._board_section_for_title(item_title)
+            if section is None:
+                return
+
+            self._set_config_monitor_section_expanded(section, True)
+            scroll_area = getattr(self, "config_monitor_scroll_area", None)
+            if isinstance(scroll_area, QScrollArea):
+                QTimer.singleShot(
+                    0,
+                    lambda target_section=section, area=scroll_area: area.ensureWidgetVisible(target_section, 0, 18),
+                )
+
+    def _next_board_tab_name(self) -> str:
+        if not hasattr(self, "tabs"):
+            return "Board 2"
+
+        max_number = 1
+        for index in range(self.tabs.count()):
+            tab_name = self._control_plane_tab_full_text(index).strip()
+            match = re.fullmatch(r"Board(?:\s+(\d+))?", tab_name, re.IGNORECASE)
+            if match is None:
+                continue
+            try:
+                number = int(match.group(1) or "1")
+            except Exception:
+                number = 1
+            max_number = max(max_number, number)
+        return f"Board {max_number + 1}"
+
+    def _is_board_runtime_tab(self, tab_widget: QWidget | None) -> bool:
+        if not isinstance(tab_widget, QWidget):
+            return False
+        if tab_widget in self._board_context_by_tab:
+            return True
+        if tab_widget not in self._runtime_tab_records:
+            return False
+        return str(tab_widget.property("runtime_role") or "").strip().lower() == "board"
+
+    def _active_board_runtime_tab(self) -> QWidget | None:
+        if not hasattr(self, "tabs"):
+            return None
+        current_widget = self.tabs.currentWidget()
+        if self._is_board_runtime_tab(current_widget):
+            return current_widget
+        return None
+
+    def _create_board_runtime_tab(self, *, activate: bool = True) -> QWidget:
+        board_title = self._next_board_tab_name()
+        board_tab, board_context = self._create_board_page(board_title)
+        board_index = self.tabs.addTab(board_tab, self._format_control_plane_tab_text(board_title))
+        board_tab.setProperty("fullTabText", board_title)
+        self._register_board_context(board_tab, board_context)
+        if activate:
+            self.tabs.setCurrentIndex(board_index)
+        self._render_board_context(board_context, include_drilldown=True)
+        return board_tab
+
+    def _ensure_board_runtime_target(self, *, activate: bool = True) -> QWidget:
+        active_board = self._active_board_runtime_tab()
+        if active_board is not None:
+            if activate:
+                active_index = self.tabs.indexOf(active_board)
+                if active_index >= 0:
+                    self.tabs.setCurrentIndex(active_index)
+            return active_board
+        return self._create_board_runtime_tab(activate=activate)
+
+    def _create_board_browser(self, parent: QWidget) -> QTextBrowser:
+        browser = QTextBrowser(parent)
+        browser.setObjectName("controlBrowser")
+        browser.setOpenExternalLinks(False)
+        browser.setMinimumHeight(0)
+        browser.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
+        return browser
+
+    def _create_board_selector(self, parent: QWidget, slot: Any) -> QComboBox:
+        selector = QComboBox(parent)
+        selector.setObjectName("controlSelector")
+        selector.setMinimumContentsLength(10)
+        selector.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        selector.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        selector.currentTextChanged.connect(slot)
+        return selector
+
+    def _create_board_tree_stream_panel(self, parent: QWidget) -> tuple[QFrame, dict[str, QLabel]]:
+        panel = QFrame(parent)
+        panel.setObjectName("controlPanel")
+        panel.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(12, 10, 12, 10)
+        layout.setSpacing(6)
+
+        title = QLabel("<b>Explorer Tree Stream</b>", panel)
+        title.setObjectName("controlMeta")
+        layout.addWidget(title)
+
+        form = QFormLayout()
+        form.setContentsMargins(0, 0, 0, 0)
+        form.setSpacing(6)
+        form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
+        layout.addLayout(form)
+
+        values: dict[str, QLabel] = {}
+        for field_label, key, default_text in (
+            ("Transport", "transport", "n/a"),
+            ("State", "state", "n/a"),
+            ("Cursor", "event", "n/a"),
+            ("Reconnect", "retry", "n/a"),
+            ("Updated", "updated", "n/a"),
+            ("Last Error", "error", "none"),
+        ):
+            label = QLabel(field_label, panel)
+            label.setObjectName("controlMeta")
+            value = QLabel(default_text, panel)
+            value.setObjectName("controlMetricLabel")
+            value.setWordWrap(True)
+            form.addRow(label, value)
+            values[key] = value
+        return panel, values
+
+    def _create_board_build_section(self, parent: QWidget) -> QWidget:
+        panel = QFrame(parent)
+        panel.setObjectName("BuildTabWidget")
+        panel.setProperty("build_tab_widget", True)
+        panel.setMinimumSize(0, 0)
+        panel.setMinimumHeight(416)
+        panel.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        header_panel = QFrame(panel)
+        header_panel.setObjectName("runtimeWidgetPanel")
+        _clear_frame_chrome(header_panel)
+        header_panel.setProperty("runtime_widget_kind", "builder_panel")
+        header_panel.setProperty("runtime_widget_title", self._BUILD_RUNTIME_TAB_LABEL)
+
+        header_layout_root = QVBoxLayout(header_panel)
+        header_layout_root.setContentsMargins(0, 0, 0, 0)
+        header_layout_root.setSpacing(6)
+
+        header_layout = QHBoxLayout()
+        header_layout.setContentsMargins(_SURFACE_INSET_PX, _SURFACE_INSET_PX, _SURFACE_INSET_PX, 0)
+        header_layout.setSpacing(6)
+        title_label = QLabel(self._BUILD_RUNTIME_TAB_LABEL, header_panel)
+        title_label.setObjectName("runtimeWidgetTitle")
+        header_layout.addWidget(title_label, 1)
+
+        builder_panel, _internal_build_btn, _internal_post_btn = self._create_runtime_builder_widget(
+            header_panel,
+            initial_text="",
+            connect_text_changed=False,
+            show_toolbar=False,
+        )
+
+        def _add_build_header_action(
+            icon_name: str,
+            tooltip: str,
+            button_name: str,
+        ) -> None:
+            target_button = builder_panel.findChild(QPushButton, button_name)
+            if not isinstance(target_button, QPushButton):
+                return
+            action_button = QToolButton(header_panel)
+            action_button.setObjectName("runtimeWidgetActionButton")
+            action_button.setIcon(_icon(icon_name))
+            action_button.setIconSize(QSize(14, 14))
+            action_button.setToolTip(tooltip)
+            action_button.setCursor(Qt.PointingHandCursor)
+            action_button.setAutoRaise(True)
+            action_button.clicked.connect(
+                lambda _checked=False, target=target_button: target.click()
+            )
+            header_layout.addWidget(action_button, 0)
+
+        _add_build_header_action("open_file.svg", "Template laden", "builderTemplateButton")
+        _add_build_header_action("deployed_code.svg", "Sync Build starten", "builderBuildButton")
+        _add_build_header_action("send.svg", "Ergebnis ins Operations-Log schreiben", "builderPostButton")
+        _add_build_header_action(
+            "file_export_24dp_666666_FILL0_wght400_GRAD0_opsz24.svg",
+            "JSON exportieren",
+            "builderCopyButton",
+        )
+
+        builder_panel.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        header_layout_root.addLayout(header_layout)
+        header_layout_root.addWidget(builder_panel, 1)
+        self._apply_runtime_widget_panel_scheme(header_panel)
+
+        layout.addWidget(header_panel, 1)
+        return panel
+
+    def _create_runtime_builder_widget(
+        self,
+        parent: QWidget,
+        *,
+        initial_text: str,
+        connect_text_changed: bool,
+        show_toolbar: bool,
+    ) -> tuple[QWidget, QPushButton | None, QPushButton | None]:
+        try:
+            initial_payload = self._build_agent_system_template("agent_system", "/create agents")
+        except Exception:
+            initial_payload = {"action": "build_agent_system_configs"}
+        builder_panel = self._create_agent_system_builder_config_panel(
+            initial_payload=initial_payload,
+            build_handler=self._execute_agent_system_builder_payload,
+            parent_container=parent,
+            show_toolbar=show_toolbar,
+        )
+
+        internal_build_btn = builder_panel.findChild(QPushButton, "builderBuildButton")
+        internal_post_btn = builder_panel.findChild(QPushButton, "builderPostButton")
+        builder_editor = builder_panel.findChild(CodeViewer)
+        if isinstance(builder_editor, CodeViewer):
+            if initial_text:
+                builder_editor.setPlainText(initial_text)
+            builder_editor.setMinimumHeight(96)
+            builder_editor.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
+            if connect_text_changed:
+                builder_editor.textChanged.connect(self._schedule_runtime_state_save)
+
+        return builder_panel, internal_build_btn, internal_post_btn
+
+    def _create_board_extensions_section(self, parent: QWidget) -> tuple[QWidget, ExtensionsWorkspaceWidget]:
+        panel = QWidget(parent)
+        panel.setObjectName("controlPanel")
+        panel.setMinimumSize(0, 0)
+        panel.setMinimumHeight(380)
+        panel.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+        workspace = ExtensionsWorkspaceWidget(
+            accent=dict(self._accent),
+            base=dict(self._base),
+            parent=panel,
+            source_uri="agentsdb://127.0.0.1:2331/tools:graph_view",
+            control_plane_widget_ref=None,
+        )
+        workspace.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        layout.addWidget(workspace)
+        return panel, workspace
+
+    def _create_board_page(self, board_title: str) -> tuple[QWidget, dict[str, Any]]:
+        config_tab = QWidget(self.tabs)
+        config_tab.setObjectName("BoardTabWidget")
+        config_tab.setProperty("board_tab_widget", True)
+        config_tab.setMinimumSize(0, 0)
+        config_tab.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
+        config_layout = QVBoxLayout(config_tab)
+        config_layout.setContentsMargins(0, 0, 0, 0)
+        config_layout.setSpacing(0)
+
+        board_context: dict[str, Any] = {
+            "tab_widget": config_tab,
+            "config_monitor_sections": [],
+            "_config_monitor_section_state": {},
+            "_config_monitor_splitter_handle_controls": {},
+            "_config_monitor_host_threat_flow_size": 220,
+            "config_monitor_host_splitter_toggle": None,
+            "config_monitor_host_splitter_label": None,
+        }
+
+        board_context["config_summary_view"] = self._create_board_browser(config_tab)
+        board_context["config_manifest_view"] = self._create_board_browser(config_tab)
+        board_context["monitor_summary_view"] = self._create_board_browser(config_tab)
+        board_context["monitor_detail_view"] = self._create_board_browser(config_tab)
+        board_context["monitor_timeline_view"] = self._create_board_browser(config_tab)
+        board_context["monitor_trace_view"] = self._create_board_browser(config_tab)
+        board_context["operator_summary_view"] = self._create_board_browser(config_tab)
+        board_context["operator_log_view"] = self._create_board_browser(config_tab)
+        board_context["config_monitor_threat_flow_view"] = self._create_board_browser(config_tab)
+
+        monitor_filter_panel = QWidget(config_tab)
+        monitor_filter_panel.setObjectName("controlPanel")
+        monitor_filter_layout = QVBoxLayout(monitor_filter_panel)
+        monitor_filter_layout.setContentsMargins(12, 10, 12, 10)
+        monitor_filter_layout.setSpacing(8)
+        monitor_filter_title = QLabel("<b>Monitoring Filters</b>", monitor_filter_panel)
+        monitor_filter_title.setObjectName("controlMeta")
+        monitor_filter_layout.addWidget(monitor_filter_title)
+        monitor_filter_form = QFormLayout()
+        monitor_filter_form.setContentsMargins(0, 0, 0, 0)
+        monitor_filter_form.setSpacing(6)
+        monitor_filter_form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
+        monitor_filter_layout.addLayout(monitor_filter_form)
+        board_context["monitor_filter_panel"] = monitor_filter_panel
+
+        board_context["agent_selector"] = self._create_board_selector(config_tab, self._refresh_drilldown_views)
+        board_context["workflow_selector"] = self._create_board_selector(config_tab, self._refresh_drilldown_views)
+        board_context["trace_agent_selector"] = self._create_board_selector(config_tab, self._refresh_monitoring_views)
+        board_context["trace_workflow_selector"] = self._create_board_selector(config_tab, self._refresh_monitoring_views)
+        board_context["trace_tool_selector"] = self._create_board_selector(config_tab, self._refresh_monitoring_views)
+        board_context["trace_handoff_selector"] = self._create_board_selector(config_tab, self._refresh_monitoring_views)
+
+        for label_text, key in (
+            ("Agent", "agent_selector"),
+            ("Workflow", "workflow_selector"),
+            ("Trace Agent", "trace_agent_selector"),
+            ("Trace Workflow", "trace_workflow_selector"),
+            ("Trace Tool", "trace_tool_selector"),
+            ("Trace Handoff", "trace_handoff_selector"),
+        ):
+            label = QLabel(label_text, monitor_filter_panel)
+            label.setObjectName("controlMeta")
+            monitor_filter_form.addRow(label, board_context[key])
+
+        tree_stream_panel, tree_stream_values = self._create_board_tree_stream_panel(config_tab)
+        board_context["tree_stream_panel"] = tree_stream_panel
+        board_context["tree_stream_transport_value"] = tree_stream_values["transport"]
+        board_context["tree_stream_state_value"] = tree_stream_values["state"]
+        board_context["tree_stream_event_value"] = tree_stream_values["event"]
+        board_context["tree_stream_retry_value"] = tree_stream_values["retry"]
+        board_context["tree_stream_updated_value"] = tree_stream_values["updated"]
+        board_context["tree_stream_error_value"] = tree_stream_values["error"]
+
+        detail_panel = QWidget(config_tab)
+        detail_layout = QVBoxLayout(detail_panel)
+        detail_layout.setContentsMargins(0, 0, 0, 0)
+        detail_layout.setSpacing(8)
+        detail_layout.addWidget(tree_stream_panel)
+        detail_action_row = QHBoxLayout()
+        detail_action_row.setContentsMargins(0, 0, 0, 0)
+        detail_action_row.setSpacing(8)
+        board_context["btn_refresh_detail"] = ToolButton(
+            "reload_.svg",
+            "Monitor-Detail aktualisieren",
+            slot=self._refresh_drilldown_views,
+            parent=config_tab,
+        )
+        board_context["btn_refresh_detail"].setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        detail_action_row.addWidget(board_context["btn_refresh_detail"], 0)
+        detail_action_row.addStretch(1)
+        detail_layout.addLayout(detail_action_row)
+        detail_layout.addWidget(board_context["monitor_detail_view"], 1)
+
+        operator_actions_panel = QWidget(config_tab)
+        operator_actions_panel.setObjectName("controlPanel")
+        operator_actions_layout = QHBoxLayout(operator_actions_panel)
+        operator_actions_layout.setContentsMargins(12, 10, 12, 10)
+        operator_actions_layout.setSpacing(8)
+        board_context["operator_actions_panel"] = operator_actions_panel
+        for key, icon_name, tooltip, slot in (
+            ("btn_refresh_health", "reload_.svg", "Operator-Checks aktualisieren", self._run_operator_health_checks),
+            ("btn_probe_queue", "play_green.svg", "Queue-Backend pruefen", self._probe_queue_health),
+            ("btn_probe_agentsdb", "cloud_.svg", "AgentsDB pruefen", self._probe_agentsdb_health),
+            ("btn_probe_dispatcher", "graph_view.svg", "Dispatcher pruefen", self._probe_dispatcher_health),
+            ("btn_repair_dispatcher", "setting_tools.svg", "Dispatcher reparieren", self._repair_dispatcher_store),
+            ("btn_probe_mcp", "extension.svg", "MCP pruefen", self._probe_mcp_health),
+            ("btn_export_runtime", "floppy-disk.svg", "Runtime exportieren", self._export_runtime_snapshot_report),
+        ):
+            button = ToolButton(icon_name, tooltip, slot=slot, parent=config_tab)
+            operator_actions_layout.addWidget(button, 0)
+            board_context[key] = button
+        operator_actions_layout.addStretch(1)
+
+        operator_filters_panel = QWidget(config_tab)
+        operator_filters_panel.setObjectName("controlPanel")
+        operator_filters_layout = QVBoxLayout(operator_filters_panel)
+        operator_filters_layout.setContentsMargins(12, 10, 12, 10)
+        operator_filters_layout.setSpacing(8)
+        operator_filters_title = QLabel("<b>Operator Filters</b>", operator_filters_panel)
+        operator_filters_title.setObjectName("controlMeta")
+        operator_filters_layout.addWidget(operator_filters_title)
+        operator_filters_form = QFormLayout()
+        operator_filters_form.setContentsMargins(0, 0, 0, 0)
+        operator_filters_form.setSpacing(6)
+        operator_filters_form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
+        operator_filters_layout.addLayout(operator_filters_form)
+        board_context["operator_filters_panel"] = operator_filters_panel
+        for label_text, key in (
+            ("Status", "operator_status_selector"),
+            ("Action Type", "operator_audit_selector"),
+            ("Group", "operator_group_selector"),
+            ("Source", "operator_source_selector"),
+        ):
+            selector = self._create_board_selector(config_tab, self._handle_operator_filter_change)
+            board_context[key] = selector
+            label = QLabel(label_text, operator_filters_panel)
+            label.setObjectName("controlMeta")
+            operator_filters_form.addRow(label, selector)
+
+        build_panel = self._create_board_build_section(config_tab)
+        board_context["build_section_panel"] = build_panel
+        extensions_panel, extensions_workspace = self._create_board_extensions_section(config_tab)
+        board_context["extensions_section_panel"] = extensions_panel
+        board_context["extensions_section_workspace"] = extensions_workspace
+
+        threat_flow_panel = QWidget(config_tab)
+        threat_flow_panel.setObjectName("controlPanel")
+        threat_flow_layout = QVBoxLayout(threat_flow_panel)
+        threat_flow_layout.setContentsMargins(12, 10, 12, 10)
+        threat_flow_layout.setSpacing(8)
+        threat_flow_title = QLabel("<b>Threat Flow</b>", threat_flow_panel)
+        threat_flow_title.setObjectName("controlMeta")
+        threat_flow_layout.addWidget(threat_flow_title)
+        threat_flow_layout.addWidget(board_context["config_monitor_threat_flow_view"], 1)
+        board_context["config_monitor_threat_flow_panel"] = threat_flow_panel
+
+        scroll_area = QScrollArea(config_tab)
+        scroll_area.setObjectName("controlMonitoringScrollArea")
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setFrameShape(QFrame.NoFrame)
+        scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll_content = QWidget(scroll_area)
+        scroll_layout = QVBoxLayout(scroll_content)
+        scroll_layout.setContentsMargins(0, 3, 0, 0)
+        scroll_layout.setSpacing(0)
+        splitter = QSplitter(Qt.Vertical, scroll_content)
+        splitter.setChildrenCollapsible(False)
+        splitter.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        splitter_anchor = QWidget(splitter)
+        splitter_anchor.setObjectName("controlSplitterAnchor")
+        splitter_anchor.setMinimumHeight(0)
+        splitter_anchor.setMaximumHeight(0)
+        splitter_anchor.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+        splitter.addWidget(splitter_anchor)
+        scroll_layout.addWidget(splitter, 0)
+        scroll_layout.addStretch(1)
+        scroll_content.setLayout(scroll_layout)
+        scroll_area.setWidget(scroll_content)
+        config_layout.addWidget(scroll_area, 1)
+
+        board_context["config_monitor_scroll_area"] = scroll_area
+        board_context["config_monitor_scroll_content"] = scroll_content
+        board_context["config_monitor_host_widget"] = scroll_content
+        board_context["config_monitor_host_splitter"] = None
+        board_context["config_monitor_splitter"] = splitter
+        board_context["config_monitor_splitter_anchor"] = splitter_anchor
+
+        section_specs = [
+            ("Monitoring Summary", board_context["monitor_summary_view"], False),
+            ("Monitoring Filters", board_context["monitor_filter_panel"], False),
+            ("Monitoring Drilldown", detail_panel, False),
+            ("Trace Detail", board_context["monitor_trace_view"], False),
+            ("Event Timeline", board_context["monitor_timeline_view"], False),
+            ("Threat Flow", board_context["config_monitor_threat_flow_panel"], False),
+            ("Configuration Summary", board_context["config_summary_view"], False),
+            ("Configuration Manifest", board_context["config_manifest_view"], False),
+            ("Operator Actions", operator_actions_panel, False),
+            ("Operator Filters", operator_filters_panel, False),
+            ("Operator Summary", board_context["operator_summary_view"], False),
+            ("Operator Log", board_context["operator_log_view"], False),
+            ("Build", build_panel, True),
+            ("Extensions", extensions_panel, True),
+        ]
+
+        with self._board_context_scope(board_context):
+            for title, content_widget, expanded in section_specs:
+                section = self._create_splitter_dropdown_section(
+                    parent=self.config_monitor_splitter,
+                    title=title,
+                    content_widget=content_widget,
+                    expanded=expanded,
+                )
+                self.config_monitor_sections.append(section)
+                self.config_monitor_splitter.addWidget(section)
+            self._setup_config_monitor_splitter_handles()
+            self._sync_config_monitor_splitter_handle_states()
+
+        return config_tab, board_context
+
+    def _render_board_context(self, board_context: dict[str, Any], *, include_drilldown: bool = False) -> None:
+        configuration_snapshot = dict(self._last_snapshot.get("configuration") or {})
+        monitoring_snapshot = dict(self._last_snapshot.get("monitoring") or {})
+        operator_snapshot = dict(self._last_snapshot.get("operations") or {})
+        with self._board_context_scope(board_context):
+            if configuration_snapshot:
+                self._render_configuration_snapshot(configuration_snapshot)
+                self._populate_drilldown_selectors(configuration_snapshot)
+            if monitoring_snapshot:
+                self._populate_trace_filter_selectors(monitoring_snapshot)
+                self._render_monitoring_snapshot(monitoring_snapshot)
+            if operator_snapshot:
+                self._populate_operator_filter_selectors(operator_snapshot)
+                self._render_operator_snapshot(operator_snapshot)
+            if include_drilldown and configuration_snapshot:
+                self._refresh_drilldown_views_for_context()
+            self._render_operator_log()
+
+    def _render_all_board_contexts(self, *, include_drilldown: bool = False) -> None:
+        board_contexts = self._board_contexts_in_display_order()
+        if not board_contexts and isinstance(self._primary_board_context, dict):
+            board_contexts = [self._primary_board_context]
+        for board_context in board_contexts:
+            self._render_board_context(board_context, include_drilldown=include_drilldown)
+
+    def _find_board_item_panel(self, tab_widget: QWidget, item_title: str) -> QWidget | None:
+        normalized_title = str(item_title or "").strip().lower()
+        if not normalized_title:
+            return None
+        for panel in self._runtime_tab_panels(tab_widget):
+            panel_title = str(
+                panel.property("runtime_board_item_title")
+                or panel.property("runtime_widget_title")
+                or ""
+            ).strip().lower()
+            if panel_title == normalized_title:
+                return panel
+        return None
+
+    def _board_item_widget_kind_for_title(self, item_title: str) -> str:
+        normalized_title = str(item_title or "").strip().lower()
+        if normalized_title == "build":
+            return "builder_panel"
+        if normalized_title == "extensions":
+            return self._EXTENSIONS_WORKSPACE_WIDGET_KIND
+        return self._BOARD_ITEM_WIDGET_KIND
+
+    def _board_extensions_source_uri(self) -> str:
+        workspace = getattr(self, "extensions_section_workspace", None)
+        if isinstance(workspace, ExtensionsWorkspaceWidget):
+            source_uri = str(workspace.current_widget_uri() or "").strip()
+            if source_uri:
+                return source_uri
+        return "agentsdb://127.0.0.1:2331/tools:graph_view"
+
+    def _add_board_item_to_active_board(self, item_title: str) -> QWidget | None:
+        resolved_title = str(item_title or "").strip()
+        if not resolved_title:
+            return None
+
+        available_titles = self._primary_board_item_titles()
+        normalized_available = {title.lower() for title in available_titles}
+        if resolved_title.lower() not in normalized_available:
+            return None
+
+        self._last_selected_board_item_title = resolved_title
+        target_tab = self._ensure_board_runtime_target(activate=True)
+        board_context = self._board_context_by_tab.get(target_tab)
+        if isinstance(board_context, dict):
+            with self._board_context_scope(board_context):
+                target_section = self._board_section_for_title(resolved_title)
+                if not isinstance(target_section, QFrame):
+                    return None
+                self._set_config_monitor_section_expanded(target_section, True)
+                scroll_area = getattr(self, "config_monitor_scroll_area", None)
+                if isinstance(scroll_area, QScrollArea):
+                    QTimer.singleShot(
+                        0,
+                        lambda target_section=target_section, area=scroll_area: area.ensureWidgetVisible(target_section, 0, 18),
+                    )
+                target_state = self._config_monitor_section_state_for(target_section)
+                if isinstance(target_state, dict):
+                    content_widget = target_state.get("content_widget")
+                    if isinstance(content_widget, QWidget):
+                        return content_widget
+                return target_section
+
+        existing_panel = self._find_board_item_panel(target_tab, resolved_title)
+        if existing_panel is not None:
+            target_index = self.tabs.indexOf(target_tab)
+            if target_index >= 0:
+                self.tabs.setCurrentIndex(target_index)
+            return existing_panel
+
+        resolved_kind = self._board_item_widget_kind_for_title(resolved_title)
+        source_path = ""
+        board_item_title = resolved_title if resolved_kind == self._BOARD_ITEM_WIDGET_KIND else ""
+        if resolved_kind == self._EXTENSIONS_WORKSPACE_WIDGET_KIND:
+            source_path = self._board_extensions_source_uri()
+
+        board_panel = self._add_widget_to_runtime_tab(
+            target_tab,
+            widget_kind=resolved_kind,
+            title=resolved_title,
+            source_path=source_path,
+            board_item_title=board_item_title,
+            persist=True,
+        )
+        target_index = self.tabs.indexOf(target_tab)
+        if target_index >= 0:
+            self.tabs.setCurrentIndex(target_index)
+        return board_panel
+
+    def _quick_add_selected_board_item(self) -> QWidget | None:
+        item_titles = self._primary_board_item_titles()
+        if not item_titles:
+            QMessageBox.information(self, "Board", "Board 1 does not contain any items yet.")
+            return None
+
+        current_selection = str(getattr(self, "_last_selected_board_item_title", "") or "").strip()
+        if current_selection.lower() not in {title.lower() for title in item_titles}:
+            current_selection = item_titles[0]
+        return self._add_board_item_to_active_board(current_selection)
+
+    def _select_board_item_from_primary_board(self) -> QWidget | None:
+        item_titles = self._primary_board_item_titles()
+        if not item_titles:
+            QMessageBox.information(self, "Board", "Board 1 does not contain any items yet.")
+            return None
+
+        current_selection = str(getattr(self, "_last_selected_board_item_title", "") or "").strip().lower()
+        current_index = 0
+        for index, item_title in enumerate(item_titles):
+            if item_title.strip().lower() == current_selection:
+                current_index = index
+                break
+
+        selected_item, accepted = QInputDialog.getItem(
+            self,
+            "Select Board Item",
+            f"Item from {self._PRIMARY_BOARD_TAB_LABEL}:",
+            item_titles,
+            current_index,
+            False,
+        )
+        if not accepted:
+            return None
+        return self._add_board_item_to_active_board(str(selected_item or "").strip())
+
+    def _refresh_control_plane_tab_corner_menu(self) -> None:
+        menu = getattr(self, "_control_tab_corner_menu", None)
+        if not isinstance(menu, QMenu):
+            return
+
+        menu.clear()
+        item_titles = self._primary_board_item_titles()
+        selected_title = str(getattr(self, "_last_selected_board_item_title", "") or "").strip()
+        if selected_title.lower() not in {title.lower() for title in item_titles}:
+            selected_title = item_titles[0] if item_titles else ""
+
+        add_board_action = menu.addAction("Add Board")
+        add_board_action.triggered.connect(lambda _checked=False: self._create_board_runtime_tab(activate=True))
+
+        add_item_label = f"Add Item: {selected_title}" if selected_title else "Add Item"
+        add_item_action = menu.addAction(add_item_label)
+        add_item_action.setEnabled(bool(item_titles))
+        add_item_action.triggered.connect(lambda _checked=False: self._quick_add_selected_board_item())
+
+        select_item_action = menu.addAction(f"Select Item from {self._PRIMARY_BOARD_TAB_LABEL}...")
+        select_item_action.setEnabled(bool(item_titles))
+        select_item_action.triggered.connect(lambda _checked=False: self._select_board_item_from_primary_board())
+
+        if item_titles:
+            menu.addSeparator()
+            direct_items_menu = menu.addMenu(f"{self._PRIMARY_BOARD_TAB_LABEL} Items")
+            for item_title in item_titles:
+                item_action = direct_items_menu.addAction(item_title)
+                item_action.triggered.connect(
+                    lambda _checked=False, selected_item=item_title: self._add_board_item_to_active_board(selected_item)
+                )
+
+    def _ensure_control_plane_tab_corner_widget(self) -> None:
+        tabs_widget = getattr(self, "tabs", None)
+        if not isinstance(tabs_widget, QTabWidget):
+            return
+
+        corner_widget = getattr(self, "_control_tab_corner_widget", None)
+        add_button = getattr(self, "_control_tab_corner_add_button", None)
+        corner_menu = getattr(self, "_control_tab_corner_menu", None)
+
+        rebuild_corner = (
+            not isinstance(corner_widget, QWidget)
+            or corner_widget.parent() is not tabs_widget
+            or not isinstance(add_button, QToolButton)
+            or not isinstance(corner_menu, QMenu)
+        )
+        if rebuild_corner:
+            corner_widget = QWidget(tabs_widget)
+            corner_layout = QHBoxLayout(corner_widget)
+            corner_layout.setContentsMargins(8, 0, 4, 0)
+            corner_layout.setSpacing(0)
+
+            add_button = QToolButton(corner_widget)
+            add_button.setObjectName("controlTabCornerAddButton")
+            add_button.setCursor(Qt.PointingHandCursor)
+            add_button.setAutoRaise(True)
+            add_button.setIcon(_icon("plus_custombar_24.svg"))
+            add_button.setIconSize(QSize(16, 16))
+            add_button.setPopupMode(QToolButton.InstantPopup)
+
+            corner_menu = QMenu(add_button)
+            corner_menu.aboutToShow.connect(self._refresh_control_plane_tab_corner_menu)
+            add_button.setMenu(corner_menu)
+
+            corner_layout.addWidget(add_button, 0, Qt.AlignRight | Qt.AlignVCenter)
+
+            self._control_tab_corner_widget = corner_widget
+            self._control_tab_corner_add_button = add_button
+            self._control_tab_corner_menu = corner_menu
+
+        tabs_widget.setCornerWidget(corner_widget, Qt.TopRightCorner)
+        self._apply_control_plane_tab_corner_widget_style()
+        self._refresh_control_plane_tab_corner_menu()
+
     def eventFilter(self, obj, event):  # noqa: N802
         if hasattr(self, "tabs") and obj is self.tabs.tabBar():
             event_type = event.type()
@@ -5075,9 +6115,11 @@ class ControlPlaneWidget(QWidget):
             pass
 
     def _handle_operator_filter_change(self, _text: str = "") -> None:
-        self._operator_filter_preferences = self._current_operator_filter_preferences()
-        self._save_operator_filter_preferences()
-        self._render_operator_log()
+        board_context = self._board_context_from_object(self.sender()) or self._active_board_context()
+        with self._board_context_scope(board_context):
+            self._operator_filter_preferences = self._current_operator_filter_preferences()
+            self._save_operator_filter_preferences()
+            self._render_operator_log()
 
     def _build_operator_log_entry(self, message: str) -> dict[str, Any]:
         timestamp = datetime.now().astimezone().isoformat(timespec="seconds")
@@ -5124,10 +6166,12 @@ class ControlPlaneWidget(QWidget):
     def _apply_operator_snapshot(self, snapshot: dict[str, Any], *, render_log: bool = True) -> None:
         applied_snapshot = dict(snapshot or {})
         self._last_snapshot["operations"] = applied_snapshot
-        self._populate_operator_filter_selectors(applied_snapshot)
-        self._render_operator_snapshot(applied_snapshot)
-        if render_log:
-            self._render_operator_log()
+        for board_context in self._board_contexts_in_display_order():
+            with self._board_context_scope(board_context):
+                self._populate_operator_filter_selectors(applied_snapshot)
+                self._render_operator_snapshot(applied_snapshot)
+                if render_log:
+                    self._render_operator_log()
 
     def _run_operator_background_task(self, *, kind: str, worker: Callable[[], dict[str, Any]]) -> None:
         if kind in self._active_operator_tasks:
@@ -5314,6 +6358,10 @@ class ControlPlaneWidget(QWidget):
 
     def _runtime_widget_language(self, panel: QWidget) -> str:
         widget_kind = str(panel.property("runtime_widget_kind") or "code_json").strip().lower()
+        if widget_kind == self._BOARD_ITEM_WIDGET_KIND:
+            return "text"
+        if widget_kind == self._EXTENSIONS_WORKSPACE_WIDGET_KIND:
+            return "text"
         if widget_kind == "code_yaml":
             return "yaml"
         if widget_kind == "code_python":
@@ -5436,8 +6484,15 @@ class ControlPlaneWidget(QWidget):
         return ""
 
     def _serialize_runtime_widget_panel(self, panel: QWidget) -> dict[str, Any]:
-        widget_kind = str(panel.property("runtime_widget_kind") or "code_json")
+        widget_kind = str(panel.property("runtime_widget_kind") or "code_json").strip().lower() or "code_json"
         title = str(panel.property("runtime_widget_title") or "runtime_widget")
+        if widget_kind == self._BOARD_ITEM_WIDGET_KIND:
+            board_item_title = str(panel.property("runtime_board_item_title") or title).strip() or title
+            return {
+                "kind": widget_kind,
+                "title": title,
+                "board_item_title": board_item_title,
+            }
         source_path = str(panel.property("runtime_source_path") or "").strip()
         content = self._collect_runtime_widget_text(panel)
 
@@ -5605,12 +6660,14 @@ class ControlPlaneWidget(QWidget):
                         widget_title = str(widget_entry.get("title") or "").strip() or None
                         widget_content = str(widget_entry.get("content") or "")
                         widget_source_path = str(widget_entry.get("source_path") or "")
+                        board_item_title = str(widget_entry.get("board_item_title") or "").strip()
                         self._add_widget_to_runtime_tab(
                             tab_widget,
                             widget_kind=widget_kind,
                             title=widget_title,
                             content=widget_content,
                             source_path=widget_source_path,
+                            board_item_title=board_item_title,
                             persist=False,
                         )
                         restored_any = True
@@ -5701,7 +6758,7 @@ class ControlPlaneWidget(QWidget):
 
         self.btn_add_runtime_tab = ToolButton(
             "add_tab_dock.svg",
-            "Neuen </Build>-Runtime-Tab anlegen (Builder-Start)",
+            f"Neuen {self._BUILD_RUNTIME_TAB_LABEL}-Runtime-Tab anlegen (Builder-Start)",
             slot=self._open_new_runtime_tab,
             parent=hero,
         )
@@ -5750,11 +6807,13 @@ class ControlPlaneWidget(QWidget):
 
         config_tab = QWidget(self.tabs)
         self._config_tab = config_tab
+        config_tab.setObjectName("BoardTabWidget")
+        config_tab.setProperty("board_tab_widget", True)
         config_tab.setMinimumSize(0, 0)
         config_tab.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
         config_layout = QVBoxLayout(config_tab)
         config_layout.setContentsMargins(0, 0, 0, 0)
-        config_layout.setSpacing(8)
+        config_layout.setSpacing(0)
 
         self.config_summary_view = QTextBrowser(config_tab)
         self.config_summary_view.setObjectName("controlBrowser")
@@ -5954,17 +7013,26 @@ class ControlPlaneWidget(QWidget):
         self.monitor_trace_view.setMinimumHeight(0)
         self.monitor_trace_view.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
 
-        # Keep host-level scaling separate from section-level splitter resizing.
-        self.config_monitor_host_splitter = self._create_viewport_splitter(config_tab)
+        self.config_monitor_scroll_area = QScrollArea(config_tab)
+        self.config_monitor_scroll_area.setObjectName("controlMonitoringScrollArea")
+        self.config_monitor_scroll_area.setWidgetResizable(True)
+        self.config_monitor_scroll_area.setFrameShape(QFrame.NoFrame)
+        self.config_monitor_scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.config_monitor_scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.config_monitor_scroll_area.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Expanding)
 
-        self.config_monitor_host_widget = QWidget(config_tab)
-        self.config_monitor_host_widget.setMinimumSize(0, 0)
-        self.config_monitor_host_widget.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Expanding)
-        config_monitor_host_layout = QVBoxLayout(self.config_monitor_host_widget)
-        config_monitor_host_layout.setContentsMargins(0, 0, 0, 0)
-        config_monitor_host_layout.setSpacing(0)
+        self.config_monitor_scroll_content = QWidget(self.config_monitor_scroll_area)
+        self.config_monitor_scroll_content.setMinimumSize(0, 0)
+        self.config_monitor_scroll_content.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        config_monitor_scroll_layout = QVBoxLayout(self.config_monitor_scroll_content)
+        config_monitor_scroll_layout.setContentsMargins(0, 3, 0, 0)
+        config_monitor_scroll_layout.setSpacing(0)
 
-        self.config_monitor_splitter = self._create_viewport_splitter(self.config_monitor_host_widget)
+        self.config_monitor_host_splitter = None
+        self.config_monitor_host_widget = self.config_monitor_scroll_content
+
+        self.config_monitor_splitter = self._create_viewport_splitter(self.config_monitor_scroll_content)
+        self.config_monitor_splitter.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         self.config_monitor_splitter_anchor = QWidget(self.config_monitor_splitter)
         self.config_monitor_splitter_anchor.setObjectName("controlSplitterAnchor")
         self.config_monitor_splitter_anchor.setMinimumHeight(0)
@@ -5975,68 +7043,14 @@ class ControlPlaneWidget(QWidget):
         self.config_monitor_sections: list[QFrame] = []
         self._config_monitor_section_state: dict[QFrame, dict[str, Any]] = {}
         self._config_monitor_splitter_handle_controls: dict[int, dict[str, Any]] = {}
-        for section_title, section_widget, section_expanded in (
-            ("Monitoring Summary", self.monitor_summary_view, False),
-            ("Monitoring Filters", self.monitor_filter_panel, False),
-            ("Monitoring Drilldown", self.monitor_detail_view, False),
-            ("Trace Detail", self.monitor_trace_view, False),
-            ("Event Timeline", self.monitor_timeline_view, False),
-            ("Configuration Summary", self.config_summary_view, False),
-            ("Configuration Manifest", self.config_manifest_view, False),
-        ):
-            section = self._create_splitter_dropdown_section(
-                parent=self.config_monitor_splitter,
-                title=section_title,
-                content_widget=section_widget,
-                expanded=section_expanded,
-            )
-            self.config_monitor_sections.append(section)
-            self.config_monitor_splitter.addWidget(section)
 
-        self.config_monitor_splitter.setSizes([1, 240, 220, 280, 260, 220, 220, 240])
-        self.config_monitor_splitter.setStretchFactor(0, 0)
-        for section_index in range(len(self.config_monitor_sections)):
-            self.config_monitor_splitter.setStretchFactor(section_index + 1, 1)
-        self._setup_config_monitor_splitter_handles()
-        self._sync_config_monitor_splitter_handle_states()
-        config_monitor_host_layout.addWidget(self.config_monitor_splitter, 1)
+        self.operator_actions_panel = QWidget(config_tab)
+        self.operator_actions_panel.setMinimumSize(0, 0)
+        self.operator_actions_panel.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
 
-        self.config_monitor_threat_flow_panel = QFrame(config_tab)
-        self.config_monitor_threat_flow_panel.setObjectName("controlMetricCard")
-        self.config_monitor_threat_flow_panel.setMinimumSize(0, 0)
-        self.config_monitor_threat_flow_panel.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Expanding)
-
-        threat_flow_layout = QVBoxLayout(self.config_monitor_threat_flow_panel)
-        threat_flow_layout.setContentsMargins(10, 10, 10, 10)
-        threat_flow_layout.setSpacing(6)
-
-        self.config_monitor_threat_flow_view = QTextBrowser(self.config_monitor_threat_flow_panel)
-        self.config_monitor_threat_flow_view.setObjectName("controlBrowser")
-        self.config_monitor_threat_flow_view.setOpenExternalLinks(False)
-        self.config_monitor_threat_flow_view.setMinimumHeight(0)
-        self.config_monitor_threat_flow_view.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Expanding)
-        self.config_monitor_threat_flow_view.setHtml(
-            "<p>Waiting for monitoring snapshot...</p>"
-        )
-        threat_flow_layout.addWidget(self.config_monitor_threat_flow_view, 1)
-
-        self.config_monitor_host_splitter.addWidget(self.config_monitor_host_widget)
-        self.config_monitor_host_splitter.addWidget(self.config_monitor_threat_flow_panel)
-        self.config_monitor_host_splitter.setSizes([860, 240])
-        self.config_monitor_host_splitter.setStretchFactor(0, 5)
-        self.config_monitor_host_splitter.setStretchFactor(1, 2)
-        self._config_monitor_host_threat_flow_size = 240
-        self._setup_config_monitor_host_splitter_handle()
-        self._sync_config_monitor_host_splitter_handle_state()
-
-        config_layout.addWidget(self.config_monitor_host_splitter, 1)
-
-        operations_tab = QWidget(self.tabs)
-        operations_tab.setMinimumSize(0, 0)
-        operations_tab.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
-        operations_layout = QVBoxLayout(operations_tab)
-        operations_layout.setContentsMargins(0, 0, 0, 0)
-        operations_layout.setSpacing(8)
+        operator_actions_layout = QVBoxLayout(self.operator_actions_panel)
+        operator_actions_layout.setContentsMargins(0, 0, 0, 0)
+        operator_actions_layout.setSpacing(8)
 
         operator_actions_grid = QGridLayout()
         operator_actions_grid.setContentsMargins(0, 0, 0, 0)
@@ -6058,20 +7072,28 @@ class ControlPlaneWidget(QWidget):
                 label_text,
                 tooltip,
                 slot,
-                operations_tab,
+                self.operator_actions_panel,
             )
             setattr(self, attr_name, button)
             operator_actions_grid.addWidget(tile, index // 3, index % 3)
-        operations_layout.addLayout(operator_actions_grid)
+        operator_actions_layout.addLayout(operator_actions_grid)
+
+        self.operator_filters_panel = QWidget(config_tab)
+        self.operator_filters_panel.setMinimumSize(0, 0)
+        self.operator_filters_panel.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+
+        operator_filters_layout = QVBoxLayout(self.operator_filters_panel)
+        operator_filters_layout.setContentsMargins(0, 0, 0, 0)
+        operator_filters_layout.setSpacing(6)
 
         operator_filter_form = QFormLayout()
         operator_filter_form.setContentsMargins(0, 0, 0, 0)
         operator_filter_form.setSpacing(8)
         operator_filter_form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
 
-        operator_status_label = QLabel("Action Status", operations_tab)
+        operator_status_label = QLabel("Action Status", self.operator_filters_panel)
         operator_status_label.setObjectName("controlMeta")
-        self.operator_status_selector = QComboBox(operations_tab)
+        self.operator_status_selector = QComboBox(self.operator_filters_panel)
         self.operator_status_selector.setObjectName("controlSelector")
         self.operator_status_selector.setMinimumContentsLength(10)
         self.operator_status_selector.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
@@ -6079,9 +7101,9 @@ class ControlPlaneWidget(QWidget):
         self.operator_status_selector.currentTextChanged.connect(self._handle_operator_filter_change)
         operator_filter_form.addRow(operator_status_label, self.operator_status_selector)
 
-        operator_audit_label = QLabel("Action Type", operations_tab)
+        operator_audit_label = QLabel("Action Type", self.operator_filters_panel)
         operator_audit_label.setObjectName("controlMeta")
-        self.operator_audit_selector = QComboBox(operations_tab)
+        self.operator_audit_selector = QComboBox(self.operator_filters_panel)
         self.operator_audit_selector.setObjectName("controlSelector")
         self.operator_audit_selector.setMinimumContentsLength(10)
         self.operator_audit_selector.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
@@ -6089,9 +7111,9 @@ class ControlPlaneWidget(QWidget):
         self.operator_audit_selector.currentTextChanged.connect(self._handle_operator_filter_change)
         operator_filter_form.addRow(operator_audit_label, self.operator_audit_selector)
 
-        operator_group_label = QLabel("Action Group", operations_tab)
+        operator_group_label = QLabel("Action Group", self.operator_filters_panel)
         operator_group_label.setObjectName("controlMeta")
-        self.operator_group_selector = QComboBox(operations_tab)
+        self.operator_group_selector = QComboBox(self.operator_filters_panel)
         self.operator_group_selector.setObjectName("controlSelector")
         self.operator_group_selector.setMinimumContentsLength(10)
         self.operator_group_selector.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
@@ -6099,39 +7121,109 @@ class ControlPlaneWidget(QWidget):
         self.operator_group_selector.currentTextChanged.connect(self._handle_operator_filter_change)
         operator_filter_form.addRow(operator_group_label, self.operator_group_selector)
 
-        operator_source_label = QLabel("Action Source", operations_tab)
+        operator_source_label = QLabel("Action Source", self.operator_filters_panel)
         operator_source_label.setObjectName("controlMeta")
-        self.operator_source_selector = QComboBox(operations_tab)
+        self.operator_source_selector = QComboBox(self.operator_filters_panel)
         self.operator_source_selector.setObjectName("controlSelector")
         self.operator_source_selector.setMinimumContentsLength(10)
         self.operator_source_selector.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
         self.operator_source_selector.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.operator_source_selector.currentTextChanged.connect(self._handle_operator_filter_change)
         operator_filter_form.addRow(operator_source_label, self.operator_source_selector)
+        operator_filters_layout.addLayout(operator_filter_form)
 
-        operations_layout.addLayout(operator_filter_form)
-
-        self.operator_summary_view = QTextBrowser(operations_tab)
+        self.operator_summary_view = QTextBrowser(config_tab)
         self.operator_summary_view.setObjectName("controlBrowser")
         self.operator_summary_view.setOpenExternalLinks(False)
         self.operator_summary_view.setMinimumHeight(0)
         self.operator_summary_view.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
 
-        self.operator_log_view = QTextBrowser(operations_tab)
+        self.operator_log_view = QTextBrowser(config_tab)
         self.operator_log_view.setObjectName("controlBrowser")
         self.operator_log_view.setOpenExternalLinks(False)
         self.operator_log_view.setMinimumHeight(0)
         self.operator_log_view.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
-        self.operations_splitter = self._create_viewport_splitter(operations_tab)
-        self.operations_splitter.addWidget(self.operator_summary_view)
-        self.operations_splitter.addWidget(self.operator_log_view)
-        self.operations_splitter.setSizes([220, 160])
-        operations_layout.addWidget(self.operations_splitter, 1)
 
-        config_tab_index = self.tabs.addTab(config_tab, "Monitoring")
-        self._set_control_plane_tab_text(config_tab_index, "Monitoring")
-        operations_tab_index = self.tabs.addTab(operations_tab, "Operations")
-        self._set_control_plane_tab_text(operations_tab_index, "Operations")
+        # ── Build section panel ─────────────────────────────────────────────
+        self.build_section_panel = self._create_board_build_section(config_tab)
+        self.build_section_panel.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Expanding)
+
+        # ── Extensions section panel ────────────────────────────────────────
+        self.extensions_section_panel = QWidget(config_tab)
+        self.extensions_section_panel.setMinimumSize(0, 0)
+        self.extensions_section_panel.setMinimumHeight(380)
+        self.extensions_section_panel.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Expanding)
+        _ext_section_layout = QVBoxLayout(self.extensions_section_panel)
+        _ext_section_layout.setContentsMargins(0, 0, 0, 0)
+        _ext_section_layout.setSpacing(0)
+        self.extensions_section_workspace = ExtensionsWorkspaceWidget(
+            accent=dict(self._accent),
+            base=dict(self._base),
+            parent=self.extensions_section_panel,
+            source_uri="agentsdb://127.0.0.1:2331/tools:graph_view",
+            control_plane_widget_ref=None,
+        )
+        self.extensions_section_workspace.setMinimumHeight(320)
+        self.extensions_section_workspace.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Expanding)
+        _ext_section_layout.addWidget(self.extensions_section_workspace, 1)
+
+        self.config_monitor_threat_flow_panel = QFrame(config_tab)
+        self.config_monitor_threat_flow_panel.setObjectName("controlMetricCard")
+        self.config_monitor_threat_flow_panel.setMinimumSize(0, 0)
+        self.config_monitor_threat_flow_panel.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Expanding)
+
+        threat_flow_layout = QVBoxLayout(self.config_monitor_threat_flow_panel)
+        threat_flow_layout.setContentsMargins(10, 10, 10, 10)
+        threat_flow_layout.setSpacing(6)
+
+        self.config_monitor_threat_flow_view = QTextBrowser(self.config_monitor_threat_flow_panel)
+        self.config_monitor_threat_flow_view.setObjectName("controlBrowser")
+        self.config_monitor_threat_flow_view.setOpenExternalLinks(False)
+        self.config_monitor_threat_flow_view.setMinimumHeight(0)
+        self.config_monitor_threat_flow_view.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Expanding)
+        self.config_monitor_threat_flow_view.setHtml(
+            "<p>Waiting for monitoring snapshot...</p>"
+        )
+        threat_flow_layout.addWidget(self.config_monitor_threat_flow_view, 1)
+
+        for section_title, section_widget, section_expanded in (
+            ("Monitoring Summary", self.monitor_summary_view, False),
+            ("Monitoring Filters", self.monitor_filter_panel, False),
+            ("Monitoring Drilldown", self.monitor_detail_view, False),
+            ("Trace Detail", self.monitor_trace_view, False),
+            ("Event Timeline", self.monitor_timeline_view, False),
+            ("Threat Flow", self.config_monitor_threat_flow_panel, False),
+            ("Configuration Summary", self.config_summary_view, False),
+            ("Configuration Manifest", self.config_manifest_view, False),
+            ("Operator Actions", self.operator_actions_panel, False),
+            ("Operator Filters", self.operator_filters_panel, False),
+            ("Operator Summary", self.operator_summary_view, False),
+            ("Operator Log", self.operator_log_view, False),
+            ("Build", self.build_section_panel, False),
+            ("Extensions", self.extensions_section_panel, False),
+        ):
+            section = self._create_splitter_dropdown_section(
+                parent=self.config_monitor_splitter,
+                title=section_title,
+                content_widget=section_widget,
+                expanded=section_expanded,
+            )
+            self.config_monitor_sections.append(section)
+            self.config_monitor_splitter.addWidget(section)
+
+        for i in range(1 + len(self.config_monitor_sections)):
+            self.config_monitor_splitter.setStretchFactor(i, 0)
+        self._setup_config_monitor_splitter_handles()
+        self._sync_config_monitor_splitter_handle_states()
+        config_monitor_scroll_layout.addWidget(self.config_monitor_splitter, 0)
+        config_monitor_scroll_layout.addStretch(1)
+        self.config_monitor_scroll_area.setWidget(self.config_monitor_scroll_content)
+
+        config_layout.addWidget(self.config_monitor_scroll_area, 1)
+
+        config_tab_index = self.tabs.addTab(config_tab, self._PRIMARY_BOARD_TAB_LABEL)
+        self._set_control_plane_tab_text(config_tab_index, self._PRIMARY_BOARD_TAB_LABEL)
+        self._register_board_context(config_tab, self._capture_current_board_context(config_tab), primary=True)
 
         # Builder-tab symbol button removed per UX request.
         self._code_tab_new_button = None
@@ -6143,7 +7235,7 @@ class ControlPlaneWidget(QWidget):
         self.primary_splitter.setStretchFactor(0, 4)
         self.primary_splitter.setStretchFactor(1, 1)
         root.addWidget(self.primary_splitter, 1)
-        self._render_operator_log()
+        self._render_all_board_contexts(include_drilldown=False)
         self._update_runtime_layout_hint()
         self._restore_runtime_tabs_state()
         self._ensure_builder_runtime_tab(activate=False, persist=False)
@@ -6213,6 +7305,7 @@ class ControlPlaneWidget(QWidget):
                 tab_name = self._control_plane_tab_full_text(i).strip().lower()
                 if role == "builder" or tab_name in {
                     self._LEGACY_BUILD_RUNTIME_TAB_LABEL.strip().lower(),
+                    self._LEGACY_BUILD_RUNTIME_SLASH_LABEL.strip().lower(),
                     self._BUILD_RUNTIME_TAB_LABEL.strip().lower(),
                 }:
                     builder_tab = candidate
@@ -6274,6 +7367,11 @@ class ControlPlaneWidget(QWidget):
 
         if builder_tab is None:
             by_name = self._find_runtime_tab_by_name(self._BUILD_RUNTIME_TAB_LABEL)
+            if by_name is not None:
+                builder_tab = by_name
+
+        if builder_tab is None:
+            by_name = self._find_runtime_tab_by_name(self._LEGACY_BUILD_RUNTIME_SLASH_LABEL)
             if by_name is not None:
                 builder_tab = by_name
 
@@ -6351,7 +7449,7 @@ class ControlPlaneWidget(QWidget):
         tab_name: str = "Runtime",
         activate: bool = True,
     ) -> QWidget:
-        allowed = {kind for _label, kind in self._runtime_widget_menu_options()}
+        allowed = self._runtime_widget_supported_kinds()
         resolved_kind = str(widget_kind or "code_json").strip().lower()
         if resolved_kind not in allowed:
             resolved_kind = "code_json"
@@ -6413,7 +7511,7 @@ class ControlPlaneWidget(QWidget):
 
     def _runtime_widget_menu_options(self) -> list[tuple[str, str]]:
         return [
-            ("</Build>", "builder_panel"),
+            (self._BUILD_RUNTIME_TAB_LABEL, "builder_panel"),
             ("Agent Graph", "agent_relation_graph"),
             ("Python", "code_python"),
             ("JSON", "code_json"),
@@ -6422,8 +7520,18 @@ class ControlPlaneWidget(QWidget):
             ("TOML", "code_toml"),
         ]
 
+    def _runtime_widget_supported_kinds(self) -> set[str]:
+        supported_kinds = {kind for _label, kind in self._runtime_widget_menu_options()}
+        supported_kinds.add(self._BOARD_ITEM_WIDGET_KIND)
+        supported_kinds.add(self._EXTENSIONS_WORKSPACE_WIDGET_KIND)
+        return supported_kinds
+
     def _runtime_widget_label_for_kind(self, widget_kind: str) -> str:
         target = str(widget_kind or "code_json").strip().lower()
+        if target == self._BOARD_ITEM_WIDGET_KIND:
+            return "Board Item"
+        if target == self._EXTENSIONS_WORKSPACE_WIDGET_KIND:
+            return "Extensions"
         for label, kind in self._runtime_widget_menu_options():
             if kind == target:
                 return label
@@ -6432,7 +7540,7 @@ class ControlPlaneWidget(QWidget):
     def _runtime_tab_default_widget_kind(self, tab_widget: QWidget) -> str:
         record = self._runtime_tab_records.get(tab_widget) or {}
         resolved_kind = str(record.get("default_widget_kind") or "code_json").strip().lower()
-        allowed = {kind for _label, kind in self._runtime_widget_menu_options()}
+        allowed = self._runtime_widget_supported_kinds()
         if resolved_kind not in allowed:
             return "code_json"
         return resolved_kind
@@ -6448,7 +7556,7 @@ class ControlPlaneWidget(QWidget):
         if not isinstance(record, dict):
             return
 
-        allowed = {kind for _label, kind in self._runtime_widget_menu_options()}
+        allowed = self._runtime_widget_supported_kinds()
         resolved_kind = str(widget_kind or "code_json").strip().lower()
         if resolved_kind not in allowed:
             resolved_kind = "code_json"
@@ -6492,6 +7600,10 @@ class ControlPlaneWidget(QWidget):
 
     def _runtime_widget_template(self, widget_kind: str) -> tuple[str, str]:
         kind = str(widget_kind or "code_json").strip().lower()
+        if kind == self._BOARD_ITEM_WIDGET_KIND:
+            return "text", ""
+        if kind == self._EXTENSIONS_WORKSPACE_WIDGET_KIND:
+            return "text", ""
         if kind == "builder_panel":
             template = self._build_agent_system_template("agent_system", "/create agents")
             return "json", json.dumps(template, ensure_ascii=False, indent=2)
@@ -6709,6 +7821,30 @@ class ControlPlaneWidget(QWidget):
 
         QTimer.singleShot(0, _finalize_removal)
 
+    def _clone_runtime_widget_panel(self, panel: QWidget) -> QWidget | None:
+        if not isinstance(panel, QWidget):
+            return None
+        tab_widget, _splitter = self._locate_runtime_tab_for_panel(panel)
+        if not isinstance(tab_widget, QWidget):
+            return None
+
+        widget_kind = str(panel.property("runtime_widget_kind") or "code_json").strip().lower() or "code_json"
+        title = str(panel.property("runtime_widget_title") or "runtime_widget").strip() or "runtime_widget"
+        source_path = str(panel.property("runtime_source_path") or "").strip()
+        board_item_title = str(panel.property("runtime_board_item_title") or "").strip()
+        content = ""
+        if widget_kind in {"builder_panel", "code_json", "code_yaml", "code_python", "code_markdown", "code_toml", "text_view"}:
+            content = self._collect_runtime_widget_text(panel)
+
+        return self._append_runtime_widget_clone_to_tab(
+            tab_widget,
+            widget_kind=widget_kind,
+            title=title,
+            source_path=source_path,
+            board_item_title=board_item_title,
+            content=content,
+        )
+
     def _create_runtime_widget_panel(
         self,
         *,
@@ -6717,12 +7853,14 @@ class ControlPlaneWidget(QWidget):
         title: str,
         content: str = "",
         source_path: str = "",
+        board_item_title: str = "",
     ) -> QWidget:
         panel = QFrame(tab_widget)
         panel.setObjectName("runtimeWidgetPanel")
         _clear_frame_chrome(panel)
         panel.setProperty("runtime_tab_panel", True)
         kind = str(widget_kind or "code_json").strip().lower()
+        resolved_board_item_title = str(board_item_title or title).strip() or title
 
         root = QVBoxLayout(panel)
         root.setContentsMargins(0, 0, 0, 0)
@@ -6755,15 +7893,22 @@ class ControlPlaneWidget(QWidget):
             header.insertWidget(max(0, header.count() - 1), action_btn, 0)
 
         _add_runtime_header_action(
-            "open_file.svg",
-            "Datei in Widget importieren",
-            lambda _checked=False, p=panel: self._import_runtime_widget_content(p),
+            "add_24dp_666666_FILL0_wght400_GRAD0_opsz24.svg",
+            "Neu: gleiches Panel anhängen",
+            lambda _checked=False, p=panel: self._clone_runtime_widget_panel(p),
         )
-        _add_runtime_header_action(
-            "file_export_24dp_666666_FILL0_wght400_GRAD0_opsz24.svg",
-            "An Chat anhängen",
-            lambda _checked=False, p=panel: self._export_runtime_widget_to_chat_context(p),
-        )
+
+        if kind not in {self._BOARD_ITEM_WIDGET_KIND, self._EXTENSIONS_WORKSPACE_WIDGET_KIND}:
+            _add_runtime_header_action(
+                "open_file.svg",
+                "Datei in Widget importieren",
+                lambda _checked=False, p=panel: self._import_runtime_widget_content(p),
+            )
+            _add_runtime_header_action(
+                "file_export_24dp_666666_FILL0_wght400_GRAD0_opsz24.svg",
+                "An Chat anhängen",
+                lambda _checked=False, p=panel: self._export_runtime_widget_to_chat_context(p),
+            )
 
         root.addLayout(header)
 
@@ -6775,9 +7920,42 @@ class ControlPlaneWidget(QWidget):
         panel.setProperty("runtime_widget_kind", kind)
         panel.setProperty("runtime_widget_title", str(title))
         panel.setProperty("runtime_source_path", resolved_source_path)
+        if kind == self._BOARD_ITEM_WIDGET_KIND:
+            panel.setProperty("runtime_board_item_title", resolved_board_item_title)
         self._apply_runtime_widget_panel_scheme(panel)
 
-        if kind == "agent_relation_graph":
+        if kind == self._BOARD_ITEM_WIDGET_KIND:
+            snapshot_browser = QTextBrowser(panel)
+            snapshot_browser.setObjectName("controlBrowser")
+            snapshot_browser.setOpenExternalLinks(False)
+            snapshot_browser.setOpenLinks(False)
+            snapshot_browser.setMinimumHeight(96)
+            snapshot_browser.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+            snapshot_browser.setHtml(self._board_item_snapshot_html(resolved_board_item_title))
+            root.addWidget(snapshot_browser, 1)
+        elif kind == self._EXTENSIONS_WORKSPACE_WIDGET_KIND:
+            workspace_source_uri = resolved_source_path or self._board_extensions_source_uri()
+            panel.setProperty("runtime_source_path", workspace_source_uri)
+            extensions_widget = ExtensionsWorkspaceWidget(
+                accent=dict(self._accent),
+                base=dict(self._base),
+                parent=panel,
+                source_uri=workspace_source_uri,
+                control_plane_widget_ref=None,
+                initial_tool_id=self._EXTENSIONS_RUNTIME_TOOL_ID,
+                auto_load_initial_tool=True,
+                hide_internal_tab_bar=True,
+            )
+            extensions_widget.setMinimumHeight(180)
+            extensions_widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+            external_uri_input = extensions_widget.create_external_uri_proxy(panel)
+            external_uri_input.setProperty("runtime_widget_header_proxy", True)
+            header.insertWidget(1, external_uri_input, 1)
+            extensions_signal = getattr(extensions_widget, "widgetStateChanged", None)
+            if extensions_signal is not None and hasattr(extensions_signal, "connect"):
+                extensions_signal.connect(self._schedule_runtime_state_save)
+            root.addWidget(extensions_widget, 1)
+        elif kind == "agent_relation_graph":
             graph_source_uri = resolved_source_path or str(content or "").strip()
             if not graph_source_uri:
                 graph_source_uri = "agentsdb://127.0.0.1:2331/tools:relation_graph_view"
@@ -6795,15 +7973,12 @@ class ControlPlaneWidget(QWidget):
             panel.setProperty("runtime_artifact_container", artifact_container)
             root.addWidget(artifact_container, 1)
         elif kind == "builder_panel":
-            builder_panel = self._create_agent_system_builder_config_panel(
-                initial_payload=self._build_agent_system_template("agent_system", "/create agents"),
-                build_handler=self._execute_agent_system_builder_payload,
-                parent_container=panel,
+            builder_panel, internal_build_btn, internal_post_btn = self._create_runtime_builder_widget(
+                panel,
+                initial_text=resolved_text,
+                connect_text_changed=True,
                 show_toolbar=False,
             )
-
-            internal_build_btn = builder_panel.findChild(QPushButton, "builderBuildButton")
-            internal_post_btn = builder_panel.findChild(QPushButton, "builderPostButton")
 
             def _add_builder_header_action(icon_name: str, tooltip: str, target_btn: QPushButton | None) -> None:
                 if target_btn is None:
@@ -6820,13 +7995,6 @@ class ControlPlaneWidget(QWidget):
 
             _add_builder_header_action("deployed_code.svg", "Sync Build starten", internal_build_btn)
             _add_builder_header_action("send.svg", "Ergebnis ins Operations-Log schreiben", internal_post_btn)
-
-            builder_editor = builder_panel.findChild(CodeViewer)
-            if isinstance(builder_editor, CodeViewer):
-                builder_editor.setPlainText(resolved_text)
-                builder_editor.setMinimumHeight(96)
-                builder_editor.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
-                builder_editor.textChanged.connect(self._schedule_runtime_state_save)
             root.addWidget(builder_panel, 1)
         elif kind.startswith("code_"):
             editor = CodeViewer(
@@ -7033,15 +8201,19 @@ class ControlPlaneWidget(QWidget):
         title: str | None = None,
         content: str = "",
         source_path: str = "",
+        board_item_title: str = "",
         persist: bool = True,
     ) -> QWidget | None:
         record = self._runtime_tab_records.get(tab_widget)
         if not isinstance(record, dict):
             return None
 
-        resolved_kind = str(widget_kind or "").strip() or "code_json"
+        resolved_kind = str(widget_kind or "").strip().lower() or "code_json"
         if widget_kind is None:
             resolved_kind = self._runtime_tab_default_widget_kind(tab_widget)
+        resolved_board_item_title = str(board_item_title or "").strip()
+        if resolved_kind == self._BOARD_ITEM_WIDGET_KIND and not resolved_board_item_title:
+            resolved_board_item_title = str(title or content or source_path or "Board Item").strip() or "Board Item"
 
         counter = int(record.get("widget_count") or 0) + 1
         record["widget_count"] = counter
@@ -7049,6 +8221,7 @@ class ControlPlaneWidget(QWidget):
         display_title = title
         if not display_title:
             label_by_kind = {
+                self._BOARD_ITEM_WIDGET_KIND: resolved_board_item_title or "Board Item",
                 "builder_panel": "agent_system_builder.json",
                 "agent_relation_graph": "agent_relation_graph",
                 "code_json": "runtime_config.json",
@@ -7066,6 +8239,7 @@ class ControlPlaneWidget(QWidget):
             title=str(display_title),
             content=content,
             source_path=source_path,
+            board_item_title=resolved_board_item_title,
         )
 
         splitter = record.get("splitter")
@@ -7092,7 +8266,7 @@ class ControlPlaneWidget(QWidget):
     ) -> QWidget:
         resolved_name = self._next_runtime_tab_name(tab_name)
 
-        allowed = {kind for _label, kind in self._runtime_widget_menu_options()}
+        allowed = self._runtime_widget_supported_kinds()
         resolved_default_kind = str(default_widget_kind or "code_json").strip().lower()
         if resolved_default_kind not in allowed:
             resolved_default_kind = "code_json"
@@ -7274,31 +8448,36 @@ class ControlPlaneWidget(QWidget):
         if not isinstance(splitter, QSplitter):
             return
 
-        splitter.setHandleWidth(22)
+        splitter.setHandleWidth(23)
         handle = splitter.handle(1)
         if handle is None:
             return
         handle.setObjectName("controlHostSplitterHandle")
 
         handle_layout = QHBoxLayout(handle)
-        handle_layout.setContentsMargins(6, 0, 6, 0)
-        handle_layout.setSpacing(6)
+        handle_layout.setContentsMargins(6, 3, 6, 1)
+        handle_layout.setSpacing(2)
+        handle_layout.setAlignment(Qt.AlignLeft | Qt.AlignTop)
 
-        host_label_text = "Thread Flow Splitter"
+        host_label_text = "Threat Flow"
         handle_label = QLabel(host_label_text, handle)
         handle_label.setObjectName("controlHostSplitterHandleLabel")
-        handle_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        handle_label.setAlignment(Qt.AlignLeft | Qt.AlignTop)
         handle_label.setAttribute(Qt.WA_TransparentForMouseEvents, True)
         handle_label.setToolTip(host_label_text)
+        host_category = self._control_monitor_splitter_category(host_label_text)
+        handle.setProperty("control_splitter_category", host_category)
+        handle_label.setProperty("control_splitter_category", host_category)
 
         toggle_button = _SplitterToggleGlyph(handle)
         toggle_button.setObjectName("controlHostSplitterHandleToggle")
         toggle_button.clicked.connect(self._toggle_config_monitor_host_threat_flow)
 
-        handle_layout.addWidget(toggle_button, 0)
-        handle_layout.addWidget(handle_label, 1)
+        handle_layout.addWidget(toggle_button, 0, Qt.AlignLeft | Qt.AlignTop)
+        handle_layout.addWidget(handle_label, 1, Qt.AlignLeft | Qt.AlignTop)
 
         self.config_monitor_host_splitter_toggle = toggle_button
+        self.config_monitor_host_splitter_label = handle_label
         splitter.splitterMoved.connect(self._sync_config_monitor_host_splitter_handle_state)
         self._apply_control_splitter_handle_styles()
 
@@ -7343,6 +8522,186 @@ class ControlPlaneWidget(QWidget):
             not self._is_config_monitor_section_expanded(section),
         )
 
+    def _restore_config_monitor_splitter_handle_default(self, handle_index: int) -> None:
+        controls = getattr(self, "_config_monitor_splitter_handle_controls", None)
+        if not isinstance(controls, dict):
+            return
+
+        control = controls.get(handle_index)
+        if not isinstance(control, dict):
+            return
+
+        action_container = control.get("action_container")
+        if isinstance(action_container, QWidget):
+            action_container.setVisible(False)
+
+        control["actions_visible"] = False
+
+        self._sync_config_monitor_splitter_handle_states()
+        self._apply_control_splitter_handle_styles()
+
+    def _show_config_monitor_splitter_handle_actions(self, handle_index: int) -> None:
+        splitter = getattr(self, "config_monitor_splitter", None)
+        controls = getattr(self, "_config_monitor_splitter_handle_controls", None)
+        if not isinstance(splitter, QSplitter) or not isinstance(controls, dict):
+            return
+
+        control = controls.get(handle_index)
+        if not isinstance(control, dict):
+            return
+
+        section = control.get("section")
+        if not isinstance(section, QFrame):
+            return
+
+        handle = splitter.handle(handle_index)
+        if handle is None:
+            return
+
+        action_container = control.get("action_container")
+        if not isinstance(action_container, QWidget):
+            return
+
+        action_container.setVisible(True)
+        control["actions_visible"] = True
+
+    def _runtime_tab_name_for_section_title(self, section_title: str) -> str:
+        resolved_title = str(section_title or "").strip()
+        if not resolved_title:
+            return "Board Item"
+        if resolved_title.lower() == "build":
+            return self._BUILD_RUNTIME_TAB_LABEL
+        return resolved_title
+
+    def _runtime_widget_descriptor_for_section_title(self, section_title: str) -> dict[str, str]:
+        resolved_title = str(section_title or "").strip()
+        widget_kind = self._board_item_widget_kind_for_title(resolved_title)
+        source_path = ""
+        board_item_title = ""
+        if widget_kind == self._BOARD_ITEM_WIDGET_KIND:
+            board_item_title = resolved_title
+        elif widget_kind == self._EXTENSIONS_WORKSPACE_WIDGET_KIND:
+            source_path = self._board_extensions_source_uri()
+        return {
+            "widget_kind": widget_kind,
+            "tab_name": self._runtime_tab_name_for_section_title(resolved_title),
+            "title": resolved_title,
+            "source_path": source_path,
+            "board_item_title": board_item_title,
+        }
+
+    def _append_runtime_widget_clone_to_tab(
+        self,
+        tab_widget: QWidget,
+        *,
+        widget_kind: str,
+        title: str,
+        source_path: str = "",
+        board_item_title: str = "",
+        content: str = "",
+    ) -> QWidget | None:
+        if not isinstance(tab_widget, QWidget):
+            return None
+        target_index = self.tabs.indexOf(tab_widget)
+        if target_index >= 0:
+            self.tabs.setCurrentIndex(target_index)
+        return self._add_widget_to_runtime_tab(
+            tab_widget,
+            widget_kind=widget_kind,
+            title=title,
+            source_path=source_path,
+            board_item_title=board_item_title,
+            content=content,
+            persist=True,
+        )
+
+    def _config_monitor_section_base_height(
+        self,
+        content_widget: QWidget,
+        remember_size: dict[str, int] | None = None,
+    ) -> int:
+        if isinstance(remember_size, dict):
+            baseline_size = int(remember_size.get("baseline_size") or 0)
+            if baseline_size > 0:
+                return baseline_size
+        return max(
+            220,
+            int(content_widget.minimumHeight() or 0),
+            int(content_widget.minimumSizeHint().height() or 0),
+        )
+
+    def _is_config_monitor_section_large_expanded(self, section: QFrame) -> bool:
+        state = self._config_monitor_section_state_for(section)
+        if not isinstance(state, dict) or not bool(state.get("expanded", False)):
+            return False
+
+        remember_size = state.get("remember_size")
+        if not isinstance(remember_size, dict):
+            return False
+        return bool(remember_size.get("large_expanded"))
+
+    def _expand_config_monitor_splitter_section(self, section: QFrame) -> None:
+        state = self._config_monitor_section_state_for(section)
+        if not isinstance(state, dict):
+            return
+
+        content_widget = state.get("content_widget")
+        remember_size = state.get("remember_size")
+        if not isinstance(content_widget, QWidget) or not isinstance(remember_size, dict):
+            return
+
+        base_height = self._config_monitor_section_base_height(content_widget, remember_size)
+        content_hint = max(0, int(content_widget.sizeHint().height()))
+        large_size = max(base_height * 2, content_hint * 2 + 64)
+
+        if bool(remember_size.get("large_expanded")):
+            remember_size["expanded_size"] = base_height
+            remember_size["large_expanded"] = False
+        else:
+            remember_size["expanded_size"] = large_size
+            remember_size["large_expanded"] = True
+
+        self._set_splitter_dropdown_expanded(
+            section=section,
+            content_widget=content_widget,
+            expanded=True,
+            remember_size=remember_size,
+            apply_splitter_sizes=True,
+        )
+
+    def _open_config_monitor_section_in_runtime_tab(self, section: QFrame) -> QWidget | None:
+        board_context = self._board_context_from_object(self.sender()) or self._active_board_context()
+        with self._board_context_scope(board_context):
+            state = self._config_monitor_section_state_for(section)
+            if not isinstance(state, dict):
+                return None
+            section_title = str(state.get("title") or section.property("control_dropdown_title") or "").strip()
+            if not section_title:
+                return None
+
+            descriptor = self._runtime_widget_descriptor_for_section_title(section_title)
+            widget_kind = descriptor["widget_kind"]
+            tab_name = descriptor["tab_name"]
+            target_tab = self._find_runtime_tab_by_name(tab_name)
+            if target_tab is None:
+                if section_title.lower() == "build":
+                    target_tab = self._ensure_builder_runtime_tab(activate=True, persist=False)
+                else:
+                    target_tab = self.create_runtime_tab(
+                        tab_name,
+                        activate=True,
+                        add_default_widget=False,
+                        persist=False,
+                        default_widget_kind=widget_kind,
+                    )
+            return self._append_runtime_widget_clone_to_tab(
+                target_tab,
+                widget_kind=widget_kind,
+                title=descriptor["title"],
+                source_path=descriptor["source_path"],
+                board_item_title=descriptor["board_item_title"],
+            )
+
     def _sync_config_monitor_splitter_handle_states(self, *_args: Any) -> None:
         splitter = getattr(self, "config_monitor_splitter", None)
         controls = getattr(self, "_config_monitor_splitter_handle_controls", None)
@@ -7360,6 +8719,7 @@ class ControlPlaneWidget(QWidget):
                 continue
 
             section_title = str(section.property("control_dropdown_title") or control.get("title") or "Widget").strip() or "Widget"
+            section_category = self._control_monitor_splitter_category(section_title)
             expanded = self._is_config_monitor_section_expanded(section)
 
             toggle_button.blockSignals(True)
@@ -7370,9 +8730,29 @@ class ControlPlaneWidget(QWidget):
             toggle_button.blockSignals(False)
 
             if isinstance(handle_label, QLabel):
-                full_label_text = f"{section_title} Splitter"
+                full_label_text = section_title
                 handle_label.setText(full_label_text)
                 handle_label.setToolTip(full_label_text)
+                handle_label.setProperty("control_splitter_category", section_category)
+
+            action_expand_button = control.get("action_expand_button")
+            if isinstance(action_expand_button, QToolButton):
+                is_large_expanded = self._is_config_monitor_section_large_expanded(section)
+                action_expand_button.setIcon(
+                    _content_resize_icon(reset=is_large_expanded)
+                )
+                action_expand_button.setToolTip(
+                    f"{section_title} auf Normalgroesse setzen"
+                    if is_large_expanded
+                    else f"{section_title} vergroessern"
+                )
+
+            action_container = control.get("action_container")
+            if isinstance(action_container, QWidget):
+                action_container.setVisible(expanded)
+                control["actions_visible"] = expanded
+
+            control["category"] = section_category
 
     def _setup_config_monitor_splitter_handles(self) -> None:
         splitter = getattr(self, "config_monitor_splitter", None)
@@ -7381,24 +8761,32 @@ class ControlPlaneWidget(QWidget):
 
         splitter.setHandleWidth(22)
         self._config_monitor_splitter_handle_controls = {}
+        previous_section_category: str | None = None
 
         for handle_index in range(1, splitter.count()):
             handle = splitter.handle(handle_index)
             if handle is None:
                 continue
             handle.setObjectName("controlSectionSplitterHandle")
+            handle.setContextMenuPolicy(Qt.DefaultContextMenu)
 
             section = splitter.widget(handle_index)
             if not isinstance(section, QFrame):
                 continue
 
             section_title = str(section.property("control_dropdown_title") or f"Widget {handle_index + 1}").strip() or f"Widget {handle_index + 1}"
+            section_category = self._control_monitor_splitter_category(section_title)
+            handle_top_margin = self._control_monitor_group_top_margin(
+                section_category,
+                previous_section_category,
+            )
 
             handle_layout = handle.layout()
             if not isinstance(handle_layout, QHBoxLayout):
                 handle_layout = QHBoxLayout(handle)
-            handle_layout.setContentsMargins(6, 0, 6, 0)
-            handle_layout.setSpacing(6)
+            handle_layout.setContentsMargins(6, handle_top_margin, 6, 1)
+            handle_layout.setSpacing(2)
+            handle_layout.setAlignment(Qt.AlignLeft | Qt.AlignTop)
 
             while handle_layout.count() > 0:
                 item = handle_layout.takeAt(0)
@@ -7412,25 +8800,118 @@ class ControlPlaneWidget(QWidget):
                 lambda sec=section: self._toggle_config_monitor_section_from_handle(sec)
             )
 
-            full_label_text = f"{section_title} Splitter"
+            full_label_text = section_title
             handle_label = QLabel(full_label_text, handle)
             handle_label.setObjectName("controlSectionSplitterHandleLabel")
-            handle_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+            handle_label.setAlignment(Qt.AlignLeft | Qt.AlignTop)
             handle_label.setAttribute(Qt.WA_TransparentForMouseEvents, True)
             handle_label.setToolTip(full_label_text)
+            handle.setProperty("control_splitter_category", section_category)
+            handle_label.setProperty("control_splitter_category", section_category)
 
-            handle_layout.addWidget(toggle_button, 0)
-            handle_layout.addWidget(handle_label, 1)
+            handle_layout.addWidget(toggle_button, 0, Qt.AlignLeft | Qt.AlignTop)
+            handle_layout.addWidget(handle_label, 1, Qt.AlignLeft | Qt.AlignTop)
+
+            action_container: QWidget | None = None
+            action_expand_button: QToolButton | None = None
+            action_dock_button: QToolButton | None = None
+
+            action_container = QWidget(handle)
+            action_layout = QHBoxLayout(action_container)
+            action_layout.setContentsMargins(0, 0, 0, 0)
+            action_layout.setSpacing(4)
+
+            def _run_action(action_callable: Callable[[], None], *, idx: int = handle_index) -> None:
+                try:
+                    action_callable()
+                finally:
+                    self._restore_config_monitor_splitter_handle_default(idx)
+
+            action_expand_button = QToolButton(action_container)
+            action_expand_button.setObjectName("runtimeWidgetActionButton")
+            action_expand_button.setIcon(_content_resize_icon(reset=False))
+            action_expand_button.setIconSize(QSize(14, 14))
+            action_expand_button.setToolTip(f"{section_title} vergroessern")
+            action_expand_button.setCursor(Qt.PointingHandCursor)
+            action_expand_button.setAutoRaise(True)
+            action_expand_button.clicked.connect(
+                lambda _checked=False, sec=section: _run_action(
+                    lambda: self._expand_config_monitor_splitter_section(sec)
+                )
+            )
+
+            action_dock_button = QToolButton(action_container)
+            action_dock_button.setObjectName("runtimeWidgetActionButton")
+            action_dock_button.setIcon(_icon("open_in_new_dock.svg"))
+            action_dock_button.setIconSize(QSize(14, 14))
+            action_dock_button.setToolTip(
+                f"{section_title} in {self._runtime_tab_name_for_section_title(section_title)} oeffnen"
+            )
+            action_dock_button.setCursor(Qt.PointingHandCursor)
+            action_dock_button.setAutoRaise(True)
+            action_dock_button.clicked.connect(
+                lambda _checked=False, sec=section: _run_action(
+                    lambda: self._open_config_monitor_section_in_runtime_tab(sec)
+                )
+            )
+
+            section_state = self._config_monitor_section_state_for(section)
+            content_widget = section_state.get("content_widget") if isinstance(section_state, dict) else None
+            if (
+                section_title.strip().lower() == "extensions"
+                and isinstance(content_widget, QWidget)
+            ):
+                extensions_workspace = (
+                    content_widget
+                    if isinstance(content_widget, ExtensionsWorkspaceWidget)
+                    else content_widget.findChild(ExtensionsWorkspaceWidget)
+                )
+            else:
+                extensions_workspace = None
+            if isinstance(extensions_workspace, ExtensionsWorkspaceWidget):
+                embedded_tab_strip = extensions_workspace.create_embedded_tab_bar_proxy(action_container)
+                embedded_tab_strip.setProperty("control_splitter_embedded_tabs", True)
+                embedded_tab_bar = embedded_tab_strip.findChild(QTabBar, "extensionsEmbeddedTabBar")
+                if isinstance(embedded_tab_bar, QTabBar):
+                    embedded_tab_bar.setStyleSheet(
+                        self._control_monitor_embedded_tab_bar_style(section_category)
+                    )
+                embedded_add_button = embedded_tab_strip.findChild(
+                    QToolButton, "extensionsEmbeddedTabAddButton"
+                )
+                if isinstance(embedded_add_button, QToolButton):
+                    embedded_add_button.setStyleSheet(
+                        self._control_monitor_embedded_tab_add_button_style(section_category)
+                    )
+                action_layout.addWidget(embedded_tab_strip, 1, Qt.AlignLeft | Qt.AlignTop)
+
+            action_layout.addWidget(action_expand_button, 0, Qt.AlignLeft | Qt.AlignTop)
+            action_layout.addWidget(action_dock_button, 0, Qt.AlignLeft | Qt.AlignTop)
+            action_container.setVisible(False)
+            handle_layout.addWidget(action_container, 0, Qt.AlignLeft | Qt.AlignTop)
+
+            handle.setContextMenuPolicy(Qt.CustomContextMenu)
+            handle.customContextMenuRequested.connect(
+                lambda _pos, idx=handle_index: self._show_config_monitor_splitter_handle_actions(idx)
+            )
 
             self._config_monitor_splitter_handle_controls[handle_index] = {
                 "section": section,
                 "title": section_title,
+                "category": section_category,
                 "toggle_button": toggle_button,
                 "label": handle_label,
+                "action_container": action_container,
+                "action_expand_button": action_expand_button,
+                "action_dock_button": action_dock_button,
+                "actions_visible": False,
             }
+            previous_section_category = section_category
 
         try:
-            splitter.splitterMoved.disconnect(self._sync_config_monitor_splitter_handle_states)
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", RuntimeWarning)
+                splitter.splitterMoved.disconnect(self._sync_config_monitor_splitter_handle_states)
         except Exception:
             pass
         splitter.splitterMoved.connect(self._sync_config_monitor_splitter_handle_states)
@@ -7447,35 +8928,244 @@ class ControlPlaneWidget(QWidget):
         active_icon_color = str(self.scheme.get("col1") or "#35ff8a")
         toggle_button.setColors(idle_icon_color, active_icon_color)
 
-    def _apply_control_splitter_handle_styles(self) -> None:
-        handle_style = (
+    def _control_monitor_splitter_category(self, section_title: str) -> str:
+        title_key = str(section_title or "").strip().lower()
+        if title_key.startswith("monitoring"):
+            return "orange"
+        if title_key.startswith("operator"):
+            return "turquoise"
+        if title_key.startswith("trace") or title_key.startswith("event") or "threat flow" in title_key:
+            return "blue"
+        if title_key.startswith("configuration"):
+            return "magenta"
+        if title_key.startswith("build") or title_key.startswith("extension"):
+            return "sunyellow"
+        return "blue"
+
+    def _control_monitor_splitter_palette(self, category: str) -> dict[str, str]:
+        palettes: dict[str, dict[str, str]] = {
+            "orange": {
+                "label_fg": "#ffd7ac",
+                "label_bg": "rgba(255, 140, 0, 0.24)",
+                "label_border": "rgba(255, 140, 0, 0.58)",
+                "handle_bg": "rgba(255, 140, 0, 0.08)",
+                "handle_bg_hover": "rgba(255, 140, 0, 0.14)",
+                "handle_bg_pressed": "rgba(255, 140, 0, 0.20)",
+                "handle_border": "rgba(255, 140, 0, 0.60)",
+                "handle_border_hover": "rgba(255, 140, 0, 0.76)",
+                "handle_border_pressed": "rgba(255, 140, 0, 0.88)",
+            },
+            "blue": {
+                "label_fg": "#bfdcff",
+                "label_bg": "rgba(49, 132, 255, 0.24)",
+                "label_border": "rgba(49, 132, 255, 0.58)",
+                "handle_bg": "rgba(49, 132, 255, 0.08)",
+                "handle_bg_hover": "rgba(49, 132, 255, 0.14)",
+                "handle_bg_pressed": "rgba(49, 132, 255, 0.20)",
+                "handle_border": "rgba(49, 132, 255, 0.60)",
+                "handle_border_hover": "rgba(49, 132, 255, 0.76)",
+                "handle_border_pressed": "rgba(49, 132, 255, 0.88)",
+            },
+            "magenta": {
+                "label_fg": "#ffc3f8",
+                "label_bg": "rgba(225, 64, 205, 0.24)",
+                "label_border": "rgba(225, 64, 205, 0.58)",
+                "handle_bg": "rgba(225, 64, 205, 0.08)",
+                "handle_bg_hover": "rgba(225, 64, 205, 0.14)",
+                "handle_bg_pressed": "rgba(225, 64, 205, 0.20)",
+                "handle_border": "rgba(225, 64, 205, 0.60)",
+                "handle_border_hover": "rgba(225, 64, 205, 0.76)",
+                "handle_border_pressed": "rgba(225, 64, 205, 0.88)",
+            },
+            "turquoise": {
+                "label_fg": "#baf7ef",
+                "label_bg": "rgba(34, 211, 196, 0.24)",
+                "label_border": "rgba(34, 211, 196, 0.60)",
+                "handle_bg": "rgba(34, 211, 196, 0.08)",
+                "handle_bg_hover": "rgba(34, 211, 196, 0.14)",
+                "handle_bg_pressed": "rgba(34, 211, 196, 0.20)",
+                "handle_border": "rgba(34, 211, 196, 0.62)",
+                "handle_border_hover": "rgba(34, 211, 196, 0.78)",
+                "handle_border_pressed": "rgba(34, 211, 196, 0.90)",
+            },
+            "sunyellow": {
+                "label_fg": "#fff3ac",
+                "label_bg": "rgba(255, 204, 0, 0.24)",
+                "label_border": "rgba(255, 204, 0, 0.62)",
+                "handle_bg": "rgba(255, 204, 0, 0.08)",
+                "handle_bg_hover": "rgba(255, 204, 0, 0.16)",
+                "handle_bg_pressed": "rgba(255, 204, 0, 0.26)",
+                "handle_border": "rgba(255, 204, 0, 0.64)",
+                "handle_border_hover": "rgba(255, 204, 0, 0.82)",
+                "handle_border_pressed": "rgba(255, 204, 0, 0.94)",
+            },
+        }
+        return palettes.get(str(category or "").strip().lower(), palettes["blue"])
+
+    def _control_monitor_group_top_margin(
+        self,
+        current_category: str,
+        previous_category: str | None = None,
+    ) -> int:
+        normalized_current = str(current_category or "").strip().lower()
+        normalized_previous = str(previous_category or "").strip().lower()
+        if not normalized_previous or normalized_current != normalized_previous:
+            return 3
+        return 0
+
+    def _control_monitor_splitter_handle_style(self, category: str) -> str:
+        palette = self._control_monitor_splitter_palette(category)
+        return (
             "QSplitterHandle {"
-            " background-color: transparent;"
+            f" background-color: {palette['handle_bg']};"
             " border: none;"
-            " border-left: 2px solid transparent;"
+            f" border-left: 2px solid {palette['handle_border']};"
+            " border-radius: 6px;"
             "}"
-            "QSplitterHandle:hover { border-left: 2px solid transparent; }"
-            "QSplitterHandle:pressed { border-left: 2px solid transparent; }"
+            "QSplitterHandle:hover {"
+            f" background-color: {palette['handle_bg_hover']};"
+            f" border-left: 2px solid {palette['handle_border_hover']};"
+            "}"
+            "QSplitterHandle:pressed {"
+            f" background-color: {palette['handle_bg_pressed']};"
+            f" border-left: 2px solid {palette['handle_border_pressed']};"
+            "}"
         )
 
+    def _control_monitor_embedded_tab_bar_style(self, category: str) -> str:
+        palette = self._control_monitor_splitter_palette(category)
+        return (
+            "QTabBar#extensionsEmbeddedTabBar {"
+            " background-color: transparent;"
+            " border: none;"
+            " border-top: 0px solid transparent;"
+            " margin: 0px;"
+            " margin-bottom: 4px;"
+            " padding-bottom: 4px;"
+            "}"
+            "QTabBar#extensionsEmbeddedTabBar:hover {"
+            " background-color: transparent;"
+            " border: none;"
+            "}"
+            "QTabBar#extensionsEmbeddedTabBar::tab {"
+            f" color: {palette['label_fg']};"
+            f" background-color: {palette['label_bg']};"
+            f" border: 1px solid {palette['label_border']};"
+            " border-radius: 6px;"
+            " font-size: 10px;"
+            " font-weight: 700;"
+            " padding: 0px 28px 0px 9px;"
+            " margin: 0px 2px 4px 0px;"
+            " margin-bottom: 4px;"
+            " min-width: 64px;"
+            " min-height: 18px;"
+            "}"
+            "QTabBar#extensionsEmbeddedTabBar::tab:hover {"
+            f" color: {palette['label_fg']};"
+            f" background-color: {palette['handle_bg_hover']};"
+            f" border: 1px solid {palette['handle_border_hover']};"
+            " border-radius: 6px;"
+            "}"
+            "QTabBar#extensionsEmbeddedTabBar::tab:selected {"
+            f" color: {palette['label_fg']};"
+            f" background-color: {palette['handle_bg_pressed']};"
+            f" border: 1px solid {palette['handle_border_pressed']};"
+            " border-radius: 6px;"
+            "}"
+            "QTabBar#extensionsEmbeddedTabBar::close-button {"
+            " image: none;"
+            " width: 0px;"
+            " height: 0px;"
+            " margin: 0px;"
+            " padding: 0px;"
+            "}"
+            "QToolButton#extensionsEmbeddedTabCloseButton {"
+            f" color: {palette['label_fg']};"
+            f" background-color: {palette['label_bg']};"
+            f" border: 1px solid {palette['label_border']};"
+            " border-radius: 6px;"
+            " font-size: 10px;"
+            " font-weight: 700;"
+            " padding: 0px;"
+            " margin: 0px;"
+            "}"
+            "QToolButton#extensionsEmbeddedTabCloseButton:hover {"
+            f" background-color: {palette['handle_bg_hover']};"
+            f" border: 1px solid {palette['handle_border_hover']};"
+            "}"
+        )
+
+    def _control_monitor_embedded_tab_add_button_style(self, category: str) -> str:
+        palette = self._control_monitor_splitter_palette(category)
+        chrome_bg = str(self.scheme.get("col9") or "#101010")
+        return (
+            "QToolButton#extensionsEmbeddedTabAddButton {"
+            f" color: {palette['label_fg']};"
+            f" background-color: {chrome_bg};"
+            " border: 1px solid transparent;"
+            " border-radius: 6px;"
+            " padding: 1px 5px;"
+            "}"
+            "QToolButton#extensionsEmbeddedTabAddButton:hover {"
+            f" background-color: {chrome_bg};"
+            " border: 1px solid transparent;"
+            "}"
+        )
+
+    def _apply_control_monitor_splitter_label_style(
+        self,
+        handle_label: QLabel | None,
+        category: str,
+        *,
+        font_size_px: int,
+    ) -> None:
+        if not isinstance(handle_label, QLabel):
+            return
+
+        palette = self._control_monitor_splitter_palette(category)
+        handle_label.setStyleSheet(
+            (
+                f"color: {palette['label_fg']};"
+                "font-weight: 700;"
+                f"font-size: {max(9, int(font_size_px))}px;"
+                f"background: {palette['label_bg']};"
+                f"border: 1px solid {palette['label_border']};"
+                "border-radius: 6px;"
+                "padding: 1px 9px;"
+            )
+        )
+
+    def _apply_control_splitter_handle_styles(self) -> None:
         host_splitter = getattr(self, "config_monitor_host_splitter", None)
         if isinstance(host_splitter, QSplitter):
+            host_category = "magenta"
             host_handle = host_splitter.handle(1)
             if isinstance(host_handle, QWidget):
-                host_handle.setStyleSheet(handle_style)
+                host_category = str(host_handle.property("control_splitter_category") or host_category)
+                host_handle.setStyleSheet(self._control_monitor_splitter_handle_style(host_category))
+            self._apply_control_monitor_splitter_label_style(
+                getattr(self, "config_monitor_host_splitter_label", None),
+                host_category,
+                font_size_px=11,
+            )
 
         section_splitter = getattr(self, "config_monitor_splitter", None)
+        controls = getattr(self, "_config_monitor_splitter_handle_controls", None)
         if isinstance(section_splitter, QSplitter):
             for handle_index in range(1, section_splitter.count()):
                 section_handle = section_splitter.handle(handle_index)
                 if isinstance(section_handle, QWidget):
-                    section_handle.setStyleSheet(handle_style)
+                    section_category = "blue"
+                    if isinstance(controls, dict):
+                        control = controls.get(handle_index)
+                        if isinstance(control, dict):
+                            section_category = str(control.get("category") or section_category)
+                    section_handle.setStyleSheet(self._control_monitor_splitter_handle_style(section_category))
 
         self._apply_control_splitter_toggle_button_style(
             getattr(self, "config_monitor_host_splitter_toggle", None)
         )
 
-        controls = getattr(self, "_config_monitor_splitter_handle_controls", None)
         if isinstance(controls, dict):
             for control in controls.values():
                 if not isinstance(control, dict):
@@ -7483,6 +9173,24 @@ class ControlPlaneWidget(QWidget):
                 self._apply_control_splitter_toggle_button_style(
                     control.get("toggle_button") if isinstance(control.get("toggle_button"), _SplitterToggleGlyph) else None
                 )
+                self._apply_control_monitor_splitter_label_style(
+                    control.get("label") if isinstance(control.get("label"), QLabel) else None,
+                    str(control.get("category") or "blue"),
+                    font_size_px=10,
+                )
+                action_container = control.get("action_container")
+                if isinstance(action_container, QWidget):
+                    section_category = str(control.get("category") or "blue")
+                    for tab_bar in action_container.findChildren(QTabBar, "extensionsEmbeddedTabBar"):
+                        tab_bar.setStyleSheet(
+                            self._control_monitor_embedded_tab_bar_style(section_category)
+                        )
+                    for add_button in action_container.findChildren(
+                        QToolButton, "extensionsEmbeddedTabAddButton"
+                    ):
+                        add_button.setStyleSheet(
+                            self._control_monitor_embedded_tab_add_button_style(section_category)
+                        )
 
     def _set_splitter_dropdown_expanded(
         self,
@@ -7505,9 +9213,11 @@ class ControlPlaneWidget(QWidget):
         content_widget.setVisible(bool(expanded))
 
         if expanded:
-            section.setMinimumHeight(0)
+            expanded_size = max(int(remember_size.get("expanded_size", 180)), splitter_handle_extent * 6)
+            section.setMinimumHeight(expanded_size)
             section.setMaximumHeight(16777215)
-            section.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Expanding)
+            section.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+            content_widget.setMinimumHeight(max(96, expanded_size - splitter_handle_extent - 16))
         else:
             if isinstance(splitter_parent, QSplitter):
                 section_index = splitter_parent.indexOf(section)
@@ -7521,6 +9231,7 @@ class ControlPlaneWidget(QWidget):
             section.setMinimumHeight(0)
             section.setMaximumHeight(0)
             section.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+            content_widget.setMinimumHeight(0)
 
         section.updateGeometry()
 
@@ -7531,11 +9242,7 @@ class ControlPlaneWidget(QWidget):
             section_index = splitter_parent.indexOf(section)
             splitter_sizes = splitter_parent.sizes()
             if 0 <= section_index < len(splitter_sizes):
-                target_size = (
-                    max(int(remember_size.get("expanded_size", 180)), splitter_handle_extent * 6)
-                    if expanded
-                    else 0
-                )
+                target_size = max(int(remember_size.get("expanded_size", 180)), splitter_handle_extent * 6) if expanded else 0
                 splitter_sizes[section_index] = target_size
                 splitter_parent.setSizes(splitter_sizes)
 
@@ -7554,7 +9261,7 @@ class ControlPlaneWidget(QWidget):
         section.setObjectName("controlDropdownSection")
         section.setFrameShape(QFrame.NoFrame)
         section.setMinimumSize(0, 0)
-        section.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Expanding)
+        section.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
 
         section_layout = QVBoxLayout(section)
         section_layout.setContentsMargins(6, 6, 6, 6)
@@ -7567,7 +9274,12 @@ class ControlPlaneWidget(QWidget):
         content_widget.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Expanding)
         section_layout.addWidget(content_widget, 1)
 
-        remember_size = {"expanded_size": max(160, int(content_widget.sizeHint().height()) + 36)}
+        baseline_size = max(160, int(content_widget.sizeHint().height()) + 36)
+        remember_size = {
+            "expanded_size": baseline_size,
+            "baseline_size": baseline_size,
+            "large_expanded": False,
+        }
         section.setProperty("control_dropdown_title", section_title)
 
         state_map = getattr(self, "_config_monitor_section_state", None)
@@ -7666,6 +9378,7 @@ class ControlPlaneWidget(QWidget):
             panel_layout.setSpacing(0)
 
         toolbar_widget = QWidget(panel)
+        toolbar_widget.setObjectName("builderToolbarWidget")
         top_buttons = QHBoxLayout(toolbar_widget)
         top_buttons.setContentsMargins(0, 0, 0, 0)
         top_buttons.setSpacing(6)
@@ -7693,9 +9406,9 @@ class ControlPlaneWidget(QWidget):
         btn_build.setObjectName("builderBuildButton")
         btn_post.setObjectName("builderPostButton")
         btn_copy.setObjectName("builderCopyButton")
+        top_buttons.addStretch(1)
         top_buttons.addWidget(btn_template, 0)
         top_buttons.addWidget(btn_build, 0)
-        top_buttons.addStretch(1)
         top_buttons.addWidget(btn_post, 0)
         top_buttons.addWidget(btn_copy, 0)
         panel_layout.addWidget(toolbar_widget)
@@ -8194,7 +9907,9 @@ class ControlPlaneWidget(QWidget):
     def _refresh_monitoring_views(self) -> None:
         monitoring_snapshot = dict(self._last_snapshot.get("monitoring") or {})
         if monitoring_snapshot:
-            self._render_monitoring_snapshot(monitoring_snapshot)
+            board_context = self._board_context_from_object(self.sender()) or self._active_board_context()
+            with self._board_context_scope(board_context):
+                self._render_monitoring_snapshot(monitoring_snapshot)
 
     def _render_monitor_trace_block(self, label: str, value: Any) -> str:
         if value in (None, "", {}, []):
@@ -8283,7 +9998,7 @@ class ControlPlaneWidget(QWidget):
             QLabel#controlHostSplitterHandleLabel {{
                 color: {self.scheme['col8']};
                 font-size: 11px;
-                font-weight: 600;
+                font-weight: 700;
                 background: transparent;
             }}
             QToolButton#controlSectionSplitterHandleToggle {{
@@ -8308,12 +10023,36 @@ class ControlPlaneWidget(QWidget):
             QLabel#controlSectionSplitterHandleLabel {{
                 color: {self.scheme['col8']};
                 font-size: 10px;
-                font-weight: 600;
+                font-weight: 700;
                 background: transparent;
             }}
             QFrame#controlBuilderContainer {{
                 background: {self.scheme['col7']};
                 border: none;
+            }}
+            QFrame#BuildTabWidget {{
+                background: {self.scheme['col7']};
+                border: none;
+            }}
+            QWidget#BoardTabWidget QFrame#controlBuilderContainer {{
+                background: {self.scheme['col7']};
+                border: none;
+            }}
+            QWidget#BoardTabWidget QFrame#BuildTabWidget {{
+                background: {self.scheme['col7']};
+                border: none;
+            }}
+            QWidget#BoardTabWidget QFrame#controlBuilderContainer > QFrame#controlBuilderPanel {{
+                background: {self.scheme['col7']};
+            }}
+            QWidget#BoardTabWidget QFrame#controlBuilderContainer QWidget#builderToolbarWidget {{
+                background: transparent;
+            }}
+            QWidget#BoardTabWidget QFrame#BuildTabWidget > QFrame#runtimeWidgetPanel {{
+                background: {self.scheme['col7']};
+            }}
+            QWidget#BoardTabWidget QFrame#BuildTabWidget QWidget#builderToolbarWidget {{
+                background: transparent;
             }}
             QTabWidget#controlPlaneTabs::pane {{
                 background: {self.scheme['col7']};
@@ -8421,6 +10160,13 @@ class ControlPlaneWidget(QWidget):
                 border-radius: 12px;
                 padding: 8px;
                 font-size: 13px;
+            }}
+            QScrollArea#controlMonitoringScrollArea {{
+                background: transparent;
+                border: none;
+            }}
+            QScrollArea#controlMonitoringScrollArea > QWidget > QWidget {{
+                background: transparent;
             }}
             QTextBrowser#controlBrowser QScrollBar:vertical,
             QTextBrowser#controlBrowser QScrollBar:horizontal {{
@@ -8547,10 +10293,63 @@ class ControlPlaneWidget(QWidget):
                 border-color: {self.scheme['col10']};
                 color: {self.scheme['col6']};
             }}
+            QWidget#extensionsEmbeddedTabBarHost {{
+                background: transparent;
+            }}
+            QTabBar#extensionsEmbeddedTabBar {{
+                background: transparent;
+                border-top: 0px solid transparent;
+                margin: 0px;
+            }}
+            QTabBar#extensionsEmbeddedTabBar::tab {{
+                color: {self.scheme['col8']};
+                background: transparent;
+                border: none;
+                border-radius: 6px;
+                font-size: 10px;
+                font-weight: 700;
+                padding: 4px 10px;
+                margin: 0px 2px 0px 0px;
+                min-width: 45px;
+                min-height: 18px;
+            }}
+            QTabBar#extensionsEmbeddedTabBar::tab:hover {{
+                color: {self.scheme['col8']};
+                background: transparent;
+                border: none;
+                border-radius: 6px;
+            }}
+            QTabBar#extensionsEmbeddedTabBar::tab:selected {{
+                color: {self.scheme['col1']};
+                background: transparent;
+                border: none;
+                border-radius: 6px;
+            }}
+            QTabBar#extensionsEmbeddedTabBar::close-button {{
+                image: none;
+                width: 10px;
+            }}
+            QToolButton#extensionsEmbeddedTabAddButton {{
+                color: {self.scheme['col8']};
+                background: {self.scheme['col9']};
+                border: 1px solid transparent;
+                border-radius: 6px;
+                padding: 2px;
+            }}
+            QToolButton#extensionsEmbeddedTabAddButton:hover {{
+                color: {self.scheme['col6']};
+                background: {self.scheme['col9']};
+                border: 1px solid transparent;
+            }}
             """
         )
+        for board_context in self._board_contexts_in_display_order():
+            extensions_workspace = board_context.get("extensions_section_workspace")
+            if isinstance(extensions_workspace, ExtensionsWorkspaceWidget):
+                extensions_workspace.update_scheme(self._accent, self._base)
         self._refresh_runtime_panel_schemes()
         self._apply_control_splitter_handle_styles()
+        self._apply_control_plane_tab_corner_widget_style()
 
     def _load_refresh_payload(self) -> dict[str, Any]:
         configuration_snapshot = self._load_configuration_snapshot()
@@ -8609,21 +10408,12 @@ class ControlPlaneWidget(QWidget):
                 configuration_snapshot = dict(snapshot_payload.get("configuration") or {})
                 monitoring_snapshot = dict(snapshot_payload.get("monitoring") or {})
                 operator_snapshot = dict(snapshot_payload.get("operations") or {})
-
-                self._populate_trace_filter_selectors(monitoring_snapshot)
-                self._populate_operator_filter_selectors(operator_snapshot)
-                self._render_configuration_snapshot(configuration_snapshot)
-                self._render_monitoring_snapshot(monitoring_snapshot)
-                self._render_operator_snapshot(operator_snapshot)
-                self._populate_drilldown_selectors(configuration_snapshot)
-                if bool(payload.get("include_drilldown")):
-                    self._refresh_drilldown_views()
                 self._last_snapshot = {
                     "configuration": configuration_snapshot,
                     "monitoring": monitoring_snapshot,
                     "operations": operator_snapshot,
                 }
-                self._render_operator_log()
+                self._render_all_board_contexts(include_drilldown=bool(payload.get("include_drilldown")))
                 self._last_refresh_label.setText(
                     f"Updated {datetime.now().strftime('%H:%M:%S')}"
                 )
@@ -8631,40 +10421,42 @@ class ControlPlaneWidget(QWidget):
                 return
 
             error_text = html.escape(str(payload.get("error") or "Unknown refresh error"))
-            self.config_summary_view.setHtml(f"<h3>Configuration unavailable</h3><p>{error_text}</p>")
-            self.config_manifest_view.setHtml(
-                "<h3>Manifest projection failed</h3><p>Check agents_config.py imports and runtime state.</p>"
-            )
-            self.monitor_summary_view.setHtml(f"<h3>Monitoring unavailable</h3><p>{error_text}</p>")
-            self.monitor_detail_view.setHtml(
-                "<h3>Drill-down unavailable</h3><p>Workflow status detail could not be projected.</p>"
-            )
-            self.monitor_timeline_view.setHtml(
-                "<h3>Timeline unavailable</h3><p>Runtime event projection could not be loaded.</p>"
-            )
-            self.monitor_trace_view.setHtml(
-                "<h3>Trace unavailable</h3><p>Detailed chat/tool/handoff projection could not be loaded.</p>"
-            )
-            if isinstance(getattr(self, "config_monitor_threat_flow_view", None), QTextBrowser):
-                self.config_monitor_threat_flow_view.setHtml(
-                    f"<p>Threat Flow unavailable: {error_text}</p>"
-                )
-            self.trace_agent_selector.clear()
-            self.trace_workflow_selector.clear()
-            self.trace_tool_selector.clear()
-            self.trace_handoff_selector.clear()
-            self.operator_status_selector.clear()
-            self.operator_audit_selector.clear()
-            self.operator_group_selector.clear()
-            self.operator_source_selector.clear()
-            self.operator_summary_view.setHtml(f"<h3>Operations unavailable</h3><p>{error_text}</p>")
             self._last_snapshot = {
                 "configuration": {"agent_count": 0, "workflow_count": 0},
                 "monitoring": {"session_count": 0, "failure_count": 0},
                 "operations": {"queue_backend": "n/a", "queue_healthy": False},
             }
+            for board_context in self._board_contexts_in_display_order():
+                with self._board_context_scope(board_context):
+                    self.config_summary_view.setHtml(f"<h3>Configuration unavailable</h3><p>{error_text}</p>")
+                    self.config_manifest_view.setHtml(
+                        "<h3>Manifest projection failed</h3><p>Check agents_config.py imports and runtime state.</p>"
+                    )
+                    self.monitor_summary_view.setHtml(f"<h3>Monitoring unavailable</h3><p>{error_text}</p>")
+                    self.monitor_detail_view.setHtml(
+                        "<h3>Drill-down unavailable</h3><p>Workflow status detail could not be projected.</p>"
+                    )
+                    self.monitor_timeline_view.setHtml(
+                        "<h3>Timeline unavailable</h3><p>Runtime event projection could not be loaded.</p>"
+                    )
+                    self.monitor_trace_view.setHtml(
+                        "<h3>Trace unavailable</h3><p>Detailed chat/tool/handoff projection could not be loaded.</p>"
+                    )
+                    if isinstance(getattr(self, "config_monitor_threat_flow_view", None), QTextBrowser):
+                        self.config_monitor_threat_flow_view.setHtml(
+                            f"<p>Threat Flow unavailable: {error_text}</p>"
+                        )
+                    self.trace_agent_selector.clear()
+                    self.trace_workflow_selector.clear()
+                    self.trace_tool_selector.clear()
+                    self.trace_handoff_selector.clear()
+                    self.operator_status_selector.clear()
+                    self.operator_audit_selector.clear()
+                    self.operator_group_selector.clear()
+                    self.operator_source_selector.clear()
+                    self.operator_summary_view.setHtml(f"<h3>Operations unavailable</h3><p>{error_text}</p>")
+                    self._render_operator_log()
             self._last_refresh_label.setText("Update failed")
-            self._render_operator_log()
             self.snapshotChanged.emit(dict(self._last_snapshot))
         finally:
             if self._refresh_pending:
@@ -9304,6 +11096,11 @@ class ControlPlaneWidget(QWidget):
         return filtered_entries
 
     def _refresh_drilldown_views(self) -> None:
+        board_context = self._board_context_from_object(self.sender()) or self._active_board_context()
+        with self._board_context_scope(board_context):
+            self._refresh_drilldown_views_for_context()
+
+    def _refresh_drilldown_views_for_context(self) -> None:
         agent_label = self.agent_selector.currentText().strip()
         workflow_name = self.workflow_selector.currentText().strip()
 
@@ -9877,7 +11674,9 @@ class ControlPlaneWidget(QWidget):
                 self._apply_operator_snapshot(operations_snapshot, render_log=False)
         except Exception:
             pass
-        self._render_operator_log()
+        for board_context in self._board_contexts_in_display_order():
+            with self._board_context_scope(board_context):
+                self._render_operator_log()
 
     def _render_operator_log(self) -> None:
         operations_snapshot = dict(self._last_snapshot.get("operations") or {})
@@ -10280,6 +12079,25 @@ class ExtensionsWorkspaceWidget(QWidget):
     _LOCAL_WIDGET_STATE_REL_PATH = "AppData/runtime_extensions_workspace.json"
     _START_TAB_TITLE = "Loadable Extensions"
 
+    @staticmethod
+    def _tab_category_for_text(tab_text: str) -> str:
+        title_key = str(tab_text or "").strip().lower()
+        if title_key.startswith("monitoring"):
+            return "orange"
+        if title_key.startswith("operator"):
+            return "turquoise"
+        if title_key.startswith("trace") or title_key.startswith("event") or "threat flow" in title_key:
+            return "blue"
+        if title_key.startswith("configuration"):
+            return "magenta"
+        if title_key.startswith("build") or title_key.startswith("extension") or "connect" in title_key or "loadable" in title_key:
+            return "sunyellow"
+        return "blue"
+
+    @staticmethod
+    def _tab_palette(category: str) -> dict[str, str]:
+        return ControlPlaneWidget._control_monitor_splitter_palette(ControlPlaneWidget, category)
+
     def __init__(
         self,
         accent: dict[str, str] | None = None,
@@ -10287,6 +12105,9 @@ class ExtensionsWorkspaceWidget(QWidget):
         parent: QWidget | None = None,
         source_uri: str | None = None,
         control_plane_widget_ref: Any = None,
+        initial_tool_id: str = "",
+        auto_load_initial_tool: bool = False,
+        hide_internal_tab_bar: bool = False,
     ) -> None:
         super().__init__(parent)
         self._accent = dict(accent or {})
@@ -10298,6 +12119,11 @@ class ExtensionsWorkspaceWidget(QWidget):
         self._preview_initialized = False
         self._initial_source_uri = str(source_uri or "").strip()
         self._control_plane_widget = control_plane_widget_ref
+        self._initial_tool_id = str(initial_tool_id or "").strip()
+        self._auto_load_initial_tool = bool(auto_load_initial_tool)
+        self._hide_internal_tab_bar = bool(hide_internal_tab_bar)
+        self._embedded_tab_bar_proxies: list[QTabBar] = []
+        self._external_uri_proxies: list[QLineEdit] = []
         self._hover_tab_index = -1
         self._hover_tab_base_text = ""
         self._hover_tab_phase = 0
@@ -10311,13 +12137,18 @@ class ExtensionsWorkspaceWidget(QWidget):
             self._add_control_plane_tab()
         restored_state = self._load_local_widget_state()
         initial_source_uri = self._initial_source_uri or str(restored_state.get("uri") or "")
+        initial_tool_id = self._initial_tool_id or str(restored_state.get("selected_tool") or "")
         self._add_extension_tab(
             source_uri=initial_source_uri,
-            tool_id=str(restored_state.get("selected_tool") or ""),
+            tool_id=initial_tool_id,
             keep_local=bool(restored_state.get("keep_local")),
             catalog_only=True,
             activate=True,
         )
+        if self._auto_load_initial_tool:
+            active_state = self._active_session_state()
+            if isinstance(active_state, dict):
+                self._load_extension_into_session(active_state, fit_view=True)
         self.update_scheme(self._accent, self._base)
 
     def _local_widget_state_path(self) -> Path:
@@ -10432,9 +12263,9 @@ class ExtensionsWorkspaceWidget(QWidget):
         self.extensions_tabs.setDocumentMode(True)
         self.extensions_tabs.setMovable(True)
         self.extensions_tabs.setTabsClosable(True)
-        self.extensions_tabs.setUsesScrollButtons(False)
+        self.extensions_tabs.setUsesScrollButtons(True)
         tab_bar = self.extensions_tabs.tabBar()
-        tab_bar.setExpanding(True)
+        tab_bar.setExpanding(False)
         tab_bar.setElideMode(Qt.ElideRight)
         tab_bar.setMouseTracking(True)
         tab_bar.installEventFilter(self)
@@ -10442,6 +12273,136 @@ class ExtensionsWorkspaceWidget(QWidget):
         self.extensions_tabs.currentChanged.connect(self._handle_active_tab_changed)
 
         root_layout.addWidget(self.extensions_tabs, 1)
+        self._sync_embedded_tab_bar_visibility()
+
+    def _prune_embedded_tab_bar_proxies(self) -> None:
+        self._embedded_tab_bar_proxies = [
+            proxy
+            for proxy in self._embedded_tab_bar_proxies
+            if isinstance(proxy, QTabBar) and proxy.parent() is not None
+        ]
+
+    def _prune_external_uri_proxies(self) -> None:
+        self._external_uri_proxies = [
+            proxy
+            for proxy in self._external_uri_proxies
+            if isinstance(proxy, QLineEdit) and proxy.parent() is not None
+        ]
+
+    def _sync_embedded_tab_bar_visibility(self) -> None:
+        self._prune_embedded_tab_bar_proxies()
+        tab_bar = self.extensions_tabs.tabBar()
+        tab_bar.setVisible(not self._hide_internal_tab_bar and not self._embedded_tab_bar_proxies)
+
+    def _sync_embedded_tab_bar_proxies(self) -> None:
+        self._prune_embedded_tab_bar_proxies()
+        tab_texts = [
+            str(self.extensions_tabs.tabText(index) or "")
+            for index in range(self.extensions_tabs.count())
+        ]
+        current_index = self.extensions_tabs.currentIndex()
+        for proxy in self._embedded_tab_bar_proxies:
+            blocker = QtCore.QSignalBlocker(proxy)
+            while proxy.count() > len(tab_texts):
+                proxy.removeTab(proxy.count() - 1)
+            for index, tab_text in enumerate(tab_texts):
+                if index >= proxy.count():
+                    proxy.addTab(tab_text)
+                else:
+                    proxy.setTabText(index, tab_text)
+                palette = self._tab_palette(self._tab_category_for_text(tab_text))
+                proxy.setTabTextColor(index, QColor(palette["label_fg"]))
+                self._set_proxy_tab_close_button(proxy, index)
+            if 0 <= current_index < proxy.count():
+                proxy.setCurrentIndex(current_index)
+            self._update_hover_close_buttons(proxy, -1)
+            del blocker
+        self._sync_embedded_tab_bar_visibility()
+
+    def create_embedded_tab_bar_proxy(self, parent: QWidget | None = None) -> QWidget:
+        proxy_host = QWidget(parent or self)
+        proxy_host.setObjectName("extensionsEmbeddedTabBarHost")
+        proxy_layout = QHBoxLayout(proxy_host)
+        proxy_layout.setContentsMargins(0, 0, 0, 0)
+        proxy_layout.setSpacing(4)
+
+        proxy_bar = QTabBar(proxy_host)
+        proxy_bar.setObjectName("extensionsEmbeddedTabBar")
+        proxy_bar.setProperty("extensions_embedded_tab_bar", True)
+        proxy_bar.setDocumentMode(True)
+        proxy_bar.setMovable(True)
+        proxy_bar.setTabsClosable(False)
+        proxy_bar.setUsesScrollButtons(True)
+        proxy_bar.setElideMode(Qt.ElideRight)
+        proxy_bar.setMouseTracking(True)
+        proxy_bar.installEventFilter(self)
+        proxy_bar.currentChanged.connect(
+            lambda index: self.extensions_tabs.setCurrentIndex(index)
+            if 0 <= index < self.extensions_tabs.count()
+            else None
+        )
+        proxy_bar.tabCloseRequested.connect(self._close_extension_tab)
+
+        add_button = QToolButton(proxy_host)
+        add_button.setObjectName("extensionsEmbeddedTabAddButton")
+        add_button.setIcon(_icon("plus_custombar_24.svg"))
+        add_button.setIconSize(QSize(14, 14))
+        add_button.setAutoRaise(True)
+        add_button.setToolTip("Neue Extension-Verbindung")
+        add_button.clicked.connect(lambda _checked=False: self.open_new_connection_tab(activate=True))
+
+        proxy_layout.addWidget(proxy_bar, 1)
+        proxy_layout.addWidget(add_button, 0)
+
+        self._embedded_tab_bar_proxies.append(proxy_bar)
+        proxy_bar.destroyed.connect(lambda *_args: self._sync_embedded_tab_bar_visibility())
+        self._sync_embedded_tab_bar_proxies()
+        return proxy_host
+
+    def _sync_external_uri_proxies(self) -> None:
+        self._prune_external_uri_proxies()
+        current_uri = self.current_widget_uri()
+        for proxy in self._external_uri_proxies:
+            blocker = QtCore.QSignalBlocker(proxy)
+            proxy.setText(current_uri)
+            del blocker
+
+    def _set_active_session_uri(self, source_uri: str) -> None:
+        active_state = self._active_session_state()
+        if not isinstance(active_state, dict):
+            return
+        uri_input = active_state.get("uri_input")
+        if not isinstance(uri_input, QLineEdit):
+            return
+        if str(uri_input.text() or "") == str(source_uri or ""):
+            return
+        uri_input.setText(str(source_uri or ""))
+
+    def _load_active_session_widget(self) -> None:
+        active_state = self._active_session_state()
+        if isinstance(active_state, dict):
+            self._load_extension_into_session(active_state, fit_view=True)
+
+    def create_external_uri_proxy(self, parent: QWidget | None = None) -> QLineEdit:
+        proxy_input = QLineEdit(parent or self)
+        proxy_input.setObjectName("extensionsGraphUriInput")
+        proxy_input.setProperty("extensions_external_uri_proxy", True)
+        proxy_input.setMinimumHeight(28)
+        proxy_input.setPlaceholderText("agentsdb://127.0.0.1:2331/tools:graph_view")
+        load_icon_idle = _icon_with_opacity("load_content.svg", opacity=0.72)
+        add_tab_icon_idle = _icon_with_opacity("plus_custombar_24.svg", opacity=0.72)
+        load_action = proxy_input.addAction(load_icon_idle, QLineEdit.TrailingPosition)
+        load_action.setToolTip("Widget laden")
+        add_tab_action = proxy_input.addAction(add_tab_icon_idle, QLineEdit.TrailingPosition)
+        add_tab_action.setToolTip("Neue Extension-Verbindung")
+        proxy_input.textEdited.connect(self._set_active_session_uri)
+        proxy_input.returnPressed.connect(self._load_active_session_widget)
+        load_action.triggered.connect(self._load_active_session_widget)
+        add_tab_action.triggered.connect(lambda: self.open_new_connection_tab(activate=True))
+        self._external_uri_proxies.append(proxy_input)
+        proxy_input.destroyed.connect(lambda *_args: self._sync_external_uri_proxies())
+        self._sync_external_uri_proxies()
+        return proxy_input
 
     def _start_tab_hover_marquee(self, tab_index: int) -> None:
         self._stop_tab_hover_marquee()
@@ -10459,7 +12420,7 @@ class ExtensionsWorkspaceWidget(QWidget):
             return
 
         tab_rect = tab_bar.tabRect(tab_index)
-        available_width = max(tab_rect.width() - 34, 18)
+        available_width = max(tab_rect.width() - 44, 18)
         text_width = tab_bar.fontMetrics().horizontalAdvance(base_text)
         if text_width <= available_width:
             return
@@ -10502,16 +12463,21 @@ class ExtensionsWorkspaceWidget(QWidget):
         self._hover_tab_phase = 0
 
     def eventFilter(self, obj, event):  # noqa: N802
-        if hasattr(self, "extensions_tabs") and obj is self.extensions_tabs.tabBar():
+        if hasattr(self, "extensions_tabs") and isinstance(obj, QTabBar):
             event_type = event.type()
             if event_type == QEvent.MouseMove:
                 if hasattr(event, "position"):
                     pos = event.position().toPoint()
                 else:
                     pos = event.pos()
-                self._start_tab_hover_marquee(self.extensions_tabs.tabBar().tabAt(pos))
+                hover_index = obj.tabAt(pos)
+                self._update_hover_close_buttons(obj, hover_index)
+                if obj is self.extensions_tabs.tabBar():
+                    self._start_tab_hover_marquee(hover_index)
             elif event_type in (QEvent.Leave, QEvent.MouseButtonPress):
-                self._stop_tab_hover_marquee()
+                self._update_hover_close_buttons(obj, -1)
+                if obj is self.extensions_tabs.tabBar():
+                    self._stop_tab_hover_marquee()
         return super().eventFilter(obj, event)
 
     def _add_control_plane_tab(self) -> None:
@@ -10525,7 +12491,7 @@ class ExtensionsWorkspaceWidget(QWidget):
         if internal_tabs is None or not isinstance(internal_tabs, QTabWidget):
             return
          
-        # Copy all Control Plane tabs (Configuration, Monitoring, Operations) to extensions_tabs
+        # Copy the Control Plane tabs in their existing visual order.
         tabs_to_copy = []
         for i in range(internal_tabs.count()):
             tab_widget = internal_tabs.widget(i)
@@ -10533,12 +12499,10 @@ class ExtensionsWorkspaceWidget(QWidget):
             if tab_widget is not None:
                 tabs_to_copy.append((tab_widget, tab_text))
         
-        # Insert tabs at the beginning (in order)
+        # Preserve the original order so the primary board remains the first board tab.
         for tab_widget, tab_text in tabs_to_copy:
-            self.extensions_tabs.insertTab(0, tab_widget, tab_text)
-            # Disable close button for control plane tabs
-            tab_bar = self.extensions_tabs.tabBar()
-            tab_bar.setTabButton(0, QTabBar.RightSide, None)
+            tab_index = self.extensions_tabs.addTab(tab_widget, tab_text)
+            self.extensions_tabs.tabBar().setTabButton(tab_index, QTabBar.RightSide, None)
         
         # Clear the internal tabs (they're now managed by extensions_tabs)
         while internal_tabs.count() > 0:
@@ -10551,6 +12515,7 @@ class ExtensionsWorkspaceWidget(QWidget):
         # Initialize the control plane widget
         if hasattr(self._control_plane_widget, "refresh_view"):
             self._control_plane_widget.refresh_view()
+        self._sync_embedded_tab_bar_proxies()
 
     def open_new_connection_tab(self, *, activate: bool = True) -> None:
         self._add_extension_tab(activate=activate)
@@ -10559,6 +12524,45 @@ class ExtensionsWorkspaceWidget(QWidget):
         tab_index = self.extensions_tabs.indexOf(tab_widget)
         if tab_index >= 0:
             self._close_extension_tab(tab_index)
+
+    def _is_extension_tab_closable(self, tab_index: int) -> bool:
+        tab_widget = self.extensions_tabs.widget(tab_index)
+        if not isinstance(tab_widget, QWidget):
+            return False
+        session_state = self._session_state_by_tab.get(tab_widget)
+        if isinstance(session_state, dict) and bool(session_state.get("catalog_only")):
+            return False
+        return True
+
+    def _new_extension_tab_close_button(
+        self,
+        parent: QWidget,
+        *,
+        object_name: str,
+        target_widget: QWidget,
+    ) -> QToolButton:
+        close_button = QToolButton(parent)
+        close_button.setObjectName(object_name)
+        close_button.setProperty("extensions_close_button", True)
+        close_button.setText("x")
+        close_button.setToolTip("Extension-Verbindung schließen")
+        close_button.setToolButtonStyle(Qt.ToolButtonTextOnly)
+        close_button.setCursor(Qt.PointingHandCursor)
+        close_button.setAutoRaise(True)
+        close_button.setFixedSize(0, 0)
+        close_button.setVisible(False)
+        close_button.clicked.connect(
+            lambda _checked=False, target=target_widget: self._close_extension_tab_for_widget(target)
+        )
+        return close_button
+
+    def _update_hover_close_buttons(self, tab_bar: QTabBar, hover_index: int) -> None:
+        for index in range(tab_bar.count()):
+            close_button = tab_bar.tabButton(index, QTabBar.RightSide)
+            if isinstance(close_button, QToolButton) and bool(close_button.property("extensions_close_button")):
+                show_button = index == hover_index and self._is_extension_tab_closable(index)
+                close_button.setFixedSize(16, 16) if show_button else close_button.setFixedSize(0, 0)
+                close_button.setVisible(show_button)
 
     def _set_tab_close_button(self, tab_widget: QWidget) -> None:
         tab_index = self.extensions_tabs.indexOf(tab_widget)
@@ -10575,23 +12579,42 @@ class ExtensionsWorkspaceWidget(QWidget):
         if isinstance(existing_button, QToolButton) and bool(existing_button.property("extensions_close_button")):
             return
 
-        close_button = QToolButton(tab_bar)
-        close_button.setObjectName("extensionsTabCloseButton")
-        close_button.setProperty("extensions_close_button", True)
-        close_button.setText("x")
-        close_button.setToolTip("Extension-Verbindung schließen")
-        close_button.setToolButtonStyle(Qt.ToolButtonTextOnly)
-        close_button.setCursor(Qt.PointingHandCursor)
-        close_button.setAutoRaise(True)
-        close_button.setFixedSize(16, 16)
-        close_button.clicked.connect(lambda _checked=False, target=tab_widget: self._close_extension_tab_for_widget(target))
+        close_button = self._new_extension_tab_close_button(
+            tab_bar,
+            object_name="extensionsTabCloseButton",
+            target_widget=tab_widget,
+        )
         tab_bar.setTabButton(tab_index, QTabBar.RightSide, close_button)
+
+    def _set_proxy_tab_close_button(self, proxy_bar: QTabBar, tab_index: int) -> None:
+        if tab_index < 0 or tab_index >= proxy_bar.count():
+            return
+        if not self._is_extension_tab_closable(tab_index):
+            proxy_bar.setTabButton(tab_index, QTabBar.RightSide, None)
+            return
+        existing_button = proxy_bar.tabButton(tab_index, QTabBar.RightSide)
+        if isinstance(existing_button, QToolButton) and bool(existing_button.property("extensions_close_button")):
+            return
+        target_widget = self.extensions_tabs.widget(tab_index)
+        if not isinstance(target_widget, QWidget):
+            return
+        close_button = self._new_extension_tab_close_button(
+            proxy_bar,
+            object_name="extensionsEmbeddedTabCloseButton",
+            target_widget=target_widget,
+        )
+        proxy_bar.setTabButton(tab_index, QTabBar.RightSide, close_button)
 
     def _sync_tab_close_buttons(self) -> None:
         for tab_index in range(self.extensions_tabs.count()):
+            palette = self._tab_palette(
+                self._tab_category_for_text(self.extensions_tabs.tabText(tab_index))
+            )
+            self.extensions_tabs.tabBar().setTabTextColor(tab_index, QColor(palette["label_fg"]))
             tab_widget = self.extensions_tabs.widget(tab_index)
             if isinstance(tab_widget, QWidget):
                 self._set_tab_close_button(tab_widget)
+        self._update_hover_close_buttons(self.extensions_tabs.tabBar(), -1)
 
     def _add_extension_tab(
         self,
@@ -10645,6 +12668,8 @@ class ExtensionsWorkspaceWidget(QWidget):
         self._refresh_connection_preview(session_state)
         if activate:
             self.extensions_tabs.setCurrentIndex(tab_index)
+        self._sync_embedded_tab_bar_proxies()
+        self._sync_external_uri_proxies()
         return session_state
 
     def _close_extension_tab(self, tab_index: int) -> None:
@@ -10652,6 +12677,24 @@ class ExtensionsWorkspaceWidget(QWidget):
         tab_widget = self.extensions_tabs.widget(tab_index)
         if tab_widget is None:
             return
+
+        control_plane = getattr(self, "_control_plane_widget", None)
+        if control_plane is not None:
+            primary_board = getattr(control_plane, "_config_tab", None)
+            if tab_widget is primary_board:
+                return
+
+            runtime_records = getattr(control_plane, "_runtime_tab_records", None)
+            close_runtime = getattr(control_plane, "_close_runtime_tab", None)
+            if isinstance(runtime_records, dict) and tab_widget in runtime_records and callable(close_runtime):
+                close_runtime(tab_widget)
+                self.widgetStateChanged.emit()
+                return
+
+            unregister_board = getattr(control_plane, "_unregister_board_context", None)
+            board_contexts = getattr(control_plane, "_board_context_by_tab", None)
+            if isinstance(board_contexts, dict) and tab_widget in board_contexts and callable(unregister_board):
+                unregister_board(tab_widget)
 
         session_state = self._session_state_by_tab.get(tab_widget)
         if isinstance(session_state, dict) and bool(session_state.get("catalog_only")):
@@ -10669,6 +12712,8 @@ class ExtensionsWorkspaceWidget(QWidget):
             session_state["loaded_widget"] = None
             self._refresh_connection_preview(session_state)
             self._set_tab_close_button(tab_widget)
+            self._sync_embedded_tab_bar_proxies()
+            self._sync_external_uri_proxies()
             return
 
         session_state = self._session_state_by_tab.pop(tab_widget, None)
@@ -10677,6 +12722,8 @@ class ExtensionsWorkspaceWidget(QWidget):
             session_state.clear()
         self.extensions_tabs.removeTab(tab_index)
         self._sync_tab_close_buttons()
+        self._sync_embedded_tab_bar_proxies()
+        self._sync_external_uri_proxies()
         tab_widget.deleteLater()
         self.widgetStateChanged.emit()
 
@@ -10692,6 +12739,8 @@ class ExtensionsWorkspaceWidget(QWidget):
     def _handle_active_tab_changed(self, _tab_index: int) -> None:
         self._stop_tab_hover_marquee()
         self.setProperty("runtime_source_path", self.current_widget_uri())
+        self._sync_embedded_tab_bar_proxies()
+        self._sync_external_uri_proxies()
         self.widgetStateChanged.emit()
 
     def _build_session_control_page(
@@ -10924,6 +12973,8 @@ class ExtensionsWorkspaceWidget(QWidget):
                 self._stop_tab_hover_marquee()
             self.extensions_tabs.setTabText(tab_index, self._START_TAB_TITLE)
             self._set_tab_close_button(tab_widget)
+            self._sync_tab_close_buttons()
+            self._sync_embedded_tab_bar_proxies()
             return
         session_id = int(session_state.get("session_id") or 0)
         if tab_index == self._hover_tab_index:
@@ -10934,6 +12985,8 @@ class ExtensionsWorkspaceWidget(QWidget):
         else:
             self.extensions_tabs.setTabText(tab_index, f"Connection {session_id}")
         self._set_tab_close_button(tab_widget)
+        self._sync_tab_close_buttons()
+        self._sync_embedded_tab_bar_proxies()
 
     def _refresh_connection_preview(self, session_state: dict[str, Any]) -> None:
         source_uri = self._session_source_uri(session_state)
@@ -11005,6 +13058,7 @@ class ExtensionsWorkspaceWidget(QWidget):
 
         self._set_session_tab_title(session_state, loaded=bool(session_state.get("loaded")))
         self._persist_local_widget_state(session_state)
+        self._sync_external_uri_proxies()
 
     def _load_extension_into_session(self, session_state: dict[str, Any], *, fit_view: bool) -> None:
         source_uri = self._session_source_uri(session_state)
@@ -11057,6 +13111,7 @@ class ExtensionsWorkspaceWidget(QWidget):
 
         self._set_session_tab_title(session_state, loaded=True)
         self._persist_local_widget_state(session_state)
+        self._sync_external_uri_proxies()
         self.widgetStateChanged.emit()
 
     def _handle_backend_widget_state_changed(self, session_state: dict[str, Any]) -> None:
@@ -11075,6 +13130,7 @@ class ExtensionsWorkspaceWidget(QWidget):
         if refresh_preview:
             self._refresh_connection_preview(session_state)
         self._persist_local_widget_state(session_state)
+        self._sync_external_uri_proxies()
         self.widgetStateChanged.emit()
 
     def update_scheme(
@@ -11087,6 +13143,7 @@ class ExtensionsWorkspaceWidget(QWidget):
         if base is not None:
             self._base = dict(base)
         self.scheme = _build_scheme(self._accent, self._base)
+        extension_tab_palette = self._tab_palette("sunyellow")
         self.setStyleSheet(
             f"""
 QWidget#extensionsSessionControlPage,
@@ -11110,46 +13167,55 @@ QTabWidget#extensionsTabs::pane {{
     border-top: 0;
     background: {self.scheme.get('col7', '#0b0b0b')};
 }}
+QTabWidget#extensionsTabs QTabBar {{
+    background: transparent;
+    border-top: 0px solid transparent;
+    margin-bottom: 4px;
+    padding-bottom: 4px;
+}}
 QTabWidget#extensionsTabs QTabBar::tab {{
-    color: {self.scheme.get('col8', '#9a9a9a')};
-    background: {self.scheme.get('col7', '#0b0b0b')};
-    border: 1px solid transparent;
-    border-bottom: 0;
-    border-top-left-radius: 0px;
-    border-top-right-radius: 0px;
-    padding: 8px 13px;
+    color: {extension_tab_palette['label_fg']};
+    background: {extension_tab_palette['label_bg']};
+    border: 1px solid {extension_tab_palette['label_border']};
+    border-radius: 6px;
+    font-size: 10px;
+    font-weight: 700;
+    padding: 1px 28px 1px 9px;
+    margin: 0px 2px 4px 0px;
+    margin-bottom: 4px;
+    min-width: 64px;
+    min-height: 18px;
 }}
 QTabWidget#extensionsTabs QTabBar::tab:hover {{
-    background: {self.scheme.get('col7', '#0b0b0b')};
-    border: 1px solid transparent;
-    border-bottom: 0;
-    border-top-left-radius: 0px;
-    border-top-right-radius: 0px;
+    color: {extension_tab_palette['label_fg']};
+    background: {extension_tab_palette['handle_bg_hover']};
+    border: 1px solid {extension_tab_palette['handle_border_hover']};
+    border-radius: 6px;
 }}
 QTabWidget#extensionsTabs QTabBar::tab:selected {{
-    color: {self.scheme.get('col6', '#E3E3DE')};
-    background: {self.scheme.get('col9', '#101010')};
-    border: 1px solid {self.scheme.get('col10', '#2a3350')};
-    border-bottom: 0;
-    border-top-left-radius: 0px;
-    border-top-right-radius: 0px;
+    color: {extension_tab_palette['label_fg']};
+    background: {extension_tab_palette['handle_bg_pressed']};
+    border: 1px solid {extension_tab_palette['handle_border_pressed']};
+    border-radius: 6px;
 }}
 QTabWidget#extensionsTabs QTabBar::scroller {{
-    width: 0px;
+    width: 24px;
 }}
 QToolButton#extensionsTabCloseButton {{
-    color: {self.scheme.get('col8', '#9a9a9a')};
-    background: transparent;
-    border: none;
-    font-size: 13px;
+    color: {extension_tab_palette['label_fg']};
+    background: {extension_tab_palette['label_bg']};
+    border: 1px solid {extension_tab_palette['label_border']};
+    border-radius: 6px;
+    font-size: 10px;
     font-weight: 700;
     padding: 0px;
     margin: 0px;
 }}
 QToolButton#extensionsTabCloseButton:hover {{
-    color: {self.scheme.get('col6', '#E3E3DE')};
-    background: {self.scheme.get('col9', '#101010')};
-    border-radius: 8px;
+    color: {extension_tab_palette['label_fg']};
+    background: {extension_tab_palette['handle_bg_hover']};
+    border: 1px solid {extension_tab_palette['handle_border_hover']};
+    border-radius: 6px;
 }}
 QLineEdit#extensionsGraphUriInput {{
     color: {self.scheme.get('col6', '#E3E3DE')};

@@ -38,6 +38,17 @@ class _StubAgentDbOperationRepository:
         return True
 
     def load_object(self, object_name: str, object_id: str) -> dict[str, Any]:
+        if str(object_name) == "entity":
+            if str(object_id) == "ent:job_posting:competency:ai_agent_engineering":
+                return {
+                    "id": "ent:job_posting:competency:ai_agent_engineering",
+                    "entity_type": "competency",
+                    "namespace_id": "ns_alde_default",
+                    "canonical_name": "AI Agent Engineering",
+                    "external_key": "competency:ai_agent_engineering",
+                    "summary": "competency: AI Agent Engineering",
+                }
+            return {}
         _ = object_id
         if str(object_name) != "relation":
             return {}
@@ -52,8 +63,31 @@ class _StubAgentDbOperationRepository:
         }
 
     def load_objects(self, object_name: str, object_filter: dict[str, Any], limit: int) -> list[dict[str, Any]]:
-        _ = object_filter
         _ = limit
+        if str(object_name) == "namespace":
+            return [
+                {
+                    "id": "ns_alde_default",
+                    "slug": "alde-default",
+                    "name": "ALDE Default Knowledge",
+                }
+            ]
+        if str(object_name) == "entity":
+            entity_type = str(object_filter.get("entity_type") or "")
+            namespace_id = str(object_filter.get("namespace_id") or "")
+            if entity_type == "competency" and namespace_id in {"", "ns_alde_default"}:
+                return [
+                    {
+                        "id": "ent:job_posting:competency:ai_agent_engineering",
+                        "entity_type": "competency",
+                        "namespace_id": "ns_alde_default",
+                        "canonical_name": "AI Agent Engineering",
+                        "external_key": "competency:ai_agent_engineering",
+                        "summary": "competency: AI Agent Engineering",
+                        "aliases": [{"alias": "AI agent engineering"}],
+                    }
+                ]
+            return []
         if str(object_name) != "relation":
             return []
         return [self.load_object("relation", "rel:sample:demo")]
@@ -63,6 +97,19 @@ class _StubAgentDbOperationRepository:
         _ = source_entity_id
         _ = max_depth
         return [self.load_object("relation", "rel:sample:demo")]
+
+    def find_objects(self, *, namespace_id: str, query_text: str, limit: int = 10) -> list[dict[str, Any]]:
+        _ = limit
+        if str(namespace_id) == "ns_alde_default" and str(query_text) == "AI Agent Engineering":
+            return [
+                {
+                    "id": "ent:job_posting:competency:ai_agent_engineering",
+                    "entity_type": "competency",
+                    "namespace_id": "ns_alde_default",
+                    "canonical_name": "AI Agent Engineering",
+                }
+            ]
+        return []
 
 
 class _StubAgentMemoryService:
@@ -433,6 +480,72 @@ class TestAgentDbOperationService(unittest.TestCase):
             ((result_payload.get("object_payload_list") or [{}])[0]).get("relation_description"),
             "sample.py defines the Demo class.",
         )
+
+    def test_execute_operation_load_object_resolves_entity_alias_by_canonical_name(self) -> None:
+        service = AgentDbOperationService()
+        repository = _StubAgentDbOperationRepository()
+
+        with patch.object(service, "_load_repository", return_value=repository):
+            result_payload = json.loads(
+                service.execute_operation(
+                    operation="load_object",
+                    object_name="competency",
+                    object_id="AI Agent Engineering",
+                    namespace_id="ns_alde_default",
+                    backend_uri="agentsmem://local",
+                )
+            )
+
+        self.assertTrue(result_payload["ok"])
+        self.assertEqual(result_payload["operation"], "load_object")
+        self.assertEqual(
+            (result_payload.get("object_payload") or {}).get("canonical_name"),
+            "AI Agent Engineering",
+        )
+        self.assertEqual(
+            (result_payload.get("object_payload") or {}).get("entity_type"),
+            "competency",
+        )
+
+    def test_execute_operation_load_objects_resolves_entity_alias_collection(self) -> None:
+        service = AgentDbOperationService()
+        repository = _StubAgentDbOperationRepository()
+
+        with patch.object(service, "_load_repository", return_value=repository):
+            result_payload = json.loads(
+                service.execute_operation(
+                    operation="load_objects",
+                    object_name="competency",
+                    namespace_id="ns_alde_default",
+                    backend_uri="agentsmem://local",
+                )
+            )
+
+        self.assertTrue(result_payload["ok"])
+        self.assertEqual(result_payload["operation"], "load_objects")
+        payload_list = result_payload.get("object_payload_list") or []
+        self.assertEqual(len(payload_list), 1)
+        self.assertEqual(payload_list[0].get("canonical_name"), "AI Agent Engineering")
+
+    def test_execute_operation_find_objects_uses_object_id_and_default_namespace_fallback(self) -> None:
+        service = AgentDbOperationService()
+        repository = _StubAgentDbOperationRepository()
+
+        with patch.object(service, "_load_repository", return_value=repository):
+            result_payload = json.loads(
+                service.execute_operation(
+                    operation="find_objects",
+                    object_name="competency",
+                    object_id="AI Agent Engineering",
+                    backend_uri="agentsmem://local",
+                )
+            )
+
+        self.assertTrue(result_payload["ok"])
+        self.assertEqual(result_payload["operation"], "find_objects")
+        payload_list = result_payload.get("object_payload_list") or []
+        self.assertEqual(len(payload_list), 1)
+        self.assertEqual(payload_list[0].get("canonical_name"), "AI Agent Engineering")
 
 
 class TestEntityRelationEmbeddingService(unittest.TestCase):
