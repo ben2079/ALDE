@@ -17,6 +17,7 @@ from types import SimpleNamespace
 from typing import Any
 from datetime import datetime
 from pyexpat import model
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 
 _THIS_MODULE = sys.modules.get(__name__)
@@ -3182,6 +3183,52 @@ def execute_tool_payload(
     return payload
 
 
+def _apply_graph_call_query_to_source_uri(source_uri: str | None, call_payload: dict[str, Any] | None) -> str:
+    resolved_uri = str(source_uri or "").strip()
+    if not resolved_uri:
+        return ""
+
+    parsed = urlparse(resolved_uri)
+    query_pairs = [(str(key), str(value)) for key, value in parse_qsl(str(parsed.query or ""), keep_blank_values=False)]
+    query_map: dict[str, str] = {key: value for key, value in query_pairs if key}
+
+    def _set_query(key: str, value: Any) -> None:
+        if value is None:
+            return
+        value_text = str(value).strip()
+        if not value_text:
+            return
+        query_map[key] = value_text
+
+    if isinstance(call_payload, dict) and call_payload:
+        for arg_key, query_key in (
+            ("relation_limit", "relation_limit"),
+            ("entity_limit", "entity_limit"),
+            ("catalog_limit", "catalog_limit"),
+        ):
+            if arg_key in call_payload:
+                _set_query(query_key, call_payload.get(arg_key))
+
+        namespace_id = call_payload.get("namespace_id") or call_payload.get("namespace")
+        if namespace_id:
+            _set_query("namespace", namespace_id)
+
+        scope_value = call_payload.get("namespace_scope") or call_payload.get("scope")
+        if scope_value:
+            _set_query("scope", scope_value)
+
+        cluster_value = call_payload.get("cluster_by") or call_payload.get("cluster")
+        if cluster_value:
+            _set_query("cluster", cluster_value)
+
+        mode_value = call_payload.get("mode") or call_payload.get("view")
+        if mode_value:
+            _set_query("mode", mode_value)
+
+    rebuilt_query = urlencode(list(query_map.items()), doseq=True)
+    return urlunparse((parsed.scheme, parsed.netloc, parsed.path, parsed.params, rebuilt_query, parsed.fragment))
+
+
 def execute_relation_graph_tool_payload(
     *,
     source_uri: str | None = None,
@@ -3255,13 +3302,17 @@ def execute_adb_relation_graph_service(
     if not source_uri:
         source_uri = f"agentsdb://127.0.0.1:2331/tools:{resolved_tool_id}"
 
+    normalized_backend_call = dict(call_payload)
+    normalized_backend_call.setdefault("tool", tool_path or f"/tools:{resolved_tool_id}")
+    normalized_backend_call["source_uri"] = _apply_graph_call_query_to_source_uri(
+        source_uri,
+        normalized_backend_call,
+    ) or source_uri
+
     payload = execute_tool_payload(
         "adb_graph_service",
         {
-            "backend_call": {
-                "tool": tool_path or f"/tools:{resolved_tool_id}",
-                "source_uri": source_uri,
-            },
+            "backend_call": normalized_backend_call,
             "include_view_state": bool(include_view_state),
             "layout_spread": float(layout_spread),
             "selected_kind": str(selected_kind or ""),

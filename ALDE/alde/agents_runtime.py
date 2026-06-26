@@ -585,7 +585,11 @@ JOB_PROMPTS: dict[str, dict[str, Any]] = {
 
             Rules:
             - Use only the relation_graph_view tool for this job.
-            - Accept only these request fields: source_uri, tool_id, include_view_state, layout_spread, selected_kind, selected_object_id, include_connection_preview.
+            - Accept request fields from both direct and runtime variants.
+            - Direct fields: source_uri, tool_id, include_view_state, layout_spread, selected_kind, selected_object_id, include_connection_preview, relation_limit, entity_limit, catalog_limit.
+            - Runtime fields: backend_call and show_widget.
+            - If show_widget is provided, map show_widget -> include_view_state.
+            - If backend_call is provided, resolve source_uri from backend_call.source_uri and resolve tool_id from backend_call.tool or backend_call.tool_path or backend_call.tool_uri.
             - Pass parameters only when provided by the request payload.
             - Keep selected_kind constrained to node or edge when a selection is requested; otherwise omit it.
             - Treat layout_spread as a rendering hint and keep it numeric.
@@ -603,13 +607,18 @@ JOB_PROMPTS: dict[str, dict[str, Any]] = {
             "input_contract": {
                 "required": [],
                 "optional": [
+                    "backend_call",
                     "source_uri",
                     "tool_id",
+                    "show_widget",
                     "include_view_state",
                     "layout_spread",
                     "selected_kind",
                     "selected_object_id",
                     "include_connection_preview",
+                    "relation_limit",
+                    "entity_limit",
+                    "catalog_limit",
                 ],
                 "constraints": {
                     "selected_kind": ["node", "edge"],
@@ -618,6 +627,7 @@ JOB_PROMPTS: dict[str, dict[str, Any]] = {
             },
             "workflow": [
                 "Validate the request envelope and keep only supported fields.",
+                "Normalize runtime aliases: map show_widget to include_view_state and resolve source_uri/tool_id from backend_call when present.",
                 "Call relation_graph_view with explicit parameters from the request.",
                 "Return the tool payload unchanged, including graph_snapshot, analysis, and optional view_state/connection_preview.",
             ],
@@ -626,7 +636,94 @@ JOB_PROMPTS: dict[str, dict[str, Any]] = {
             "ok": True,
             "tool": "relation_graph_view",
             "tool_id": "relation_graph_view",
-            "source_uri": "agentsdb://127.0.0.1:2331/tools:relation_graph_view",
+            "source_uri": "agentsdb://127.0.0.1:2331/tools:graph_view",
+            "status_text": "",
+            "message": "",
+            "graph_snapshot": {
+                "view_kind": "relations_graph",
+                "metadata": {},
+                "nodes": [],
+                "edges": [],
+            },
+            "analysis": {
+                "node_count": 0,
+                "edge_count": 0,
+                "kind_counts": {},
+                "relation_type_counts": {},
+                "average_degree": 0.0,
+                "directed_density": 0.0,
+                "top_hubs": [],
+                "modeling_guidance": [],
+            },
+            "view_state": {
+                "has_graph": False,
+                "message": "",
+                "overview_html": "",
+                "detail_html": "",
+                "node_draw_objects": [],
+                "edge_draw_objects": [],
+                "render_commands": [],
+                "selected_kind": "",
+                "selected_object_id": "",
+            },
+            "connection_preview": {},
+        },
+    },
+    "adb_graph_service": {
+        "prompt": _text(
+            """
+            === Job: adb_graph_service ===
+            Description: Deterministic GraphToolService execution job using the runtime backend_call envelope.
+            Goal: Execute adb_graph_service with explicit request parameters, preserve source-grounded graph payloads, and return the tool result unchanged.
+
+            Rules:
+            - Use only the adb_graph_service tool for this job.
+            - backend_call is required to resolve tool_id and source_uri (tool, tool_path, or tool_uri + source_uri).
+            - backend_call.source_uri may include query args (e.g., namespace=all, scope=all, cluster=namespace, mode=catalog, limit=500).
+            - Accept include_view_state, layout_spread, selected_kind, selected_object_id, include_connection_preview,
+              relation_limit, entity_limit, catalog_limit only when explicitly provided.
+            - Keep selected_kind constrained to node or edge when a selection is requested; otherwise omit it.
+            - Treat layout_spread as a rendering hint and keep it numeric.
+            - Prefer include_view_state=true when the user asks for rendering payloads.
+            - Use include_connection_preview=true only when connection diagnostics are explicitly requested.
+            - Preserve tool-reported diagnostics and modeling guidance exactly as returned.
+            - Return the tool result payload unchanged.
+            - Do not invent nodes, edges, diagnostics, view-state fields, or connection-preview metadata.
+            - Do not post-process or rewrite the returned analysis metrics.
+            """
+        ),
+        "task": {
+            "mode": "tool_execution",
+            "tool_name": "adb_graph_service",
+            "input_contract": {
+                "required": ["backend_call"],
+                "optional": [
+                    "include_view_state",
+                    "layout_spread",
+                    "selected_kind",
+                    "selected_object_id",
+                    "include_connection_preview",
+                    "relation_limit",
+                    "entity_limit",
+                    "catalog_limit",
+                ],
+                "constraints": {
+                    "selected_kind": ["node", "edge"],
+                    "layout_spread": "float",
+                },
+            },
+            "workflow": [
+                "Validate the request envelope and keep only supported fields.",
+                "Resolve tool_id and source_uri from backend_call.",
+                "Call adb_graph_service with explicit parameters from the request.",
+                "Return the tool payload unchanged, including graph_snapshot, analysis, and optional view_state/connection_preview.",
+            ],
+        },
+        "output_schema": {
+            "ok": True,
+            "tool": "relation_graph_view",
+            "tool_id": "relation_graph_view",
+            "source_uri": "agentsdb://127.0.0.1:2331/tools:graph_view",
             "status_text": "",
             "message": "",
             "graph_snapshot": {
@@ -668,6 +765,11 @@ JOB_PROMPTS: dict[str, dict[str, Any]] = {
 
             Rules:
             - Use only the relation_graph_analysis tool for this job.
+            - Accept request fields from both direct and runtime variants.
+            - Direct fields: source_uri, tool_id, include_view_state, layout_spread, selected_kind, selected_object_id, include_connection_preview, relation_limit, entity_limit, catalog_limit.
+            - Runtime fields: backend_call and show_widget.
+            - If show_widget is provided, map show_widget -> include_view_state.
+            - If backend_call is provided, resolve source_uri from backend_call.source_uri and resolve tool_id from backend_call.tool or backend_call.tool_path or backend_call.tool_uri.
             - Keep source_uri and tool_id explicit when provided.
             - Prefer include_view_state=true unless the user explicitly disables view rendering payloads.
             - Use include_connection_preview=true only when connection-level diagnostics are requested.
@@ -684,13 +786,18 @@ JOB_PROMPTS: dict[str, dict[str, Any]] = {
             "input_contract": {
                 "required": [],
                 "optional": [
+                    "backend_call",
                     "source_uri",
                     "tool_id",
+                    "show_widget",
                     "include_view_state",
                     "layout_spread",
                     "selected_kind",
                     "selected_object_id",
                     "include_connection_preview",
+                    "relation_limit",
+                    "entity_limit",
+                    "catalog_limit",
                 ],
                 "constraints": {
                     "selected_kind": ["node", "edge"],
@@ -703,6 +810,7 @@ JOB_PROMPTS: dict[str, dict[str, Any]] = {
             },
             "workflow": [
                 "Normalize and validate analysis-focused graph request fields.",
+                "Normalize runtime aliases: map show_widget to include_view_state and resolve source_uri/tool_id from backend_call when present.",
                 "Execute relation_graph_analysis with explicit parameters.",
                 "Return the full tool payload unchanged for deterministic downstream analysis.",
             ],
@@ -711,7 +819,7 @@ JOB_PROMPTS: dict[str, dict[str, Any]] = {
             "ok": True,
             "tool": "relation_graph_analysis",
             "tool_id": "relation_graph_analysis",
-            "source_uri": "agentsdb://127.0.0.1:2331/tools:relation_graph_view",
+            "source_uri": "agentsdb://127.0.0.1:2331/tools:graph_view",
             "status_text": "",
             "message": "",
             "graph_snapshot": {
@@ -756,7 +864,7 @@ JOB_PROMPTS: dict[str, dict[str, Any]] = {
                         - Keep operation explicit: scan, build, cleanup, delete, rebuild, status, or repair_namespace.
                         - Use repair_namespace to cleanup wrong namespace writes and rebuild in one deterministic run.
                         - For long runs prefer run_async=true and poll with operation=status + job_id.
-                        - Pass root_dir, extensions, workers, image_path, cleanup_namespace_ids, cleanup_object_names,
+                        - Pass root_dir, extensions, recursive, workers, image_path, cleanup_namespace_ids, cleanup_object_names,
                             cleanup_owner_prefixes, cleanup_before_build, delete_async, run_async, and job_id only when provided.
             - Return the tool result payload unchanged.
             - Do not invent repository state, indexing metrics, or errors.
@@ -816,7 +924,7 @@ JOB_PROMPTS: dict[str, dict[str, Any]] = {
             "chunks": [],
         },
     },
-    "router_planner_repo_knowledge_async": {
+    "xrouter_planner_async": {
         "prompt": _text(
             """
             === Job: Xrouter_Xplanner for repo_knowledge_async ===
@@ -869,6 +977,54 @@ JOB_PROMPTS: dict[str, dict[str, Any]] = {
             },
         },
     },
+    "router_planner_repo_update": {
+        "prompt": _text(
+            """
+            === Job: Xrouter_Xplanner for repo_update_orchestration ===
+            Description: Planner/router orchestration for deterministic repository update execution.
+            Goal: Delegate repo_knowledge_worker updates to _xworker (preferred) or execute directly when explicitly requested.
+
+            Rules:
+            - Keep operation explicit: scan, build, cleanup, delete, rebuild, status, or repair_namespace.
+            - For full repository updates, default to recursive=true.
+            - Prefer delegating to _xworker with job_name=adb_worker.
+            - For asynchronous delegation include run_async=true and max_agents>=1.
+            - Use operation=status with job_id for polling.
+            - Return tool payloads unchanged.
+            - Do not invent runtime state, indexing metrics, or errors.
+            """
+        ),
+        "task": {
+            "mode": "router_or_tool_execution",
+            "defaults": {
+                "target_agent": "_xworker",
+                "job_name": "adb_worker",
+                "operation": "rebuild",
+                "recursive": True,
+                "run_async": True,
+                "max_agents": 4,
+            },
+            "available_jobs": [
+                "adb_worker",
+                "adb_query",
+            ],
+            "available_tools": [
+                "route_to_agent",
+                "repo_knowledge_worker",
+                "adb_query",
+            ],
+        },
+        "output_schema": {
+            "target_agent": "_xworker",
+            "job_name": "adb_worker",
+            "tool_name": "repo_knowledge_worker",
+            "operation": "scan|build|cleanup|delete|rebuild|status|repair_namespace",
+            "run_async": True,
+            "max_agents": 4,
+            "job_id": "repo-job-...",
+            "status": "queued|running|completed|failed",
+        },
+    },
    
     "mail_agent_runtime": {
         "prompt": _text(
@@ -889,6 +1045,7 @@ JOB_PROMPTS: dict[str, dict[str, Any]] = {
             "action_tool": "run_mail_agent",
         },
         "output_schema": {
+            
             "status": "ok|error|started",
             "mode": "once|watch",
             "exit_code": 0,
@@ -935,7 +1092,7 @@ JOB_CONFIGS: dict[str, dict[str, Any]] = {
     },
     "adb_worker": {
         "runtime_agent": "_xworker",
-        "skill_profile": "xworker_core",
+        "skill_profile": "xworker_repo_update_execute",
         "default_object_name": "repo_knowledge",
         "workflow_name": "xworker_adb_worker_leaf",
         "default_tool_names": ["repo_knowledge_worker"],
@@ -947,13 +1104,32 @@ JOB_CONFIGS: dict[str, dict[str, Any]] = {
         "workflow_name": "xworker_adb_query_leaf",
         "default_tool_names": ["adb_query"],
     },
-    "router_planner_repo_knowledge_async": {
+    "xrouter_planner_async": {
         "runtime_agent": "_xrouter_xplanner",
         "skill_profile": "xrouter_repo_knowledge_async_planner",
         "default_object_name": "repo_knowledge",
         "workflow_name": "xrouter_repo_knowledge_async_router",
         "route_defaults": {
             "target_agent": "_xworker",
+            "handoff_metadata": {
+                "workflow_name": "xrouter_repo_knowledge_async_router",
+                "parallel_mode": "router_parallel_branches",
+                "parallel_workers": 4,
+                "run_async": True,
+                "max_agents": 4,
+                "parallel_enabled_env": "ALDE_ROUTER_BRANCH_PARALLEL_ENABLED",
+                "parallel_workers_env": "ALDE_ROUTER_BRANCH_PARALLEL_WORKERS",
+            },
+        },
+    },
+    "router_planner_repo_update": {
+        "runtime_agent": "_xrouter_xplanner",
+        "skill_profile": "xrouter_repo_update_orchestrator",
+        "default_object_name": "repo_knowledge",
+        "workflow_name": "xrouter_repo_knowledge_async_router",
+        "route_defaults": {
+            "target_agent": "_xworker",
+            "job_name": "adb_worker",
             "handoff_metadata": {
                 "workflow_name": "xrouter_repo_knowledge_async_router",
                 "parallel_mode": "router_parallel_branches",
@@ -1044,6 +1220,63 @@ JOB_CONFIGS: dict[str, dict[str, Any]] = {
         "default_object_name": "emails",
     },
   
+}
+
+
+# Compact runtime templates that planner/router agents can load directly.
+REPO_UPDATE_RUNTIME_TEMPLATES: dict[str, dict[str, Any]] = {
+    "delegate_route_to_xworker": {
+        "type": "function",
+        "function": {
+            "name": "route_to_agent",
+            "arguments_template": {
+                "target_agent": "_xworker",
+                "job_name": "adb_worker",
+                "run_async": True,
+                "max_agents": 4,
+                "user_question": {
+                    "operation": "rebuild",
+                    "root_dir": "/home/ben/Vs_Code_Projects/Projects/ALDE_Projekt",
+                    "recursive": True,
+                    "extensions": [".py", ".md", ".json", ".yaml", ".yml", ".sql", ".sh"],
+                    "cleanup_namespace_ids": ["ns_repo_knowledge", "ns_alde_default"],
+                    "cleanup_object_names": ["embedding", "relation", "entity", "document"],
+                    "cleanup_owner_prefixes": ["blk:repo:"],
+                    "delete_async": True,
+                    "workers": 4,
+                    "run_async": True,
+                },
+            },
+        },
+    },
+    "direct_repo_knowledge_worker": {
+        "type": "function",
+        "function": {
+            "name": "repo_knowledge_worker",
+            "arguments_template": {
+                "operation": "rebuild",
+                "root_dir": "/home/ben/Vs_Code_Projects/Projects/ALDE_Projekt",
+                "recursive": True,
+                "extensions": [".py", ".md", ".json", ".yaml", ".yml", ".sql", ".sh"],
+                "cleanup_namespace_ids": ["ns_repo_knowledge", "ns_alde_default"],
+                "cleanup_object_names": ["embedding", "relation", "entity", "document"],
+                "cleanup_owner_prefixes": ["blk:repo:"],
+                "delete_async": True,
+                "workers": 4,
+                "run_async": True,
+            },
+        },
+    },
+    "status_poll": {
+        "type": "function",
+        "function": {
+            "name": "repo_knowledge_worker",
+            "arguments_template": {
+                "operation": "status",
+                "job_id": "repo-job-XXXXXXXXXXXX",
+            },
+        },
+    },
 }
 
 
@@ -1635,7 +1868,7 @@ AGENT_SKILLS: dict[str, dict[str, Any]] = {
         "description": "Planning profile for deterministic dispatch->parse->cover-letter sequence initialization.",
         "job_name": "router_planner_cover_letter_sequence",
     },
-    "xrouter_repo_knowledge_async_planner": {
+    "xrouter_planner_async": {
         "role": "xplaner_xrouter",
         "prompt_fragments": ["source_grounding", "router_handoff", "deterministic_workflow"],
         "description": "Planning profile for async repo-knowledge fanout routing to xworker.",
@@ -1793,22 +2026,7 @@ AGENT_MANIFEST: dict[str, dict[str, Any]] = {
 
 TOOL_CONFIGS: list[dict[str, Any]] = [
     
-    {
-        "name": "vdb_worker",
-        "description": "Create/list/build/wipe vector store directories under AppData (runs in a subprocess).",
-        "parameters": [
-            {"name": "operation", "type": "string", "description": "Operation to run: list|create|status|build|wipe.", "required": True, "enum": ["list", "create", "status", "build", "wipe"]},
-            {"name": "store", "type": "string", "description": "Store id/name. Examples: '1' => VSM_1_Data, 'my_store' => VSM_my_store_Data. Empty => auto-next."},
-            {"name": "root_dir", "type": "string", "description": "Root directory to index (only used for build). Default: project root."},
-            {"name": "doc_types", "type": "array", "description": "Optional suffix filter for build operations, e.g. ['.txt', '.md']. When provided, only matching files are indexed.", "items": {"type": "string"}},
-            {"name": "chunk_strategy", "type": "string", "description": "Optional chunking strategy for build operations: recursive|character|markdown."},
-            {"name": "chunk_size", "type": "integer", "description": "Optional chunk size for build operations."},
-            {"name": "overlap", "type": "integer", "description": "Optional chunk overlap for build operations."},
-            {"name": "force", "type": "boolean", "description": "Required for wipe operations.", "default": False},
-            {"name": "remove_store_dir", "type": "boolean", "description": "If true and operation=wipe: delete the whole store directory. Otherwise remove only index+manifest files.", "default": False},
-        ],
-    },
-    {
+      {
         "name": "adb_operation",
         "description": "Execute a generic AgentDB repository operation such as health, index setup, object upsert/load/delete, text search, relation-graph load, or batch apply_operations.",
         "parameters": [
@@ -1831,7 +2049,7 @@ TOOL_CONFIGS: list[dict[str, Any]] = [
     },
     {
         "name": "relation_graph_view",
-        "description": "Load and analyze the AgentsDB relation graph for visualization and AI/ML data-model exploration.",
+        "description": "Load and analyze the AgentsDB relation graph for visualization and AI/ML data-model exploration. Runtime alias note: show_widget is normalized to include_view_state by the job layer; backend_call envelopes are supported via adb_graph_service alias routing.",
         "implementation_name": "adb_relation_graph",
         "parameters": [
             {"name": "source_uri", "type": "string", "description": "Optional AgentsDB tool endpoint URI. Example: agentsdb://127.0.0.1:2331/tools:adb_relation_graph.", "required": False},
@@ -1841,20 +2059,43 @@ TOOL_CONFIGS: list[dict[str, Any]] = [
             {"name": "selected_kind", "type": "string", "description": "Optional focus selector kind for the graph view state.", "required": False, "enum": ["", "node", "edge"], "default": ""},
             {"name": "selected_object_id", "type": "string", "description": "Optional focused node_id or edge_id used with selected_kind.", "required": False},
             {"name": "include_connection_preview", "type": "boolean", "description": "When true, include connection/tool preview metadata from the graph control plane.", "required": False, "default": False},
+            {"name": "relation_limit", "type": "integer", "description": "Optional max number of relation objects to load. Use 0 or a negative value to disable limits.", "required": False},
+            {"name": "entity_limit", "type": "integer", "description": "Optional max number of entity nodes to load. Use 0 or a negative value to disable limits.", "required": False},
+            {"name": "catalog_limit", "type": "integer", "description": "Optional max number of objects per catalog collection. Use 0 or a negative value to disable limits.", "required": False},
         ],
     },
     {
-        "name": "relation_graph_analysis",
-        "description": "Analyze relation graph quality signals and return deterministic diagnostics for modeling decisions.",
-        "implementation_name": "adb_relation_graph",
+        "name": "graph_view_analysis",
+        "description": "Analyze relation graph quality signals and return deterministic diagnostics for modeling decisions, including modeling_guidance and topology summaries.",
+        "implementation_name": "graph_view_analysis",
         "parameters": [
-            {"name": "source_uri", "type": "string", "description": "Optional AgentsDB tool endpoint URI. Example: agentsdb://127.0.0.1:2331/tools:relation_graph_view.", "required": False},
+            {"name": "source_uri", "type": "string", "description": "Optional AgentsDB tool endpoint URI. Example: agentsdb://127.0.0.1:2331/tools:graph_view.", "required": False},
             {"name": "tool_id", "type": "string", "description": "Graphic tool id to resolve. Default: relation_graph_view.", "required": False, "enum": ["relation_graph_view", "workflow_diagram", "sequence_diagram"], "default": "relation_graph_view"},
             {"name": "include_view_state", "type": "boolean", "description": "When true, include render-oriented node/edge draw objects.", "required": False, "default": True},
             {"name": "layout_spread", "type": "number", "description": "Optional graph layout spread factor used for view_state generation.", "required": False, "default": 1.0},
             {"name": "selected_kind", "type": "string", "description": "Optional focus selector kind for the graph view state.", "required": False, "enum": ["", "node", "edge"], "default": ""},
             {"name": "selected_object_id", "type": "string", "description": "Optional focused node_id or edge_id used with selected_kind.", "required": False},
             {"name": "include_connection_preview", "type": "boolean", "description": "When true, include connection/tool preview metadata from the graph control plane.", "required": False, "default": False},
+            {"name": "relation_limit", "type": "integer", "description": "Optional max number of relation objects to load. Use 0 or a negative value to disable limits.", "required": False},
+            {"name": "entity_limit", "type": "integer", "description": "Optional max number of entity nodes to load. Use 0 or a negative value to disable limits.", "required": False},
+            {"name": "catalog_limit", "type": "integer", "description": "Optional max number of objects per catalog collection. Use 0 or a negative value to disable limits.", "required": False},
+        ],
+    },
+    {
+        "name": "relation_graph_analysis",
+        "description": "Analyze relation graph quality signals and return deterministic diagnostics for modeling decisions. Runtime alias note: show_widget is normalized to include_view_state by the job layer; backend_call envelopes are supported via adb_graph_service alias routing.",
+        "implementation_name": "adb_relation_graph",
+        "parameters": [
+            {"name": "source_uri", "type": "string", "description": "Optional AgentsDB tool endpoint URI. Example: agentsdb://127.0.0.1:2331/tools:graph_view.", "required": False},
+            {"name": "tool_id", "type": "string", "description": "Graphic tool id to resolve. Default: relation_graph_view.", "required": False, "enum": ["relation_graph_view", "workflow_diagram", "sequence_diagram"], "default": "relation_graph_view"},
+            {"name": "include_view_state", "type": "boolean", "description": "When true, include render-oriented node/edge draw objects.", "required": False, "default": True},
+            {"name": "layout_spread", "type": "number", "description": "Optional graph layout spread factor used for view_state generation.", "required": False, "default": 1.0},
+            {"name": "selected_kind", "type": "string", "description": "Optional focus selector kind for the graph view state.", "required": False, "enum": ["", "node", "edge"], "default": ""},
+            {"name": "selected_object_id", "type": "string", "description": "Optional focused node_id or edge_id used with selected_kind.", "required": False},
+            {"name": "include_connection_preview", "type": "boolean", "description": "When true, include connection/tool preview metadata from the graph control plane.", "required": False, "default": False},
+            {"name": "relation_limit", "type": "integer", "description": "Optional max number of relation objects to load. Use 0 or a negative value to disable limits.", "required": False},
+            {"name": "entity_limit", "type": "integer", "description": "Optional max number of entity nodes to load. Use 0 or a negative value to disable limits.", "required": False},
+            {"name": "catalog_limit", "type": "integer", "description": "Optional max number of objects per catalog collection. Use 0 or a negative value to disable limits.", "required": False},
         ],
     },
     {
@@ -1866,6 +2107,7 @@ TOOL_CONFIGS: list[dict[str, Any]] = [
             {"name": "image_path", "type": "string", "description": "Optional snapshot path when the runtime falls back to an in-memory AgentsDB backend."},
             {"name": "workers", "type": "integer", "description": "Number of indexing workers.", "default": 4},
             {"name": "extensions", "type": "array", "description": "Optional extension filter, default ['.py'].", "items": {"type": "string"}},
+            {"name": "recursive", "type": "boolean", "description": "When true, scan directories recursively from root_dir. Default: true.", "required": False, "default": True},
             {"name": "cleanup_before_build", "type": "boolean", "description": "When operation=build, run cleanup first via delete_object calls.", "required": False, "default": False},
             {"name": "cleanup_namespace_ids", "type": "array", "description": "Namespaces to clean during cleanup/rebuild. Default: ['ns_alde_default', 'ns_repo_knowledge'].", "required": False, "items": {"type": "string"}},
             {"name": "cleanup_object_names", "type": "array", "description": "Object types to clean: embedding|relation|entity|document.", "required": False, "items": {"type": "string"}},
@@ -2162,13 +2404,16 @@ TOOL_NAMES: dict[str, str] = {
     "agentdb_operation": "adb_operation",
     "agentsdb_operation": "adb_operation",
     "relation_graph_view": "relation_graph_view",
+    "graph_view_analysis": "graph_view_analysis",
     "relation_graph_analysis": "relation_graph_analysis",
     "agent_relation_graph": "relation_graph_view",
     "agentdb_relation_graph": "relation_graph_view",
     "agentsdb_relation_graph": "relation_graph_view",
     "adb_relation_graph": "relation_graph_view",
     "agentsdb://127.0.0.1:2331/tools:agent_relation_graph": "relation_graph_view",
+    "agentsdb://127.0.0.1:2331/tools:graph_view": "relation_graph_view",
     "agentsdb://127.0.0.1:2331/tools:relation_graph_view": "relation_graph_view",
+    "adb_graph_service": "relation_graph_view",
     "dispatch_docs": "dispatch_documents",
     "dispatch_documents": "dispatch_documents",
     "data_dispatcher/dispatch_documents": "dispatch_documents",
@@ -2644,9 +2889,9 @@ WORKFLOWS: dict[str, dict[str, Any]] = {
             },
         ],
     },
-    "xrouter_repo_knowledge_async_router": {
+    "xrouter_async_router": {
         "description": "xrouter_xplanner workflow for async repo-knowledge fanout to xworker branches.",
-        "entry_state": "xrouter_repo_knowledge_ready",
+        "entry_state": "xrouter_eady",
         "parallel": {
             "mode": "router_parallel_branches",
             "enabled": True,
@@ -2655,35 +2900,35 @@ WORKFLOWS: dict[str, dict[str, Any]] = {
             "workers_env": "ALDE_ROUTER_BRANCH_PARALLEL_WORKERS",
         },
         "states": {
-            "xrouter_repo_knowledge_ready": {
+            "xrouter_ready": {
                 "actor": {"kind": "agent", "name": "_xrouter_xplanner"},
                 "terminal": False,
             },
-            "xrouter_repo_knowledge_routed": {
+            "xrouter_routed": {
                 "actor": {"kind": "tool", "name": "route_to_agent"},
                 "terminal": False,
             },
-            "xrouter_repo_knowledge_complete": {
+            "xrouter_complete": {
                 "actor": {"kind": "state", "name": "workflow_complete"},
                 "terminal": True,
             },
-            "xrouter_repo_knowledge_failed": {
+            "xrouterfailed": {
                 "actor": {"kind": "state", "name": "workflow_failed"},
                 "terminal": True,
             },
         },
         "transitions": [
             {
-                "from": "xrouter_repo_knowledge_ready",
+                "from": "xrouterready",
                 "on": {
                     "kind": "tool",
                     "name": "route_to_agent",
                     "conditions": {"target_agent": "_xworker"},
                 },
-                "to": "xrouter_repo_knowledge_routed",
+                "to": "xrouter_routed",
             },
             {
-                "from": "xrouter_repo_knowledge_routed",
+                "from": "xrouter_routed",
                 "on": {
                     "kind": "state",
                     "name": ["followup_complete", "routed_agent_complete"],
@@ -2694,12 +2939,12 @@ WORKFLOWS: dict[str, dict[str, Any]] = {
                         ]
                     },
                 },
-                "to": "xrouter_repo_knowledge_complete",
+                "to": "xrouter_complete",
             },
             {
-                "from": ["xrouter_repo_knowledge_ready", "xrouter_repo_knowledge_routed"],
+                "from": ["xrouter_ready", "xrouter_routed"],
                 "on": {"kind": "state", "name": ["model_failed", "tool_failed", "routed_agent_failed"]},
-                "to": "xrouter_repo_knowledge_failed",
+                "to": "xrouter_failed",
             },
         ],
     },

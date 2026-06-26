@@ -56,6 +56,15 @@ class ExtensionArtifactBackendService(Protocol):
     def load_tool_runtime_manifest(self, *, tool_id: str | None = None, source_uri: str | None = None) -> dict[str, Any]:
         ...
 
+    def load_runtime_artifact_bundle(
+        self,
+        *,
+        tool_id: str | None = None,
+        source_uri: str | None = None,
+        manifest_payload: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        ...
+
 
 def load_default_graph_backend_service() -> GraphViewBackendService:
     try:

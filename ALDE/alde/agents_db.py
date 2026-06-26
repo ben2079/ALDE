@@ -2,6 +2,8 @@ from __future__ import annotations
 
 
 
+import ast
+import colorsys
 import hashlib
 import json
 import logging
@@ -367,6 +369,18 @@ def _first_number(values: Iterable[Any]) -> float | None:
     return None
 
 
+def _normalize_limit_value(value: Any) -> int | None:
+    if value is None:
+        return None
+    try:
+        normalized_value = int(value)
+    except Exception:
+        return None
+    if normalized_value <= 0:
+        return None
+    return normalized_value
+
+
 def _mapping_value(payload: Mapping[str, Any], key: str) -> Any:
     current: Any = payload
     for segment in str(key or "").split("."):
@@ -595,7 +609,7 @@ class NamespaceObject:
     slug: str
     name: str
     default_embedding_model: str
-    default_embedding_dimension: int
+    default_embedding_dimension:  int
     description: str = ""
     index_backend: str = "faiss"
     metadata: dict[str, Any] = field(default_factory=dict)
@@ -1226,18 +1240,24 @@ class KnowledgeRepository():
             payload = collection.get(str(object_id))
             return dict(payload) if isinstance(payload, Mapping) else None
 
-    def load_objects(self, object_name: str, object_filter: Mapping[str, Any] | None = None, limit: int = 50) -> list[dict[str, Any]]:
+    def load_objects(
+        self,
+        object_name: str,
+        object_filter: Mapping[str, Any] | None = None,
+        limit: int | None = 50,
+    ) -> list[dict[str, Any]]:
         with self._lock:
             collection = self.load_collection(object_name)
             filter_payload = dict(object_filter or {})
             result_payload_list: list[dict[str, Any]] = []
+            normalized_limit = _normalize_limit_value(limit)
             for object_payload in collection.values():
                 if not isinstance(object_payload, Mapping):
                     continue
                 if any(object_payload.get(key) != value for key, value in filter_payload.items()):
                     continue
                 result_payload_list.append(dict(object_payload))
-                if len(result_payload_list) >= max(1, int(limit)):
+                if normalized_limit is not None and len(result_payload_list) >= normalized_limit:
                     break
             return result_payload_list
 
@@ -1337,21 +1357,34 @@ class AgentDbSocketRepository:
 
     _OBJECT_COLLECTION_MAP = KnowledgeRepository._OBJECT_COLLECTION_MAP
     _DEFAULT_APPLY_OPERATIONS_BATCH_SIZE = 64
+    _DEFAULT_WRITE_TIMEOUT_SECONDS = 20.0
+    _DEFAULT_SOCKET_TIMEOUT_SECONDS = 90.0
+    _DEFAULT_REQUEST_RETRY_ATTEMPTS = 3
+    _DEFAULT_REQUEST_RETRY_LOG_ENABLED = True
 
-    def __init__(self, agents_db_uri: str, database_name: str = "alde_knowledge", timeout_seconds: float = 5.0) -> None:
+    def __init__(
+        self,
+        agents_db_uri: str,
+        database_name: str = "alde_knowledge",
+        timeout_seconds: float | None = None,
+    ) -> None:
         endpoint = _load_agentsdb_socket_endpoint(agents_db_uri)
         if endpoint is None:
             raise ValueError(f"invalid agentsdb socket uri: {agents_db_uri}")
         normalized_uri, resolved_host, resolved_port = endpoint
         self._agents_db_uri = normalized_uri
         self._database_name = str(database_name or "alde_knowledge").strip() or "alde_knowledge"
-        self._timeout_seconds = max(float(timeout_seconds), 0.5)
+        resolved_timeout_seconds = self._load_socket_timeout_seconds() if timeout_seconds is None else timeout_seconds
+        self._timeout_seconds = max(float(resolved_timeout_seconds), 0.5)
         self._host = resolved_host
         self._port = resolved_port
         self._write_lock = threading.RLock()
         self._deferred_write_depth = 0
         self._pending_write_operations: list[dict[str, Any]] = []
         self._apply_operations_batch_size = self._load_apply_operations_batch_size()
+        self._write_timeout_seconds = self._load_write_timeout_seconds()
+        self._request_retry_attempts = self._load_request_retry_attempts()
+        self._request_retry_log_enabled = self._load_request_retry_log_enabled()
 
     @classmethod
     def _load_apply_operations_batch_size(cls) -> int:
@@ -1369,11 +1402,82 @@ class AgentDbSocketRepository:
         return max(1, resolved_value)
 
     @classmethod
+    def _load_write_timeout_seconds(cls) -> float:
+        raw_value = str(
+            os.getenv(
+                "AI_IDE_KNOWLEDGE_AGENTS_DB_SOCKET_WRITE_TIMEOUT_SECONDS",
+                str(cls._DEFAULT_WRITE_TIMEOUT_SECONDS),
+            )
+            or str(cls._DEFAULT_WRITE_TIMEOUT_SECONDS)
+        ).strip()
+        try:
+            resolved_value = float(raw_value)
+        except Exception:
+            resolved_value = cls._DEFAULT_WRITE_TIMEOUT_SECONDS
+        return max(0.5, resolved_value)
+
+    @classmethod
+    def _load_socket_timeout_seconds(cls) -> float:
+        raw_value = str(
+            os.getenv(
+                "AI_IDE_KNOWLEDGE_AGENTS_DB_SOCKET_TIMEOUT_SECONDS",
+                str(cls._DEFAULT_SOCKET_TIMEOUT_SECONDS),
+            )
+            or str(cls._DEFAULT_SOCKET_TIMEOUT_SECONDS)
+        ).strip()
+        try:
+            resolved_value = float(raw_value)
+        except Exception:
+            resolved_value = cls._DEFAULT_SOCKET_TIMEOUT_SECONDS
+        return max(0.5, resolved_value)
+
+    @classmethod
+    def _load_request_retry_attempts(cls) -> int:
+        raw_value = str(
+            os.getenv(
+                "AI_IDE_KNOWLEDGE_AGENTS_DB_SOCKET_RETRY_ATTEMPTS",
+                str(cls._DEFAULT_REQUEST_RETRY_ATTEMPTS),
+            )
+            or str(cls._DEFAULT_REQUEST_RETRY_ATTEMPTS)
+        ).strip()
+        try:
+            resolved_value = int(raw_value)
+        except Exception:
+            resolved_value = cls._DEFAULT_REQUEST_RETRY_ATTEMPTS
+        return max(1, resolved_value)
+
+    @classmethod
+    def _load_healthcheck_timeout_seconds(cls) -> float:
+        raw_timeout = str(
+            os.getenv(
+                "AI_IDE_KNOWLEDGE_AGENTS_DB_HEALTHCHECK_TIMEOUT_SECONDS",
+                os.getenv("AI_IDE_DISPATCHER_HEALTHCHECK_TIMEOUT_SECONDS", "1.0"),
+            )
+            or "1.0"
+        ).strip()
+        try:
+            resolved_value = float(raw_timeout)
+        except Exception:
+            resolved_value = 1.0
+        return max(0.1, min(10.0, resolved_value))
+
+    @classmethod
+    def _load_request_retry_log_enabled(cls) -> bool:
+        raw_value = str(
+            os.getenv(
+                "AI_IDE_KNOWLEDGE_AGENTS_DB_SOCKET_RETRY_LOG_ENABLED",
+                "1" if cls._DEFAULT_REQUEST_RETRY_LOG_ENABLED else "0",
+            )
+            or "1"
+        ).strip().lower()
+        return raw_value not in {"0", "false", "no", "off"}
+
+    @classmethod
     def create_from_uri(
         cls,
         agents_db_uri: str,
         database_name: str = "alde_knowledge",
-        timeout_seconds: float = 5.0,
+        timeout_seconds: float | None = None,
     ) -> AgentDbSocketRepository:
         return cls(
             agents_db_uri=agents_db_uri,
@@ -1387,13 +1491,39 @@ class AgentDbSocketRepository:
             "database_name": self._database_name,
             "payload": _deepcopy_object(dict(action_payload or {})),
         }
-        try:
-            response_bytes = self._send_request_bytes(request_payload)
-        except OSError:
-            if _ensure_local_agentsdb_socket_server(self._agents_db_uri, timeout_seconds=self._timeout_seconds):
-                response_bytes = self._send_request_bytes(request_payload)
-            else:
-                raise
+        response_bytes: bytes | None = None
+        last_error: Exception | None = None
+        request_retry_attempts = self._load_request_retry_attempts_for_payload(request_payload)
+        for attempt_index in range(request_retry_attempts):
+            try:
+                try:
+                    response_bytes = self._send_request_bytes(request_payload)
+                except OSError:
+                    if _ensure_local_agentsdb_socket_server(self._agents_db_uri, timeout_seconds=self._timeout_seconds):
+                        response_bytes = self._send_request_bytes(request_payload)
+                    else:
+                        raise
+                break
+            except (OSError, TimeoutError) as exc:
+                last_error = exc
+                if self._request_retry_log_enabled:
+                    command_name = str(request_payload.get("cmd") or action_name or "request").strip() or "request"
+                    attempt_number = attempt_index + 1
+                    total_attempts = max(1, int(request_retry_attempts))
+                    print(
+                        "[agents_db] socket_retry "
+                        f"cmd={command_name} "
+                        f"attempt={attempt_number}/{total_attempts} "
+                        f"error={type(exc).__name__}: {exc}"
+                    )
+                if attempt_index + 1 >= request_retry_attempts:
+                    raise
+                # Brief bounded backoff for transient socket saturation.
+                time.sleep(min(0.1 * (attempt_index + 1), 0.3))
+        if response_bytes is None:
+            if last_error is not None:
+                raise last_error
+            raise RuntimeError("agentsdb socket request failed without response")
         if not response_bytes:
             raise RuntimeError("agentsdb socket returned no response")
         raw_line = response_bytes.split(b"\n", 1)[0].decode("utf-8", errors="replace").strip()
@@ -1418,18 +1548,20 @@ class AgentDbSocketRepository:
         payload = request_payload.get("payload") if isinstance(request_payload.get("payload"), Mapping) else {}
         return str(payload.get("object_id") or "").strip() == "__dispatch_healthcheck__"
 
+    def _load_request_retry_attempts_for_payload(self, request_payload: Mapping[str, Any]) -> int:
+        command_name = str(request_payload.get("cmd") or "").strip().lower()
+        if command_name in {"health", "ping", "status"} or self._is_dispatcher_healthcheck_request(request_payload):
+            return 1
+        return self._load_request_retry_attempts()
+
     def _load_request_timeout_seconds(self, request_payload: Mapping[str, Any]) -> float:
         default_timeout_seconds = max(float(self._timeout_seconds), 0.5)
-        if not self._is_dispatcher_healthcheck_request(request_payload):
-            return default_timeout_seconds
-
-        raw_timeout = str(os.getenv("AI_IDE_DISPATCHER_HEALTHCHECK_TIMEOUT_SECONDS", "1.0") or "1.0").strip()
-        try:
-            healthcheck_timeout_seconds = float(raw_timeout)
-        except Exception:
-            healthcheck_timeout_seconds = 1.0
-        healthcheck_timeout_seconds = max(0.1, healthcheck_timeout_seconds)
-        return min(default_timeout_seconds, healthcheck_timeout_seconds)
+        command_name = str(request_payload.get("cmd") or "").strip().lower()
+        if command_name in {"upsert_object", "apply_operations", "delete_object"}:
+            default_timeout_seconds = max(default_timeout_seconds, float(self._write_timeout_seconds))
+        if command_name in {"health", "ping", "status"} or self._is_dispatcher_healthcheck_request(request_payload):
+            return min(default_timeout_seconds, self._load_healthcheck_timeout_seconds())
+        return default_timeout_seconds
 
     def _send_request_bytes(self, request_payload: Mapping[str, Any]) -> bytes:
         serialized_request_payload = _json_safe_object(dict(request_payload))
@@ -1696,15 +1828,19 @@ class AgentDbSocketRepository:
         object_payload = response_payload.get("object_payload")
         return dict(object_payload) if isinstance(object_payload, Mapping) else None
 
-    def load_objects(self, object_name: str, object_filter: Mapping[str, Any] | None = None, limit: int = 50) -> list[dict[str, Any]]:
-        response_payload = self._request_object(
-            "load_objects",
-            {
-                "object_name": str(object_name),
-                "object_filter": _deepcopy_object(dict(object_filter or {})),
-                "limit": max(1, int(limit)),
-            },
-        )
+    def load_objects(
+        self,
+        object_name: str,
+        object_filter: Mapping[str, Any] | None = None,
+        limit: int | None = 50,
+    ) -> list[dict[str, Any]]:
+        normalized_limit = _normalize_limit_value(limit)
+        request_payload = {
+            "object_name": str(object_name),
+            "object_filter": _deepcopy_object(dict(object_filter or {})),
+            "limit": normalized_limit if normalized_limit is not None else 0,
+        }
+        response_payload = self._request_object("load_objects", request_payload)
         object_payload_list = response_payload.get("object_payload_list")
         if not isinstance(object_payload_list, list):
             return []
@@ -1757,6 +1893,85 @@ class AgentDbSocketRepository:
             num_candidates=num_candidates,
             index_name=index_name,
         )
+
+
+class UiAgentDbSocketRepository(AgentDbSocketRepository):
+    _DEFAULT_UI_SOCKET_TIMEOUT_SECONDS = 3.0
+    _DEFAULT_UI_REQUEST_RETRY_ATTEMPTS = 1
+
+    def __init__(
+        self,
+        agents_db_uri: str,
+        database_name: str = "alde_knowledge",
+        timeout_seconds: float | None = None,
+        retry_attempts: int | None = None,
+    ) -> None:
+        resolved_timeout_seconds = self._load_ui_socket_timeout_seconds() if timeout_seconds is None else timeout_seconds
+        super().__init__(
+            agents_db_uri=agents_db_uri,
+            database_name=database_name,
+            timeout_seconds=resolved_timeout_seconds,
+        )
+        if retry_attempts is None:
+            retry_attempts = self._load_ui_request_retry_attempts()
+        try:
+            resolved_retry_attempts = int(retry_attempts)
+        except Exception:
+            resolved_retry_attempts = self._DEFAULT_UI_REQUEST_RETRY_ATTEMPTS
+        self._ui_request_retry_attempts = max(1, resolved_retry_attempts)
+
+    @classmethod
+    def _load_ui_socket_timeout_seconds(cls) -> float:
+        raw_value = str(
+            os.getenv(
+                "AI_IDE_UI_AGENTS_DB_SOCKET_TIMEOUT_SECONDS",
+                str(cls._DEFAULT_UI_SOCKET_TIMEOUT_SECONDS),
+            )
+            or str(cls._DEFAULT_UI_SOCKET_TIMEOUT_SECONDS)
+        ).strip()
+        try:
+            resolved_value = float(raw_value)
+        except Exception:
+            resolved_value = cls._DEFAULT_UI_SOCKET_TIMEOUT_SECONDS
+        return max(0.5, min(15.0, resolved_value))
+
+    @classmethod
+    def _load_ui_request_retry_attempts(cls) -> int:
+        raw_value = str(
+            os.getenv(
+                "AI_IDE_UI_AGENTS_DB_SOCKET_RETRY_ATTEMPTS",
+                str(cls._DEFAULT_UI_REQUEST_RETRY_ATTEMPTS),
+            )
+            or str(cls._DEFAULT_UI_REQUEST_RETRY_ATTEMPTS)
+        ).strip()
+        try:
+            resolved_value = int(raw_value)
+        except Exception:
+            resolved_value = cls._DEFAULT_UI_REQUEST_RETRY_ATTEMPTS
+        return max(1, min(3, resolved_value))
+
+    @classmethod
+    def create_from_uri(
+        cls,
+        agents_db_uri: str,
+        database_name: str = "alde_knowledge",
+        timeout_seconds: float | None = None,
+        retry_attempts: int | None = None,
+    ) -> UiAgentDbSocketRepository:
+        return cls(
+            agents_db_uri=agents_db_uri,
+            database_name=database_name,
+            timeout_seconds=timeout_seconds,
+            retry_attempts=retry_attempts,
+        )
+
+    def _load_request_retry_attempts_for_payload(self, request_payload: Mapping[str, Any]) -> int:
+        command_name = str(request_payload.get("cmd") or "").strip().lower()
+        if command_name in {"upsert_object", "apply_operations", "delete_object"}:
+            return super()._load_request_retry_attempts_for_payload(request_payload)
+        if command_name in {"health", "ping", "status"} or self._is_dispatcher_healthcheck_request(request_payload):
+            return super()._load_request_retry_attempts_for_payload(request_payload)
+        return max(1, int(self._ui_request_retry_attempts))
 
     def request(
         self,
@@ -1924,18 +2139,24 @@ class AgentDbInMemoryRepository:
             payload = collection.get(object_id)
             return dict(payload) if isinstance(payload, Mapping) else None
 
-    def load_objects(self, object_name: str, object_filter: Mapping[str, Any] | None = None, limit: int = 50) -> list[dict[str, Any]]:
+    def load_objects(
+        self,
+        object_name: str,
+        object_filter: Mapping[str, Any] | None = None,
+        limit: int | None = 50,
+    ) -> list[dict[str, Any]]:
         with self._lock:
             collection = self._load_collection_object(object_name)
             filter_payload = dict(object_filter or {})
             result_payload_list: list[dict[str, Any]] = []
+            normalized_limit = _normalize_limit_value(limit)
             for object_payload in collection.values():
                 if not isinstance(object_payload, Mapping):
                     continue
                 if any(object_payload.get(key) != value for key, value in filter_payload.items()):
                     continue
                 result_payload_list.append(dict(object_payload))
-                if len(result_payload_list) >= max(1, int(limit)):
+                if normalized_limit is not None and len(result_payload_list) >= normalized_limit:
                     break
             return result_payload_list
 
@@ -2639,6 +2860,7 @@ class AgentDbRepositoryFactoryConfig:
     default_database_name: str = "alde_knowledge"
     memory_image_path: str | None = None
     prefer_explicit_inmemory: bool = False
+    prefer_ui_socket_repository: bool = False
 
 
 class AgentDbRepositoryFactory:
@@ -2650,7 +2872,10 @@ class AgentDbRepositoryFactory:
     def load_repository(self, database_name: str | None = None) -> KnowledgeRepositoryProtocol:
         resolved_database_name = str(database_name or self._config.default_database_name).strip() or self._config.default_database_name
         if _is_agentsdb_socket_uri(self._config.backend_uri):
-            return AgentDbSocketRepository.create_from_uri(
+            socket_repository_class = AgentDbSocketRepository
+            if self._config.prefer_ui_socket_repository and UiAgentDbSocketRepository is not None:
+                socket_repository_class = UiAgentDbSocketRepository
+            return socket_repository_class.create_from_uri(
                 self._config.backend_uri,
                 resolved_database_name,
             )
@@ -3048,15 +3273,19 @@ class AgentDbSocketServerService:
         if normalized_cmd == "load_objects":
             object_name = str(payload.get("object_name") or "").strip()
             object_filter = payload.get("object_filter")
+            limit_provided = "limit" in payload
             limit = payload.get("limit", 50)
             if not object_name:
                 raise ValueError("load_objects requires object_name")
             if object_filter is not None and not isinstance(object_filter, Mapping):
                 raise ValueError("load_objects object_filter must be an object")
+            normalized_limit = _normalize_limit_value(limit)
+            if normalized_limit is None and not limit_provided:
+                normalized_limit = 50
             object_payload_list = repository.load_objects(
                 object_name,
                 dict(object_filter or {}),
-                max(1, int(limit)),
+                normalized_limit,
             )
             return {"ok": True, "object_payload_list": _json_safe_object(object_payload_list)}
         if normalized_cmd == "find_objects":
@@ -7007,8 +7236,8 @@ MemoryAttachmentService = AgentMemoryAttachmentService
 import html
 
 class GraphViewService:
-    _RELATION_LIMIT = None
-    _CATALOG_LIMIT = None
+    _RELATION_LIMIT = 0
+    _CATALOG_LIMIT = 0
     _WIDGET_PATH_ALIASES = {"adbgraphview"}
     _DEFAULT_WIDGET_KIND = "graph_view" 
     _DEFAULT_TOOL_ID = "graph_view"
@@ -7050,25 +7279,52 @@ class GraphViewService:
        
  
     }
-    _TOOL_RUNTIME_ARTIFACTS: dict[str, dict[str, str]] = {
+    _TOOL_RUNTIME_ARTIFACTS: dict[str, dict[str, Any]] = {
         "agent_relation_graph": {
             "artifact_kind": "native_qwidget",
+            "delivery_mode": "service_bundle",
+            "bundle_scope": "dependency_closure",
+            "artifact_uri": "agentsdb://127.0.0.1:2331/artifacts/agent_relation_graph",
+            "artifact_version": "2026-06-12",
             "entry_module": "alde.widget_artifacts.relation_graph_artifact",
             "entry_class": "RelationGraphWidgetArtifactFactory",
             "build_method": "load_object_widget",
+            "bundle_files": [
+                "__init__.py",
+                "artifact_backends.py",
+                "widget_artifacts/relation_graph_artifact.py",
+            ],
         },
       
         "workflow_diagram": {
             "artifact_kind": "native_qwidget",
+            "delivery_mode": "service_bundle",
+            "bundle_scope": "dependency_closure",
+            "artifact_uri": "agentsdb://127.0.0.1:2331/artifacts/workflow_diagram",
+            "artifact_version": "2026-06-12",
             "entry_module": "alde.widget_artifacts.relation_graph_artifact",
             "entry_class": "RelationGraphWidgetArtifactFactory",
             "build_method": "load_object_widget",
+            "bundle_files": [
+                "__init__.py",
+                "artifact_backends.py",
+                "widget_artifacts/relation_graph_artifact.py",
+            ],
         },
         "sequence_diagram": {
             "artifact_kind": "native_qwidget",
+            "delivery_mode": "service_bundle",
+            "bundle_scope": "dependency_closure",
+            "artifact_uri": "agentsdb://127.0.0.1:2331/artifacts/sequence_diagram",
+            "artifact_version": "2026-06-12",
             "entry_module": "alde.widget_artifacts.relation_graph_artifact",
             "entry_class": "RelationGraphWidgetArtifactFactory",
             "build_method": "load_object_widget",
+            "bundle_files": [
+                "__init__.py",
+                "artifact_backends.py",
+                "widget_artifacts/relation_graph_artifact.py",
+            ],
         },
      
     }
@@ -7108,21 +7364,303 @@ class GraphViewService:
             class_rows = ("AgentRelationGraphService", "RelationGraphWidgetArtifactFactory", "RuntimeWidget")
         return [str(class_name) for class_name in class_rows if str(class_name or "").strip()]
 
-    def _load_runtime_artifact_for_tool(self, tool_id: str | None = None) -> dict[str, str]:
+    def _load_runtime_artifact_cache_root(self) -> Path:
+        project_root = Path(__file__).resolve().parents[2]
+        cache_root = (project_root / "AppData" / "runtime_artifacts").resolve()
+        cache_root.mkdir(parents=True, exist_ok=True)
+        return cache_root
+
+    def _load_runtime_artifact_source_root(self) -> Path:
+        return Path(__file__).resolve().parent
+
+    def _load_complete_module_bundle_files(self) -> list[str]:
+        source_root = self._load_runtime_artifact_source_root()
+        excluded_directories = {
+            "__pycache__",
+            "venv",
+            "symbols",
+            "ctr",
+            "_ctr_",
+            "Dokumente",
+            "Künstliche Intelligenz",
+        }
+
+        relative_paths: list[str] = []
+        for source_path in source_root.rglob("*.py"):
+            relative_path = source_path.relative_to(source_root)
+            path_parts = [str(part) for part in relative_path.parts]
+            if any(part in excluded_directories for part in path_parts):
+                continue
+            normalized_relative_path = str(relative_path).replace("\\", "/")
+            if not normalized_relative_path:
+                continue
+            relative_paths.append(normalized_relative_path)
+
+        relative_paths.sort()
+        return relative_paths
+
+    def _load_module_name_from_relative_path(self, relative_path: str) -> str:
+        normalized_relative_path = str(relative_path or "").strip().replace("\\", "/")
+        if not normalized_relative_path:
+            return "alde"
+        if normalized_relative_path == "__init__.py":
+            return "alde"
+        if normalized_relative_path.endswith("/__init__.py"):
+            module_tail = normalized_relative_path[: -len("/__init__.py")]
+        elif normalized_relative_path.endswith(".py"):
+            module_tail = normalized_relative_path[:-3]
+        else:
+            module_tail = normalized_relative_path
+        module_tail = module_tail.replace("/", ".").strip(".")
+        return f"alde.{module_tail}" if module_tail else "alde"
+
+    def _load_relative_path_for_module(self, module_name: str) -> str | None:
+        normalized_module_name = str(module_name or "").strip()
+        if not normalized_module_name or normalized_module_name == "alde":
+            return "__init__.py"
+        if not normalized_module_name.startswith("alde."):
+            return None
+
+        module_tail = normalized_module_name.split(".", 1)[1]
+        module_relpath = module_tail.replace(".", "/")
+        source_root = self._load_runtime_artifact_source_root()
+
+        module_file = (source_root / f"{module_relpath}.py").resolve()
+        if module_file.exists() and module_file.is_file():
+            return f"{module_relpath}.py"
+
+        package_init_file = (source_root / module_relpath / "__init__.py").resolve()
+        if package_init_file.exists() and package_init_file.is_file():
+            return f"{module_relpath}/__init__.py"
+        return None
+
+    def _load_local_module_imports(self, source_path: Path, *, current_relative_path: str) -> set[str]:
+        try:
+            source_text = source_path.read_text(encoding="utf-8")
+        except Exception:
+            return set()
+        try:
+            module_tree = ast.parse(source_text)
+        except Exception:
+            return set()
+
+        current_module_name = self._load_module_name_from_relative_path(current_relative_path)
+        current_module_parts = [part for part in current_module_name.split(".") if part]
+        current_package_parts = current_module_parts[:-1]
+        imported_module_names: set[str] = set()
+
+        for node in module_tree.body:
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    imported_name = str(alias.name or "").strip()
+                    if imported_name == "alde" or imported_name.startswith("alde."):
+                        imported_module_names.add(imported_name)
+                continue
+
+            if not isinstance(node, ast.ImportFrom):
+                continue
+
+            if int(node.level or 0) > 0:
+                level = int(node.level or 0)
+                ascends = max(0, level - 1)
+                if ascends > len(current_package_parts):
+                    continue
+                base_parts = current_package_parts[: len(current_package_parts) - ascends]
+                module_parts = [part for part in str(node.module or "").split(".") if part]
+                if module_parts:
+                    imported_module_names.add(".".join(base_parts + module_parts))
+                else:
+                    for alias in node.names:
+                        alias_name = str(alias.name or "").strip()
+                        if not alias_name or alias_name == "*":
+                            continue
+                        imported_module_names.add(".".join(base_parts + [alias_name]))
+                continue
+
+            module_name = str(node.module or "").strip()
+            if module_name == "alde":
+                imported_module_names.add("alde")
+                for alias in node.names:
+                    alias_name = str(alias.name or "").strip()
+                    if alias_name and alias_name != "*":
+                        imported_module_names.add(f"alde.{alias_name}")
+            elif module_name.startswith("alde."):
+                imported_module_names.add(module_name)
+
+        return {
+            str(module_name)
+            for module_name in imported_module_names
+            if str(module_name or "").strip()
+        }
+
+    def _load_dependency_closure_bundle_files(self, artifact_payload: Mapping[str, Any] | None) -> list[str]:
+        source_root = self._load_runtime_artifact_source_root()
+        entry_module = str((artifact_payload or {}).get("entry_module") or "").strip()
+        entry_relative_path = self._load_relative_path_for_module(entry_module)
+
+        seed_paths: set[str] = {"__init__.py"}
+        explicit_paths = [
+            str(item).strip().replace("\\", "/")
+            for item in ((artifact_payload or {}).get("bundle_files") or [])
+            if str(item or "").strip()
+        ]
+        seed_paths.update(explicit_paths)
+        if entry_relative_path:
+            seed_paths.add(entry_relative_path)
+
+        pending_paths = [path for path in seed_paths if path]
+        resolved_paths: set[str] = set()
+
+        while pending_paths:
+            current_relative_path = str(pending_paths.pop()).strip().replace("\\", "/")
+            if not current_relative_path or current_relative_path in resolved_paths:
+                continue
+            current_source_path = (source_root / current_relative_path).resolve()
+            if not current_source_path.exists() or not current_source_path.is_file():
+                continue
+
+            resolved_paths.add(current_relative_path)
+            for imported_module_name in self._load_local_module_imports(
+                current_source_path,
+                current_relative_path=current_relative_path,
+            ):
+                imported_relative_path = self._load_relative_path_for_module(imported_module_name)
+                if imported_relative_path and imported_relative_path not in resolved_paths:
+                    pending_paths.append(imported_relative_path)
+
+        if not resolved_paths:
+            return [
+                "__init__.py",
+                "artifact_backends.py",
+                "widget_artifacts/relation_graph_artifact.py",
+            ]
+
+        resolved_list = sorted(resolved_paths)
+        return resolved_list
+
+    def _load_runtime_artifact_bundle_files(self, artifact_payload: Mapping[str, Any] | None) -> list[str]:
+        bundle_scope = str((artifact_payload or {}).get("bundle_scope") or "").strip().lower()
+        if bundle_scope == "complete_module":
+            complete_module_files = self._load_complete_module_bundle_files()
+            if complete_module_files:
+                return complete_module_files
+        if bundle_scope == "dependency_closure":
+            dependency_files = self._load_dependency_closure_bundle_files(artifact_payload)
+            if dependency_files:
+                return dependency_files
+
+        bundle_files = [
+            str(item).strip().replace("\\", "/")
+            for item in ((artifact_payload or {}).get("bundle_files") or [])
+            if str(item or "").strip()
+        ]
+        if bundle_files:
+            return bundle_files
+        return [
+            "__init__.py",
+            "artifact_backends.py",
+            "widget_artifacts/relation_graph_artifact.py",
+        ]
+
+    def _load_runtime_artifact_source_entries(self, artifact_payload: Mapping[str, Any] | None) -> list[tuple[str, Path]]:
+        source_root = self._load_runtime_artifact_source_root()
+        source_entries: list[tuple[str, Path]] = []
+        for relative_path in self._load_runtime_artifact_bundle_files(artifact_payload):
+            normalized_relative_path = str(relative_path or "").strip().lstrip("/")
+            if not normalized_relative_path:
+                continue
+            source_path = (source_root / normalized_relative_path).resolve()
+            if not source_path.exists() or not source_path.is_file():
+                raise FileNotFoundError(f"runtime artifact source file missing: {normalized_relative_path}")
+            source_entries.append((normalized_relative_path, source_path))
+        return source_entries
+
+    def _compute_runtime_artifact_sha256(self, artifact_payload: Mapping[str, Any] | None) -> str:
+        digest = hashlib.sha256()
+        for relative_path, source_path in self._load_runtime_artifact_source_entries(artifact_payload):
+            digest.update(relative_path.encode("utf-8", errors="ignore"))
+            digest.update(b"\0")
+            digest.update(source_path.read_bytes())
+            digest.update(b"\0")
+        return digest.hexdigest()
+
+    def _materialize_runtime_artifact_bundle(
+        self,
+        *,
+        tool_id: str,
+        artifact_payload: Mapping[str, Any] | None,
+    ) -> dict[str, Any]:
+        resolved_artifact_payload = dict(artifact_payload or {})
+        artifact_version = str(resolved_artifact_payload.get("artifact_version") or "latest").strip() or "latest"
+        artifact_sha256 = str(resolved_artifact_payload.get("artifact_sha256") or "").strip() or self._compute_runtime_artifact_sha256(resolved_artifact_payload)
+        cache_key = str(resolved_artifact_payload.get("cache_key") or "").strip() or f"{tool_id}-{artifact_version}-{artifact_sha256[:16]}"
+        cache_root = self._load_runtime_artifact_cache_root()
+        bundle_root = (cache_root / str(tool_id or "runtime_artifact") / cache_key).resolve()
+        package_root = bundle_root / "alde"
+
+        bundle_entries = self._load_runtime_artifact_source_entries(resolved_artifact_payload)
+        if not package_root.exists():
+            package_root.mkdir(parents=True, exist_ok=True)
+        for relative_path, source_path in bundle_entries:
+            target_path = (package_root / relative_path).resolve()
+            target_path.parent.mkdir(parents=True, exist_ok=True)
+            source_bytes = source_path.read_bytes()
+            if not target_path.exists() or target_path.read_bytes() != source_bytes:
+                target_path.write_bytes(source_bytes)
+
+        entry_module = str(resolved_artifact_payload.get("entry_module") or "").strip()
+        entry_file = ""
+        if entry_module:
+            entry_segments = [segment for segment in entry_module.split(".") if str(segment or "").strip()]
+            if entry_segments:
+                entry_file = str((bundle_root / ("/".join(entry_segments) + ".py")).resolve())
+
+        return {
+            "tool_id": str(tool_id or "").strip(),
+            "delivery_mode": str(resolved_artifact_payload.get("delivery_mode") or "service_bundle"),
+            "artifact_uri": str(resolved_artifact_payload.get("artifact_uri") or ""),
+            "artifact_version": artifact_version,
+            "artifact_sha256": artifact_sha256,
+            "cache_key": cache_key,
+            "bundle_scope": str(resolved_artifact_payload.get("bundle_scope") or ""),
+            "bundle_root": str(bundle_root),
+            "entry_file": entry_file,
+            "entry_module": str(resolved_artifact_payload.get("entry_module") or ""),
+            "entry_class": str(resolved_artifact_payload.get("entry_class") or ""),
+            "build_method": str(resolved_artifact_payload.get("build_method") or "load_object_widget"),
+            "module_search_paths": [str(bundle_root)],
+            "bundle_files": [relative_path for relative_path, _source_path in bundle_entries],
+            "materialization_state": "ready",
+        }
+
+    def _load_runtime_artifact_for_tool(self, tool_id: str | None = None) -> dict[str, Any]:
         resolved_tool_id = str(tool_id or self._DEFAULT_TOOL_ID).strip() or self._DEFAULT_TOOL_ID
         artifact_payload = self._TOOL_RUNTIME_ARTIFACTS.get(resolved_tool_id)
         if not isinstance(artifact_payload, dict):
             artifact_payload = {
                 "artifact_kind": "native_qwidget",
+                "delivery_mode": "host_builtin",
                 "entry_module": "alde.widget_artifacts.relation_graph_artifact",
                 "entry_class": "RelationGraphWidgetArtifactFactory",
                 "build_method": "load_object_widget",
             }
         return {
             "artifact_kind": str(artifact_payload.get("artifact_kind") or "native_qwidget"),
+            "delivery_mode": str(artifact_payload.get("delivery_mode") or "host_builtin"),
+            "artifact_uri": str(artifact_payload.get("artifact_uri") or ""),
+            "artifact_version": str(artifact_payload.get("artifact_version") or ""),
+            "artifact_sha256": self._compute_runtime_artifact_sha256(artifact_payload) if str(artifact_payload.get("delivery_mode") or "").strip() == "service_bundle" else str(artifact_payload.get("artifact_sha256") or ""),
+            "cache_key": str(artifact_payload.get("cache_key") or ""),
+            "bundle_scope": str(artifact_payload.get("bundle_scope") or ""),
             "entry_module": str(artifact_payload.get("entry_module") or ""),
             "entry_class": str(artifact_payload.get("entry_class") or ""),
             "build_method": str(artifact_payload.get("build_method") or "load_object_widget"),
+            "module_search_paths": [
+                str(item)
+                for item in (artifact_payload.get("module_search_paths") or [])
+                if str(item or "").strip()
+            ],
+            "bundle_files": self._load_runtime_artifact_bundle_files(artifact_payload),
         }
 
     def load_tool_runtime_manifest(self, *, tool_id: str | None = None, source_uri: str | None = None) -> dict[str, Any]:
@@ -7131,6 +7669,87 @@ class GraphViewService:
             "tool_id": resolved_tool_id,
             "runtime_classes": self._load_runtime_classes_for_tool(resolved_tool_id),
             "runtime_artifact": self._load_runtime_artifact_for_tool(resolved_tool_id),
+        }
+
+    def load_runtime_artifact_bundle(
+        self,
+        *,
+        tool_id: str | None = None,
+        source_uri: str | None = None,
+        manifest_payload: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        resolved_tool_id = self._resolve_tool_id_for_manifest(tool_id=tool_id, source_uri=source_uri)
+        resolved_manifest = dict(manifest_payload or self.load_tool_runtime_manifest(tool_id=resolved_tool_id, source_uri=source_uri) or {})
+        runtime_artifact = resolved_manifest.get("runtime_artifact")
+        artifact_payload = dict(runtime_artifact) if isinstance(runtime_artifact, Mapping) else {}
+
+        delivery_mode = str(artifact_payload.get("delivery_mode") or "host_builtin").strip() or "host_builtin"
+        if delivery_mode == "service_bundle":
+            return self._materialize_runtime_artifact_bundle(tool_id=resolved_tool_id, artifact_payload=artifact_payload)
+
+        return {
+            "tool_id": resolved_tool_id,
+            "delivery_mode": delivery_mode,
+            "artifact_uri": str(artifact_payload.get("artifact_uri") or ""),
+            "artifact_version": str(artifact_payload.get("artifact_version") or ""),
+            "artifact_sha256": str(artifact_payload.get("artifact_sha256") or ""),
+            "cache_key": str(artifact_payload.get("cache_key") or ""),
+            "bundle_scope": str(artifact_payload.get("bundle_scope") or ""),
+            "bundle_root": "",
+            "entry_file": "",
+            "entry_module": str(artifact_payload.get("entry_module") or ""),
+            "entry_class": str(artifact_payload.get("entry_class") or ""),
+            "build_method": str(artifact_payload.get("build_method") or "load_object_widget"),
+            "module_search_paths": [
+                str(item)
+                for item in (artifact_payload.get("module_search_paths") or [])
+                if str(item or "").strip()
+            ],
+            "bundle_files": self._load_runtime_artifact_bundle_files(artifact_payload),
+            "materialization_state": "not_required",
+        }
+
+    def load_runtime_artifact_download_payload(
+        self,
+        *,
+        tool_id: str | None = None,
+        source_uri: str | None = None,
+        manifest_payload: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        resolved_tool_id = self._resolve_tool_id_for_manifest(tool_id=tool_id, source_uri=source_uri)
+        resolved_manifest = dict(manifest_payload or self.load_tool_runtime_manifest(tool_id=resolved_tool_id, source_uri=source_uri) or {})
+        runtime_artifact = resolved_manifest.get("runtime_artifact")
+        artifact_payload = dict(runtime_artifact) if isinstance(runtime_artifact, Mapping) else {}
+        resolved_bundle = self.load_runtime_artifact_bundle(
+            tool_id=resolved_tool_id,
+            source_uri=source_uri,
+            manifest_payload=resolved_manifest,
+        )
+
+        file_rows: list[dict[str, Any]] = []
+        for relative_path, source_path in self._load_runtime_artifact_source_entries(artifact_payload):
+            file_rows.append(
+                {
+                    "relative_path": relative_path,
+                    "encoding": "utf-8",
+                    "content_type": "text/plain",
+                    "content_text": source_path.read_text(encoding="utf-8"),
+                    "content_sha256": hashlib.sha256(source_path.read_bytes()).hexdigest(),
+                }
+            )
+
+        return {
+            "ok": True,
+            "tool_id": resolved_tool_id,
+            "source_uri": str(source_uri or "").strip(),
+            "runtime_manifest": resolved_manifest,
+            "runtime_artifact_bundle": resolved_bundle,
+            "download_payload": {
+                "transport": "mcp.tools/call",
+                "bundle_format": "alde_python_package_utf8",
+                "file_count": len(file_rows),
+                "files": file_rows,
+            },
         }
 
     def load_connection_preview(self, *, source_uri: str | None = None) -> dict[str, Any]:
@@ -7178,7 +7797,13 @@ class GraphViewService:
                     "label": label,
                     "transport": transport,
                     "runtime_classes": self._load_runtime_classes_for_tool(tool_id),
-                    "runtime_artifact": self._load_runtime_artifact_for_tool(tool_id),
+                    "runtime_artifact": {
+                        "artifact_kind": "native_qwidget",
+                        "delivery_mode": "host_builtin",
+                        "entry_module": "alde.widget_artifacts.relation_graph_artifact",
+                        "entry_class": "RelationGraphWidgetArtifactFactory",
+                        "build_method": "load_object_widget",
+                    },
                 }
             )
 
@@ -7188,7 +7813,15 @@ class GraphViewService:
             "tools": tool_rows,
         }
 
-    def load_widget_snapshot(self, *, tool_id: str | None = None, source_uri: str | None = None) -> dict[str, Any]:
+    def load_widget_snapshot(
+        self,
+        *,
+        tool_id: str | None = None,
+        source_uri: str | None = None,
+        relation_limit: int | None = 0,
+        entity_limit: int | None = 0,
+        catalog_limit: int | None = 0,
+    ) -> dict[str, Any]:
         resolved_tool_id = str(tool_id or self._DEFAULT_TOOL_ID).strip() or self._DEFAULT_TOOL_ID
         resolved_source_uri = str(source_uri or "").strip()
 
@@ -7240,7 +7873,13 @@ class GraphViewService:
             )
 
         try:
-            snapshot_payload = self.load_graph_snapshot(object_name=resolved_tool_id, source_uri=resolved_source_uri)
+            snapshot_payload = self.load_graph_snapshot(
+                object_name=resolved_tool_id,
+                source_uri=resolved_source_uri,
+                relation_limit=relation_limit,
+                entity_limit=entity_limit,
+                catalog_limit=catalog_limit,
+            )
         except Exception as exc:
             error_text = html.escape(f"{type(exc).__name__}: {exc}")
             return self._load_graphic_tool_placeholder_snapshot(
@@ -7403,10 +8042,16 @@ class GraphViewService:
                     "start_y": start_y,
                     "end_x": end_x,
                     "end_y": end_y,
+                    "relation_type": str(edge_object.get("label") or "related_to"),
                     "label": self._short_graph_label(str(edge_object.get("label") or "related_to"), max_length=30),
                     "tooltip": f"Relation öffnen: {str(edge_object.get('label') or 'related_to')}",
                     "description": str(edge_object.get("description") or "").strip(),
                     "is_highlighted": (not highlight_edge_ids or edge_id in highlight_edge_ids),
+                    "is_selected": (
+                        resolved_selected_kind == "edge"
+                        and bool(resolved_selected_object_id)
+                        and edge_id == resolved_selected_object_id
+                    ),
                 }
             )
 
@@ -7550,7 +8195,14 @@ class GraphViewService:
         except Exception:
             return None
 
-    def load_graph_snapshot(self, object_name: str | None = None, source_uri: str | None = None) -> dict[str, Any]:
+    def load_graph_snapshot(
+        self,
+        object_name: str | None = None,
+        source_uri: str | None = None,
+        relation_limit: int | None = None,
+        entity_limit: int | None = None,
+        catalog_limit: int | None = None,
+    ) -> dict[str, Any]:
         runtime_config = self._load_runtime_config()
         graph_context = self._load_graph_request_context(
             runtime_config=runtime_config,
@@ -7560,6 +8212,21 @@ class GraphViewService:
         snapshot_metadata = graph_context["metadata"]
         projection_config = self._load_projection_config(snapshot_metadata)
         runtime_config = graph_context.get("runtime_config") or runtime_config
+        resolved_relation_limit = _normalize_limit_value(relation_limit)
+        if resolved_relation_limit is None:
+            resolved_relation_limit = _normalize_limit_value(projection_config.get("relation_limit"))
+        if resolved_relation_limit is None:
+            resolved_relation_limit = _normalize_limit_value(self._RELATION_LIMIT)
+
+        resolved_entity_limit = _normalize_limit_value(entity_limit)
+        if resolved_entity_limit is None:
+            resolved_entity_limit = _normalize_limit_value(projection_config.get("entity_limit"))
+
+        resolved_catalog_limit = _normalize_limit_value(catalog_limit)
+        if resolved_catalog_limit is None:
+            resolved_catalog_limit = _normalize_limit_value(projection_config.get("catalog_limit"))
+        if resolved_catalog_limit is None:
+            resolved_catalog_limit = _normalize_limit_value(self._CATALOG_LIMIT)
         if runtime_config is None:
             return {
                 "status_text": "AgentsDB runtime config missing",
@@ -7584,24 +8251,41 @@ class GraphViewService:
                 runtime_config=runtime_config,
                 snapshot_metadata=snapshot_metadata,
                 projection_config=projection_config,
+                catalog_limit=resolved_catalog_limit,
             )
 
-        relation_objects = self._load_relation_objects(repository, str(getattr(runtime_config, "namespace_id", "") or ""))
+        namespace_scope = str(projection_config.get("namespace_scope") or "single").strip().lower()
+        cluster_by = str(projection_config.get("cluster_by") or "").strip().lower()
+        if namespace_scope == "all" and not cluster_by:
+            cluster_by = "namespace"
+        resolved_namespace_id = str(
+            projection_config.get("namespace_id")
+            or getattr(runtime_config, "namespace_id", "")
+            or ""
+        ).strip()
+        namespace_label = "all" if namespace_scope == "all" else (resolved_namespace_id or "n/a")
+
+        relation_objects = self._load_relation_objects(
+            repository,
+            "" if namespace_scope == "all" else resolved_namespace_id,
+            relation_limit=resolved_relation_limit,
+        )
         if not relation_objects:
             fallback_repository = self._load_memory_fallback_repository(runtime_config)
             if fallback_repository is not None:
                 fallback_relations = self._load_relation_objects(
                     fallback_repository,
-                    str(getattr(runtime_config, "namespace_id", "") or ""),
+                    "" if namespace_scope == "all" else resolved_namespace_id,
+                    relation_limit=resolved_relation_limit,
                 )
                 if fallback_relations:
                     repository = fallback_repository
                     relation_objects = fallback_relations
         if not relation_objects:
-            namespace_id = html.escape(str(getattr(runtime_config, "namespace_id", "") or "n/a"))
+            namespace_id = html.escape(namespace_label)
             database_name = html.escape(str(getattr(runtime_config, "database_name", "") or "n/a"))
             return {
-                "status_text": f"No relations in {getattr(runtime_config, 'namespace_id', 'n/a')}",
+                "status_text": f"No relations in {namespace_label}",
                 "message": "No relation objects were found for the active namespace.",
                 "detail_html": (
                     f"<h3>Relations Graph</h3><p>No relation objects were found in namespace <code>{namespace_id}</code> "
@@ -7617,10 +8301,16 @@ class GraphViewService:
                 "view_kind": projection_config.get("view_kind", self._RELATIONS_VIEW_KIND),
             }
 
-        node_payload_by_id = self._load_node_payload_by_id(repository, relation_objects)
+        node_payload_by_id = self._load_node_payload_by_id(
+            repository,
+            relation_objects,
+            entity_limit=resolved_entity_limit,
+            relation_limit=resolved_relation_limit,
+        )
         relation_type_counts: dict[str, int] = {}
         edge_objects: list[dict[str, Any]] = []
         node_objects_by_id: dict[str, dict[str, Any]] = {}
+        namespace_nodes: dict[str, dict[str, Any]] = {}
 
         for relation_payload in relation_objects:
             source_entity_id = str(relation_payload.get("source_entity_id") or "").strip()
@@ -7634,15 +8324,27 @@ class GraphViewService:
 
             source_payload = node_payload_by_id.get(source_entity_id) or {}
             target_payload = node_payload_by_id.get(target_entity_id) or {}
+            source_namespace = str(
+                source_payload.get("namespace_id")
+                or relation_payload.get("namespace_id")
+                or ""
+            ).strip() or "default"
+            target_namespace = str(
+                target_payload.get("namespace_id")
+                or relation_payload.get("namespace_id")
+                or ""
+            ).strip() or "default"
             node_objects_by_id[source_entity_id] = {
                 "node_id": source_entity_id,
                 "label": self._entity_label(source_payload, source_entity_id),
                 "kind": str(source_payload.get("entity_type") or source_payload.get("type_key") or "entity"),
+                "namespace_id": source_namespace,
             }
             node_objects_by_id[target_entity_id] = {
                 "node_id": target_entity_id,
                 "label": self._entity_label(target_payload, target_entity_id),
                 "kind": str(target_payload.get("entity_type") or target_payload.get("type_key") or "entity"),
+                "namespace_id": target_namespace,
             }
             edge_objects.append(
                 {
@@ -7653,6 +8355,46 @@ class GraphViewService:
                 }
             )
 
+            if namespace_scope == "all" and cluster_by == "namespace":
+                source_namespace_node_id = f"namespace:{source_namespace}"
+                namespace_nodes.setdefault(
+                    source_namespace_node_id,
+                    {
+                        "node_id": source_namespace_node_id,
+                        "label": source_namespace,
+                        "kind": "namespace",
+                    },
+                )
+                edge_objects.append(
+                    {
+                        "source": source_namespace_node_id,
+                        "target": source_entity_id,
+                        "label": "in_namespace",
+                        "description": "Clustered by namespace",
+                    }
+                )
+
+                target_namespace_node_id = f"namespace:{target_namespace}"
+                namespace_nodes.setdefault(
+                    target_namespace_node_id,
+                    {
+                        "node_id": target_namespace_node_id,
+                        "label": target_namespace,
+                        "kind": "namespace",
+                    },
+                )
+                edge_objects.append(
+                    {
+                        "source": target_namespace_node_id,
+                        "target": target_entity_id,
+                        "label": "in_namespace",
+                        "description": "Clustered by namespace",
+                    }
+                )
+
+        if namespace_nodes:
+            node_objects_by_id.update(namespace_nodes)
+
         node_objects = sorted(node_objects_by_id.values(), key=lambda item: str(item.get("label") or "").lower())
         status_text = (
             f"{len(edge_objects)} relations | {len(node_objects)} nodes | "
@@ -7661,7 +8403,14 @@ class GraphViewService:
         return {
             "status_text": status_text,
             "message": "",
-            "detail_html": self._build_detail_html(runtime_config, node_objects, edge_objects, relation_type_counts, snapshot_metadata),
+            "detail_html": self._build_detail_html(
+                runtime_config,
+                node_objects,
+                edge_objects,
+                relation_type_counts,
+                snapshot_metadata,
+                namespace_label=namespace_label,
+            ),
             "nodes": node_objects,
             "edges": edge_objects,
             "metadata": snapshot_metadata,
@@ -7691,19 +8440,41 @@ class GraphViewService:
             mode_value = "relations"
 
         namespace_id = _q("namespace", _q("namespace_id", "")).strip()
+        namespace_scope = _q("scope", _q("namespace_scope", "")).strip().lower()
+        cluster_by = _q("cluster", _q("cluster_by", "")).strip().lower()
+        if namespace_id.lower() in {"*", "all", "any", "mixed"}:
+            namespace_scope = "all"
+            namespace_id = ""
+        if namespace_scope in {"*", "all", "any", "mixed"}:
+            namespace_scope = "all"
         include_embeddings = _q("embeddings", "1").strip().lower() not in {"0", "false", "no", "off"}
         include_documents = _q("documents", "1").strip().lower() not in {"0", "false", "no", "off"}
         include_blocks = _q("blocks", "1").strip().lower() not in {"0", "false", "no", "off"}
         include_seeds = _q("seeds", "1").strip().lower() not in {"0", "false", "no", "off"}
+        shorthand_limit = _normalize_limit_value(_q("limit", ""))
+        relation_limit = _normalize_limit_value(_q("relation_limit", _q("relations_limit", "")))
+        entity_limit = _normalize_limit_value(_q("entity_limit", _q("entities_limit", "")))
+        catalog_limit = _normalize_limit_value(_q("catalog_limit", _q("catalogs_limit", "")))
+        if relation_limit is None:
+            relation_limit = shorthand_limit
+        if entity_limit is None:
+            entity_limit = shorthand_limit
+        if catalog_limit is None:
+            catalog_limit = shorthand_limit
 
         return {
             "mode": mode_value,
             "view_kind": self._CATALOG_VIEW_KIND if mode_value == "catalog" else self._RELATIONS_VIEW_KIND,
             "namespace_id": namespace_id,
+            "namespace_scope": namespace_scope or "single",
+            "cluster_by": cluster_by,
             "include_embeddings": include_embeddings,
             "include_documents": include_documents,
             "include_blocks": include_blocks,
             "include_seeds": include_seeds,
+            "relation_limit": relation_limit,
+            "entity_limit": entity_limit,
+            "catalog_limit": catalog_limit,
         }
 
     def _load_catalog_snapshot(
@@ -7713,12 +8484,21 @@ class GraphViewService:
         runtime_config: Any,
         snapshot_metadata: Mapping[str, Any],
         projection_config: Mapping[str, Any],
+        catalog_limit: int | None = None,
     ) -> dict[str, Any]:
+        namespace_scope = str(projection_config.get("namespace_scope") or "single").strip().lower()
+        cluster_by = str(projection_config.get("cluster_by") or "").strip().lower()
+        if namespace_scope == "all" and not cluster_by:
+            cluster_by = "namespace"
         namespace_id = str(
             projection_config.get("namespace_id")
             or getattr(runtime_config, "namespace_id", "")
             or ""
         ).strip()
+        namespace_label = "all" if namespace_scope == "all" else (namespace_id or "n/a")
+        resolved_catalog_limit = _normalize_limit_value(catalog_limit)
+        if resolved_catalog_limit is None:
+            resolved_catalog_limit = _normalize_limit_value(self._CATALOG_LIMIT)
 
         nodes_by_id: dict[str, dict[str, Any]] = {}
         edges: list[dict[str, Any]] = []
@@ -7752,7 +8532,10 @@ class GraphViewService:
             )
 
         namespace_node_id = f"namespace:{namespace_id or 'default'}"
-        add_node(namespace_node_id, namespace_id or "default namespace", "namespace")
+        if namespace_scope == "all":
+            add_node("namespace:all", "all namespaces", "namespace_root")
+        else:
+            add_node(namespace_node_id, namespace_id or "default namespace", "namespace")
 
         load_objects = getattr(repository, "load_objects", None)
         if not callable(load_objects):
@@ -7782,11 +8565,12 @@ class GraphViewService:
         for object_name in collection_object_names:
             collection_node_id = f"collection:{object_name}"
             add_node(collection_node_id, object_name, "collection")
-            add_edge(namespace_node_id, collection_node_id, "contains_collection")
+            if namespace_scope != "all":
+                add_edge(namespace_node_id, collection_node_id, "contains_collection")
 
-            object_filter = {"namespace_id": namespace_id} if namespace_id else None
+            object_filter = {"namespace_id": namespace_id} if namespace_scope != "all" and namespace_id else None
             try:
-                payload_rows = load_objects(object_name, object_filter, limit=self._CATALOG_LIMIT)
+                payload_rows = load_objects(object_name, object_filter, limit=resolved_catalog_limit)
             except TypeError:
                 payload_rows = load_objects(object_name, object_filter)
             except Exception:
@@ -7798,6 +8582,11 @@ class GraphViewService:
                 payload_id = str(payload.get("_id") or payload.get("id") or "").strip()
                 if not payload_id:
                     continue
+                payload_namespace = str(payload.get("namespace_id") or "default").strip() or "default"
+                if namespace_scope == "all" and cluster_by == "namespace":
+                    namespace_cluster_id = f"namespace:{payload_namespace}"
+                    add_node(namespace_cluster_id, payload_namespace, "namespace")
+                    add_edge("namespace:all", namespace_cluster_id, "contains_namespace")
 
                 if object_name == "entity":
                     node_id = f"entity:{payload_id}"
@@ -7806,6 +8595,8 @@ class GraphViewService:
                     add_node(node_id, label, entity_type)
                     entity_node_ids.add(node_id)
                     add_edge(collection_node_id, node_id, "contains")
+                    if namespace_scope == "all" and cluster_by == "namespace":
+                        add_edge(f"namespace:{payload_namespace}", node_id, "in_namespace")
 
                     type_node_id = f"type:entity:{entity_type}"
                     add_node(type_node_id, entity_type, "entity_type")
@@ -7824,6 +8615,8 @@ class GraphViewService:
                     relation_type = str(payload.get("relation_type") or "related_to").strip() or "related_to"
                     add_node(relation_node_id, relation_type, "relation")
                     add_edge(collection_node_id, relation_node_id, "contains")
+                    if namespace_scope == "all" and cluster_by == "namespace":
+                        add_edge(f"namespace:{payload_namespace}", relation_node_id, "in_namespace")
 
                     type_node_id = f"type:relation:{relation_type}"
                     add_node(type_node_id, relation_type, "relation_type")
@@ -7854,6 +8647,8 @@ class GraphViewService:
                     title = str(payload.get("title") or payload.get("source_uri") or payload_id)
                     add_node(document_node_id, title, "document")
                     add_edge(collection_node_id, document_node_id, "contains")
+                    if namespace_scope == "all" and cluster_by == "namespace":
+                        add_edge(f"namespace:{payload_namespace}", document_node_id, "in_namespace")
 
                     document_type = str(payload.get("document_type") or "document").strip() or "document"
                     doc_type_node_id = f"type:document:{document_type}"
@@ -7885,6 +8680,8 @@ class GraphViewService:
                     model_id = str(payload.get("model_id") or "embedding")
                     add_node(embedding_node_id, model_id, "embedding")
                     add_edge(collection_node_id, embedding_node_id, "contains")
+                    if namespace_scope == "all" and cluster_by == "namespace":
+                        add_edge(f"namespace:{payload_namespace}", embedding_node_id, "in_namespace")
 
                     if owner_type:
                         owner_type_node_id = owner_type_nodes.get(owner_type)
@@ -7892,7 +8689,10 @@ class GraphViewService:
                             owner_type_node_id = f"owner_type:{owner_type}"
                             owner_type_nodes[owner_type] = owner_type_node_id
                             add_node(owner_type_node_id, owner_type, "owner_type")
-                            add_edge(namespace_node_id, owner_type_node_id, "supports_owner")
+                            if namespace_scope == "all" and cluster_by == "namespace":
+                                add_edge(f"namespace:{payload_namespace}", owner_type_node_id, "supports_owner")
+                            else:
+                                add_edge(namespace_node_id, owner_type_node_id, "supports_owner")
                         add_edge(owner_type_node_id, embedding_node_id, "owns_embedding")
 
                     if owner_id:
@@ -7915,6 +8715,7 @@ class GraphViewService:
             edge_objects=edges,
             type_counts=type_counts,
             snapshot_metadata=snapshot_metadata,
+            namespace_label=namespace_label,
         )
         return {
             "status_text": f"ADB Catalog | {len(node_objects)} nodes | {len(edges)} edges",
@@ -7938,8 +8739,10 @@ class GraphViewService:
         edge_objects: Sequence[Mapping[str, Any]],
         type_counts: Mapping[str, int],
         snapshot_metadata: Mapping[str, Any] | None = None,
+        namespace_label: str | None = None,
     ) -> str:
         metadata = snapshot_metadata if isinstance(snapshot_metadata, Mapping) else {}
+        resolved_namespace_label = str(namespace_label or getattr(runtime_config, "namespace_id", "n/a") or "n/a")
         type_rows = "".join(
             f"<li><b>{html.escape(str(type_name))}</b>: {int(type_count)}</li>"
             for type_name, type_count in sorted(type_counts.items(), key=lambda item: (-int(item[1]), str(item[0])))[:16]
@@ -7964,7 +8767,7 @@ class GraphViewService:
                 "<p>Unified graph projection for collection analysis, modeling and exploration.</p>",
                 "<ul>",
                 f"<li><b>Database:</b> {html.escape(str(getattr(runtime_config, 'database_name', 'n/a') or 'n/a'))}</li>",
-                f"<li><b>Namespace:</b> {html.escape(str(getattr(runtime_config, 'namespace_id', 'n/a') or 'n/a'))}</li>",
+                f"<li><b>Namespace:</b> {html.escape(resolved_namespace_label)}</li>",
                 f"<li><b>Backend:</b> {html.escape(str(getattr(runtime_config, 'agents_db_uri', 'n/a') or 'n/a'))}</li>",
                 f"<li><b>Widget URI:</b> {html.escape(str(metadata.get('widget_uri') or metadata.get('source_uri') or 'n/a'))}</li>",
                 f"<li><b>Tool:</b> {html.escape(str(metadata.get('tool_id') or self._DEFAULT_TOOL_ID))}</li>",
@@ -8180,6 +8983,53 @@ class GraphViewService:
             return normalized_label[:max_length]
         return f"{normalized_label[: max_length - 1]}…"
 
+    def _hsv_to_hex_color(self, hue_value: float, saturation_value: float, value_value: float) -> str:
+        clamped_hue = float(hue_value) % 1.0
+        clamped_saturation = max(0.0, min(1.0, float(saturation_value)))
+        clamped_value = max(0.0, min(1.0, float(value_value)))
+        red, green, blue = colorsys.hsv_to_rgb(clamped_hue, clamped_saturation, clamped_value)
+        return f"#{int(round(red * 255.0)):02x}{int(round(green * 255.0)):02x}{int(round(blue * 255.0)):02x}"
+
+    def _relation_palette_for_label(
+        self,
+        relation_label: str,
+        *,
+        is_selected: bool,
+        is_highlighted: bool,
+    ) -> dict[str, str]:
+        normalized_relation_label = str(relation_label or "related_to").strip().lower() or "related_to"
+        relation_digest = hashlib.sha1(normalized_relation_label.encode("utf-8", errors="ignore")).digest()
+        hue_value = ((int(relation_digest[0]) << 8) | int(relation_digest[1])) / 65535.0
+
+        if is_selected:
+            stroke_color = self._hsv_to_hex_color(hue_value, 0.92, 0.98)
+            text_color = self._hsv_to_hex_color((hue_value + 0.012) % 1.0, 0.35, 1.0)
+            outline_color = self._hsv_to_hex_color(hue_value, 0.24, 1.0)
+            return {
+                "stroke_color": stroke_color,
+                "text_color": text_color,
+                "outline_color": outline_color,
+            }
+
+        if is_highlighted:
+            stroke_color = self._hsv_to_hex_color(hue_value, 0.78, 0.90)
+            text_color = self._hsv_to_hex_color((hue_value + 0.008) % 1.0, 0.46, 0.96)
+            outline_color = self._hsv_to_hex_color(hue_value, 0.22, 0.92)
+            return {
+                "stroke_color": stroke_color,
+                "text_color": text_color,
+                "outline_color": outline_color,
+            }
+
+        stroke_color = self._hsv_to_hex_color(hue_value, 0.56, 0.74)
+        text_color = self._hsv_to_hex_color((hue_value + 0.006) % 1.0, 0.28, 0.86)
+        outline_color = self._hsv_to_hex_color(hue_value, 0.16, 0.82)
+        return {
+            "stroke_color": stroke_color,
+            "text_color": text_color,
+            "outline_color": outline_color,
+        }
+
     def _build_graph_render_commands(
         self,
         node_draw_objects: Sequence[Mapping[str, Any]],
@@ -8236,8 +9086,34 @@ class GraphViewService:
             end_x = float(edge_object.get("end_x") or 0.0)
             end_y = float(edge_object.get("end_y") or 0.0)
             is_highlighted = bool(edge_object.get("is_highlighted", True))
+            is_selected = bool(edge_object.get("is_selected", False))
             edge_payload = {"kind": "edge", "edge_id": edge_id}
             edge_tooltip = str(edge_object.get("tooltip") or f"Relation öffnen: {edge_id}")
+            relation_type = str(edge_object.get("relation_type") or edge_object.get("label") or "related_to")
+            relation_palette = self._relation_palette_for_label(
+                relation_type,
+                is_selected=is_selected,
+                is_highlighted=is_highlighted,
+            )
+            line_width = 6.2 if is_selected else (4.0 if is_highlighted else 1.7)
+
+            if is_selected:
+                render_commands.append(
+                    {
+                        "type": "line",
+                        "start_x": start_x,
+                        "start_y": start_y,
+                        "end_x": end_x,
+                        "end_y": end_y,
+                        "payload": edge_payload,
+                        "tooltip": edge_tooltip,
+                        "style": {
+                            "stroke_role": "accent",
+                            "stroke_color": relation_palette["outline_color"],
+                            "line_width": line_width + 2.6,
+                        },
+                    }
+                )
 
             render_commands.append(
                 {
@@ -8250,7 +9126,8 @@ class GraphViewService:
                     "tooltip": edge_tooltip,
                     "style": {
                         "stroke_role": "accent" if is_highlighted else "link",
-                        "line_width": 4.0 if is_highlighted else 1.7,
+                        "stroke_color": relation_palette["stroke_color"],
+                        "line_width": line_width,
                     },
                 }
             )
@@ -8258,7 +9135,11 @@ class GraphViewService:
             render_commands.append(
                 {
                     "type": "text",
-                    "text": str(edge_object.get("label") or "related_to"),
+                    "text": (
+                        f"selected: {str(edge_object.get('label') or 'related_to')}"
+                        if is_selected
+                        else str(edge_object.get("label") or "related_to")
+                    ),
                     "x": (start_x + end_x) / 2.0,
                     "y": (start_y + end_y) / 2.0,
                     "anchor": "center_above",
@@ -8266,6 +9147,7 @@ class GraphViewService:
                     "tooltip": edge_tooltip,
                     "style": {
                         "text_role": "accent" if is_highlighted else "text_secondary",
+                        "text_color": relation_palette["text_color"],
                     },
                 }
             )
@@ -8306,6 +9188,11 @@ class GraphViewService:
             ring_radius = radius * math.sqrt((index + 0.5) / node_count)
             angle = index * golden_angle
             positions[node_id] = [math.cos(angle) * ring_radius, math.sin(angle) * ring_radius]
+
+        # Large graphs can make the full O(n^2) force layout too slow for UI workflows.
+        # Fall back to the deterministic golden-angle seed layout to keep rendering responsive.
+        if node_count > 320:
+            return {node_id: (position[0], position[1]) for node_id, position in positions.items()}
 
         ideal_distance = max(190.0, min(360.0, 95.0 + (node_count * 8.0)))
         canvas_radius = max(360.0, radius * 2.35)
@@ -8416,7 +9303,7 @@ class GraphViewService:
 
         repository_uri = normalize_agentsdb_socket_uri(normalized_source_uri, default_on_empty=False) or normalized_source_uri
         widget_path = str(parsed_uri.path or "").strip("/")
-        normalized_widget_path = "AdbGraphVIew" if widget_path.lower() in self._WIDGET_PATH_ALIASES else widget_path
+        normalized_widget_path = "adbGraphView" if widget_path.lower() in self._WIDGET_PATH_ALIASES else widget_path
         widget_uri = f"{repository_uri}/{normalized_widget_path}" if normalized_widget_path else repository_uri
         return repository_uri, widget_uri
 
@@ -8429,15 +9316,22 @@ class GraphViewService:
 
         project_root = Path(__file__).resolve().parents[2]
         memory_image_path = project_root / "AppData" / "agentsdb.json"
+        backend_uri = str(getattr(runtime_config, "agents_db_uri", "") or "").strip()
+        database_name = str(getattr(runtime_config, "database_name", "alde_knowledge") or "alde_knowledge").strip() or "alde_knowledge"
+        if _is_agentsdb_socket_uri(backend_uri):
+            return UiAgentDbSocketRepository.create_from_uri(
+                backend_uri,
+                database_name,
+            )
         repository_factory = repository_factory_class(
             repository_factory_config_class(
-                backend_uri=str(getattr(runtime_config, "agents_db_uri", "") or "").strip(),
-                default_database_name=str(getattr(runtime_config, "database_name", "alde_knowledge") or "alde_knowledge").strip() or "alde_knowledge",
+                backend_uri=backend_uri,
+                default_database_name=database_name,
                 memory_image_path=str(memory_image_path),
                 prefer_explicit_inmemory=True,
             )
         )
-        return repository_factory.load_repository(str(getattr(runtime_config, "database_name", "alde_knowledge") or "alde_knowledge"))
+        return repository_factory.load_repository(database_name)
 
     def _load_memory_fallback_repository(self, runtime_config: Any) -> Any | None:
         repository_factory_class, repository_factory_config_class, _ = self._load_agentsdb_dependencies()
@@ -8460,16 +9354,26 @@ class GraphViewService:
         except Exception:
             return None
 
-    def _load_relation_objects(self, repository: Any, namespace_id: str) -> list[dict[str, Any]]:
+    def _load_relation_objects(
+        self,
+        repository: Any,
+        namespace_id: str,
+        *,
+        relation_limit: int | None = None,
+    ) -> list[dict[str, Any]]:
         load_objects = getattr(repository, "load_objects", None)
         if not callable(load_objects):
             return []
+
+        resolved_relation_limit = _normalize_limit_value(relation_limit)
+        if resolved_relation_limit is None:
+            resolved_relation_limit = _normalize_limit_value(self._RELATION_LIMIT)
 
         relation_filter = {"namespace_id": namespace_id} if namespace_id else None
         relation_objects: Any = []
         for object_name in ("relation", "entity_relations", "relations"):
             try:
-                relation_objects = load_objects(object_name, relation_filter, limit=self._RELATION_LIMIT)
+                relation_objects = load_objects(object_name, relation_filter, limit=resolved_relation_limit)
             except TypeError:
                 try:
                     relation_objects = load_objects(object_name, relation_filter)
@@ -8482,7 +9386,7 @@ class GraphViewService:
 
         if not relation_objects:
             try:
-                relation_objects = load_objects("relation", None, limit=self._RELATION_LIMIT)
+                relation_objects = load_objects("relation", None, limit=resolved_relation_limit)
             except TypeError:
                 try:
                     relation_objects = load_objects("relation", None)
@@ -8493,7 +9397,7 @@ class GraphViewService:
         if not relation_objects:
             for object_name in ("entity_relations", "relations"):
                 try:
-                    relation_objects = load_objects(object_name, None, limit=self._RELATION_LIMIT)
+                    relation_objects = load_objects(object_name, None, limit=resolved_relation_limit)
                 except TypeError:
                     try:
                         relation_objects = load_objects(object_name, None)
@@ -8506,7 +9410,14 @@ class GraphViewService:
 
         return [dict(item) for item in (relation_objects or []) if isinstance(item, dict)]
 
-    def _load_node_payload_by_id(self, repository: Any, relation_objects: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    def _load_node_payload_by_id(
+        self,
+        repository: Any,
+        relation_objects: list[dict[str, Any]],
+        *,
+        entity_limit: int | None = None,
+        relation_limit: int | None = None,
+    ) -> dict[str, dict[str, Any]]:
         load_object = getattr(repository, "load_object", None)
         if not callable(load_object):
             return {}
@@ -8523,8 +9434,18 @@ class GraphViewService:
                     entity_id_list.append(entity_id)
 
         node_payload_by_id: dict[str, dict[str, Any]] = {}
-        relation_limit = self._RELATION_LIMIT if isinstance(self._RELATION_LIMIT, int) and self._RELATION_LIMIT > 0 else len(entity_id_list)
-        for entity_id in entity_id_list[: relation_limit * 2]:
+        resolved_entity_limit = _normalize_limit_value(entity_limit)
+        resolved_relation_limit = _normalize_limit_value(relation_limit)
+        if resolved_relation_limit is None:
+            resolved_relation_limit = _normalize_limit_value(self._RELATION_LIMIT)
+
+        max_entities = len(entity_id_list)
+        if resolved_entity_limit is not None:
+            max_entities = min(max_entities, resolved_entity_limit)
+        elif resolved_relation_limit is not None:
+            max_entities = min(max_entities, resolved_relation_limit * 2)
+
+        for entity_id in entity_id_list[:max_entities]:
             entity_payload = None
             for object_name in ("entity", "entities"):
                 try:
@@ -8563,8 +9484,10 @@ class GraphViewService:
         edge_objects: list[dict[str, Any]],
         relation_type_counts: dict[str, int],
         snapshot_metadata: Mapping[str, Any] | None = None,
+        namespace_label: str | None = None,
     ) -> str:
         metadata = snapshot_metadata if isinstance(snapshot_metadata, Mapping) else {}
+        resolved_namespace_label = str(namespace_label or getattr(runtime_config, "namespace_id", "n/a") or "n/a")
         relation_rows = "".join(
             f"<li><b>{html.escape(relation_type)}</b>: {count}</li>"
             for relation_type, count in sorted(relation_type_counts.items(), key=lambda item: (-item[1], item[0]))[:10]
@@ -8594,10 +9517,10 @@ class GraphViewService:
         return "".join(
             [
                 "<h3>Graph View</h3>",
-                "<p>Graph projection of AgentDB objects for the active namespace.</p>",
+                "<p>Graph projection of AgentDB objects for the selected namespace scope.</p>",
                 "<ul>",   
                 f"<li><b>Database:</b> {html.escape(str(getattr(runtime_config, 'database_name', 'n/a') or 'n/a'))}</li>",
-                f"<li><b>Namespace:</b> {html.escape(str(getattr(runtime_config, 'namespace_id', 'n/a') or 'n/a'))}</li>",
+                f"<li><b>Namespace:</b> {html.escape(resolved_namespace_label)}</li>",
                 f"<li><b>Backend:</b> {html.escape(str(getattr(runtime_config, 'agents_db_uri', 'n/a') or 'n/a'))}</li>",
                 f"<li><b>Widget URI:</b> {html.escape(str(metadata.get('widget_uri') or metadata.get('source_uri') or 'n/a'))}</li>",
                 f"<li><b>Tool:</b> {html.escape(str(metadata.get('tool_id') or self._DEFAULT_TOOL_ID))}</li>",

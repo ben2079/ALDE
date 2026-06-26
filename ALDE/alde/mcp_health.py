@@ -330,6 +330,139 @@ class McpHealthProbeService:
             startup_output = self._stop_process(proc)
         return init_response, list_response, startup_output, init_latency_ms, list_latency_ms
 
+    def _call_stdio(self, server: Dict[str, Any], payload: Dict[str, Any]) -> tuple[Dict[str, Any], str, float]:
+        proc = self._launch_process(server)
+        if proc is None:
+            raise RuntimeError("stdio server requires command + args")
+        startup_output = ""
+        try:
+            self._send_stdio_request(proc, {"method": "initialize", "params": {}})
+            response_start = time.perf_counter()
+            response_payload = self._send_stdio_request(proc, payload)
+            response_latency_ms = (time.perf_counter() - response_start) * 1000.0
+        finally:
+            startup_output = self._stop_process(proc)
+        return response_payload, startup_output, response_latency_ms
+
+    def _call_tcp(self, server: Dict[str, Any], payload: Dict[str, Any]) -> tuple[Dict[str, Any], str, float]:
+        host = str(server.get("host") or "127.0.0.1").strip() or "127.0.0.1"
+        port = int(server.get("port") or 8765)
+        proc = self._launch_process(server)
+        startup_output = ""
+        try:
+            self._retry_request(
+                lambda: self._send_tcp_request(host, port, {"method": "initialize", "params": {}})
+            )
+            response_payload, response_latency_ms = self._retry_request(
+                lambda: self._send_tcp_request(host, port, payload)
+            )
+        finally:
+            startup_output = self._stop_process(proc)
+        return response_payload, startup_output, response_latency_ms
+
+    def _call_http(self, server: Dict[str, Any], payload: Dict[str, Any]) -> tuple[Dict[str, Any], str, float]:
+        url = str(server.get("url") or "").strip()
+        if not url:
+            raise RuntimeError("http server requires url")
+        proc = self._launch_process(server)
+        startup_output = ""
+        try:
+            self._retry_request(
+                lambda: self._send_http_request(url, {"method": "initialize", "params": {}})
+            )
+            response_payload, response_latency_ms = self._retry_request(
+                lambda: self._send_http_request(url, payload)
+            )
+        finally:
+            startup_output = self._stop_process(proc)
+        return response_payload, startup_output, response_latency_ms
+
+    def execute_request(self, payload: Dict[str, Any], *, server_name: str | None = None) -> Dict[str, Any]:
+        server_map, selected_server_name, configured_fallback_order = self.load_server_map()
+        resolved_server_name = str(server_name or "").strip() or selected_server_name
+        probe_order = self.load_probe_order(
+            server_map,
+            resolved_server_name,
+            configured_fallback_order=configured_fallback_order,
+        )
+        attempts: list[dict[str, Any]] = []
+
+        for candidate_server_name in probe_order:
+            server = dict(server_map.get(candidate_server_name) or {})
+            transport = str(server.get("type") or "").strip().lower() or "unknown"
+            started_at = _utc_now_iso()
+            start_perf = time.perf_counter()
+            startup_log = ""
+            try:
+                if transport == "stdio":
+                    response_payload, startup_log, response_latency_ms = self._call_stdio(server, payload)
+                elif transport == "tcp":
+                    response_payload, startup_log, response_latency_ms = self._call_tcp(server, payload)
+                elif transport == "http":
+                    response_payload, startup_log, response_latency_ms = self._call_http(server, payload)
+                else:
+                    raise RuntimeError(f"Unsupported MCP transport: {transport}")
+
+                attempts.append(
+                    {
+                        "server_name": candidate_server_name,
+                        "transport": transport,
+                        "started_at": started_at,
+                        "latency_ms": round((time.perf_counter() - start_perf) * 1000.0, 3),
+                        "response_latency_ms": round(response_latency_ms, 3),
+                        "ok": True,
+                        "timed_out": False,
+                        "error": "",
+                        "startup_log": startup_log[:400],
+                    }
+                )
+                return {
+                    "ok": True,
+                    "selected_server": resolved_server_name,
+                    "active_server": candidate_server_name,
+                    "active_transport": transport,
+                    "fallback_used": candidate_server_name != resolved_server_name,
+                    "response": response_payload,
+                    "attempts": attempts,
+                }
+            except Exception as exc:
+                attempts.append(
+                    {
+                        "server_name": candidate_server_name,
+                        "transport": transport,
+                        "started_at": started_at,
+                        "latency_ms": round((time.perf_counter() - start_perf) * 1000.0, 3),
+                        "response_latency_ms": 0.0,
+                        "ok": False,
+                        "timed_out": self._is_timeout_error(exc),
+                        "error": f"{type(exc).__name__}: {exc}",
+                        "startup_log": startup_log[:400],
+                    }
+                )
+
+        return {
+            "ok": False,
+            "selected_server": resolved_server_name,
+            "active_server": "",
+            "active_transport": "",
+            "fallback_used": False,
+            "response": {},
+            "attempts": attempts,
+            "error": str((attempts[-1] if attempts else {}).get("error") or "mcp_request_failed"),
+        }
+
+    def execute_tools_call(self, tool_name: str, arguments_payload: Dict[str, Any] | None = None, *, server_name: str | None = None) -> Dict[str, Any]:
+        return self.execute_request(
+            {
+                "method": "tools/call",
+                "params": {
+                    "name": str(tool_name or "").strip(),
+                    "arguments": dict(arguments_payload or {}),
+                },
+            },
+            server_name=server_name,
+        )
+
     def _is_timeout_error(self, error_object: Exception) -> bool:
         if isinstance(error_object, (TimeoutError, socket.timeout, subprocess.TimeoutExpired)):
             return True
@@ -579,3 +712,22 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+
+
+def call_mcp_tool(
+    tool_name: str,
+    arguments_payload: Dict[str, Any] | None = None,
+    *,
+    config_path: Path = CONFIG_PATH,
+    timeout_seconds: float = DEFAULT_TIMEOUT,
+    server_name: str | None = None,
+) -> Dict[str, Any]:
+    probe_service = McpHealthProbeService(
+        config_path=config_path,
+        timeout_seconds=timeout_seconds,
+    )
+    return probe_service.execute_tools_call(
+        tool_name,
+        arguments_payload,
+        server_name=server_name,
+    )

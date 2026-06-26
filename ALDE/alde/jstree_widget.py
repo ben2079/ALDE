@@ -18,7 +18,7 @@ buttons will show a placeholder message.
 """
 
 from typing import Any, Callable, Iterable, Mapping, Sequence
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 import hashlib
 import importlib
 import importlib.util
@@ -56,13 +56,14 @@ from PySide6.QtWidgets import (
 )
 
 try:
-    from .agents_db import AgentDbSocketRepository, KnowledgeRepository, load_agentsdb_runtime_config_from_env, normalize_agentsdb_socket_uri, sync_parser_result_to_agentsdb_knowledge  # type: ignore
+    from .agents_db import AgentDbSocketRepository, KnowledgeRepository, UiAgentDbSocketRepository, load_agentsdb_runtime_config_from_env, normalize_agentsdb_socket_uri, sync_parser_result_to_agentsdb_knowledge  # type: ignore
 except Exception:
     try:
-        from alde.agents_db import AgentDbSocketRepository, KnowledgeRepository, load_agentsdb_runtime_config_from_env, normalize_agentsdb_socket_uri, sync_parser_result_to_agentsdb_knowledge  # type: ignore
+        from alde.agents_db import AgentDbSocketRepository, KnowledgeRepository, UiAgentDbSocketRepository, load_agentsdb_runtime_config_from_env, normalize_agentsdb_socket_uri, sync_parser_result_to_agentsdb_knowledge  # type: ignore
     except Exception:
         AgentDbSocketRepository = None  # type: ignore[assignment]
         KnowledgeRepository = None  # type: ignore[assignment]
+        UiAgentDbSocketRepository = None  # type: ignore[assignment]
         load_agentsdb_runtime_config_from_env = None  # type: ignore[assignment]
         normalize_agentsdb_socket_uri = None  # type: ignore[assignment]
         sync_parser_result_to_agentsdb_knowledge = None  # type: ignore[assignment]
@@ -95,6 +96,7 @@ class TreeDataPersistenceService:
 
     _ENV_ASSIGNMENT_PATTERN = re.compile(r"^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$")
     _ENV_OBJECT_NAME_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+    _MCP_SECTION_NAME = "MCP"
     _AGENTSDB_REPOSITORY_SECTION_NAME = "DATABASES"
     _AGENTSDB_REPOSITORY_SECTION_KEY = "agentsdb_repository"
     _TREE_AGENTSDB_URI_PATTERN = re.compile(
@@ -106,6 +108,7 @@ class TreeDataPersistenceService:
         "PROJECTS",
         "RUNTIME",
         "ENV",
+        "MCP",
         "TEMPLATES",
         "DATABASES",
         "CHAT_HISTORY",
@@ -127,6 +130,17 @@ class TreeDataPersistenceService:
         {"section": "GENERATED_DATA", "key": "generated_files", "kind": "directory_index", "dir_name": "generated", "pattern": "*"},
         {"section": "CHAT_HISTORY", "key": "chat_history", "kind": "chat_history"},
     )
+    _DEFAULT_SECTION_ALLOWLIST: tuple[str, ...] = (
+        "PROJECTS",
+        "RUNTIME",
+        "ENV",
+        "MCP",
+        "DATABASES",
+        "CHAT_HISTORY",
+    )
+    _DEFAULT_HISTORY_RETENTION_DAYS = 28
+    _DEFAULT_HISTORY_MAX_ITEMS = 2000
+    _HISTORY_SECTION_NAMES: tuple[str, ...] = ("CHAT_HISTORY", "HISTORY")
 
     def __init__(self, app_data_dir: Path) -> None:
         self._app_data_dir = app_data_dir
@@ -344,9 +358,10 @@ class TreeDataPersistenceService:
         if not uri:
             return None, None
         if uri.lower().startswith("agentsdb://"):
-            if AgentDbSocketRepository is None:
+            repository_class = UiAgentDbSocketRepository or AgentDbSocketRepository
+            if repository_class is None:
                 return None, None
-            return runtime_config, AgentDbSocketRepository.create_from_uri(uri, database_name)
+            return runtime_config, repository_class.create_from_uri(uri, database_name)
         if KnowledgeRepository is None:
             return None, None
         return runtime_config, KnowledgeRepository.create_from_uri(uri, database_name)
@@ -472,6 +487,120 @@ class TreeDataPersistenceService:
             normalized_data.setdefault(section_name, {})
 
         return normalized_data
+
+    def _tree_section_allowlist(self) -> set[str]:
+        raw_value = str(os.getenv("AI_IDE_TREE_SECTION_ALLOWLIST", "")).strip()
+        if raw_value:
+            candidates = re.split(r"[\s,]+", raw_value)
+            return {item.strip().upper() for item in candidates if item.strip()}
+        return set(self._DEFAULT_SECTION_ALLOWLIST)
+
+    def _history_retention_days(self) -> int:
+        raw_value = str(os.getenv("AI_IDE_TREE_HISTORY_DAYS", str(self._DEFAULT_HISTORY_RETENTION_DAYS))).strip()
+        try:
+            return max(0, int(raw_value))
+        except Exception:
+            return self._DEFAULT_HISTORY_RETENTION_DAYS
+
+    def _history_max_entries(self) -> int:
+        raw_value = str(os.getenv("AI_IDE_TREE_HISTORY_MAX_ITEMS", str(self._DEFAULT_HISTORY_MAX_ITEMS))).strip()
+        try:
+            return max(0, int(raw_value))
+        except Exception:
+            return self._DEFAULT_HISTORY_MAX_ITEMS
+
+    def _parse_history_timestamp(self, entry: Mapping[str, Any]) -> datetime | None:
+        for key in ("timestamp", "updated_at", "created_at", "time", "date"):
+            value = entry.get(key)
+            if value is None:
+                continue
+            if isinstance(value, (int, float)):
+                try:
+                    return datetime.fromtimestamp(float(value), timezone.utc)
+                except Exception:
+                    continue
+            if not isinstance(value, str):
+                value = str(value)
+            text = value.strip()
+            if not text:
+                continue
+            if text.endswith("Z"):
+                text = f"{text[:-1]}+00:00"
+            try:
+                parsed = datetime.fromisoformat(text)
+            except Exception:
+                parsed = None
+            if parsed is None:
+                for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+                    try:
+                        parsed = datetime.strptime(text, fmt)
+                        break
+                    except Exception:
+                        continue
+            if parsed is None:
+                continue
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return parsed.astimezone(timezone.utc)
+        return None
+
+    def _trim_history_entries(self, entries: list[Any]) -> list[Any]:
+        retention_days = self._history_retention_days()
+        max_entries = self._history_max_entries()
+        cutoff = None
+        if retention_days > 0:
+            cutoff = datetime.now(timezone.utc) - timedelta(days=retention_days)
+
+        filtered: list[Any] = []
+        for entry in entries:
+            if not isinstance(entry, dict):
+                filtered.append(entry)
+                continue
+            if cutoff is None:
+                filtered.append(entry)
+                continue
+            timestamp = self._parse_history_timestamp(entry)
+            if timestamp is None or timestamp >= cutoff:
+                filtered.append(entry)
+
+        if max_entries > 0 and len(filtered) > max_entries:
+            filtered = filtered[-max_entries:]
+        return filtered
+
+    def _trim_history_section(self, section_payload: dict[str, Any]) -> dict[str, Any]:
+        trimmed_payload: dict[str, Any] = {}
+        for key, value in section_payload.items():
+            if isinstance(value, list):
+                trimmed_payload[key] = self._trim_history_entries(value)
+            else:
+                trimmed_payload[key] = value
+        return trimmed_payload
+
+    def _prune_projects_section(self, section_payload: dict[str, Any]) -> dict[str, Any]:
+        storage_payload = section_payload.get("tree_widget_storage")
+        if isinstance(storage_payload, dict):
+            return {"tree_widget_storage": dict(storage_payload)}
+        return {"tree_widget_storage": {}}
+
+    def _filter_tree_sections(self, data: dict[str, Any]) -> dict[str, Any]:
+        normalized_data = self._normalize_tree_data_structure(data)
+        allowed_sections = self._tree_section_allowlist()
+        filtered: dict[str, Any] = {}
+
+        for section_name, section_payload in normalized_data.items():
+            if section_name not in allowed_sections:
+                continue
+            payload = section_payload if isinstance(section_payload, dict) else {}
+            if section_name == "PROJECTS":
+                payload = self._prune_projects_section(payload)
+            if section_name in self._HISTORY_SECTION_NAMES:
+                payload = self._trim_history_section(payload)
+            filtered[section_name] = dict(payload)
+
+        for section_name in allowed_sections:
+            filtered.setdefault(section_name, {})
+
+        return filtered
 
     def _projection_app_data_dir_list(self) -> list[Path]:
         candidate_dir_list: list[Path] = []
@@ -1399,10 +1528,33 @@ class TreeDataPersistenceService:
                 merged_data[section_name] = target_section_payload
             for projection_key, projection_value in section_payload.items():
                 target_section_payload[projection_key] = projection_value
+        merged_data[self._MCP_SECTION_NAME] = self._load_mcp_projection_section_from_env(merged_data)
         return self._apply_tree_storage_projection_policy(merged_data)
 
+    def _load_mcp_projection_section_from_env(self, data: dict[str, Any]) -> dict[str, Any]:
+        env_projection_payload = self._env_projection_payload_from_tree_data(data)
+        if not isinstance(env_projection_payload, dict):
+            return {}
+
+        section_payload_map = env_projection_payload.get("sections")
+        if not isinstance(section_payload_map, dict):
+            return {}
+
+        mcp_payload = section_payload_map.get("mcp")
+        if not isinstance(mcp_payload, dict):
+            for section_name, section_payload in section_payload_map.items():
+                if str(section_name or "").strip().lower() == "mcp" and isinstance(section_payload, dict):
+                    mcp_payload = section_payload
+                    break
+
+        if not isinstance(mcp_payload, dict):
+            return {}
+        return {"mcp": dict(mcp_payload)}
+
     def _apply_tree_storage_projection_policy(self, data: dict[str, Any]) -> dict[str, Any]:
-        normalized_data = self._normalize_tree_data_structure(data)
+        normalized_data = self._filter_tree_sections(data)
+        if "PROJECTS" not in normalized_data:
+            return normalized_data
         projects_payload = normalized_data.get("PROJECTS")
         if not isinstance(projects_payload, dict):
             projects_payload = {}
@@ -1613,10 +1765,12 @@ class TreeDataPersistenceService:
         normalized_data = self._normalize_tree_data_structure(data)
         section_payload = normalized_data.get(self._AGENTSDB_REPOSITORY_SECTION_NAME)
         if not isinstance(section_payload, dict):
+            normalized_data[self._MCP_SECTION_NAME] = {}
             return normalized_data
         stripped_section_payload = dict(section_payload)
         stripped_section_payload.pop(self._AGENTSDB_REPOSITORY_SECTION_KEY, None)
         normalized_data[self._AGENTSDB_REPOSITORY_SECTION_NAME] = stripped_section_payload
+        normalized_data[self._MCP_SECTION_NAME] = {}
         return normalized_data
 
     def _overlay_agentsdb_repository_sections(
@@ -2485,6 +2639,8 @@ QScrollBar::add-page, QScrollBar::sub-page {
 }
 """
 
+_LOCAL_ICON_CACHE: dict[str, QIcon | None] = {}
+
 def _icon(name: str) -> QIcon:
     """Import-safe icon loader.
 
@@ -2505,9 +2661,17 @@ def _icon(name: str) -> QIcon:
     if s.startswith("http://") or s.startswith("https://"):
         return _icon_from_url(s)
 
+    if s in _LOCAL_ICON_CACHE:
+        cached_icon = _LOCAL_ICON_CACHE.get(s)
+        return QIcon(cached_icon) if isinstance(cached_icon, QIcon) else QIcon()
+
     p = Path(__file__).with_name("symbols") / s
     if p.is_file():
-        return QIcon(str(p))
+        icon = QIcon(str(p))
+        _LOCAL_ICON_CACHE[s] = icon
+        return QIcon(icon)
+
+    _LOCAL_ICON_CACHE[s] = None
     return QIcon()
 
 
@@ -2819,22 +2983,18 @@ class JsonTreeWidgetWithToolbar(QWidget):
 # ------------------------- JsonTreeWidget -------------------------------
 class JsonTreeWidget(QTreeWidget):
     _DEFAULT_ROOT_SECTION_LAYOUT: tuple[tuple[str, bool], ...] = (
-        ("PROJECTS", False),
-        ("RUNTIME", True),
-        ("ENV", True),
-        ("TEMPLATES", True),
-        ("DATABASES", True),
+        ("RUNTIME", False),
         ("CHAT_HISTORY", True),
-        ("DOCUMENTS", True),
-        ("RUNTIME_VIEWS", True),
-        ("DISPATCHER_DB", True),
-        ("GENERATED_DATA", True),
-        ("HISTORY", True),
+        ("DATABASES", True),
+        ("ENV", True),
+        ("MCP", True),
+        ("PROJECTS", True),
     )
-    _SMALL_FONT_SECTION_NAMES: set[str] = {"PROJECTS", "CHAT_HISTORY", "HISTORY"}
+    _SMALL_FONT_SECTION_NAMES: set[str] = {"PROJECTS", "CHAT_HISTORY"}
     _HISTORY_SECTION_NAMES: set[str] = {"CHAT_HISTORY", "HISTORY"}
     _TREE_ICON_SIZE = QSize(18, 18)
     _TREE_INDENTATION = 12
+    _initial_load_async_result_ready = Signal(object)
 
     def minimumSizeHint(self) -> QSize:
         return QSize(0, 0)
@@ -2870,8 +3030,10 @@ class JsonTreeWidget(QTreeWidget):
         self._push_update_timer: QTimer | None = None
         self._push_update_pending: tuple[Any, Any] | None = None
         self._push_update_apply_in_flight = False
+        self._initial_load_inflight = False
         app_data_dir = Path(__file__).parent.parent / "AppData"
         self._persistence_service = TreeDataPersistenceService(app_data_dir)
+        self._initial_load_async_enabled = self._initial_tree_load_async_enabled()
         self._initialize_live_sync_diagnostic()
         
         # Store data for each section separately
@@ -2886,6 +3048,7 @@ class JsonTreeWidget(QTreeWidget):
         self._item_kind: dict[QTreeWidgetItem, str] = {}
         self._item_badge: dict[QTreeWidgetItem, str] = {}
         self._lazy_children: dict[QTreeWidgetItem, tuple[Any, str | None]] = {}
+        self._linked_root_expand_sync_in_flight = False
 
         self._style_template = """
                QTreeWidget, QTreeView {{
@@ -2933,18 +3096,77 @@ class JsonTreeWidget(QTreeWidget):
         # Enable context menu
         self.setContextMenuPolicy(Qt.CustomContextMenu)
         self.customContextMenuRequested.connect(self._show_context_menu)
+        self._initial_load_async_result_ready.connect(self._handle_initial_tree_load_result)
         
         # Initialize default root sections
         self._initialize_root_sections()
 
         # Connect signal for handling item edits (after initial load).
         self.itemExpanded.connect(self._on_item_expanded)
+        self.itemCollapsed.connect(self._on_item_collapsed)
         self.itemChanged.connect(self._on_item_changed)
         self._remember_tree_texts()
         self._initializing = False
         self._update_live_sync_cursor()
         self.destroyed.connect(self._handle_widget_destroyed)
+        if self._initial_load_async_enabled:
+            self._start_initial_tree_load_async()
         self._start_live_sync_transport()
+
+    def _initial_tree_load_async_enabled(self) -> bool:
+        value = str(os.getenv("AI_IDE_TREE_INITIAL_LOAD_ASYNC", "1") or "1").strip().lower()
+        return value not in {"0", "false", "no", "off"}
+
+    def _start_initial_tree_load_async(self) -> None:
+        if self._initial_load_inflight:
+            return
+        self._initial_load_inflight = True
+
+        def _worker() -> None:
+            try:
+                loaded_data, backend_name, source = self._persistence_service.load_data()
+                payload = {
+                    "ok": True,
+                    "loaded_data": loaded_data,
+                    "backend_name": str(backend_name or "memory"),
+                    "source": str(source or ""),
+                }
+            except Exception as exc:
+                payload = {
+                    "ok": False,
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+            try:
+                self._initial_load_async_result_ready.emit(payload)
+            except RuntimeError:
+                return
+
+        threading.Thread(target=_worker, name="tree-initial-load", daemon=True).start()
+
+    @Slot(object)
+    def _handle_initial_tree_load_result(self, payload: object) -> None:
+        self._initial_load_inflight = False
+        if not isinstance(payload, dict):
+            return
+
+        if not bool(payload.get("ok")):
+            error_text = str(payload.get("error") or "").strip()
+            if error_text:
+                print(f"[INFO] Could not load tree data (async init): {error_text}")
+            return
+
+        loaded_data = payload.get("loaded_data")
+        if not isinstance(loaded_data, dict):
+            return
+
+        backend_name = str(payload.get("backend_name") or "memory")
+        source = str(payload.get("source") or "")
+        self._apply_loaded_tree_data(
+            loaded_data,
+            backend_name=backend_name,
+            source=source,
+            log_message=backend_name != "memory",
+        )
 
     def _initialize_live_sync_diagnostic(self) -> None:
         self._live_sync_diagnostic = {
@@ -3078,7 +3300,10 @@ class JsonTreeWidget(QTreeWidget):
         self._item_last_text = {}
         self._data = {}
 
+        allowed_sections = self._persistence_service._tree_section_allowlist()
         for section_name, collapsed in self._DEFAULT_ROOT_SECTION_LAYOUT:
+            if section_name not in allowed_sections:
+                continue
             section = self._add_root_section(section_name, collapsed=collapsed)
             if isinstance(expanded_sections, dict) and section_name in expanded_sections:
                 section.setExpanded(bool(expanded_sections.get(section_name)))
@@ -3092,7 +3317,7 @@ class JsonTreeWidget(QTreeWidget):
         source: str,
         log_message: bool = True,
     ) -> None:
-        normalized_loaded_data = self._persistence_service._normalize_tree_data_structure(loaded_data)
+        normalized_loaded_data = self._persistence_service._filter_tree_sections(loaded_data)
         payload = json.dumps(normalized_loaded_data, ensure_ascii=False, sort_keys=True)
         self._last_saved_hash = hashlib.sha256(payload.encode("utf-8")).hexdigest()
         expanded_sections = {
@@ -3105,7 +3330,10 @@ class JsonTreeWidget(QTreeWidget):
         self.blockSignals(True)
         try:
             self._reset_tree_view_state(expanded_sections=expanded_sections)
+            allowed_sections = self._persistence_service._tree_section_allowlist()
             for section_name, section_data in normalized_loaded_data.items():
+                if section_name not in allowed_sections:
+                    continue
                 if section_name not in self._root_sections:
                     section = self._add_root_section(section_name)
                     if section_name in expanded_sections:
@@ -3351,7 +3579,7 @@ class JsonTreeWidget(QTreeWidget):
             backoff_seconds=0.0,
         )
 
-        normalized_loaded_data = self._persistence_service._normalize_tree_data_structure(loaded_data)
+        normalized_loaded_data = self._persistence_service._filter_tree_sections(loaded_data)
         payload_hash = hashlib.sha256(
             json.dumps(normalized_loaded_data, ensure_ascii=False, sort_keys=True).encode("utf-8")
         ).hexdigest()
@@ -3494,7 +3722,22 @@ class JsonTreeWidget(QTreeWidget):
 
     def _should_lazy_load_children(self, section_name: str | None, value: Any) -> bool:
         section_upper = (section_name or "").upper()
-        return section_upper in self._HISTORY_SECTION_NAMES and isinstance(value, (dict, list, tuple)) and bool(value)
+        if not isinstance(value, (dict, list, tuple)) or not value:
+            return False
+        if section_upper in self._HISTORY_SECTION_NAMES:
+            return True
+
+        raw_threshold = str(os.getenv("AI_IDE_TREE_LAZY_CHILDREN_THRESHOLD", "24") or "24").strip()
+        try:
+            lazy_threshold = int(raw_threshold)
+        except Exception:
+            lazy_threshold = 24
+        lazy_threshold = max(4, min(lazy_threshold, 500))
+
+        child_count = len(value)
+        if section_upper in {"DATABASES", "PROJECTS", "RUNTIME", "ENV", "MCP"} and child_count >= lazy_threshold:
+            return True
+        return False
 
     def _add_lazy_placeholder(self, item: QTreeWidgetItem, value: Any, section_name: str | None) -> None:
         placeholder = QTreeWidgetItem(["..."])
@@ -3504,6 +3747,7 @@ class JsonTreeWidget(QTreeWidget):
 
     @Slot(QTreeWidgetItem)
     def _on_item_expanded(self, item: QTreeWidgetItem) -> None:
+        self._sync_linked_root_section_expansion(item, expanded=True)
         lazy_payload = self._lazy_children.pop(item, None)
         if lazy_payload is None:
             return
@@ -3519,6 +3763,28 @@ class JsonTreeWidget(QTreeWidget):
                 item.addChild(self._build_item(index, child_value, section_name=section_name))
 
         self._remember_item_texts_recursive(item)
+
+    @Slot(QTreeWidgetItem)
+    def _on_item_collapsed(self, item: QTreeWidgetItem) -> None:
+        self._sync_linked_root_section_expansion(item, expanded=False)
+
+    def _sync_linked_root_section_expansion(self, item: QTreeWidgetItem, *, expanded: bool) -> None:
+        if self._linked_root_expand_sync_in_flight:
+            return
+        section_name = self._resolve_section_name_for_item(item)
+        if section_name not in {"ENV", "MCP"}:
+            return
+
+        linked_section_name = "MCP" if section_name == "ENV" else "ENV"
+        linked_item = self._root_sections.get(linked_section_name)
+        if linked_item is None or linked_item is item or bool(linked_item.isExpanded()) == bool(expanded):
+            return
+
+        self._linked_root_expand_sync_in_flight = True
+        try:
+            linked_item.setExpanded(bool(expanded))
+        finally:
+            self._linked_root_expand_sync_in_flight = False
 
     def _remember_tree_texts(self) -> None:
         for section in self._root_sections.values():
@@ -3556,6 +3822,7 @@ class JsonTreeWidget(QTreeWidget):
             "PROJECTS": "deployed_code.svg",
             "RUNTIME": "deployed_code.svg",
             "ENV": "variable_add_26dp_E3E3E3_FILL0_wght600_GRAD0_opsz24.svg",
+            "MCP": "network_node_24dp_E3E3E3_FILL0_wght400_GRAD0_opsz24.svg",
             "TEMPLATES": "schema_25dp_B7B7B7_FILL0_wght500_GRAD0_opsz24.svg",
             "DATABASES": "database_25dp_B7B7B7_FILL0_wght500_GRAD0_opsz24.svg",
             "CHAT_HISTORY": "load_content.svg",
@@ -3569,6 +3836,11 @@ class JsonTreeWidget(QTreeWidget):
     def _item_base_icon_name(self, item: QTreeWidgetItem) -> str:
         kind = self._item_kind.get(item, "")
         depth = self._item_depth(item)
+        section_name = (self._resolve_section_name_for_item(item) or "").upper()
+        item_key = self._extract_item_key_from_text(item.text(0)).strip().lower()
+
+        if section_name == "ENV" and item_key == "mcp":
+            return "network_node_24dp_E3E3E3_FILL0_wght400_GRAD0_opsz24.svg"
 
         # Special-case: items directly under the HISTORY section should use a history icon.
         try:
@@ -4107,8 +4379,11 @@ class JsonTreeWidget(QTreeWidget):
             self._add_root_section(section_name, collapsed=collapsed)
             self._data[section_name] = {}
         
-        # Load previously saved data if available
-        self._load_data()
+        # Load previously saved data if available.
+        # This can be expensive when repository projection is active, so keep
+        # startup responsive by loading asynchronously unless explicitly disabled.
+        if not self._initial_load_async_enabled:
+            self._load_data()
 
         # Ensure root headers match current theme settings.
         self._update_root_section_header_styles()
@@ -4846,6 +5121,7 @@ class JsonTreeWidget(QTreeWidget):
                 "PROJECTS": {},
                 "RUNTIME": {},
                 "ENV": {},
+                "MCP": {},
                 "TEMPLATES": {},
                 "DATABASES": {},
                 "CHAT_HISTORY": {},

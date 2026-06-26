@@ -619,10 +619,12 @@ class AgentsDbDocumentBackend:
                             backend_uri=agents_db_uri,
                             default_database_name=database_name,
                             memory_image_path=self._config.memory_image_path,
+                            prefer_ui_socket_repository=True,
                         )
                     ).load_repository()
                 else:
-                    socket_repository = AgentDbSocketRepository.create_from_uri(agents_db_uri, database_name)
+                    socket_repository_class = UiAgentDbSocketRepository or AgentDbSocketRepository
+                    socket_repository = socket_repository_class.create_from_uri(agents_db_uri, database_name)
                 # Validate socket reachability before selecting this backend.
                 socket_repository.ensure_index_objects()
                 self._repository = socket_repository
@@ -661,7 +663,7 @@ class AgentsDbDocumentBackend:
         repository_type = type(repository).__name__ if repository is not None else None
         backend_mode = "unavailable"
         effective_uri = ""
-        if repository_type == "AgentDbSocketRepository":
+        if repository_type in {"AgentDbSocketRepository", "UiAgentDbSocketRepository"}:
             backend_mode = "socket"
             effective_uri = str(self._config.agents_db_uri or "").strip()
         elif repository_type == "KnowledgeRepository":
@@ -2636,15 +2638,22 @@ def adb_operation(
 class GraphToolService():
     _DEFAULT_TOOL_ID = "graph_view"
     _DEFAULT_SOURCE_URI = "agentsdb://127.0.0.1:2331/tools:graph_view"
+    _MCP_PROXY_SOURCE_URI_ENV_NAMES: tuple[str, ...] = (
+        "AI_IDE_MCP_CONNECTION_PROXY_URI",
+        "ALDE_MCP_CONNECTION_PROXY_URI",
+    )
 
     def _json_result(self, payload: dict[str, Any]) -> str:
         return json.dumps(payload, ensure_ascii=False, default=str)
 
     def _error_result(self, error_code: str, detail: str | None = None) -> str:
+        normalized_error_code = str(error_code or "graph_view_failed")
         payload: dict[str, Any] = {
             "ok": False,
+            "status": "error",
             "tool": self._DEFAULT_TOOL_ID,
-            "error": str(error_code or "graph_view_failed"),
+            "error": normalized_error_code,
+            "error_status": normalized_error_code,
         }
         if detail:
             payload["detail"] = str(detail)
@@ -2659,6 +2668,14 @@ class GraphToolService():
         normalized_source_uri = str(source_uri or "").strip()
         if normalized_source_uri:
             return normalized_source_uri
+
+        os.environ.setdefault("AI_IDE_MCP_CONNECTION_PROXY_URI", self._DEFAULT_SOURCE_URI)
+        os.environ.setdefault("ALDE_MCP_CONNECTION_PROXY_URI", str(os.getenv("AI_IDE_MCP_CONNECTION_PROXY_URI", "")).strip() or self._DEFAULT_SOURCE_URI)
+
+        for env_name in self._MCP_PROXY_SOURCE_URI_ENV_NAMES:
+            configured_proxy_uri = str(os.getenv(env_name, "")).strip()
+            if configured_proxy_uri:
+                return configured_proxy_uri
 
         runtime_uri = str(os.getenv("AI_IDE_KNOWLEDGE_AGENTS_DB_URI", "")).strip()
         if runtime_uri.lower().startswith("agentsdb://"):
@@ -2850,6 +2867,9 @@ class GraphToolService():
         selected_kind: str | None = None,
         selected_object_id: str | None = None,
         include_connection_preview: bool | None = False,
+        relation_limit: int | None = None,
+        entity_limit: int | None = None,
+        catalog_limit: int | None = None,
     ) -> str:
         resolved_tool_id = str(tool_id or self._DEFAULT_TOOL_ID).strip() or self._DEFAULT_TOOL_ID
         resolved_selected_kind = str(selected_kind or "").strip().lower()
@@ -2872,7 +2892,14 @@ class GraphToolService():
 
         try:
             snapshot_payload = dict(
-                graph_service.load_widget_snapshot(tool_id=resolved_tool_id, source_uri=resolved_source_uri) or {}
+                graph_service.load_widget_snapshot(
+                    tool_id=resolved_tool_id,
+                    source_uri=resolved_source_uri,
+                    relation_limit=relation_limit,
+                    entity_limit=entity_limit,
+                    catalog_limit=catalog_limit,
+                )
+                or {}
             )
         except Exception as exc:
             return self._error_result("agent_relation_graph_load_failed", detail=f"{type(exc).__name__}: {exc}")
@@ -2903,6 +2930,7 @@ class GraphToolService():
 
         result_payload: dict[str, Any] = {
             "ok": True,
+            "status": "ok",
             "tool": self._DEFAULT_TOOL_ID,
             "tool_id": str(snapshot_payload.get("tool_id") or resolved_tool_id),
             "source_uri": str(snapshot_payload.get("source_uri") or resolved_source_uri),
@@ -2983,6 +3011,63 @@ class GraphToolService():
 GRAPH_TOOL_SERVICE = GraphToolService()
 
 
+class RuntimeArtifactToolService():
+    _DEFAULT_TOOL_ID = "agent_relation_graph"
+
+    def _json_result(self, payload: dict[str, Any]) -> str:
+        return json.dumps(payload, ensure_ascii=False, default=str)
+
+    def _error_result(self, error_code: str, detail: str | None = None) -> str:
+        payload: dict[str, Any] = {
+            "ok": False,
+            "tool": "adb_runtime_artifact_bundle",
+            "error": str(error_code or "runtime_artifact_bundle_failed"),
+        }
+        if detail:
+            payload["detail"] = str(detail)
+        return self._json_result(payload)
+
+    def _load_graph_service(self) -> Any:
+        if GraphViewService is None:
+            raise RuntimeError("graph_view_service_unavailable")
+        return GraphViewService()
+
+    def execute_tool(
+        self,
+        source_uri: str | None = None,
+        tool_id: str | None = None,
+    ) -> str:
+        resolved_tool_id = str(tool_id or self._DEFAULT_TOOL_ID).strip() or self._DEFAULT_TOOL_ID
+
+        try:
+            graph_service = self._load_graph_service()
+        except Exception as exc:
+            return self._error_result("runtime_artifact_service_unavailable", detail=f"{type(exc).__name__}: {exc}")
+
+        try:
+            manifest_payload = dict(
+                graph_service.load_tool_runtime_manifest(tool_id=resolved_tool_id, source_uri=source_uri) or {}
+            )
+            download_payload = dict(
+                graph_service.load_runtime_artifact_download_payload(
+                    tool_id=resolved_tool_id,
+                    source_uri=source_uri,
+                    manifest_payload=manifest_payload,
+                )
+                or {}
+            )
+        except Exception as exc:
+            return self._error_result("runtime_artifact_bundle_load_failed", detail=f"{type(exc).__name__}: {exc}")
+
+        download_payload.setdefault("tool", "adb_runtime_artifact_bundle")
+        download_payload.setdefault("tool_id", resolved_tool_id)
+        download_payload.setdefault("source_uri", str(source_uri or "").strip())
+        return self._json_result(download_payload)
+
+
+RUNTIME_ARTIFACT_TOOL_SERVICE = RuntimeArtifactToolService()
+
+
 def adb_relation_graph(
     source_uri: str | None = None,
     tool_id: str | None = None,
@@ -2991,6 +3076,9 @@ def adb_relation_graph(
     selected_kind: str | None = None,
     selected_object_id: str | None = None,
     include_connection_preview: bool | None = False,
+    relation_limit: int | None = None,
+    entity_limit: int | None = None,
+    catalog_limit: int | None = None,
 ) -> str:
     return GRAPH_TOOL_SERVICE.execute_tool(
         source_uri=source_uri,
@@ -3000,6 +3088,35 @@ def adb_relation_graph(
         selected_kind=selected_kind,
         selected_object_id=selected_object_id,
         include_connection_preview=include_connection_preview,
+        relation_limit=relation_limit,
+        entity_limit=entity_limit,
+        catalog_limit=catalog_limit,
+    )
+
+
+def graph_view_analysis(
+    source_uri: str | None = None,
+    tool_id: str | None = None,
+    include_view_state: bool | None = True,
+    layout_spread: float | None = 1.0,
+    selected_kind: str | None = None,
+    selected_object_id: str | None = None,
+    include_connection_preview: bool | None = False,
+    relation_limit: int | None = None,
+    entity_limit: int | None = None,
+    catalog_limit: int | None = None,
+) -> str:
+    return GRAPH_TOOL_SERVICE.execute_tool(
+        source_uri=source_uri,
+        tool_id=tool_id,
+        include_view_state=include_view_state,
+        layout_spread=layout_spread,
+        selected_kind=selected_kind,
+        selected_object_id=selected_object_id,
+        include_connection_preview=include_connection_preview,
+        relation_limit=relation_limit,
+        entity_limit=entity_limit,
+        catalog_limit=catalog_limit,
     )
 
 
@@ -3010,6 +3127,9 @@ def adb_graph_service(
     selected_kind: str | None = None,
     selected_object_id: str | None = None,
     include_connection_preview: bool | None = False,
+    relation_limit: int | None = None,
+    entity_limit: int | None = None,
+    catalog_limit: int | None = None,
 ) -> str:
     """Backend-facing graph service wrapper used by engine tool calls.
 
@@ -3029,7 +3149,7 @@ def adb_graph_service(
     ).strip()
     resolved_source_uri = str(backend_payload.get("source_uri") or "").strip() or None
 
-    resolved_tool_id = "relation_graph_view"
+    resolved_tool_id = "graph_view"
     if tool_path:
         normalized_path = tool_path.strip()
         if ":" in normalized_path:
@@ -3047,6 +3167,9 @@ def adb_graph_service(
         selected_kind=selected_kind,
         selected_object_id=selected_object_id,
         include_connection_preview=include_connection_preview,
+        relation_limit=relation_limit,
+        entity_limit=entity_limit,
+        catalog_limit=catalog_limit,
     )
 
 
@@ -3058,6 +3181,9 @@ def adb_relation_graph_payload(
     selected_kind: str | None = None,
     selected_object_id: str | None = None,
     include_connection_preview: bool | None = False,
+    relation_limit: int | None = None,
+    entity_limit: int | None = None,
+    catalog_limit: int | None = None,
 ) -> dict[str, Any]:
     """Return the parsed dict payload for the relation graph tool.
 
@@ -3074,6 +3200,9 @@ def adb_relation_graph_payload(
             selected_kind=selected_kind,
             selected_object_id=selected_object_id,
             include_connection_preview=include_connection_preview,
+            relation_limit=relation_limit,
+            entity_limit=entity_limit,
+            catalog_limit=catalog_limit,
         )
     except Exception as exc:
         return {
@@ -3112,6 +3241,16 @@ def adb_relation_graph_payload(
         "error": "graph_tool_invalid_payload",
         "detail": f"payload_type={type(raw_payload).__name__}",
     }
+
+
+def adb_runtime_artifact_bundle(
+    source_uri: str | None = None,
+    tool_id: str | None = None,
+) -> str:
+    return RUNTIME_ARTIFACT_TOOL_SERVICE.execute_tool(
+        source_uri=source_uri,
+        tool_id=tool_id,
+    )
 
 
 def diagnose_dispatch_backend(*, db_path: str | None = None, emit: bool = False) -> dict[str, Any]:
@@ -7803,7 +7942,9 @@ _TOOL_IMPLEMENTATIONS: dict[str, Callable | None] = {
     "vdb_worker": vdb_worker,
     "adb_operation": adb_operation,
     "adb_relation_graph": adb_relation_graph,
+    "graph_view_analysis": graph_view_analysis,
     "adb_graph_service": adb_graph_service,
+    "adb_runtime_artifact_bundle": adb_runtime_artifact_bundle,
     "adb_knowledge_worker": adb_worker,
     "adb_knowledge_query": adb_query,
     "repo_knowledge_worker": adb_worker,
@@ -7898,6 +8039,20 @@ def _build_unified_tools() -> list[ToolSpec]:
                     ParamSpec(name="include_connection_preview", type="boolean", description="Include connection/tool preview metadata.", required=False, default=True),
                 ],
                 implementation=adb_graph_service,
+                final_result=False,
+                tool_response_required=True,
+            )
+        )
+    if not any(spec.name == "adb_runtime_artifact_bundle" for spec in unified_tool_specs):
+        unified_tool_specs.append(
+            ToolSpec(
+                name="adb_runtime_artifact_bundle",
+                description="Return a download payload for a runtime artifact bundle so QWidget/Web helpers can be transferred over MCP tools/call.",
+                parameters=[
+                    ParamSpec(name="source_uri", type="string", description="Optional AgentsDB artifact endpoint URI.", required=False),
+                    ParamSpec(name="tool_id", type="string", description="Runtime artifact tool id to resolve.", required=False, default="agent_relation_graph"),
+                ],
+                implementation=adb_runtime_artifact_bundle,
                 final_result=False,
                 tool_response_required=True,
             )

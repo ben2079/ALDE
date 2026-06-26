@@ -9,7 +9,7 @@ from tempfile import TemporaryDirectory
 from PySide6.QtCore import QPoint, QPointF, QRect, Qt, QTimer
 from PySide6.QtGui import QWheelEvent
 from PySide6.QtWidgets import QHBoxLayout
-from PySide6.QtWidgets import QApplication, QLineEdit, QTabBar, QTabWidget, QToolButton, QWidget
+from PySide6.QtWidgets import QApplication, QLineEdit, QStackedWidget, QTabBar, QTabWidget, QToolButton, QWidget
 
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -23,6 +23,7 @@ from alde.ai_ide_v1756 import (
     ChatSegment,
     ChatWindow,
     CodeViewer,
+    ControlPlaneTabBar,
     ControlPlaneWidget,
     ExtensionsWorkspaceWidget,
     MsgWidget,
@@ -424,6 +425,9 @@ class TestChatWindowSegmentation(unittest.TestCase):
 
         harness._apply_runtime_tab_page_scheme(tab_page)
 
+        self.assertIn("QWidget#controlRuntimeTabPage", tab_page.styleSheet())
+        self.assertIn("background: transparent;", tab_page.styleSheet())
+        self.assertIn("QWidget#controlRuntimeTabPage > QSplitter#controlViewportSplitter", tab_page.styleSheet())
         self.assertIn("background: #0b0b0b;", tab_page.styleSheet())
 
         builder_panel = QWidget()
@@ -670,6 +674,43 @@ class TestControlPlaneBoardHelpers(unittest.TestCase):
         self.assertIn(runtime_tab, widget._runtime_tab_records)
         self.assertEqual(str(panel.property("runtime_widget_kind") or ""), widget._BOARD_ITEM_WIDGET_KIND)
         self.assertEqual(str(panel.property("runtime_board_item_title") or ""), "Monitoring Summary")
+        runtime_index = widget.tabs.indexOf(runtime_tab)
+        self.assertGreaterEqual(runtime_index, 0)
+        tab_color = widget.tabs.tabBar().tabTextColor(runtime_index).name().lower()
+        self.assertEqual(tab_color, "#ffd7ac")
+        self.assertTrue(widget.tabs.tabIcon(runtime_index).isNull())
+        self.assertIsInstance(widget.tabs.tabBar(), ControlPlaneTabBar)
+        tab_palette = widget.tabs.tabBar().tab_palette_for_index(runtime_index)
+        self.assertEqual(str(tab_palette.get("label_bg") or ""), "rgba(255, 140, 0, 0.24)")
+
+    def test_control_plane_surface_renders_rounded_border_under_tabs(self) -> None:
+        scheme = {
+            "col1": "#3a5fff",
+            "col2": "#6280ff",
+            "col5": "#1a1a1a",
+            "col6": "#e3e3de",
+            "col7": "#0b0b0b",
+            "col8": "#9a9a95",
+            "col9": "#101010",
+            "col10": "#303030",
+        }
+        widget = ControlPlaneWidget(dict(scheme), dict(scheme))
+        self.addCleanup(widget.deleteLater)
+        widget._refresh_timer.stop()
+        widget._runtime_state_save_timer.stop()
+        widget._control_tab_hover_marquee_timer.stop()
+
+        # Verify TabWidget itself has border applied
+        self.assertIsInstance(widget.tabs, QTabWidget)
+        self.assertTrue(widget.tabs.testAttribute(Qt.WA_StyledBackground))
+        
+        # Check TabWidget's local stylesheet contains visible border with bright blue on all sides
+        tabs_style = widget.tabs.styleSheet()
+        self.assertIn("QTabWidget#controlPlaneTabs", tabs_style)
+        self.assertIn("border: 2px solid", tabs_style)
+        self.assertIn("#3a5fff", tabs_style)  # Bright blue color
+        self.assertIn("border-radius: 14px;", tabs_style)
+        self.assertIn("background:", tabs_style)
 
     def test_build_section_uses_runtime_builder_widget_in_board_tabs(self) -> None:
         scheme = {

@@ -1,7 +1,7 @@
 from __future__ import annotations    ## ai_ide_v1756.py
 
 # Maintainer contact: see repository README.
-from PySide6.QtCore import QObject, QEvent
+from PySide6.QtCore import QObject, QEvent, QRect
 
 import os
 import sys
@@ -214,7 +214,7 @@ except Exception:
         return False
 
 from PySide6.QtCore import( Qt, QSize, Signal, Slot, QTimer, QEvent,
-                            QSettings, QByteArray, QPoint )            # >>>  NEU ai_ide_v1.7.5.py
+                            QSettings, QByteArray, QPoint, QPointF )            # >>>  NEU ai_ide_v1.7.5.py
 from PySide6 import QtCore
 
 from PySide6.QtGui import (
@@ -226,6 +226,7 @@ from PySide6.QtGui import (
     QDropEvent,
     QImage,
     QIntValidator,
+    QMouseEvent,
     QTextCursor,
     QTextOption,
     QFontMetrics,
@@ -4912,7 +4913,7 @@ class ControlPlaneWidget(QWidget):
         self._refresh_inflight = False
         self._refresh_pending = False
         self._refresh_pending_include_drilldown = False
-        self._tab_bar_label_max_chars = 10
+        self._tab_bar_label_max_chars = 8
         self._control_tab_hover_index = -1
         self._control_tab_hover_base_text = ""
         self._control_tab_hover_phase = 0
@@ -4949,6 +4950,21 @@ class ControlPlaneWidget(QWidget):
         self.tabs = tabs_widget
         self._apply_control_plane_tab_text_limits()
         self._setup_control_plane_tab_bar_interactions()
+
+    def _external_extensions_tab_text_setter(self):
+        tabs_widget = getattr(self, "tabs", None)
+        if not isinstance(tabs_widget, QTabWidget):
+            return None
+        if str(tabs_widget.objectName() or "") != "extensionsTabs":
+            return None
+
+        current_parent = tabs_widget.parentWidget()
+        while current_parent is not None:
+            setter = getattr(current_parent, "_set_extensions_tab_text", None)
+            if callable(setter):
+                return setter
+            current_parent = current_parent.parentWidget()
+        return None
 
     def _board_context_attribute_names(self) -> tuple[str, ...]:
         return (
@@ -5081,6 +5097,9 @@ class ControlPlaneWidget(QWidget):
 
     def _format_control_plane_tab_text(self, value: str) -> str:
         text = str(value or "")
+        external_setter = self._external_extensions_tab_text_setter()
+        if callable(external_setter):
+            return text
         max_chars_raw = getattr(self, "_tab_bar_label_max_chars", 10)
         try:
             max_chars = int(max_chars_raw)
@@ -5114,6 +5133,11 @@ class ControlPlaneWidget(QWidget):
         if isinstance(tab_bar, QTabBar):
             tab_bar.setTabData(index, full_text)
 
+        external_setter = self._external_extensions_tab_text_setter()
+        if callable(external_setter) and isinstance(tab_bar, QTabBar):
+            external_setter(tab_bar, index, full_text)
+            return
+
         self.tabs.setTabToolTip(index, "")
         self.tabs.setTabText(index, self._format_control_plane_tab_text(full_text))
 
@@ -5128,6 +5152,14 @@ class ControlPlaneWidget(QWidget):
             return
         tab_bar = self.tabs.tabBar()
         if not isinstance(tab_bar, QTabBar):
+            return
+        external_setter = self._external_extensions_tab_text_setter()
+        if callable(external_setter):
+            try:
+                tab_bar.removeEventFilter(self)
+            except Exception:
+                pass
+            self._clear_control_plane_tab_corner_widget()
             return
         tab_bar.setMouseTracking(True)
         tab_bar.installEventFilter(self)
@@ -6064,6 +6096,8 @@ class ControlPlaneWidget(QWidget):
         self._refresh_control_plane_tab_corner_menu()
 
     def eventFilter(self, obj, event):  # noqa: N802
+        if callable(self._external_extensions_tab_text_setter()):
+            return super().eventFilter(obj, event)
         if hasattr(self, "tabs") and obj is self.tabs.tabBar():
             event_type = event.type()
             if event_type == QEvent.MouseMove:
@@ -9057,7 +9091,7 @@ class ControlPlaneWidget(QWidget):
             " padding: 0px 28px 0px 9px;"
             " margin: 0px 2px 4px 0px;"
             " margin-bottom: 4px;"
-            " min-width: 64px;"
+            " min-width: 0px;"
             " min-height: 18px;"
             "}"
             "QTabBar#extensionsEmbeddedTabBar::tab:hover {"
@@ -9078,6 +9112,9 @@ class ControlPlaneWidget(QWidget):
             " height: 0px;"
             " margin: 0px;"
             " padding: 0px;"
+            "}"
+            "QTabBar#extensionsEmbeddedTabBar::scroller {"
+            " width: 0px;"
             "}"
             "QToolButton#extensionsEmbeddedTabCloseButton {"
             f" color: {palette['label_fg']};"
@@ -10328,6 +10365,9 @@ class ControlPlaneWidget(QWidget):
             QTabBar#extensionsEmbeddedTabBar::close-button {{
                 image: none;
                 width: 10px;
+            }}
+            QTabBar#extensionsEmbeddedTabBar::scroller {{
+                width: 0px;
             }}
             QToolButton#extensionsEmbeddedTabAddButton {{
                 color: {self.scheme['col8']};
@@ -12074,10 +12114,313 @@ class ExtensionArtifactService:
         return error_widget
 
 
+_TITLEBAR_URI_PROXY_DATA = "__window_titlebar_uri_proxy__"
+_WINDOW_FRAME_EMBEDDED_TAB_BAR_OBJECT_NAME = "windowFrameExtensionsEmbeddedTabBar"
+
+
+class ExtensionsWorkspaceTabBar(QTabBar):
+    URI_PROXY_DATA = "__window_titlebar_uri_proxy__"
+
+    def __init__(
+        self,
+        *args,
+        text_formatter: Callable[[str], str] | None = None,
+        tab_row_height: int = 18,
+        **kwargs,
+    ) -> None:
+        super().__init__(*args, **kwargs)
+        self._text_formatter = text_formatter
+        self._tab_row_height = max(18, int(tab_row_height))
+        self._titlebar_uri_mouse_target: QLineEdit | None = None
+        self.setLayoutDirection(Qt.RightToLeft)
+
+    def set_text_formatter(self, text_formatter: Callable[[str], str] | None) -> None:
+        self._text_formatter = text_formatter
+        self.updateGeometry()
+        self.update()
+
+    def set_tab_row_height(self, value: int) -> None:
+        resolved_height = max(18, int(value))
+        if resolved_height == self._tab_row_height:
+            return
+        self._tab_row_height = resolved_height
+        self.updateGeometry()
+        self.update()
+
+    def _stable_display_text(self, index: int) -> str:
+        if index < 0 or index >= self.count():
+            return ""
+        tab_data = self.tabData(index)
+        full_text = str(tab_data or self.tabText(index) or "")
+        formatter = self._text_formatter
+        if callable(formatter):
+            try:
+                return str(formatter(full_text) or "")
+            except Exception:
+                return full_text
+        return full_text
+
+    def _extra_button_width(self, index: int) -> int:
+        extra_width = 18
+        for side in (QTabBar.LeftSide, QTabBar.RightSide):
+            button = self.tabButton(index, side)
+            if not isinstance(button, QWidget):
+                continue
+            try:
+                button_width = max(int(button.sizeHint().width()), int(button.width()), 0)
+            except RuntimeError:
+                button_width = 0
+            if button_width > 0:
+                extra_width += button_width + 4
+        return extra_width
+
+    def _stable_tab_size_hint(self, index: int) -> QSize:
+        base_hint = super().tabSizeHint(index)
+        tab_data = self.tabData(index)
+        titlebar_proxy_mode = bool(self.property("extensions_titlebar_proxy_bar"))
+        if tab_data == type(self).URI_PROXY_DATA:
+            titlebar_button = self.tabButton(index, QTabBar.LeftSide)
+            if not isinstance(titlebar_button, QWidget):
+                titlebar_button = self.tabButton(index, QTabBar.RightSide)
+            if isinstance(titlebar_button, QWidget):
+                try:
+                    button_hint = titlebar_button.sizeHint()
+                except RuntimeError:
+                    button_hint = QSize(0, 0)
+                width = max(120, int(button_hint.width()) + 14)
+                if titlebar_proxy_mode:
+                    height = int(self._tab_row_height)
+                else:
+                    height = max(int(base_hint.height()), int(button_hint.height()), int(self._tab_row_height))
+                return QSize(width, height)
+        stable_text = self._stable_display_text(index)
+        text_width = max(self.fontMetrics().horizontalAdvance(stable_text), 12)
+        width = max(24, text_width + self._extra_button_width(index))
+        if titlebar_proxy_mode:
+            height = int(self._tab_row_height)
+        else:
+            height = max(int(base_hint.height()), int(self._tab_row_height))
+        return QSize(width, height)
+
+    def tabSizeHint(self, index: int) -> QSize:  # noqa: N802
+        return self._stable_tab_size_hint(index)
+
+    def minimumTabSizeHint(self, index: int) -> QSize:  # noqa: N802
+        return self._stable_tab_size_hint(index)
+
+    def _paint_titlebar_uri_tab_fill(self) -> None:
+        if not bool(self.property("extensions_titlebar_uri_mode")):
+            return
+        fill_color = QColor(str(self.property("extensions_titlebar_uri_fill") or "#101010"))
+        if not fill_color.isValid():
+            fill_color = QColor("#101010")
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(fill_color)
+        for index in range(self.count()):
+            if self.tabData(index) != type(self).URI_PROXY_DATA:
+                continue
+            tab_rect = self.tabRect(index).adjusted(1, 1, -1, -1)
+            if not tab_rect.isValid():
+                continue
+            painter.drawRoundedRect(tab_rect, 6, 6)
+        painter.end()
+
+    def paintEvent(self, event):  # noqa: N802
+        super().paintEvent(event)
+        self._paint_titlebar_uri_tab_fill()
+
+    def _resolve_titlebar_uri_mouse_target(self, local_pos: QPoint) -> tuple[QLineEdit, QPoint] | None:
+        if not bool(self.property("extensions_titlebar_uri_mode")):
+            return None
+        tab_index = self.tabAt(local_pos)
+        if tab_index < 0 or self.tabData(tab_index) != type(self).URI_PROXY_DATA:
+            return None
+        global_pos = self.mapToGlobal(local_pos)
+        for side in (QTabBar.LeftSide, QTabBar.RightSide):
+            tab_button = self.tabButton(tab_index, side)
+            if not isinstance(tab_button, QWidget):
+                continue
+            container_local = tab_button.mapFromGlobal(global_pos)
+            if not tab_button.rect().contains(container_local):
+                continue
+            handle = getattr(self, "_titlebar_uri_proxy_handle", None)
+            if isinstance(handle, QWidget):
+                handle_local = handle.mapFromGlobal(global_pos)
+                if handle.rect().contains(handle_local):
+                    return None
+            line_edit = tab_button.findChild(QLineEdit, "extensionsGraphUriInput")
+            if isinstance(line_edit, QLineEdit):
+                return line_edit, line_edit.mapFromGlobal(global_pos)
+        return None
+
+    def _forward_titlebar_uri_mouse_event(self, line_edit: QLineEdit, event) -> None:
+        global_pos = event.globalPosition().toPoint() if hasattr(event, "globalPosition") else event.globalPos()
+        local_pos = line_edit.mapFromGlobal(global_pos)
+        line_edit.setFocus(Qt.MouseFocusReason)
+        forwarded_event = QMouseEvent(
+            event.type(),
+            QPointF(local_pos),
+            QPointF(local_pos),
+            QPointF(global_pos),
+            event.button(),
+            event.buttons(),
+            event.modifiers(),
+        )
+        QApplication.sendEvent(line_edit, forwarded_event)
+
+    def mousePressEvent(self, event):  # noqa: N802
+        if event.button() == Qt.LeftButton:
+            uri_target = self._resolve_titlebar_uri_mouse_target(event.pos())
+            if uri_target is not None:
+                line_edit, _line_local_pos = uri_target
+                self._titlebar_uri_mouse_target = line_edit
+                self._forward_titlebar_uri_mouse_event(line_edit, event)
+                event.accept()
+                return
+        self._titlebar_uri_mouse_target = None
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):  # noqa: N802
+        if isinstance(self._titlebar_uri_mouse_target, QLineEdit) and (event.buttons() & Qt.LeftButton):
+            self._forward_titlebar_uri_mouse_event(self._titlebar_uri_mouse_target, event)
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):  # noqa: N802
+        if isinstance(self._titlebar_uri_mouse_target, QLineEdit):
+            self._forward_titlebar_uri_mouse_event(self._titlebar_uri_mouse_target, event)
+            self._titlebar_uri_mouse_target = None
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+
+class ExtensionsExternalUriLineEdit(QLineEdit):
+    menuRequested = Signal()
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._drag_candidate = False
+        self._drag_active = False
+        self._menu_request_on_release = False
+        self._suppress_next_release_menu = False
+        self._drag_start_global = QPoint()
+        self._drag_start_window = QPoint()
+        self._drag_press_local = QPoint()
+        self._drag_press_cursor_position = -1
+
+    def _try_system_move(self) -> bool:
+        top_window = self.window()
+        handle = top_window.windowHandle() if isinstance(top_window, QWidget) else None
+        if handle is None or not hasattr(handle, "startSystemMove"):
+            return False
+        try:
+            return bool(handle.startSystemMove())
+        except Exception:
+            return False
+
+    def _titlebar_tab_edit_mode_enabled(self) -> bool:
+        return bool(self.property("extensions_titlebar_uri_tab_mode"))
+
+    def _should_start_window_drag(self, current_local_pos: QPoint) -> bool:
+        if self._titlebar_tab_edit_mode_enabled():
+            return False
+        if self.hasSelectedText():
+            return False
+        return True
+
+    def mousePressEvent(self, event):  # noqa: N802
+        if self._titlebar_tab_edit_mode_enabled():
+            super().mousePressEvent(event)
+            return
+        if event.button() == Qt.LeftButton:
+            self._drag_candidate = True
+            self._drag_active = False
+            self._suppress_next_release_menu = False
+            self._menu_request_on_release = True
+            self._drag_start_global = event.globalPosition().toPoint()
+            top_window = self.window()
+            self._drag_start_window = top_window.frameGeometry().topLeft() if isinstance(top_window, QWidget) else QPoint()
+            self._drag_press_local = event.position().toPoint() if hasattr(event, "position") else event.pos()
+            try:
+                self._drag_press_cursor_position = int(self.cursorPositionAt(self._drag_press_local))
+            except Exception:
+                self._drag_press_cursor_position = -1
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):  # noqa: N802
+        if self._titlebar_tab_edit_mode_enabled():
+            super().mouseMoveEvent(event)
+            return
+        if self._drag_active and (event.buttons() & Qt.LeftButton):
+            delta = event.globalPosition().toPoint() - self._drag_start_global
+            top_window = self.window()
+            if isinstance(top_window, QWidget):
+                top_window.move(self._drag_start_window + delta)
+            event.accept()
+            return
+
+        if self._drag_candidate and (event.buttons() & Qt.LeftButton):
+            current_local_pos = event.position().toPoint() if hasattr(event, "position") else event.pos()
+            drag_distance = (current_local_pos - self._drag_press_local).manhattanLength()
+            if drag_distance >= QApplication.startDragDistance() and self._should_start_window_drag(current_local_pos):
+                self._drag_candidate = False
+                self._menu_request_on_release = False
+                if self._try_system_move():
+                    self._suppress_next_release_menu = True
+                    event.accept()
+                    return
+                self._drag_active = True
+                delta = event.globalPosition().toPoint() - self._drag_start_global
+                top_window = self.window()
+                if isinstance(top_window, QWidget):
+                    top_window.move(self._drag_start_window + delta)
+                event.accept()
+                return
+
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):  # noqa: N802
+        if self._titlebar_tab_edit_mode_enabled():
+            super().mouseReleaseEvent(event)
+            return
+        popup_requested = (
+            event.button() == Qt.LeftButton
+            and self._drag_candidate
+            and not self._drag_active
+            and self._menu_request_on_release
+            and not self._suppress_next_release_menu
+        )
+        self._drag_candidate = False
+        self._drag_active = False
+        self._menu_request_on_release = False
+        self._suppress_next_release_menu = False
+        super().mouseReleaseEvent(event)
+        if popup_requested:
+            self.menuRequested.emit()
+
+
 class ExtensionsWorkspaceWidget(QWidget):
     widgetStateChanged = Signal()
     _LOCAL_WIDGET_STATE_REL_PATH = "AppData/runtime_extensions_workspace.json"
     _START_TAB_TITLE = "Loadable Extensions"
+    _TAB_LABEL_MAX_VISIBLE_CHARS = 8
+
+    @classmethod
+    def _hide_titlebar_proxy_tab_for_text(cls, tab_text: str) -> bool:
+        raw_title = str(tab_text or "").strip().lower()
+        if not raw_title:
+            return False
+
+        normalized_title = raw_title.replace("<", "").replace(">", "").replace("/", "").strip()
+        if raw_title.startswith("loadable") or normalized_title.startswith("loadable"):
+            return True
+        if normalized_title in {"build", "builder"}:
+            return True
+        return False
 
     @staticmethod
     def _tab_category_for_text(tab_text: str) -> str:
@@ -12097,6 +12440,49 @@ class ExtensionsWorkspaceWidget(QWidget):
     @staticmethod
     def _tab_palette(category: str) -> dict[str, str]:
         return ControlPlaneWidget._control_monitor_splitter_palette(ControlPlaneWidget, category)
+
+    def _format_extensions_tab_text(self, value: str) -> str:
+        text = str(value or "")
+        visible_limit = max(0, int(getattr(self, "_tab_label_max_visible_chars", self._TAB_LABEL_MAX_VISIBLE_CHARS)))
+
+        if not text:
+            return ""
+        if visible_limit <= 0:
+            return text
+        if len(text) <= visible_limit:
+            return text
+        return "".join(list(text)[:visible_limit])
+
+    def _extensions_tab_full_text(self, tab_bar: QTabBar, index: int) -> str:
+        if index < 0 or index >= tab_bar.count():
+            return ""
+        tab_data = tab_bar.tabData(index)
+        if isinstance(tab_data, str) and tab_data:
+            return tab_data
+        return str(tab_bar.tabText(index) or "")
+
+    def _set_extensions_tab_text(self, tab_bar: QTabBar, index: int, value: str) -> None:
+        if index < 0 or index >= tab_bar.count():
+            return
+
+        full_text = str(value or "")
+        tab_bar.setTabData(index, full_text)
+        tab_bar.setTabText(index, self._format_extensions_tab_text(full_text))
+
+        try:
+            source_tab_bar = self.extensions_tabs.tabBar()
+        except RuntimeError:
+            source_tab_bar = None
+        if isinstance(source_tab_bar, QTabBar) and tab_bar is source_tab_bar:
+            self.extensions_tabs.setTabToolTip(index, full_text)
+
+    def _is_extensions_tab_bar(self, tab_bar: QTabBar) -> bool:
+        try:
+            if tab_bar is self.extensions_tabs.tabBar():
+                return True
+        except RuntimeError:
+            return False
+        return bool(tab_bar.property("extensions_embedded_tab_bar"))
 
     def __init__(
         self,
@@ -12122,29 +12508,67 @@ class ExtensionsWorkspaceWidget(QWidget):
         self._initial_tool_id = str(initial_tool_id or "").strip()
         self._auto_load_initial_tool = bool(auto_load_initial_tool)
         self._hide_internal_tab_bar = bool(hide_internal_tab_bar)
+        self._tab_label_max_visible_chars = self._TAB_LABEL_MAX_VISIBLE_CHARS
         self._embedded_tab_bar_proxies: list[QTabBar] = []
         self._external_uri_proxies: list[QLineEdit] = []
+        self._titlebar_uri_drag_handle: QToolButton | None = None
+        self._titlebar_uri_drag_proxy_bar: QTabBar | None = None
+        self._titlebar_uri_drag_active = False
+        self._titlebar_uri_drag_moved = False
+        self._hover_tab_bar: QTabBar | None = None
         self._hover_tab_index = -1
         self._hover_tab_base_text = ""
         self._hover_tab_phase = 0
         self._hover_tab_marquee_timer = QTimer(self)
         self._hover_tab_marquee_timer.setInterval(160)
         self._hover_tab_marquee_timer.timeout.connect(self._tick_tab_hover_marquee)
+        self._pending_preview_session_state: dict[str, Any] | None = None
+        self._preview_refresh_timer = QTimer(self)
+        self._preview_refresh_timer.setSingleShot(True)
+        self._preview_refresh_timer.setInterval(260)
+        self._preview_refresh_timer.timeout.connect(self._flush_scheduled_preview_refresh)
 
         self._build_ui()
         # Add ControlPlaneWidget as first tab if provided
         if self._control_plane_widget is not None:
             self._add_control_plane_tab()
         restored_state = self._load_local_widget_state()
-        initial_source_uri = self._initial_source_uri or str(restored_state.get("uri") or "")
-        initial_tool_id = self._initial_tool_id or str(restored_state.get("selected_tool") or "")
-        self._add_extension_tab(
-            source_uri=initial_source_uri,
-            tool_id=initial_tool_id,
-            keep_local=bool(restored_state.get("keep_local")),
-            catalog_only=True,
-            activate=True,
-        )
+        restored_sessions = [
+            dict(item)
+            for item in (restored_state.get("sessions") or [])
+            if isinstance(item, dict)
+        ]
+        restored_active_session_token = str(restored_state.get("active_session_token") or "").strip()
+
+        if restored_sessions:
+            active_tab_index = -1
+            for session_payload in restored_sessions:
+                restored_session_state = self._add_extension_tab(
+                    source_uri=str(session_payload.get("uri") or "").strip(),
+                    tool_id=str(session_payload.get("selected_tool") or "").strip(),
+                    keep_local=bool(session_payload.get("keep_local", True)),
+                    catalog_only=bool(session_payload.get("catalog_only", False)),
+                    activate=False,
+                    session_token=str(session_payload.get("session_token") or "").strip(),
+                )
+                if str(restored_session_state.get("session_token") or "") == restored_active_session_token:
+                    tab_widget = restored_session_state.get("tab_widget")
+                    if isinstance(tab_widget, QWidget):
+                        active_tab_index = self.extensions_tabs.indexOf(tab_widget)
+            if active_tab_index >= 0:
+                self.extensions_tabs.setCurrentIndex(active_tab_index)
+            elif self.extensions_tabs.count() > 0:
+                self.extensions_tabs.setCurrentIndex(self.extensions_tabs.count() - 1)
+        else:
+            initial_source_uri = self._initial_source_uri or str(restored_state.get("uri") or "")
+            initial_tool_id = self._initial_tool_id or str(restored_state.get("selected_tool") or "")
+            self._add_extension_tab(
+                source_uri=initial_source_uri,
+                tool_id=initial_tool_id,
+                keep_local=bool(restored_state.get("keep_local")),
+                catalog_only=True,
+                activate=True,
+            )
         if self._auto_load_initial_tool:
             active_state = self._active_session_state()
             if isinstance(active_state, dict):
@@ -12166,6 +12590,8 @@ class ExtensionsWorkspaceWidget(QWidget):
             "keep_local": True,
             "last_status": "",
             "last_widget_summary": {},
+            "sessions": [],
+            "active_session_token": "",
         }
         if not state_path.exists():
             return dict(default_state)
@@ -12173,15 +12599,56 @@ class ExtensionsWorkspaceWidget(QWidget):
             payload = json.loads(state_path.read_text(encoding="utf-8"))
             if not isinstance(payload, dict):
                 return dict(default_state)
+            restored_sessions: list[dict[str, Any]] = []
+            for item in (payload.get("sessions") or []):
+                if not isinstance(item, dict):
+                    continue
+                restored_sessions.append(
+                    {
+                        "session_token": str(item.get("session_token") or uuid.uuid4().hex).strip() or uuid.uuid4().hex,
+                        "uri": str(item.get("uri") or default_uri).strip() or default_uri,
+                        "selected_tool": str(item.get("selected_tool") or "").strip(),
+                        "keep_local": bool(item.get("keep_local", True)),
+                        "catalog_only": bool(item.get("catalog_only", False)),
+                    }
+                )
             return {
                 "uri": str(payload.get("uri") or default_uri),
                 "selected_tool": str(payload.get("selected_tool") or ""),
                 "keep_local": bool(payload.get("keep_local", True)),
                 "last_status": str(payload.get("last_status") or ""),
                 "last_widget_summary": dict(payload.get("last_widget_summary") or {}),
+                "sessions": restored_sessions,
+                "active_session_token": str(payload.get("active_session_token") or "").strip(),
             }
         except Exception:
             return dict(default_state)
+
+    def _persisted_session_payload(self, session_state: Mapping[str, Any]) -> dict[str, Any]:
+        uri_input = session_state.get("uri_input")
+        selected_payload = session_state.get("selected_tool_payload")
+        selected_tool_id = ""
+        if isinstance(selected_payload, dict):
+            selected_tool_id = str(selected_payload.get("tool_id") or "").strip()
+        return {
+            "session_token": str(session_state.get("session_token") or uuid.uuid4().hex).strip() or uuid.uuid4().hex,
+            "uri": str(uri_input.text() if isinstance(uri_input, QLineEdit) else "").strip(),
+            "selected_tool": selected_tool_id,
+            "keep_local": bool(session_state.get("keep_local", True)),
+            "catalog_only": bool(session_state.get("catalog_only", False)),
+        }
+
+    def _persisted_session_payloads_in_visual_order(self) -> list[dict[str, Any]]:
+        persisted_sessions: list[dict[str, Any]] = []
+        for tab_index in range(self.extensions_tabs.count()):
+            tab_widget = self.extensions_tabs.widget(tab_index)
+            if not isinstance(tab_widget, QWidget):
+                continue
+            session_state = self._session_state_by_tab.get(tab_widget)
+            if not isinstance(session_state, dict):
+                continue
+            persisted_sessions.append(self._persisted_session_payload(session_state))
+        return persisted_sessions
 
     def _loaded_widget_summary(self, session_state: Mapping[str, Any]) -> dict[str, Any]:
         loaded_widget = session_state.get("loaded_widget")
@@ -12211,6 +12678,8 @@ class ExtensionsWorkspaceWidget(QWidget):
             "keep_local": True,
             "last_status": "",
             "last_widget_summary": self._loaded_widget_summary(state),
+            "sessions": self._persisted_session_payloads_in_visual_order(),
+            "active_session_token": str((self._active_session_state() or {}).get("session_token") or "").strip(),
         }
 
         state_path = self._local_widget_state_path()
@@ -12263,12 +12732,20 @@ class ExtensionsWorkspaceWidget(QWidget):
         self.extensions_tabs.setDocumentMode(True)
         self.extensions_tabs.setMovable(True)
         self.extensions_tabs.setTabsClosable(True)
-        self.extensions_tabs.setUsesScrollButtons(True)
+        self.extensions_tabs.setTabBar(
+            ExtensionsWorkspaceTabBar(
+                self.extensions_tabs,
+                text_formatter=self._format_extensions_tab_text,
+            )
+        )
+        self.extensions_tabs.setUsesScrollButtons(False)
         tab_bar = self.extensions_tabs.tabBar()
+        tab_bar.setUsesScrollButtons(False)
         tab_bar.setExpanding(False)
-        tab_bar.setElideMode(Qt.ElideRight)
+        tab_bar.setElideMode(Qt.ElideNone)
         tab_bar.setMouseTracking(True)
         tab_bar.installEventFilter(self)
+        tab_bar.tabMoved.connect(self._handle_extensions_tab_moved)
         self.extensions_tabs.tabCloseRequested.connect(self._close_extension_tab)
         self.extensions_tabs.currentChanged.connect(self._handle_active_tab_changed)
 
@@ -12276,48 +12753,212 @@ class ExtensionsWorkspaceWidget(QWidget):
         self._sync_embedded_tab_bar_visibility()
 
     def _prune_embedded_tab_bar_proxies(self) -> None:
-        self._embedded_tab_bar_proxies = [
-            proxy
-            for proxy in self._embedded_tab_bar_proxies
-            if isinstance(proxy, QTabBar) and proxy.parent() is not None
-        ]
+        live_proxies: list[QTabBar] = []
+        for proxy in self._embedded_tab_bar_proxies:
+            if not isinstance(proxy, QTabBar):
+                continue
+            try:
+                if proxy.parent() is None:
+                    continue
+            except RuntimeError:
+                continue
+            live_proxies.append(proxy)
+        self._embedded_tab_bar_proxies = live_proxies
 
     def _prune_external_uri_proxies(self) -> None:
-        self._external_uri_proxies = [
-            proxy
-            for proxy in self._external_uri_proxies
-            if isinstance(proxy, QLineEdit) and proxy.parent() is not None
-        ]
+        live_proxies: list[QLineEdit] = []
+        for proxy in self._external_uri_proxies:
+            if not isinstance(proxy, QLineEdit):
+                continue
+            try:
+                if proxy.parent() is None:
+                    continue
+            except RuntimeError:
+                continue
+            live_proxies.append(proxy)
+        self._external_uri_proxies = live_proxies
 
     def _sync_embedded_tab_bar_visibility(self) -> None:
         self._prune_embedded_tab_bar_proxies()
-        tab_bar = self.extensions_tabs.tabBar()
+        try:
+            tab_bar = self.extensions_tabs.tabBar()
+        except RuntimeError:
+            return
         tab_bar.setVisible(not self._hide_internal_tab_bar and not self._embedded_tab_bar_proxies)
 
     def _sync_embedded_tab_bar_proxies(self) -> None:
         self._prune_embedded_tab_bar_proxies()
+        source_tab_bar = self.extensions_tabs.tabBar()
         tab_texts = [
-            str(self.extensions_tabs.tabText(index) or "")
+            self._extensions_tab_full_text(source_tab_bar, index)
             for index in range(self.extensions_tabs.count())
         ]
+
+        for index, tab_text in enumerate(tab_texts):
+            self._set_extensions_tab_text(source_tab_bar, index, tab_text)
+
         current_index = self.extensions_tabs.currentIndex()
         for proxy in self._embedded_tab_bar_proxies:
-            blocker = QtCore.QSignalBlocker(proxy)
-            while proxy.count() > len(tab_texts):
-                proxy.removeTab(proxy.count() - 1)
-            for index, tab_text in enumerate(tab_texts):
-                if index >= proxy.count():
-                    proxy.addTab(tab_text)
+            titlebar_uri_mode = bool(proxy.property("extensions_titlebar_uri_mode"))
+            split_role = str(proxy.property("extensions_titlebar_split_role") or "").strip().lower()
+            split_slot_index = -1
+            raw_split_slot_index = proxy.property("extensions_titlebar_split_slot_index")
+            try:
+                if raw_split_slot_index is not None and str(raw_split_slot_index).strip() != "":
+                    split_slot_index = int(raw_split_slot_index)
+            except Exception:
+                split_slot_index = -1
+            raw_uri_slot_index = proxy.property("extensions_titlebar_uri_slot_index")
+            try:
+                uri_slot_index = int(raw_uri_slot_index) if raw_uri_slot_index is not None and str(raw_uri_slot_index).strip() != "" else 0
+            except Exception:
+                uri_slot_index = 0
+            proxy_entries: list[int | str] = list(range(len(tab_texts)))
+            if bool(proxy.property("extensions_titlebar_proxy_bar")):
+                proxy_entries = [
+                    source_index
+                    for source_index, tab_text in enumerate(tab_texts)
+                    if not self._hide_titlebar_proxy_tab_for_text(tab_text)
+                ]
+            if titlebar_uri_mode:
+                uri_slot_index = max(0, min(uri_slot_index, len(tab_texts)))
+                proxy_entries = list(range(uri_slot_index)) + [ExtensionsWorkspaceTabBar.URI_PROXY_DATA] + list(range(uri_slot_index, len(tab_texts)))
+            elif split_role in {"left", "right"} and split_slot_index >= 0:
+                split_slot_index = max(0, min(split_slot_index, len(tab_texts)))
+                if split_role == "left":
+                    proxy_entries = list(range(split_slot_index))
                 else:
-                    proxy.setTabText(index, tab_text)
+                    proxy_entries = list(range(split_slot_index, len(tab_texts)))
+            blocker = QtCore.QSignalBlocker(proxy)
+            while proxy.count() > len(proxy_entries):
+                proxy.removeTab(proxy.count() - 1)
+            for proxy_index, proxy_entry in enumerate(proxy_entries):
+                if proxy_index >= proxy.count():
+                    proxy.addTab("")
+                if proxy_entry == ExtensionsWorkspaceTabBar.URI_PROXY_DATA:
+                    self._sync_titlebar_uri_proxy_tab(proxy, proxy_index)
+                    continue
+                source_index = int(proxy_entry)
+                tab_text = tab_texts[source_index]
+                self._clear_titlebar_uri_proxy_tab_button(proxy, proxy_index)
+                self._set_extensions_tab_text(proxy, proxy_index, tab_text)
                 palette = self._tab_palette(self._tab_category_for_text(tab_text))
-                proxy.setTabTextColor(index, QColor(palette["label_fg"]))
-                self._set_proxy_tab_close_button(proxy, index)
-            if 0 <= current_index < proxy.count():
-                proxy.setCurrentIndex(current_index)
+                proxy.setTabTextColor(proxy_index, QColor(palette["label_fg"]))
+                proxy.setTabData(proxy_index, source_index)
+                self._set_proxy_tab_close_button(proxy, proxy_index, source_index=source_index)
+            try:
+                current_proxy_index = proxy_entries.index(current_index)
+            except ValueError:
+                current_proxy_index = -1
+            if 0 <= current_proxy_index < proxy.count():
+                proxy.setCurrentIndex(current_proxy_index)
             self._update_hover_close_buttons(proxy, -1)
+            proxy.setVisible(bool(proxy_entries))
             del blocker
         self._sync_embedded_tab_bar_visibility()
+
+    def _clear_titlebar_uri_proxy_tab_button(self, proxy_bar: QTabBar, tab_index: int) -> None:
+        if tab_index < 0 or tab_index >= proxy_bar.count():
+            return
+        for side in (QTabBar.LeftSide, QTabBar.RightSide):
+            tab_button = proxy_bar.tabButton(tab_index, side)
+            if isinstance(tab_button, QWidget) and bool(tab_button.property("extensions_titlebar_uri_container")):
+                proxy_bar.setTabButton(tab_index, side, None)
+
+    def _ensure_titlebar_uri_proxy_container(self, proxy_bar: QTabBar) -> QWidget:
+        container = getattr(proxy_bar, "_titlebar_uri_proxy_container", None)
+        if isinstance(container, QWidget):
+            try:
+                _ = container.objectName()
+                return container
+            except RuntimeError:
+                pass
+
+        container = QWidget(proxy_bar)
+        container.setObjectName("windowFrameExternalUriHost")
+        container.setProperty("extensions_titlebar_uri_container", True)
+        container.setAttribute(Qt.WA_StyledBackground, True)
+        container_layout = QHBoxLayout(container)
+        container_layout.setContentsMargins(0, 0, 0, 0)
+        container_layout.setSpacing(0)
+
+        handle = QToolButton(container)
+        handle.setObjectName("windowFrameSectionHandle")
+        handle.setText("::")
+        handle.setAutoRaise(True)
+        handle.setFocusPolicy(Qt.NoFocus)
+        handle.setCursor(Qt.SizeHorCursor)
+        handle.setToolTip("URI-Tab verschieben")
+        handle.setFixedSize(18, 18)
+        handle.setProperty("extensions_titlebar_uri_handle", True)
+        handle.installEventFilter(self)
+        container_layout.addWidget(handle, 0, Qt.AlignVCenter)
+
+        setattr(proxy_bar, "_titlebar_uri_proxy_container", container)
+        setattr(proxy_bar, "_titlebar_uri_proxy_container_layout", container_layout)
+        setattr(proxy_bar, "_titlebar_uri_proxy_handle", handle)
+        setattr(proxy_bar, "_titlebar_uri_proxy_widget", None)
+        return container
+
+    def _mount_titlebar_uri_proxy_widget(self, proxy_bar: QTabBar, uri_widget: QWidget | None) -> QWidget:
+        container = self._ensure_titlebar_uri_proxy_container(proxy_bar)
+        container_layout = getattr(proxy_bar, "_titlebar_uri_proxy_container_layout", None)
+        mounted_widget = getattr(proxy_bar, "_titlebar_uri_proxy_widget", None)
+        if isinstance(mounted_widget, QWidget) and mounted_widget is not uri_widget and isinstance(container_layout, QHBoxLayout):
+            container_layout.removeWidget(mounted_widget)
+            mounted_widget.setParent(None)
+        setattr(proxy_bar, "_titlebar_uri_proxy_widget", None)
+        if isinstance(uri_widget, QWidget) and isinstance(container_layout, QHBoxLayout):
+            container_layout.addWidget(uri_widget, 1)
+            setattr(proxy_bar, "_titlebar_uri_proxy_widget", uri_widget)
+        return container
+
+    def _sync_titlebar_uri_proxy_tab(self, proxy_bar: QTabBar, tab_index: int) -> None:
+        if tab_index < 0 or tab_index >= proxy_bar.count():
+            return
+        uri_widget = getattr(proxy_bar, "_titlebar_uri_proxy_source_widget", None)
+        uri_container = self._mount_titlebar_uri_proxy_widget(proxy_bar, uri_widget if isinstance(uri_widget, QWidget) else None)
+        proxy_bar.setTabData(tab_index, ExtensionsWorkspaceTabBar.URI_PROXY_DATA)
+        proxy_bar.setTabText(tab_index, "")
+        proxy_bar.setTabToolTip(tab_index, "Adresseingabe")
+        proxy_bar.setTabButton(tab_index, QTabBar.RightSide, None)
+        proxy_bar.setTabButton(tab_index, QTabBar.LeftSide, uri_container)
+
+    def _titlebar_uri_real_tab_count_before_proxy_index(self, proxy_bar: QTabBar, proxy_index: int) -> int:
+        real_tab_count = 0
+        for index in range(max(0, min(proxy_index, proxy_bar.count()))):
+            if isinstance(proxy_bar.tabData(index), int):
+                real_tab_count += 1
+        return real_tab_count
+
+    def _resolve_titlebar_uri_proxy_bar(self, widget: QWidget | None) -> QTabBar | None:
+        current_widget = widget
+        while isinstance(current_widget, QWidget):
+            if isinstance(current_widget, QTabBar) and bool(current_widget.property("extensions_titlebar_uri_mode")):
+                return current_widget
+            current_widget = current_widget.parentWidget()
+        return None
+
+    def _titlebar_uri_proxy_slot_index_from_local_x(self, proxy_bar: QTabBar, local_x: int) -> int:
+        slot_index = 0
+        real_tab_count = 0
+        for index in range(proxy_bar.count()):
+            if not isinstance(proxy_bar.tabData(index), int):
+                continue
+            real_tab_count += 1
+            try:
+                tab_center_x = int(proxy_bar.tabRect(index).center().x())
+            except RuntimeError:
+                continue
+            if tab_center_x > int(local_x):
+                slot_index += 1
+        return max(0, min(slot_index, real_tab_count))
+
+    def _apply_titlebar_uri_proxy_slot_index(self, slot_index: int) -> None:
+        top_level_window = self.window()
+        slot_setter = getattr(top_level_window, "_set_window_titlebar_uri_tab_slot_index", None)
+        if callable(slot_setter):
+            slot_setter(int(slot_index))
 
     def create_embedded_tab_bar_proxy(self, parent: QWidget | None = None) -> QWidget:
         proxy_host = QWidget(parent or self)
@@ -12326,14 +12967,18 @@ class ExtensionsWorkspaceWidget(QWidget):
         proxy_layout.setContentsMargins(0, 0, 0, 0)
         proxy_layout.setSpacing(4)
 
-        proxy_bar = QTabBar(proxy_host)
+        proxy_bar = ExtensionsWorkspaceTabBar(
+            proxy_host,
+            text_formatter=self._format_extensions_tab_text,
+        )
         proxy_bar.setObjectName("extensionsEmbeddedTabBar")
         proxy_bar.setProperty("extensions_embedded_tab_bar", True)
         proxy_bar.setDocumentMode(True)
         proxy_bar.setMovable(True)
         proxy_bar.setTabsClosable(False)
-        proxy_bar.setUsesScrollButtons(True)
-        proxy_bar.setElideMode(Qt.ElideRight)
+        proxy_bar.setUsesScrollButtons(False)
+        proxy_bar.setExpanding(False)
+        proxy_bar.setElideMode(Qt.ElideNone)
         proxy_bar.setMouseTracking(True)
         proxy_bar.installEventFilter(self)
         proxy_bar.currentChanged.connect(
@@ -12359,13 +13004,102 @@ class ExtensionsWorkspaceWidget(QWidget):
         self._sync_embedded_tab_bar_proxies()
         return proxy_host
 
+    def create_titlebar_tab_bar_proxy(self, parent: QWidget | None = None, *, split_role: str = "right") -> QWidget:
+        proxy_host = QWidget(parent or self)
+        proxy_host.setObjectName("windowFrameExtensionsTabProxyHost")
+        proxy_layout = QHBoxLayout(proxy_host)
+        proxy_layout.setContentsMargins(0, 0, 0, 0)
+        proxy_layout.setSpacing(0)
+        titlebar_tab_height = max(18, int(CustomWindowTitleBar._HEIGHT) - 4)
+
+        proxy_bar = ExtensionsWorkspaceTabBar(
+            proxy_host,
+            text_formatter=self._format_extensions_tab_text,
+            tab_row_height=titlebar_tab_height,
+        )
+        proxy_bar.setObjectName(_WINDOW_FRAME_EMBEDDED_TAB_BAR_OBJECT_NAME)
+        proxy_bar.setProperty("extensions_embedded_tab_bar", True)
+        proxy_bar.setProperty("extensions_titlebar_proxy_bar", True)
+        proxy_bar.setProperty("extensions_titlebar_uri_mode", True)
+        proxy_bar.setProperty("extensions_titlebar_uri_fill", "#101010")
+        proxy_bar.setProperty("extensions_titlebar_uri_slot_index", 0)
+        proxy_bar.setDocumentMode(True)
+        proxy_bar.setMovable(True)
+        proxy_bar.setTabsClosable(False)
+        proxy_bar.setUsesScrollButtons(False)
+        proxy_bar.setExpanding(False)
+        proxy_bar.setElideMode(Qt.ElideNone)
+        proxy_bar.setMouseTracking(True)
+        proxy_bar.setMinimumHeight(titlebar_tab_height)
+        proxy_bar.setMaximumHeight(titlebar_tab_height)
+        proxy_bar.installEventFilter(self)
+        proxy_bar.currentChanged.connect(
+            lambda index, bar=proxy_bar: self.extensions_tabs.setCurrentIndex(
+                int(bar.tabData(index))
+            )
+            if 0 <= index < bar.count() and isinstance(bar.tabData(index), int) and 0 <= int(bar.tabData(index)) < self.extensions_tabs.count()
+            else None
+        )
+        proxy_bar.tabMoved.connect(self._handle_extensions_tab_moved)
+        proxy_layout.addWidget(proxy_bar, 1)
+
+        self._embedded_tab_bar_proxies.append(proxy_bar)
+        proxy_bar.destroyed.connect(lambda *_args: self._sync_embedded_tab_bar_visibility())
+        self._sync_embedded_tab_bar_proxies()
+        return proxy_host
+
     def _sync_external_uri_proxies(self) -> None:
         self._prune_external_uri_proxies()
-        current_uri = self.current_widget_uri()
+        try:
+            current_uri = self.current_widget_uri()
+        except RuntimeError:
+            return
         for proxy in self._external_uri_proxies:
             blocker = QtCore.QSignalBlocker(proxy)
             proxy.setText(current_uri)
             del blocker
+
+    def _active_session_selection_menu(self) -> QMenu | None:
+        active_state = self._active_session_state()
+        if not isinstance(active_state, dict):
+            return None
+        selection_menu = active_state.get("selection_menu")
+        if isinstance(selection_menu, QMenu):
+            return selection_menu
+        return None
+
+    def _popup_active_session_selection_menu(self, anchor_widget: QWidget) -> bool:
+        if not isinstance(anchor_widget, QWidget):
+            return False
+        selection_menu = self._active_session_selection_menu()
+        if not isinstance(selection_menu, QMenu):
+            return False
+        if not selection_menu.actions():
+            return False
+        try:
+            popup_point = anchor_widget.mapToGlobal(QPoint(0, anchor_widget.height()))
+        except RuntimeError:
+            return False
+        selection_menu.popup(popup_point)
+        return True
+
+    def _schedule_connection_preview_refresh(self, session_state: dict[str, Any]) -> None:
+        if not isinstance(session_state, dict):
+            return
+        self._pending_preview_session_state = session_state
+        self._preview_refresh_timer.start()
+
+    def _flush_scheduled_preview_refresh(self) -> None:
+        session_state = self._pending_preview_session_state
+        self._pending_preview_session_state = None
+        if not isinstance(session_state, dict):
+            return
+        tab_widget = session_state.get("tab_widget")
+        if not isinstance(tab_widget, QWidget):
+            return
+        if self._session_state_by_tab.get(tab_widget) is not session_state:
+            return
+        self._refresh_connection_preview(session_state)
 
     def _set_active_session_uri(self, source_uri: str) -> None:
         active_state = self._active_session_state()
@@ -12384,9 +13118,12 @@ class ExtensionsWorkspaceWidget(QWidget):
             self._load_extension_into_session(active_state, fit_view=True)
 
     def create_external_uri_proxy(self, parent: QWidget | None = None) -> QLineEdit:
-        proxy_input = QLineEdit(parent or self)
+        proxy_input = ExtensionsExternalUriLineEdit(parent or self)
         proxy_input.setObjectName("extensionsGraphUriInput")
         proxy_input.setProperty("extensions_external_uri_proxy", True)
+        proxy_input.setLayoutDirection(Qt.LeftToRight)
+        proxy_input.setAttribute(Qt.WA_StyledBackground, True)
+        proxy_input.setAutoFillBackground(True)
         proxy_input.setMinimumHeight(28)
         proxy_input.setPlaceholderText("agentsdb://127.0.0.1:2331/tools:graph_view")
         load_icon_idle = _icon_with_opacity("load_content.svg", opacity=0.72)
@@ -12395,6 +13132,7 @@ class ExtensionsWorkspaceWidget(QWidget):
         load_action.setToolTip("Widget laden")
         add_tab_action = proxy_input.addAction(add_tab_icon_idle, QLineEdit.TrailingPosition)
         add_tab_action.setToolTip("Neue Extension-Verbindung")
+        proxy_input.menuRequested.connect(lambda: self._popup_active_session_selection_menu(proxy_input))
         proxy_input.textEdited.connect(self._set_active_session_uri)
         proxy_input.returnPressed.connect(self._load_active_session_widget)
         load_action.triggered.connect(self._load_active_session_widget)
@@ -12404,36 +13142,48 @@ class ExtensionsWorkspaceWidget(QWidget):
         self._sync_external_uri_proxies()
         return proxy_input
 
-    def _start_tab_hover_marquee(self, tab_index: int) -> None:
+    def _start_tab_hover_marquee(self, tab_bar: QTabBar, tab_index: int) -> None:
         self._stop_tab_hover_marquee()
-        tab_bar = self.extensions_tabs.tabBar()
+        if not self._is_extensions_tab_bar(tab_bar):
+            return
         if tab_index < 0 or tab_index >= tab_bar.count():
             self._stop_tab_hover_marquee()
             return
-        if tab_index == self._hover_tab_index:
+        if tab_index == self._hover_tab_index and tab_bar is self._hover_tab_bar:
             return
 
         self._stop_tab_hover_marquee()
 
-        base_text = str(tab_bar.tabText(tab_index) or "")
+        base_text = self._extensions_tab_full_text(tab_bar, tab_index)
         if not base_text:
             return
 
         tab_rect = tab_bar.tabRect(tab_index)
-        available_width = max(tab_rect.width() - 44, 18)
+        close_button = tab_bar.tabButton(tab_index, QTabBar.RightSide)
+        close_button_width = close_button.width() if isinstance(close_button, QToolButton) and close_button.isVisible() else 0
+        available_width = max(tab_rect.width() - 20 - close_button_width, 18)
         text_width = tab_bar.fontMetrics().horizontalAdvance(base_text)
         if text_width <= available_width:
             return
 
+        self._hover_tab_bar = tab_bar
         self._hover_tab_index = tab_index
         self._hover_tab_base_text = base_text
         self._hover_tab_phase = 0
         self._hover_tab_marquee_timer.start()
 
     def _tick_tab_hover_marquee(self) -> None:
-        tab_bar = self.extensions_tabs.tabBar()
+        tab_bar = self._hover_tab_bar
+        if not isinstance(tab_bar, QTabBar):
+            self._stop_tab_hover_marquee()
+            return
         tab_index = self._hover_tab_index
-        if tab_index < 0 or tab_index >= tab_bar.count():
+        try:
+            tab_count = tab_bar.count()
+        except RuntimeError:
+            self._stop_tab_hover_marquee()
+            return
+        if tab_index < 0 or tab_index >= tab_count:
             self._stop_tab_hover_marquee()
             return
         if not self._hover_tab_base_text:
@@ -12452,17 +13202,49 @@ class ExtensionsWorkspaceWidget(QWidget):
         if self._hover_tab_marquee_timer.isActive():
             self._hover_tab_marquee_timer.stop()
 
+        tab_bar = self._hover_tab_bar
         tab_index = self._hover_tab_index
-        if tab_index >= 0 and self._hover_tab_base_text:
-            tab_bar = self.extensions_tabs.tabBar()
-            if tab_index < tab_bar.count():
-                tab_bar.setTabText(tab_index, self._hover_tab_base_text)
+        if tab_index >= 0 and self._hover_tab_base_text and isinstance(tab_bar, QTabBar):
+            try:
+                if tab_index < tab_bar.count():
+                    self._set_extensions_tab_text(tab_bar, tab_index, self._hover_tab_base_text)
+            except RuntimeError:
+                pass
 
+        self._hover_tab_bar = None
         self._hover_tab_index = -1
         self._hover_tab_base_text = ""
         self._hover_tab_phase = 0
 
     def eventFilter(self, obj, event):  # noqa: N802
+        if isinstance(obj, QToolButton) and bool(obj.property("extensions_titlebar_uri_handle")):
+            event_type = event.type()
+            if event_type == QEvent.MouseButtonPress and event.button() == Qt.LeftButton:
+                proxy_bar = self._resolve_titlebar_uri_proxy_bar(obj)
+                if isinstance(proxy_bar, QTabBar):
+                    self._titlebar_uri_drag_handle = obj
+                    self._titlebar_uri_drag_proxy_bar = proxy_bar
+                    self._titlebar_uri_drag_active = True
+                    self._titlebar_uri_drag_moved = False
+                    event.accept()
+                    return True
+            elif event_type == QEvent.MouseMove and self._titlebar_uri_drag_active and self._titlebar_uri_drag_handle is obj and (event.buttons() & Qt.LeftButton):
+                proxy_bar = self._titlebar_uri_drag_proxy_bar
+                if isinstance(proxy_bar, QTabBar):
+                    self._titlebar_uri_drag_moved = True
+                    global_point = event.globalPosition().toPoint() if hasattr(event, "globalPosition") else event.globalPos()
+                    local_point = proxy_bar.mapFromGlobal(global_point)
+                    slot_index = self._titlebar_uri_proxy_slot_index_from_local_x(proxy_bar, local_point.x())
+                    self._apply_titlebar_uri_proxy_slot_index(slot_index)
+                    event.accept()
+                    return True
+            elif event_type == QEvent.MouseButtonRelease and self._titlebar_uri_drag_active and self._titlebar_uri_drag_handle is obj and event.button() == Qt.LeftButton:
+                self._titlebar_uri_drag_handle = None
+                self._titlebar_uri_drag_proxy_bar = None
+                self._titlebar_uri_drag_active = False
+                self._titlebar_uri_drag_moved = False
+                event.accept()
+                return True
         if hasattr(self, "extensions_tabs") and isinstance(obj, QTabBar):
             event_type = event.type()
             if event_type == QEvent.MouseMove:
@@ -12472,11 +13254,11 @@ class ExtensionsWorkspaceWidget(QWidget):
                     pos = event.pos()
                 hover_index = obj.tabAt(pos)
                 self._update_hover_close_buttons(obj, hover_index)
-                if obj is self.extensions_tabs.tabBar():
-                    self._start_tab_hover_marquee(hover_index)
+                if self._is_extensions_tab_bar(obj):
+                    self._start_tab_hover_marquee(obj, hover_index)
             elif event_type in (QEvent.Leave, QEvent.MouseButtonPress):
                 self._update_hover_close_buttons(obj, -1)
-                if obj is self.extensions_tabs.tabBar():
+                if obj is self._hover_tab_bar:
                     self._stop_tab_hover_marquee()
         return super().eventFilter(obj, event)
 
@@ -12502,6 +13284,7 @@ class ExtensionsWorkspaceWidget(QWidget):
         # Preserve the original order so the primary board remains the first board tab.
         for tab_widget, tab_text in tabs_to_copy:
             tab_index = self.extensions_tabs.addTab(tab_widget, tab_text)
+            self._set_extensions_tab_text(self.extensions_tabs.tabBar(), tab_index, tab_text)
             self.extensions_tabs.tabBar().setTabButton(tab_index, QTabBar.RightSide, None)
         
         # Clear the internal tabs (they're now managed by extensions_tabs)
@@ -12586,16 +13369,17 @@ class ExtensionsWorkspaceWidget(QWidget):
         )
         tab_bar.setTabButton(tab_index, QTabBar.RightSide, close_button)
 
-    def _set_proxy_tab_close_button(self, proxy_bar: QTabBar, tab_index: int) -> None:
+    def _set_proxy_tab_close_button(self, proxy_bar: QTabBar, tab_index: int, *, source_index: int | None = None) -> None:
         if tab_index < 0 or tab_index >= proxy_bar.count():
             return
-        if not self._is_extension_tab_closable(tab_index):
+        resolved_source_index = tab_index if source_index is None else int(source_index)
+        if not self._is_extension_tab_closable(resolved_source_index):
             proxy_bar.setTabButton(tab_index, QTabBar.RightSide, None)
             return
         existing_button = proxy_bar.tabButton(tab_index, QTabBar.RightSide)
         if isinstance(existing_button, QToolButton) and bool(existing_button.property("extensions_close_button")):
             return
-        target_widget = self.extensions_tabs.widget(tab_index)
+        target_widget = self.extensions_tabs.widget(resolved_source_index)
         if not isinstance(target_widget, QWidget):
             return
         close_button = self._new_extension_tab_close_button(
@@ -12606,15 +13390,17 @@ class ExtensionsWorkspaceWidget(QWidget):
         proxy_bar.setTabButton(tab_index, QTabBar.RightSide, close_button)
 
     def _sync_tab_close_buttons(self) -> None:
+        source_tab_bar = self.extensions_tabs.tabBar()
         for tab_index in range(self.extensions_tabs.count()):
+            full_text = self._extensions_tab_full_text(source_tab_bar, tab_index)
             palette = self._tab_palette(
-                self._tab_category_for_text(self.extensions_tabs.tabText(tab_index))
+                self._tab_category_for_text(full_text)
             )
-            self.extensions_tabs.tabBar().setTabTextColor(tab_index, QColor(palette["label_fg"]))
+            source_tab_bar.setTabTextColor(tab_index, QColor(palette["label_fg"]))
             tab_widget = self.extensions_tabs.widget(tab_index)
             if isinstance(tab_widget, QWidget):
                 self._set_tab_close_button(tab_widget)
-        self._update_hover_close_buttons(self.extensions_tabs.tabBar(), -1)
+        self._update_hover_close_buttons(source_tab_bar, -1)
 
     def _add_extension_tab(
         self,
@@ -12624,6 +13410,7 @@ class ExtensionsWorkspaceWidget(QWidget):
         keep_local: bool = True,
         catalog_only: bool = False,
         activate: bool = True,
+        session_token: str = "",
     ) -> dict[str, Any]:
         self._session_counter += 1
         session_id = self._session_counter
@@ -12638,6 +13425,7 @@ class ExtensionsWorkspaceWidget(QWidget):
 
         session_state: dict[str, Any] = {
             "session_id": session_id,
+            "session_token": str(session_token or uuid.uuid4().hex).strip() or uuid.uuid4().hex,
             "tab_widget": tab_widget,
             "stack": session_stack,
             "catalog_only": bool(catalog_only),
@@ -12663,6 +13451,7 @@ class ExtensionsWorkspaceWidget(QWidget):
         self._session_state_by_tab[tab_widget] = session_state
         default_title = self._START_TAB_TITLE if bool(catalog_only) else f"Connection {session_id}"
         tab_index = self.extensions_tabs.addTab(tab_widget, default_title)
+        self._set_extensions_tab_text(self.extensions_tabs.tabBar(), tab_index, default_title)
         self._set_tab_close_button(tab_widget)
 
         self._refresh_connection_preview(session_state)
@@ -12714,6 +13503,7 @@ class ExtensionsWorkspaceWidget(QWidget):
             self._set_tab_close_button(tab_widget)
             self._sync_embedded_tab_bar_proxies()
             self._sync_external_uri_proxies()
+            self._persist_local_widget_state(session_state)
             return
 
         session_state = self._session_state_by_tab.pop(tab_widget, None)
@@ -12724,11 +13514,15 @@ class ExtensionsWorkspaceWidget(QWidget):
         self._sync_tab_close_buttons()
         self._sync_embedded_tab_bar_proxies()
         self._sync_external_uri_proxies()
+        self._persist_local_widget_state()
         tab_widget.deleteLater()
         self.widgetStateChanged.emit()
 
     def _active_session_state(self) -> dict[str, Any] | None:
-        current_widget = self.extensions_tabs.currentWidget()
+        try:
+            current_widget = self.extensions_tabs.currentWidget()
+        except RuntimeError:
+            return None
         if current_widget is None:
             return None
         session_state = self._session_state_by_tab.get(current_widget)
@@ -12741,6 +13535,92 @@ class ExtensionsWorkspaceWidget(QWidget):
         self.setProperty("runtime_source_path", self.current_widget_uri())
         self._sync_embedded_tab_bar_proxies()
         self._sync_external_uri_proxies()
+        self._persist_local_widget_state()
+        self.widgetStateChanged.emit()
+
+    def _move_extension_tab_owner_index(self, from_index: int, to_index: int) -> bool:
+        try:
+            total_tabs = int(self.extensions_tabs.count())
+            source_tab_bar = self.extensions_tabs.tabBar()
+        except RuntimeError:
+            return False
+        if total_tabs <= 1:
+            return False
+        if from_index < 0 or from_index >= total_tabs:
+            return False
+        resolved_to_index = max(0, min(int(to_index), total_tabs - 1))
+        if from_index == resolved_to_index:
+            return False
+
+        moved_widget = self.extensions_tabs.widget(from_index)
+        if not isinstance(moved_widget, QWidget):
+            return False
+
+        current_widget = self.extensions_tabs.currentWidget()
+        full_text = self._extensions_tab_full_text(source_tab_bar, from_index)
+        tab_icon = self.extensions_tabs.tabIcon(from_index)
+        is_enabled = self.extensions_tabs.isTabEnabled(from_index)
+
+        tabs_blocker = QtCore.QSignalBlocker(self.extensions_tabs)
+        tab_bar_blocker = QtCore.QSignalBlocker(source_tab_bar)
+        self.extensions_tabs.removeTab(from_index)
+        inserted_index = self.extensions_tabs.insertTab(resolved_to_index, moved_widget, tab_icon, "")
+        self._set_extensions_tab_text(source_tab_bar, inserted_index, full_text)
+        self.extensions_tabs.setTabEnabled(inserted_index, is_enabled)
+        if isinstance(current_widget, QWidget):
+            self.extensions_tabs.setCurrentWidget(current_widget)
+        del tab_bar_blocker
+        del tabs_blocker
+        return True
+
+    def _resolved_proxy_move_indexes(self, proxy_bar: QTabBar, proxy_to_index: int) -> tuple[int, int] | None:
+        if proxy_to_index < 0 or proxy_to_index >= proxy_bar.count():
+            return None
+
+        moved_source_index = proxy_bar.tabData(proxy_to_index)
+        if not isinstance(moved_source_index, int):
+            return None
+
+        split_role = str(proxy_bar.property("extensions_titlebar_split_role") or "").strip().lower()
+        raw_split_slot_index = proxy_bar.property("extensions_titlebar_split_slot_index")
+        try:
+            split_slot_index = int(raw_split_slot_index) if raw_split_slot_index is not None and str(raw_split_slot_index).strip() != "" else 0
+        except Exception:
+            split_slot_index = 0
+
+        if split_role == "left":
+            return int(moved_source_index), int(proxy_to_index)
+        if split_role == "right":
+            return int(moved_source_index), int(split_slot_index + proxy_to_index)
+        return int(moved_source_index), int(proxy_to_index)
+
+    def _handle_extensions_tab_moved(self, _from_index: int, _to_index: int) -> None:
+        sender_object = self.sender()
+        try:
+            source_tab_bar = self.extensions_tabs.tabBar()
+        except RuntimeError:
+            source_tab_bar = None
+        if isinstance(sender_object, QTabBar) and sender_object is not source_tab_bar:
+            if bool(sender_object.property("extensions_titlebar_uri_mode")):
+                moved_tab_data = sender_object.tabData(_to_index) if 0 <= _to_index < sender_object.count() else None
+                if moved_tab_data == ExtensionsWorkspaceTabBar.URI_PROXY_DATA:
+                    self._apply_titlebar_uri_proxy_slot_index(
+                        self._titlebar_uri_real_tab_count_before_proxy_index(sender_object, _to_index)
+                    )
+                elif isinstance(moved_tab_data, int):
+                    self._move_extension_tab_owner_index(
+                        int(moved_tab_data),
+                        self._titlebar_uri_real_tab_count_before_proxy_index(sender_object, _to_index),
+                    )
+            else:
+                resolved_move_indexes = self._resolved_proxy_move_indexes(sender_object, _to_index)
+                if resolved_move_indexes is not None:
+                    self._move_extension_tab_owner_index(*resolved_move_indexes)
+        self._stop_tab_hover_marquee()
+        self._sync_tab_close_buttons()
+        self._sync_embedded_tab_bar_proxies()
+        self._sync_external_uri_proxies()
+        self._persist_local_widget_state()
         self.widgetStateChanged.emit()
 
     def _build_session_control_page(
@@ -12763,6 +13643,7 @@ class ExtensionsWorkspaceWidget(QWidget):
         uri_input.setMinimumHeight(30)
         uri_input.setPlaceholderText("agentsdb://127.0.0.1:2331/tools:graph_view")
         uri_input.setText(str(source_uri or "agentsdb://127.0.0.1:2331/tools:graph_view"))
+        uri_input.hide()
         load_icon_idle = _icon_with_opacity("load_content.svg", opacity=0.72)
         load_icon_active = _icon_with_opacity("load_content.svg", opacity=1.0)
         load_action = uri_input.addAction(load_icon_idle, QLineEdit.TrailingPosition)
@@ -12790,8 +13671,6 @@ class ExtensionsWorkspaceWidget(QWidget):
         uri_filter = _UriMenuEventFilter(selection_menu, uri_input)
         uri_input.installEventFilter(uri_filter)
         session_state["requested_tool_id"] = str(tool_id or "").strip()
-
-        control_layout.addWidget(uri_input, 0, Qt.AlignTop)
         control_layout.addStretch(1)
 
         session_state["uri_input"] = uri_input
@@ -12816,9 +13695,12 @@ class ExtensionsWorkspaceWidget(QWidget):
                 del blocker
                 session_state["selected_tool_payload"] = dict(selected_payload)
                 session_state["requested_tool_id"] = requested_tool_id
-            self._handle_session_control_change(session_state, refresh_preview=True)
+            self._handle_session_control_change(session_state, refresh_preview=False)
+            self._refresh_connection_preview(session_state)
 
-        uri_input.textChanged.connect(lambda _text: self._handle_session_control_change(session_state, refresh_preview=True))
+        uri_input.textChanged.connect(
+            lambda _text: self._handle_session_control_change(session_state, refresh_preview=True)
+        )
         selection_menu.triggered.connect(_apply_selector_choice)
         load_action.triggered.connect(lambda: self._load_extension_into_session(session_state, fit_view=True))
         add_tab_action.triggered.connect(lambda: self.open_new_connection_tab(activate=True))
@@ -12971,7 +13853,7 @@ class ExtensionsWorkspaceWidget(QWidget):
         if bool(session_state.get("catalog_only")) and not loaded:
             if tab_index == self._hover_tab_index:
                 self._stop_tab_hover_marquee()
-            self.extensions_tabs.setTabText(tab_index, self._START_TAB_TITLE)
+            self._set_extensions_tab_text(self.extensions_tabs.tabBar(), tab_index, self._START_TAB_TITLE)
             self._set_tab_close_button(tab_widget)
             self._sync_tab_close_buttons()
             self._sync_embedded_tab_bar_proxies()
@@ -12981,9 +13863,9 @@ class ExtensionsWorkspaceWidget(QWidget):
             self._stop_tab_hover_marquee()
         if loaded:
             tool_label = self._session_tool_label(session_state)
-            self.extensions_tabs.setTabText(tab_index, f"{tool_label} #{session_id}")
+            self._set_extensions_tab_text(self.extensions_tabs.tabBar(), tab_index, f"{tool_label} #{session_id}")
         else:
-            self.extensions_tabs.setTabText(tab_index, f"Connection {session_id}")
+            self._set_extensions_tab_text(self.extensions_tabs.tabBar(), tab_index, f"Connection {session_id}")
         self._set_tab_close_button(tab_widget)
         self._sync_tab_close_buttons()
         self._sync_embedded_tab_bar_proxies()
@@ -13128,7 +14010,7 @@ class ExtensionsWorkspaceWidget(QWidget):
         if isinstance(tab_widget, QWidget):
             tab_widget.setProperty("runtime_source_path", self._session_source_uri(session_state))
         if refresh_preview:
-            self._refresh_connection_preview(session_state)
+            self._schedule_connection_preview_refresh(session_state)
         self._persist_local_widget_state(session_state)
         self._sync_external_uri_proxies()
         self.widgetStateChanged.emit()
@@ -13144,6 +14026,11 @@ class ExtensionsWorkspaceWidget(QWidget):
             self._base = dict(base)
         self.scheme = _build_scheme(self._accent, self._base)
         extension_tab_palette = self._tab_palette("sunyellow")
+        extension_selected_bg = _color_with_alpha(
+            extension_tab_palette.get("handle_bg_pressed", extension_tab_palette.get("label_bg", "#222222")),
+            34,
+            fallback=extension_tab_palette.get("handle_bg_pressed", "rgba(32,32,32,34)"),
+        )
         self.setStyleSheet(
             f"""
 QWidget#extensionsSessionControlPage,
@@ -13183,7 +14070,7 @@ QTabWidget#extensionsTabs QTabBar::tab {{
     padding: 1px 28px 1px 9px;
     margin: 0px 2px 4px 0px;
     margin-bottom: 4px;
-    min-width: 64px;
+    min-width: 0px;
     min-height: 18px;
 }}
 QTabWidget#extensionsTabs QTabBar::tab:hover {{
@@ -13194,12 +14081,16 @@ QTabWidget#extensionsTabs QTabBar::tab:hover {{
 }}
 QTabWidget#extensionsTabs QTabBar::tab:selected {{
     color: {extension_tab_palette['label_fg']};
-    background: {extension_tab_palette['handle_bg_pressed']};
+    background: {extension_selected_bg};
     border: 1px solid {extension_tab_palette['handle_border_pressed']};
     border-radius: 6px;
 }}
 QTabWidget#extensionsTabs QTabBar::scroller {{
-    width: 24px;
+    width: 0px;
+}}
+QTabWidget#extensionsTabs QTabBar::tear {{
+    width: 0px;
+    height: 0px;
 }}
 QToolButton#extensionsTabCloseButton {{
     color: {extension_tab_palette['label_fg']};
@@ -13830,7 +14721,11 @@ class EnvConfigWidget(QWidget):
 class CustomWindowTitleBar(QWidget):
     """Custom frame title bar with menu button and window controls."""
 
+    sectionOrderChanged = Signal(object)
+    uriAnchorRatioChanged = Signal(float)
+    uriTabSlotIndexChanged = Signal(int)
     _HEIGHT = 34
+    _SECTION_ORDER_DEFAULT = ("tab_strip", "external_uri")
 
     def __init__(self, window: "MainAIEditor") -> None:
         super().__init__(window)
@@ -13864,7 +14759,79 @@ class CustomWindowTitleBar(QWidget):
         self._menu_btn.clicked.connect(self._open_window_menu)
         layout.addWidget(self._menu_btn, 0, Qt.AlignLeft | Qt.AlignVCenter)
 
-        layout.addStretch(1)
+        self._sections_container = QWidget(self)
+        self._sections_container.setObjectName("windowFrameSectionsContainer")
+        self._sections_container.setAttribute(Qt.WA_StyledBackground, True)
+        self._sections_container.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self._sections_layout = QHBoxLayout(self._sections_container)
+        self._sections_layout.setContentsMargins(0, 0, 0, 0)
+        self._sections_layout.setSpacing(6)
+        layout.addWidget(self._sections_container, 1, Qt.AlignVCenter)
+
+        self._uri_anchor_ratio = 0.5
+        self._uri_tab_slot_index = 0
+        self._uri_anchor_drag_active = False
+        self._uri_anchor_drag_moved = False
+        self._uri_tab_slot_count = 0
+        self._uri_tab_slot_rects: list[QRect] = []
+        self._uri_anchor_layout_update_pending = False
+        self._tab_strip_host = QWidget(self)
+        self._tab_strip_host.setObjectName("windowFrameTabStripHost")
+        self._tab_strip_host.setAttribute(Qt.WA_StyledBackground, True)
+        self._tab_strip_host.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self._tab_strip_host_layout = QHBoxLayout(self._tab_strip_host)
+        self._tab_strip_host_layout.setContentsMargins(0, 0, 0, 0)
+        self._tab_strip_host_layout.setSpacing(6)
+        self._tab_strip_host.setMinimumWidth(220)
+        self._tab_strip_host.setVisible(False)
+        self._tab_strip_handle = self._new_section_handle("tab_strip", "Tab-Leiste umpositionieren")
+        self._tab_strip_handle.setVisible(False)
+        self._left_tab_strip_widget: QWidget | None = None
+        self._right_tab_strip_widget: QWidget | None = None
+        self._tab_strip_left_host = QWidget(self._tab_strip_host)
+        self._tab_strip_left_host.setObjectName("windowFrameTabStripLeftHost")
+        self._tab_strip_left_host.setAttribute(Qt.WA_StyledBackground, True)
+        self._tab_strip_left_host.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self._tab_strip_left_layout = QHBoxLayout(self._tab_strip_left_host)
+        self._tab_strip_left_layout.setContentsMargins(0, 0, 0, 0)
+        self._tab_strip_left_layout.setSpacing(0)
+        self._tab_strip_right_host = QWidget(self._tab_strip_host)
+        self._tab_strip_right_host.setObjectName("windowFrameTabStripRightHost")
+        self._tab_strip_right_host.setAttribute(Qt.WA_StyledBackground, True)
+        self._tab_strip_right_host.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self._tab_strip_right_layout = QHBoxLayout(self._tab_strip_right_host)
+        self._tab_strip_right_layout.setContentsMargins(0, 0, 0, 0)
+        self._tab_strip_right_layout.setSpacing(0)
+
+        self._external_uri_widget: QWidget | None = None
+        self._external_uri_host = QWidget(self._tab_strip_host)
+        self._external_uri_host.setObjectName("windowFrameExternalUriHost")
+        self._external_uri_host.setAttribute(Qt.WA_StyledBackground, True)
+        self._external_uri_host.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        self._external_uri_host_layout = QHBoxLayout(self._external_uri_host)
+        self._external_uri_host_layout.setContentsMargins(0, 0, 0, 0)
+        self._external_uri_host_layout.setSpacing(0)
+        self._external_uri_host.setMinimumWidth(280)
+        self._external_uri_host.setMaximumWidth(640)
+        self._external_uri_host.setVisible(False)
+        self._external_uri_handle = self._new_section_handle(
+            "external_uri",
+            "Adresseingabe horizontal ziehen; Klick zentriert",
+        )
+        self._external_uri_handle.setCursor(Qt.SizeHorCursor)
+        self._external_uri_handle.installEventFilter(self)
+        self._external_uri_host_layout.addWidget(self._external_uri_handle, 0, Qt.AlignVCenter)
+        self._tab_strip_host_layout.addWidget(self._tab_strip_left_host, 1, Qt.AlignVCenter)
+        self._tab_strip_host_layout.addWidget(self._external_uri_host, 0, Qt.AlignVCenter)
+        self._tab_strip_host_layout.addWidget(self._tab_strip_right_host, 1, Qt.AlignVCenter)
+        self._section_widgets: dict[str, QWidget] = {
+            "tab_strip": self._tab_strip_host,
+        }
+        self._section_stretch: dict[str, int] = {
+            "tab_strip": 1,
+        }
+        self._section_order = list(self._SECTION_ORDER_DEFAULT)
+        self._apply_section_order(self._section_order)
 
         self._min_btn = QToolButton(self)
         self._min_btn.setObjectName("windowFrameButton")
@@ -13914,6 +14881,335 @@ class CustomWindowTitleBar(QWidget):
     def set_menu_enabled(self, enabled: bool) -> None:
         self._menu_btn.setEnabled(bool(enabled))
 
+    def _new_section_handle(self, section_id: str, tool_tip: str) -> QToolButton:
+        handle_button = QToolButton(self)
+        handle_button.setObjectName("windowFrameSectionHandle")
+        handle_button.setText("::")
+        handle_button.setAutoRaise(True)
+        handle_button.setFocusPolicy(Qt.NoFocus)
+        handle_button.setCursor(Qt.PointingHandCursor)
+        handle_button.setToolTip(tool_tip)
+        handle_button.setFixedSize(18, 18)
+        handle_button.setProperty("titlebar_section_id", section_id)
+        return handle_button
+
+    def _normalized_section_order(self, order: Sequence[str] | None) -> list[str]:
+        normalized_order: list[str] = []
+        for section_id in list(order or []):
+            normalized_section_id = str(section_id or "").strip().lower()
+            if normalized_section_id in self._SECTION_ORDER_DEFAULT and normalized_section_id not in normalized_order:
+                normalized_order.append(normalized_section_id)
+        for section_id in self._SECTION_ORDER_DEFAULT:
+            if section_id not in normalized_order:
+                normalized_order.append(section_id)
+        return normalized_order
+
+    def _apply_section_order(self, order: Sequence[str] | None) -> None:
+        resolved_order = self._normalized_section_order(order)
+        while self._sections_layout.count() > 0:
+            layout_item = self._sections_layout.takeAt(0)
+            layout_widget = layout_item.widget()
+            if isinstance(layout_widget, QWidget):
+                layout_widget.setParent(self._sections_container)
+        self._sections_layout.addWidget(self._tab_strip_host, 1, Qt.AlignVCenter)
+        self._section_order = resolved_order
+        self._update_uri_anchor_layout()
+
+    def current_section_order(self) -> list[str]:
+        return list(self._section_order)
+
+    def set_section_order(self, order: Sequence[str] | None) -> None:
+        self._apply_section_order(order)
+
+    def uri_anchor_ratio(self) -> float:
+        return float(self._uri_anchor_ratio)
+
+    def uri_tab_slot_index(self) -> int:
+        return int(self._uri_tab_slot_index)
+
+    def set_uri_tab_slot_count(self, count: int) -> None:
+        try:
+            resolved_count = int(count)
+        except Exception:
+            resolved_count = 0
+        resolved_count = max(0, resolved_count)
+        if resolved_count == self._uri_tab_slot_count:
+            return
+        self._uri_tab_slot_count = resolved_count
+        self.set_uri_tab_slot_index(self._uri_tab_slot_index)
+        self._update_uri_anchor_layout()
+
+    def set_uri_tab_slot_index(self, index: int) -> None:
+        try:
+            resolved_index = int(index)
+        except Exception:
+            resolved_index = 0
+        max_slot_index = max(0, int(self._uri_tab_slot_count))
+        resolved_index = max(0, min(resolved_index, max_slot_index))
+        if resolved_index == self._uri_tab_slot_index and self._uri_tab_slot_rects:
+            return
+        self._uri_tab_slot_index = resolved_index
+        self._update_uri_anchor_layout()
+        self.uriTabSlotIndexChanged.emit(int(self._uri_tab_slot_index))
+
+    def set_uri_anchor_ratio(self, value: float) -> None:
+        try:
+            resolved_ratio = float(value)
+        except Exception:
+            resolved_ratio = 0.5
+        resolved_ratio = max(0.0, min(1.0, resolved_ratio))
+        if math.isclose(resolved_ratio, float(self._uri_anchor_ratio), abs_tol=1e-6):
+            return
+        self._uri_anchor_ratio = resolved_ratio
+        self._update_uri_anchor_layout()
+        self.uriAnchorRatioChanged.emit(float(self._uri_anchor_ratio))
+
+    def _reset_uri_anchor_position(self) -> None:
+        self.set_uri_anchor_ratio(0.5)
+
+    def _resolved_external_uri_host_width(self) -> int:
+        if not self._external_uri_host.isVisible():
+            return 0
+        try:
+            hint_width = int(self._external_uri_host.sizeHint().width())
+        except Exception:
+            hint_width = 0
+        min_width = max(0, int(self._external_uri_host.minimumWidth()))
+        max_width = int(self._external_uri_host.maximumWidth())
+        if max_width <= 0:
+            max_width = max(min_width, hint_width)
+        resolved_width = max(min_width, hint_width)
+        return max(min_width, min(resolved_width, max_width))
+
+    def _resolved_tab_strip_required_width(self) -> int:
+        if not self._tab_strip_host.isVisible():
+            return 0
+        try:
+            hint_width = int(self._tab_strip_host.sizeHint().width())
+        except Exception:
+            hint_width = 0
+        try:
+            min_hint_width = int(self._tab_strip_host.minimumSizeHint().width())
+        except Exception:
+            min_hint_width = 0
+        min_width = max(0, int(self._tab_strip_host.minimumWidth()))
+        return max(min_width, hint_width, min_hint_width)
+
+    def _refresh_tab_strip_host_visibility(self) -> None:
+        left_widget = self._left_tab_strip_widget
+        right_widget = self._right_tab_strip_widget
+        has_left = isinstance(left_widget, QWidget)
+        has_right = isinstance(right_widget, QWidget)
+        if isinstance(left_widget, QTabBar):
+            try:
+                has_left = left_widget.count() > 0
+            except RuntimeError:
+                has_left = False
+        if isinstance(right_widget, QTabBar):
+            try:
+                has_right = right_widget.count() > 0
+            except RuntimeError:
+                has_right = False
+        has_uri = isinstance(self._external_uri_widget, QWidget)
+        self._tab_strip_left_host.setVisible(has_left or has_uri)
+        self._tab_strip_right_host.setVisible(has_right or has_uri)
+        self._external_uri_host.setVisible(has_uri)
+        self._tab_strip_host.setVisible(has_left or has_right or has_uri)
+        self._schedule_uri_anchor_layout_update()
+
+    def _schedule_uri_anchor_layout_update(self) -> None:
+        if self._uri_anchor_layout_update_pending:
+            return
+        self._uri_anchor_layout_update_pending = True
+
+        def _apply_pending_update() -> None:
+            self._uri_anchor_layout_update_pending = False
+            try:
+                self._update_uri_anchor_layout()
+            except RuntimeError:
+                return
+
+        QtCore.QTimer.singleShot(0, _apply_pending_update)
+
+    def _uses_uri_tab_slot_layout(self) -> bool:
+        left_widget = self._left_tab_strip_widget
+        if not isinstance(left_widget, QWidget):
+            return False
+        if isinstance(left_widget, QTabBar):
+            try:
+                return left_widget.count() > 0
+            except RuntimeError:
+                return False
+        try:
+            return left_widget.isVisible()
+        except RuntimeError:
+            return False
+
+    def _set_uri_anchor_from_container_x(self, container_x: int) -> None:
+        if self._uri_tab_slot_rects and self._uses_uri_tab_slot_layout():
+            closest_index = 0
+            closest_distance = None
+            for slot_index, slot_rect in enumerate(self._uri_tab_slot_rects):
+                slot_center = slot_rect.center().x()
+                slot_distance = abs(int(container_x) - int(slot_center))
+                if closest_distance is None or slot_distance < closest_distance:
+                    closest_distance = slot_distance
+                    closest_index = slot_index
+            self.set_uri_tab_slot_index(closest_index)
+            return
+        available_width = max(0, int(self._tab_strip_host.width() or self._sections_container.width()))
+        uri_width = self._resolved_external_uri_host_width()
+        max_left = max(0, available_width - uri_width)
+        desired_left = max(0, min(int(container_x - (uri_width / 2)), max_left))
+        self.set_uri_anchor_ratio(self._uri_anchor_ratio_from_left(desired_left, max_left, uri_width))
+
+    def _resolved_titlebar_centered_uri_left(self, max_left: int, uri_width: int) -> int:
+        max_left = max(0, int(max_left))
+        uri_width = max(0, int(uri_width))
+        try:
+            host_left = int(self._tab_strip_host.mapTo(self, QPoint(0, 0)).x())
+        except Exception:
+            host_left = int(self._tab_strip_host.x())
+        titlebar_center = int(self.contentsRect().center().x())
+        centered_left = int(round(titlebar_center - host_left - (uri_width / 2.0)))
+        return max(0, min(centered_left, max_left))
+
+    def _uri_left_from_anchor_ratio(self, ratio: float, max_left: int, uri_width: int) -> int:
+        max_left = max(0, int(max_left))
+        if max_left <= 0:
+            return 0
+        centered_left = self._resolved_titlebar_centered_uri_left(max_left, uri_width)
+        resolved_ratio = max(0.0, min(1.0, float(ratio)))
+        if resolved_ratio <= 0.5:
+            if centered_left <= 0:
+                return 0
+            return int(round(centered_left * (resolved_ratio / 0.5)))
+        right_span = max(0, max_left - centered_left)
+        if right_span <= 0:
+            return centered_left
+        return int(round(centered_left + (right_span * ((resolved_ratio - 0.5) / 0.5))))
+
+    def _uri_anchor_ratio_from_left(self, left: int, max_left: int, uri_width: int) -> float:
+        max_left = max(0, int(max_left))
+        desired_left = max(0, min(int(left), max_left))
+        if max_left <= 0:
+            return 0.5
+        centered_left = self._resolved_titlebar_centered_uri_left(max_left, uri_width)
+        if desired_left <= centered_left:
+            if centered_left <= 0:
+                return 0.0
+            return max(0.0, min(0.5, 0.5 * (desired_left / float(centered_left))))
+        right_span = max_left - centered_left
+        if right_span <= 0:
+            return 1.0
+        return max(0.5, min(1.0, 0.5 + (0.5 * ((desired_left - centered_left) / float(right_span)))))
+
+    def _tab_slot_left_from_index(self, slot_index: int) -> int:
+        if not self._uri_tab_slot_rects:
+            return 0
+        resolved_slot_index = max(0, min(int(slot_index), len(self._uri_tab_slot_rects) - 1))
+        slot_rect = self._uri_tab_slot_rects[resolved_slot_index]
+        uri_width = self._resolved_external_uri_host_width()
+        return max(0, int(round(slot_rect.center().x() - (uri_width / 2))))
+
+    def _rebuild_uri_tab_slot_rects(self, available_width: int, uri_width: int) -> None:
+        slot_count = max(0, int(self._uri_tab_slot_count))
+        if slot_count <= 0 or available_width <= 0:
+            self._uri_tab_slot_rects = []
+            return
+        step_count = max(1, slot_count)
+        max_left = max(0, available_width - uri_width)
+        self._uri_tab_slot_rects = []
+        for slot_index in range(slot_count + 1):
+            if slot_count <= 0:
+                left = 0
+            else:
+                left = int(round((max_left * slot_index) / float(step_count)))
+            self._uri_tab_slot_rects.append(QRect(left, 0, uri_width, max(1, int(self._sections_container.height()))))
+
+    def _update_uri_anchor_layout(self) -> None:
+        if not self._external_uri_host.isVisible():
+            self._uri_tab_slot_rects = []
+            self._tab_strip_left_host.setMinimumWidth(0)
+            self._tab_strip_left_host.setMaximumWidth(16777215)
+            return
+
+        available_width = max(0, int(self._tab_strip_host.width() or self._sections_container.width()))
+        uri_width = self._resolved_external_uri_host_width()
+        self._rebuild_uri_tab_slot_rects(available_width, uri_width)
+        max_left = max(0, available_width - uri_width)
+        if self._uri_tab_slot_rects and self._uses_uri_tab_slot_layout():
+            desired_left = self._tab_slot_left_from_index(self._uri_tab_slot_index)
+        else:
+            desired_left = self._resolved_titlebar_centered_uri_left(max_left, uri_width)
+        desired_left = max(0, min(desired_left, max_left))
+        left_spacing = max(0, int(self._tab_strip_host_layout.spacing()))
+        left_spacer_width = max(0, desired_left - left_spacing)
+        self._tab_strip_left_host.setMinimumWidth(left_spacer_width)
+        self._tab_strip_left_host.setMaximumWidth(left_spacer_width)
+        self._external_uri_host.setMinimumWidth(uri_width)
+        self._external_uri_host.setMaximumWidth(uri_width)
+        self._tab_strip_left_host.updateGeometry()
+        self._external_uri_host.updateGeometry()
+        self._tab_strip_right_host.updateGeometry()
+        self._tab_strip_host_layout.invalidate()
+        self._sections_layout.invalidate()
+        self._sections_container.updateGeometry()
+        self._sections_container.update()
+
+    def _toggle_section_position(self, section_id: str) -> None:
+        resolved_order = self._normalized_section_order(self._section_order)
+        if section_id not in resolved_order or len(resolved_order) < 2:
+            return
+        current_index = resolved_order.index(section_id)
+        target_index = 0 if current_index > 0 else len(resolved_order) - 1
+        if current_index == target_index:
+            return
+        moved_section_id = resolved_order.pop(current_index)
+        resolved_order.insert(target_index, moved_section_id)
+        self._apply_section_order(resolved_order)
+        self.sectionOrderChanged.emit(list(self._section_order))
+
+    def _mount_host_widget(
+        self,
+        host_layout: QHBoxLayout,
+        attr_name: str,
+        widget: QWidget | None,
+    ) -> None:
+        mounted_widget = getattr(self, attr_name, None)
+        if mounted_widget is widget:
+            return
+        if isinstance(mounted_widget, QWidget):
+            host_layout.removeWidget(mounted_widget)
+            mounted_widget.setParent(None)
+            mounted_widget.deleteLater()
+        setattr(self, attr_name, None)
+        if isinstance(widget, QWidget):
+            host_layout.addWidget(widget, 1)
+            setattr(self, attr_name, widget)
+
+    def set_tab_strip_widget(self, widget: QWidget | None) -> None:
+        self._mount_host_widget(self._tab_strip_right_layout, "_right_tab_strip_widget", widget)
+        self._mount_host_widget(self._tab_strip_left_layout, "_left_tab_strip_widget", None)
+        self._refresh_tab_strip_host_visibility()
+        self._update_uri_anchor_layout()
+
+    def set_left_tab_strip_widget(self, widget: QWidget | None) -> None:
+        self._mount_host_widget(self._tab_strip_left_layout, "_left_tab_strip_widget", widget)
+        self._refresh_tab_strip_host_visibility()
+        self._update_uri_anchor_layout()
+
+    def set_right_tab_strip_widget(self, widget: QWidget | None) -> None:
+        self._mount_host_widget(self._tab_strip_right_layout, "_right_tab_strip_widget", widget)
+        self._refresh_tab_strip_host_visibility()
+        self._update_uri_anchor_layout()
+
+    def set_external_uri_widget(self, widget: QWidget | None) -> None:
+        self._mount_host_widget(self._external_uri_host_layout, "_external_uri_widget", widget)
+        self._external_uri_handle.setVisible(False)
+        self._refresh_tab_strip_host_visibility()
+        self._update_uri_anchor_layout()
+
     def apply_scheme(self, scheme: Mapping[str, str]) -> None:
         bg = str(scheme.get("col5") or scheme.get("col7") or "#000000")
         fg = str(scheme.get("col6") or "#E3E3DED6")
@@ -13921,10 +15217,40 @@ class CustomWindowTitleBar(QWidget):
         hover = "rgba(190,190,190,22)"
         menu_pressed = "rgba(190,190,190,24)"
         close_hover = "rgba(190,190,190,26)"
+        tab_fg = "#FFFFFF"
+        tab_bg = "rgba(255, 204, 0, 0.28)"
+        tab_hover_bg = "rgba(255, 204, 0, 0.44)"
+        tab_selected_bg = "rgba(255, 204, 0, 0.22)"
+        tab_border = "rgba(255, 204, 0, 0.95)"
+        uri_bg = str(scheme.get("col9") or "#101010")
+        titlebar_surface_bg = str(scheme.get("col5") or bg or "#000000")
+        uri_border = str(scheme.get("col10") or "#1f1f1f")
+        uri_hover_bg = str(scheme.get("col7") or uri_bg)
+        uri_hover_border = str(scheme.get("col10") or uri_border)
+        uri_focus_border = str(scheme.get("col2") or scheme.get("col1") or uri_hover_border)
+        titlebar_tab_height = max(18, int(self._HEIGHT) - 10)
         self.setStyleSheet(
             f"""
             QWidget#windowFrameTitleBar {{
                 background: {bg};
+                background-color: {bg};
+                border: none;
+            }}
+            QWidget#windowFrameSectionsContainer {{
+                background: {titlebar_surface_bg};
+                background-color: {titlebar_surface_bg};
+                border: none;
+            }}
+            QWidget#windowFrameTabStripHost,
+            QWidget#windowFrameExternalUriHost,
+            QWidget#windowFrameExtensionsTabProxyHost {{
+                background: {titlebar_surface_bg};
+                background-color: {titlebar_surface_bg};
+                border: none;
+            }}
+            QWidget[extensions_titlebar_uri_container="true"] {{
+                background: {titlebar_surface_bg};
+                background-color: {titlebar_surface_bg};
                 border: none;
             }}
             QLabel#windowFrameTitle {{
@@ -13953,6 +15279,18 @@ class CustomWindowTitleBar(QWidget):
                 background: transparent;
                 border: none;
             }}
+            QToolButton#windowFrameSectionHandle {{
+                background: transparent;
+                color: {fg};
+                border: 1px solid transparent;
+                border-radius: 5px;
+                padding: 0px 4px;
+                margin-right: 4px;
+            }}
+            QToolButton#windowFrameSectionHandle:hover {{
+                background: {hover};
+                border-color: {border};
+            }}
             QToolButton#windowFrameButton,
             QToolButton#windowFrameCloseButton {{
                 background: transparent;
@@ -13974,6 +15312,77 @@ class CustomWindowTitleBar(QWidget):
                 background: {close_hover};
                 border-color: transparent;
             }}
+            QTabBar#windowFrameExtensionsEmbeddedTabBar {{
+                background: {titlebar_surface_bg};
+                background-color: {titlebar_surface_bg};
+            }}
+            QTabBar#windowFrameExtensionsEmbeddedTabBar::tab {{
+                color: {tab_fg};
+                background: {tab_bg};
+                border: 1px solid {tab_border};
+                border-radius: 6px;
+                font-size: 10px;
+                font-weight: 700;
+                padding: 0px 26px 0px 9px;
+                margin: 0px 2px 0px 0px;
+                min-width: 0px;
+                min-height: 0px;
+                max-height: {titlebar_tab_height}px;
+            }}
+            QTabBar#windowFrameExtensionsEmbeddedTabBar::tab:hover {{
+                color: {tab_fg};
+                background: {tab_hover_bg};
+                border: 1px solid {tab_border};
+            }}
+            QTabBar#windowFrameExtensionsEmbeddedTabBar::tab:selected {{
+                color: {tab_fg};
+                background: {tab_selected_bg};
+                border: 1px solid {tab_border};
+            }}
+            QTabBar#windowFrameExtensionsEmbeddedTabBar::scroller {{
+                width: 0px;
+            }}
+            QToolButton#extensionsEmbeddedTabCloseButton {{
+                color: {tab_fg};
+                background: {tab_bg};
+                border: 1px solid {tab_border};
+                border-radius: 6px;
+                font-size: 10px;
+                font-weight: 700;
+                padding: 0px;
+                margin: 0px;
+            }}
+            QToolButton#extensionsEmbeddedTabCloseButton:hover {{
+                color: {tab_fg};
+                background: {tab_hover_bg};
+                border: 1px solid {tab_border};
+                border-radius: 6px;
+            }}
+            QLineEdit#extensionsGraphUriInput {{
+                color: {fg};
+                background: {titlebar_surface_bg};
+                background-color: {titlebar_surface_bg};
+                border: 1px solid {uri_border};
+                border-radius: 8px;
+                padding: 4px 8px;
+                min-height: 18px;
+                selection-background-color: {scheme.get('col2') or uri_focus_border};
+                selection-color: {fg};
+            }}
+            QLineEdit#extensionsGraphUriInput:hover {{
+                background: {titlebar_surface_bg};
+                background-color: {titlebar_surface_bg};
+                border-color: {scheme.get('col2') or uri_hover_border};
+            }}
+            QLineEdit#extensionsGraphUriInput:focus {{
+                background: {titlebar_surface_bg};
+                background-color: {titlebar_surface_bg};
+                border-color: {scheme.get('col1') or uri_focus_border};
+            }}
+            QLineEdit#extensionsGraphUriInput QToolButton {{
+                background: transparent;
+                border: none;
+            }}
             QToolButton:disabled {{
                 color: {border};
             }}
@@ -13994,6 +15403,36 @@ class CustomWindowTitleBar(QWidget):
         is_fullscreen = self._window.isFullScreen()
         self._fullscreen_btn.setChecked(is_fullscreen)
         self._fullscreen_btn.setToolTip("Fullscreen beenden (F11)" if is_fullscreen else "Echtes Fullscreen (F11)")
+
+    def resizeEvent(self, event):  # noqa: N802
+        super().resizeEvent(event)
+        self._update_uri_anchor_layout()
+
+    def eventFilter(self, obj, event):  # noqa: N802
+        if obj is self._external_uri_handle:
+            if event.type() == QEvent.MouseButtonPress and event.button() == Qt.LeftButton:
+                self._uri_anchor_drag_active = True
+                self._uri_anchor_drag_moved = False
+                event.accept()
+                return True
+            if event.type() == QEvent.MouseMove and self._uri_anchor_drag_active and (event.buttons() & Qt.LeftButton):
+                self._uri_anchor_drag_moved = True
+                global_point = event.globalPosition().toPoint() if hasattr(event, "globalPosition") else event.globalPos()
+                local_point = self._tab_strip_host.mapFromGlobal(global_point)
+                self._set_uri_anchor_from_container_x(local_point.x())
+                event.accept()
+                return True
+            if event.type() == QEvent.MouseButtonRelease and self._uri_anchor_drag_active and event.button() == Qt.LeftButton:
+                self._uri_anchor_drag_active = False
+                if not self._uri_anchor_drag_moved:
+                    if self._uri_tab_slot_rects and self._uses_uri_tab_slot_layout():
+                        midpoint_slot = int(round(len(self._uri_tab_slot_rects) / 2.0))
+                        self.set_uri_tab_slot_index(midpoint_slot)
+                    else:
+                        self._reset_uri_anchor_position()
+                event.accept()
+                return True
+        return super().eventFilter(obj, event)
 
     def _open_window_menu(self) -> None:
         anchor = self._menu_btn.mapToGlobal(QPoint(0, self._menu_btn.height()))
@@ -14107,7 +15546,8 @@ class WindowTopFrameBar(WindowToolbarDragHandle):
 class MainAIEditor(QMainWindow):
     ORG_NAME: Final = "ai.bentu"
 
-    APP_NAME: Final = "/\\/ AI IDE"
+    APP_NAME: Final = "A.I.M"
+    WINDOW_TITLE: Final = "A.I.M"
     _SCHEMA:  Final = 2
 
     # ---------------------------------------------------------------- init --
@@ -14122,6 +15562,12 @@ class MainAIEditor(QMainWindow):
         self._explorer_database_panel_visible: bool = False
         self._window_menu_bar: QMenuBar | None = None
         self._title_bar_widget: CustomWindowTitleBar | None = None
+        self._window_titlebar_left_tab_proxy_host: QWidget | None = None
+        self._window_titlebar_tab_proxy_host: QWidget | None = None
+        self._window_titlebar_uri_proxy: QLineEdit | None = None
+        self._window_titlebar_section_order: list[str] = ["external_uri", "tab_strip"]
+        self._window_titlebar_uri_anchor_ratio: float = 0.5
+        self._window_titlebar_uri_tab_slot_index: int = 0
         self._title_menu_popup: QMenu | None = None
         self._tb_left_chrome_widget: QWidget | None = None
         self._tb_left_title_label: QLabel | None = None
@@ -14138,6 +15584,8 @@ class MainAIEditor(QMainWindow):
         self._tb_left_drag_handle: WindowToolbarDragHandle | None = None
         self._window_top_frame_widget: WindowTopFrameBar | None = None
         self._custom_titlebar_active = False
+        self._toolbar_left_user_visible = True
+        self._toolbar_right_user_visible = True
         self._was_maximized_before_fullscreen = False
 
         # Crash-isolation helper: progressively enable init steps.
@@ -14147,7 +15595,7 @@ class MainAIEditor(QMainWindow):
         except Exception:
             init_level = 999
 
-        self.setWindowTitle(self.APP_NAME)
+        self.setWindowTitle(self.WINDOW_TITLE)
         self.resize(1280, 800)
         #self.showFullScreen
         # ---- create primary widgets/layout --------------------------------
@@ -14226,6 +15674,59 @@ class MainAIEditor(QMainWindow):
         # 2 mm in device pixels.
         return max(1, int(round((dpi_y * 2.0) / 25.4)))
 
+    def _normalize_window_titlebar_section_order(self, order: Sequence[str] | None) -> list[str]:
+        default_order = ["external_uri", "tab_strip"]
+        normalized_order: list[str] = []
+        for section_id in list(order or []):
+            normalized_section_id = str(section_id or "").strip().lower()
+            if normalized_section_id in default_order and normalized_section_id not in normalized_order:
+                normalized_order.append(normalized_section_id)
+        for section_id in default_order:
+            if section_id not in normalized_order:
+                normalized_order.append(section_id)
+        return normalized_order
+
+    @Slot(object)
+    def _handle_window_titlebar_section_order_changed(self, order: object) -> None:
+        if isinstance(order, (list, tuple)):
+            self._window_titlebar_section_order = self._normalize_window_titlebar_section_order(order)
+
+    @staticmethod
+    def _normalize_window_titlebar_uri_anchor_ratio(value: object) -> float:
+        try:
+            resolved_ratio = float(value)
+        except Exception:
+            resolved_ratio = 0.5
+        return max(0.0, min(1.0, resolved_ratio))
+
+    @Slot(float)
+    def _handle_window_titlebar_uri_anchor_ratio_changed(self, value: float) -> None:
+        self._window_titlebar_uri_anchor_ratio = self._normalize_window_titlebar_uri_anchor_ratio(value)
+
+    @Slot(int)
+    def _handle_window_titlebar_uri_tab_slot_index_changed(self, value: int) -> None:
+        try:
+            self._window_titlebar_uri_tab_slot_index = max(0, int(value))
+        except Exception:
+            self._window_titlebar_uri_tab_slot_index = 0
+        self._sync_window_titlebar_tab_slot_split()
+
+    def _set_window_titlebar_uri_tab_slot_index(self, value: int) -> None:
+        self._handle_window_titlebar_uri_tab_slot_index_changed(value)
+        self._sync_window_titlebar_extensions()
+
+    def _sync_window_titlebar_tab_slot_split(self) -> None:
+        extensions_widget = getattr(self, "extensions_widget", None)
+        if not isinstance(extensions_widget, ExtensionsWorkspaceWidget):
+            return
+
+        right_tab_proxy_host = self._window_titlebar_tab_proxy_host
+        right_proxy_tab_bar = right_tab_proxy_host.findChild(QTabBar, _WINDOW_FRAME_EMBEDDED_TAB_BAR_OBJECT_NAME) if isinstance(right_tab_proxy_host, QWidget) else None
+
+        if isinstance(right_proxy_tab_bar, QTabBar):
+            right_proxy_tab_bar.setProperty("extensions_titlebar_uri_slot_index", self._window_titlebar_uri_tab_slot_index)
+        extensions_widget._sync_embedded_tab_bar_proxies()
+
     def _get_or_create_top_frame_widget(self) -> WindowTopFrameBar:
         widget = self._get_live_top_frame_widget()
         height_px = self._top_frame_height_px()
@@ -14242,11 +15743,18 @@ class MainAIEditor(QMainWindow):
 
         self.setWindowFlag(Qt.FramelessWindowHint, True)
         self._title_bar_widget = CustomWindowTitleBar(self)
+        self._title_bar_widget.sectionOrderChanged.connect(self._handle_window_titlebar_section_order_changed)
+        self._title_bar_widget.uriAnchorRatioChanged.connect(self._handle_window_titlebar_uri_anchor_ratio_changed)
+        self._title_bar_widget.uriTabSlotIndexChanged.connect(self._handle_window_titlebar_uri_tab_slot_index_changed)
+        self._title_bar_widget.set_section_order(self._window_titlebar_section_order)
+        self._title_bar_widget.set_uri_anchor_ratio(self._window_titlebar_uri_anchor_ratio)
+        self._title_bar_widget.set_uri_tab_slot_index(self._window_titlebar_uri_tab_slot_index)
         self._title_bar_widget.set_menu_enabled(bool(self._window_menu_bar and self._window_menu_bar.actions()))
         self.setMenuWidget(self._title_bar_widget)
         self._custom_titlebar_active = True
         self._sync_window_titlebar_scheme()
         self._refresh_window_titlebar_state()
+        self._sync_window_titlebar_extensions()
 
         menu_toggle_action = getattr(self, "menu_visible_action", None)
         if isinstance(menu_toggle_action, QAction):
@@ -14288,6 +15796,7 @@ class MainAIEditor(QMainWindow):
                 self._window_top_frame_widget = None
             self._custom_titlebar_active = False
 
+        self._sync_window_titlebar_extensions()
         self._sync_window_chrome_toolbar_visibility()
         self._sync_window_chrome_toolbar_scheme()
 
@@ -14295,7 +15804,7 @@ class MainAIEditor(QMainWindow):
         label = self._tb_left_title_label
         if not isinstance(label, QLabel):
             return
-        resolved_title = str(title if title is not None else self.windowTitle() or "").strip() or self.APP_NAME
+        resolved_title = str(title if title is not None else self.windowTitle() or "").strip() or self.WINDOW_TITLE
         label.setText(resolved_title)
 
     def _sync_toolbar_window_controls(self) -> None:
@@ -14370,38 +15879,227 @@ class MainAIEditor(QMainWindow):
         if isinstance(menu_btn, QToolButton):
             menu_btn.setEnabled(bool(enabled))
 
+    def _sync_toolbar_visibility_menu_actions(self) -> None:
+        left_toolbar = getattr(self, "tb_left", None)
+        right_toolbar = getattr(self, "tb_right", None)
+
+        left_action = getattr(self, "act_view_sidebar_left", None)
+        if isinstance(left_action, QAction):
+            blocker = QtCore.QSignalBlocker(left_action)
+            left_action.setChecked(bool(isinstance(left_toolbar, QToolBar) and left_toolbar.isVisible()))
+            del blocker
+
+        right_action = getattr(self, "act_view_sidebar_right", None)
+        if isinstance(right_action, QAction):
+            blocker = QtCore.QSignalBlocker(right_action)
+            right_action.setChecked(bool(isinstance(right_toolbar, QToolBar) and right_toolbar.isVisible()))
+            del blocker
+
+    def _sync_right_workspace_tabs_visibility(self, visible: bool) -> None:
+        titlebar_widget = self._get_live_title_bar_widget()
+        extensions_widget = getattr(self, "extensions_widget", None)
+        if isinstance(extensions_widget, ExtensionsWorkspaceWidget):
+            extensions_widget._hide_internal_tab_bar = bool(titlebar_widget is not None)
+            extensions_widget._sync_embedded_tab_bar_visibility()
+
+        if titlebar_widget is None:
+            return
+        if bool(visible):
+            self._sync_window_titlebar_extensions()
+            return
+        tab_proxy_host = self._window_titlebar_tab_proxy_host
+        titlebar_widget.set_right_tab_strip_widget(None)
+        if isinstance(tab_proxy_host, QWidget):
+            try:
+                tab_proxy_host.hide()
+                tab_proxy_host.setParent(None)
+                tab_proxy_host.deleteLater()
+            except RuntimeError:
+                pass
+        self._window_titlebar_tab_proxy_host = None
+
+    def _sync_toolbar_action_symbol_visibility(self) -> None:
+        left_toolbar = getattr(self, "tb_left", None)
+        if not isinstance(left_toolbar, QToolBar):
+            return
+        for action_name in (
+            "act_toggle_explorer",
+            "act_graph_placeholder",
+        ):
+            toolbar_action = getattr(self, action_name, None)
+            if not isinstance(toolbar_action, QAction):
+                continue
+            toolbar_widget = left_toolbar.widgetForAction(toolbar_action)
+            if isinstance(toolbar_widget, QWidget):
+                toolbar_widget.setVisible(False)
+
+    @Slot(bool)
+    def _set_left_toolbar_visible(self, visible: bool) -> None:
+        self._toolbar_left_user_visible = bool(visible)
+        self._sync_window_chrome_toolbar_visibility()
+
+    @Slot(bool)
+    def _set_right_toolbar_visible(self, visible: bool) -> None:
+        self._toolbar_right_user_visible = bool(visible)
+        self._sync_window_chrome_toolbar_visibility()
+
     def _sync_window_chrome_toolbar_visibility(self) -> None:
+        self._normalize_toolbar_layout()
         if self._custom_titlebar_active and self._get_live_title_bar_widget() is None:
             self._custom_titlebar_active = False
-        if _env_truthy("AI_IDE_DISABLE_CUSTOM_WINDOW_FRAME", "0"):
-            toolbar_chrome_visible = False
-        else:
-            toolbar_chrome_visible = not bool(self._custom_titlebar_active)
+        custom_frame_disabled = _env_truthy("AI_IDE_DISABLE_CUSTOM_WINDOW_FRAME", "0")
+        left_toolbar_visible = bool(self._toolbar_left_user_visible)
+        right_toolbar_visible = (not custom_frame_disabled) and bool(self._toolbar_right_user_visible)
+        left_chrome_visible = left_toolbar_visible and (not custom_frame_disabled) and (not bool(self._custom_titlebar_active))
+        right_chrome_visible = right_toolbar_visible
+        if isinstance(getattr(self, "tb_right", None), QToolBar):
+            self.tb_right.setVisible(right_toolbar_visible)
+        if isinstance(getattr(self, "tb_left", None), QToolBar):
+            self.tb_left.setVisible(left_toolbar_visible)
+        if isinstance(self._tb_left_chrome_action, QAction):
+            self._tb_left_chrome_action.setVisible(left_chrome_visible)
         for action in (
-            self._tb_left_chrome_action,
             self._tb_right_min_action,
             self._tb_right_max_action,
             self._tb_right_fullscreen_action,
             self._tb_right_close_action,
         ):
             if isinstance(action, QAction):
-                action.setVisible(toolbar_chrome_visible)
+                action.setVisible(right_chrome_visible)
         for widget in (
-            self._tb_left_chrome_widget,
             self._tb_right_min_btn,
             self._tb_right_max_btn,
             self._tb_right_fullscreen_btn,
             self._tb_right_close_btn,
+        ):
+            if isinstance(widget, QWidget):
+                widget.setVisible(right_chrome_visible)
+        for widget in (
+            self._tb_left_chrome_widget,
             self._tb_left_drag_handle,
         ):
             if isinstance(widget, QWidget):
-                widget.setVisible(toolbar_chrome_visible)
+                widget.setVisible(left_chrome_visible)
+        self._sync_toolbar_action_symbol_visibility()
         self._set_toolbar_window_menu_enabled(bool(self._window_menu_bar and self._window_menu_bar.actions()))
+        self._sync_toolbar_visibility_menu_actions()
+
+    def _sync_window_titlebar_extensions(self) -> None:
+        titlebar_widget = self._get_live_title_bar_widget()
+
+        if titlebar_widget is None:
+            tab_proxy_host = self._window_titlebar_tab_proxy_host
+            if isinstance(tab_proxy_host, QWidget):
+                tab_proxy_host.deleteLater()
+            left_tab_proxy_host = getattr(self, "_window_titlebar_left_tab_proxy_host", None)
+            if isinstance(left_tab_proxy_host, QWidget):
+                left_tab_proxy_host.deleteLater()
+            uri_proxy = self._window_titlebar_uri_proxy
+            if isinstance(uri_proxy, QWidget):
+                uri_proxy.deleteLater()
+            self._window_titlebar_tab_proxy_host = None
+            self._window_titlebar_left_tab_proxy_host = None
+            self._window_titlebar_uri_proxy = None
+            return
+
+        extensions_widget = getattr(self, "extensions_widget", None)
+        if not self._custom_titlebar_active or not isinstance(extensions_widget, ExtensionsWorkspaceWidget):
+            titlebar_widget.set_right_tab_strip_widget(None)
+            titlebar_widget.set_external_uri_widget(None)
+            self._window_titlebar_tab_proxy_host = None
+            self._window_titlebar_left_tab_proxy_host = None
+            self._window_titlebar_uri_proxy = None
+            return
+
+        titlebar_widget.set_section_order(self._window_titlebar_section_order)
+        titlebar_widget.set_uri_anchor_ratio(self._window_titlebar_uri_anchor_ratio)
+
+        uri_proxy = self._window_titlebar_uri_proxy
+        if not isinstance(uri_proxy, QLineEdit) or uri_proxy.parent() is None:
+            uri_proxy = extensions_widget.create_external_uri_proxy(titlebar_widget)
+            self._window_titlebar_uri_proxy = uri_proxy
+        uri_proxy.setProperty("extensions_titlebar_uri_tab_mode", True)
+
+        tab_proxy_host = self._window_titlebar_tab_proxy_host
+        try:
+            tab_proxy_host_parent = tab_proxy_host.parent() if isinstance(tab_proxy_host, QWidget) else None
+        except RuntimeError:
+            tab_proxy_host = None
+            tab_proxy_host_parent = None
+        if not isinstance(tab_proxy_host, QWidget) or tab_proxy_host_parent is None:
+            tab_proxy_host = extensions_widget.create_titlebar_tab_bar_proxy(titlebar_widget)
+            self._window_titlebar_tab_proxy_host = tab_proxy_host
+        for orphan_host in titlebar_widget.findChildren(QWidget, "windowFrameExtensionsTabProxyHost"):
+            if orphan_host is tab_proxy_host:
+                continue
+            try:
+                orphan_host.hide()
+                orphan_host.setParent(None)
+                orphan_host.deleteLater()
+            except RuntimeError:
+                pass
+
+        left_tab_proxy_host = getattr(self, "_window_titlebar_left_tab_proxy_host", None)
+        if isinstance(left_tab_proxy_host, QWidget):
+            left_tab_proxy_host.deleteLater()
+        self._window_titlebar_left_tab_proxy_host = None
+
+        def _tab_row_height(tab_bar: QTabBar | None) -> int:
+            if not isinstance(tab_bar, QTabBar):
+                return 0
+            try:
+                tab_count = int(tab_bar.count())
+            except RuntimeError:
+                return 0
+
+            row_height = 0
+            for tab_index in range(tab_count):
+                try:
+                    tab_rect = tab_bar.tabRect(tab_index)
+                except RuntimeError:
+                    break
+                row_height = max(row_height, int(tab_rect.height()))
+            if row_height > 0:
+                return row_height
+
+            try:
+                return max(0, int(tab_bar.sizeHint().height()))
+            except Exception:
+                return 0
+
+        proxy_tab_bar = tab_proxy_host.findChild(QTabBar, _WINDOW_FRAME_EMBEDDED_TAB_BAR_OBJECT_NAME)
+        source_tab_bar = None
+        try:
+            source_tab_bar = extensions_widget.extensions_tabs.tabBar()
+        except RuntimeError:
+            source_tab_bar = None
+
+        target_height = max(18, int(titlebar_widget.height()) - 10)
+        titlebar_widget.set_uri_tab_slot_count(max(0, extensions_widget.extensions_tabs.count()))
+        titlebar_widget.set_uri_tab_slot_index(self._window_titlebar_uri_tab_slot_index)
+        uri_proxy.setLayoutDirection(Qt.LeftToRight)
+        uri_proxy.setMinimumHeight(target_height)
+        uri_proxy.setMaximumHeight(target_height)
+        if isinstance(proxy_tab_bar, QTabBar):
+            proxy_tab_bar.setProperty("extensions_titlebar_uri_mode", False)
+            if isinstance(proxy_tab_bar, ExtensionsWorkspaceTabBar):
+                proxy_tab_bar.set_tab_row_height(target_height)
+            proxy_tab_bar.setMinimumHeight(target_height)
+            proxy_tab_bar.setMaximumHeight(target_height)
+            setattr(proxy_tab_bar, "_titlebar_uri_proxy_source_widget", None)
+            proxy_tab_bar.setProperty("extensions_titlebar_uri_slot_index", self._window_titlebar_uri_tab_slot_index)
+        self._sync_window_titlebar_tab_slot_split()
+
+        right_workspace_visible = bool(getattr(self, "extensions_dock", None) and self.extensions_dock.isVisible())
+        titlebar_widget.set_left_tab_strip_widget(None)
+        titlebar_widget.set_right_tab_strip_widget(tab_proxy_host if right_workspace_visible else None)
+        titlebar_widget.set_external_uri_widget(uri_proxy)
 
     def _sync_window_titlebar_scheme(self) -> None:
         titlebar_widget = self._get_live_title_bar_widget()
         if titlebar_widget is not None:
             titlebar_widget.apply_scheme(_build_scheme(self._accent, self._base))
+        self._sync_window_titlebar_extensions()
         self._sync_window_chrome_toolbar_scheme()
 
     def _refresh_window_titlebar_state(self) -> None:
@@ -15133,6 +16831,7 @@ class MainAIEditor(QMainWindow):
                 self._base,
                 self,
                 control_plane_widget_ref=self.control_plane_widget,
+                hide_internal_tab_bar=not _env_truthy("AI_IDE_DISABLE_CUSTOM_WINDOW_FRAME", "0"),
             )
             self.extensions_widget.setMinimumSize(0, 0)
             self.extensions_widget.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Expanding)
@@ -15468,7 +17167,7 @@ class MainAIEditor(QMainWindow):
         self.act_toggle_chat.setToolTip("AI-Chat anzeigen/ausblenden")
 
         self.act_toggle_control_plane = QAction(
-            _icon("automation_25dp_B7B7B7_FILL0_wght500_GRAD0_opsz24.svg"),
+            _icon("dashboard_25dp_B7B7B7_FILL0_wght500_GRAD0_opsz24.svg"),
             "Control Plane",
             self,
             checkable=True,
@@ -15491,19 +17190,19 @@ class MainAIEditor(QMainWindow):
         # ---------- Right-Dock Toggle (for right side-toolbar) --------------
         # Uses panel-style icons instead of the chat glyph.
         self.act_toggle_right_dock = QAction(
-            _icon("right_panel_close_24dp_666666_FILL0_wght400_GRAD0_opsz24.svg"),
-            "Monitor",
+            _icon("dashboard_25dp_B7B7B7_FILL0_wght500_GRAD0_opsz24.svg"),
+            "Dashboard",
             self,
             checkable=True,
             checked=True,
         )
-        self.act_toggle_right_dock.setToolTip("Monitor anzeigen/ausblenden")
+        self.act_toggle_right_dock.setToolTip("Dashboard anzeigen/ausblenden")
         self.act_toggle_right_dock.toggled.connect(self.extensions_dock.setVisible)
 
-        polymer_icon_path = Path(__file__).with_name("polymer_24dp_E3E3E3_FILL0_wght400_GRAD0_opsz24.svg")
-        polymer_icon = QIcon(str(polymer_icon_path)) if polymer_icon_path.is_file() else _icon("polymer_24dp_E3E3E3_FILL0_wght400_GRAD0_opsz24.svg")
+        chat_icon_path = Path(__file__).with_name("chat.svg")
+        chat_icon = QIcon(str(chat_icon_path)) if chat_icon_path.is_file() else _icon("chat.svg")
         self.act_toggle_control_plane_left = QAction(
-            polymer_icon,
+            chat_icon,
             "Chat",
             self,
             checkable=True,
@@ -15741,81 +17440,16 @@ class MainAIEditor(QMainWindow):
             )
             self.addToolBar(Qt.RightToolBarArea, bar)
 
-        tb_right_mini_host = QWidget(self.tb_right)
-        tb_right_mini_host.setObjectName("toolbarWindowMiniControlsHost")
-        tb_right_mini_host.setStyleSheet("background: transparent; border: none;")
-        tb_right_mini_host.setFixedWidth(right_toolbar_width)
-        tb_right_mini_host_layout = QHBoxLayout(tb_right_mini_host)
-        tb_right_mini_host_layout.setContentsMargins(0, 0, 0, 0)
-        tb_right_mini_host_layout.setSpacing(0)
-        tb_right_mini_host_layout.addStretch(1)
+        self._tb_right_min_btn = None
+        self._tb_right_max_btn = None
+        self._tb_right_fullscreen_btn = None
+        self._tb_right_close_btn = None
+        self._tb_right_min_action = None
+        self._tb_right_max_action = None
+        self._tb_right_fullscreen_action = None
+        self._tb_right_close_action = None
 
-        tb_right_mini_controls = QWidget(tb_right_mini_host)
-        tb_right_mini_controls.setObjectName("toolbarWindowMiniControls")
-        tb_right_mini_controls.setStyleSheet("background: transparent; border: none;")
-        tb_right_mini_controls.setLayoutDirection(Qt.LeftToRight)
-        tb_right_mini_controls.setFixedSize(33, 33)
-        tb_right_mini_layout = QGridLayout(tb_right_mini_controls)
-        tb_right_mini_layout.setContentsMargins(0, 0, 0, 0)
-        tb_right_mini_layout.setSpacing(1)
-
-        self._tb_right_max_btn = QToolButton(tb_right_mini_controls)
-        self._tb_right_max_btn.setObjectName("toolbarWindowMaxButton")
-        self._tb_right_max_btn.setIcon(_draw_window_control_icon("maximize", size=14))
-        self._tb_right_max_btn.setIconSize(QSize(12, 12))
-        self._tb_right_max_btn.setToolTip("Maximieren")
-        self._tb_right_max_btn.setCursor(Qt.PointingHandCursor)
-        self._tb_right_max_btn.setFocusPolicy(Qt.NoFocus)
-        self._tb_right_max_btn.setAutoRaise(True)
-        self._tb_right_max_btn.setFixedSize(16, 16)
-        self._tb_right_max_btn.clicked.connect(self._toggle_window_maximize_restore)
-        tb_right_mini_layout.addWidget(self._tb_right_max_btn, 0, 0)
-
-        self._tb_right_min_btn = QToolButton(tb_right_mini_controls)
-        self._tb_right_min_btn.setObjectName("toolbarWindowMinButton")
-        self._tb_right_min_btn.setText("")
-        self._tb_right_min_btn.setIcon(_draw_window_control_icon("minimize", size=14))
-        self._tb_right_min_btn.setIconSize(QSize(12, 12))
-        self._tb_right_min_btn.setToolTip("Minimieren")
-        self._tb_right_min_btn.setCursor(Qt.PointingHandCursor)
-        self._tb_right_min_btn.setFocusPolicy(Qt.NoFocus)
-        self._tb_right_min_btn.setAutoRaise(True)
-        self._tb_right_min_btn.setFixedSize(16, 16)
-        self._tb_right_min_btn.clicked.connect(self.showMinimized)
-        tb_right_mini_layout.addWidget(self._tb_right_min_btn, 1, 0)
-
-        self._tb_right_fullscreen_btn = QToolButton(tb_right_mini_controls)
-        self._tb_right_fullscreen_btn.setObjectName("toolbarWindowFullscreenButton")
-        self._tb_right_fullscreen_btn.setIcon(_icon("open_in_full_26dp_999999_FILL0_wght500_GRAD0_opsz24.svg"))
-        self._tb_right_fullscreen_btn.setIconSize(QSize(12, 12))
-        self._tb_right_fullscreen_btn.setToolTip("Echtes Fullscreen (F11)")
-        self._tb_right_fullscreen_btn.setCursor(Qt.PointingHandCursor)
-        self._tb_right_fullscreen_btn.setFocusPolicy(Qt.NoFocus)
-        self._tb_right_fullscreen_btn.setAutoRaise(True)
-        self._tb_right_fullscreen_btn.setCheckable(True)
-        self._tb_right_fullscreen_btn.setFixedSize(16, 16)
-        self._tb_right_fullscreen_btn.clicked.connect(self._toggle_true_fullscreen_mode)
-        tb_right_mini_layout.addWidget(self._tb_right_fullscreen_btn, 0, 1)
-
-        self._tb_right_close_btn = QToolButton(tb_right_mini_controls)
-        self._tb_right_close_btn.setObjectName("toolbarWindowCloseButton")
-        self._tb_right_close_btn.setIcon(_draw_window_control_icon("close", size=14))
-        self._tb_right_close_btn.setIconSize(QSize(12, 12))
-        self._tb_right_close_btn.setToolTip("Schliessen")
-        self._tb_right_close_btn.setCursor(Qt.PointingHandCursor)
-        self._tb_right_close_btn.setFocusPolicy(Qt.NoFocus)
-        self._tb_right_close_btn.setAutoRaise(True)
-        self._tb_right_close_btn.setFixedSize(16, 16)
-        self._tb_right_close_btn.clicked.connect(self.close)
-        tb_right_mini_layout.addWidget(self._tb_right_close_btn, 1, 1)
-
-        tb_right_mini_host_layout.addWidget(tb_right_mini_controls, 0, Qt.AlignCenter)
-        tb_right_mini_host_layout.addStretch(1)
-
-        self._tb_right_close_action = self.tb_right.addWidget(tb_right_mini_host)
-        self._tb_right_min_action = self._tb_right_close_action
-        self._tb_right_max_action = self._tb_right_close_action
-        self._tb_right_fullscreen_action = self._tb_right_close_action
+        self.tb_right.addAction(self.act_toggle_right_dock)
 
         self._tb_right_spacer = QWidget(self.tb_right)
         self._tb_right_spacer.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
@@ -15897,14 +17531,13 @@ class MainAIEditor(QMainWindow):
         tb_left_chrome_layout.addWidget(self._tb_left_menu_button, 0, Qt.AlignCenter)
         self._tb_left_chrome_action = self.tb_left.addWidget(self._tb_left_chrome_widget)
 
-        if hasattr(self, "act_toggle_explorer"):
-            self.tb_left.addAction(self.act_toggle_explorer)
-        if hasattr(self, "act_toggle_control_plane_left"):
-            self.tb_left.addAction(self.act_toggle_control_plane_left)
-        if hasattr(self, "act_toggle_control_plane"):
-            self.tb_left.addAction(self.act_toggle_control_plane)
-        if hasattr(self, "act_graph_placeholder"):
-            self.tb_left.addAction(self.act_graph_placeholder)
+        for toolbar_action in (
+            getattr(self, "act_refresh_control_plane", None),
+            getattr(self, "act_toggle_control_plane_left", None),
+        ):
+            if isinstance(toolbar_action, QAction):
+                self.tb_left.addAction(toolbar_action)
+
         self._tb_left_spacer = QWidget(self.tb_left)
         self._tb_left_spacer.setStyleSheet(f"background: {chrome_bg}; border: none;")
         self._tb_left_spacer.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
@@ -16085,6 +17718,29 @@ class MainAIEditor(QMainWindow):
         if not custom_frame_enabled:
             self.act_toggle_custom_titlebar.setEnabled(False)
             self.act_toggle_custom_titlebar.setToolTip("Custom Titlebar ist via Environment deaktiviert")
+
+        left_toolbar = getattr(self, "tb_left", None)
+        right_toolbar = getattr(self, "tb_right", None)
+        self.act_view_sidebar_left = QAction(
+            self.act_toggle_explorer.icon(),
+            "Toolbar Left",
+            self,
+            checkable=True,
+            checked=bool(isinstance(left_toolbar, QToolBar) and left_toolbar.isVisible()),
+        )
+        self.act_view_sidebar_left.setToolTip("Linke Toolbar anzeigen/ausblenden")
+        self.act_view_sidebar_left.toggled.connect(self._set_left_toolbar_visible)
+
+        self.act_view_sidebar_right = QAction(
+            self.act_toggle_right_dock.icon(),
+            "Toolbar Right",
+            self,
+            checkable=True,
+            checked=bool(isinstance(right_toolbar, QToolBar) and right_toolbar.isVisible()),
+        )
+        self.act_view_sidebar_right.setToolTip("Rechte Toolbar anzeigen/ausblenden")
+        self.act_view_sidebar_right.toggled.connect(self._set_right_toolbar_visible)
+
         # helper to insert action + separator (except after the last one)
         action_list: list = \
             [
@@ -16109,7 +17765,12 @@ class MainAIEditor(QMainWindow):
                 view.addAction(act)
                 if not last:
                     view.addSeparator()
-        
+
+        view.addAction(self.act_view_sidebar_left)
+        view.addSeparator()
+        view.addAction(self.act_view_sidebar_right)
+        view.addSeparator()
+
         _addActions(action_list) 
         
         # -------------- TOOLS ------------------------------------------------
@@ -16180,8 +17841,10 @@ class MainAIEditor(QMainWindow):
         if hasattr(self, "act_toggle_right_dock"):
             self.extensions_dock.visibilityChanged.connect(self.act_toggle_right_dock.setChecked)
             self.extensions_dock.visibilityChanged.connect(self._update_right_dock_icon)
+            self.extensions_dock.visibilityChanged.connect(self._sync_right_workspace_tabs_visibility)
             # Initialize icon state
             self._update_right_dock_icon(self.extensions_dock.isVisible())
+            self._sync_right_workspace_tabs_visibility(self.extensions_dock.isVisible())
         self._rebalance_workspace_columns()
 
     @Slot()
@@ -16637,11 +18300,11 @@ class MainAIEditor(QMainWindow):
             self._st_runtime.setText(runtime_text)
 
     def _update_right_dock_icon(self, visible: bool) -> None:
-        """Update the right-toolbar icon depending on monitor visibility."""
+        """Update the right-toolbar icon depending on dashboard visibility."""
         if not hasattr(self, "act_toggle_right_dock"):
             return
         self.act_toggle_right_dock.setIcon(
-            _icon("right_panel_close_24dp_666666_FILL0_wght400_GRAD0_opsz24.svg")
+            _icon("dashboard_25dp_B7B7B7_FILL0_wght500_GRAD0_opsz24.svg")
         )
 
     def _update_tabdock_toggle_state(self) -> None:
@@ -17388,6 +19051,12 @@ class MainAIEditor(QMainWindow):
 
         # eigene Felder ---------------------------------------------------
 
+        self._window_titlebar_section_order = self._normalize_window_titlebar_section_order(["external_uri", "tab_strip"])
+        self._window_titlebar_uri_anchor_ratio = self._normalize_window_titlebar_uri_anchor_ratio(
+            s.value("titlebarUriAnchorRatio", self._window_titlebar_uri_anchor_ratio)
+        )
+        self._window_titlebar_uri_tab_slot_index = max(0, s.value("titlebarUriTabSlotIndex", self._window_titlebar_uri_tab_slot_index, int))
+
         self._accent_name = _normalize_accent_name(s.value("accent", "green"))
         self._accent = _accent_from_name(self._accent_name)
         self._base   = SCHEME_GREY  if s.value("base")   == "grey"  else SCHEME_DARK
@@ -17466,6 +19135,9 @@ class MainAIEditor(QMainWindow):
 
         s.setValue("accent", _normalize_accent_name(getattr(self, "_accent_name", "green")))
         s.setValue("base",   "grey"  if self._base   is SCHEME_GREY  else "dark")
+        s.setValue("titlebarSectionOrder", list(self._window_titlebar_section_order))
+        s.setValue("titlebarUriAnchorRatio", float(self._window_titlebar_uri_anchor_ratio))
+        s.setValue("titlebarUriTabSlotIndex", int(self._window_titlebar_uri_tab_slot_index))
         s.setValue("showExplorer", self.files_dock.isVisible())
         s.setValue("showConsole",  False)
         s.setValue("showChat", self.chat_dock.isVisible())   
@@ -17539,6 +19211,9 @@ def main() -> None:
     minimal = _env_truthy("AI_IDE_MINIMAL", "0")
 
     app = QApplication(sys.argv)
+    app.setApplicationName(MainAIEditor.APP_NAME)
+    app.setApplicationDisplayName(MainAIEditor.APP_NAME)
+    app.setOrganizationName(MainAIEditor.ORG_NAME)
 
     # Persist chat history on clean shutdown even if MainAIEditor.closeEvent
     # is not reached (e.g. alternative quit paths).
@@ -17594,7 +19269,7 @@ def main() -> None:
 
     if minimal:
         mini = QMainWindow()
-        mini.setWindowTitle("AI IDE - Minimal Mode")
+        mini.setWindowTitle(f"{MainAIEditor.APP_NAME} - Minimal Mode")
         te = QTextEdit()
         te.setPlainText("Minimal mode active. Use normal mode to reproduce crashes.\n\nEnv flags:\n- AI_IDE_SAFE=1\n- AI_IDE_NO_STYLE=1\n- AI_IDE_QT_DEBUG=1")
         mini.setCentralWidget(te)

@@ -697,7 +697,13 @@ class RepoIndexService:
         self._module_parser = RepoModuleParser(self._splitter)
         self._mapping_service = ObjectMappingService(self._ks, self._runtime_config)
 
-    def scan_object(self, scan_root: str, *, extensions: tuple[str, ...] = (".py",)) -> list[str]:
+    def scan_object(
+        self,
+        scan_root: str,
+        *,
+        extensions: tuple[str, ...] = (".py",),
+        recursive: bool = True,
+    ) -> list[str]:
         """Return sorted list of source file paths under *scan_root*."""
         result: list[str] = []
         exclude = self._DEFAULT_EXCLUDE
@@ -706,6 +712,8 @@ class RepoIndexService:
             for fname in filenames:
                 if any(fname.endswith(ext) for ext in extensions):
                     result.append(os.path.join(dirpath, fname))
+            if not bool(recursive):
+                break
         return sorted(result)
 
     def index_object(self, source_path: str, *, repo_root: str) -> dict[str, Any]:
@@ -826,13 +834,19 @@ class RepoIndexService:
             "skipped": False,
         }
 
-    def index_repo_object(self, scan_root: str, *, extensions: Sequence[str] = (".py",)) -> dict[str, Any]:
+    def index_repo_object(
+        self,
+        scan_root: str,
+        *,
+        extensions: Sequence[str] = (".py",),
+        recursive: bool = True,
+    ) -> dict[str, Any]:
         """Full repo index run: scan → split → store → embed. Returns summary report."""
         # Ensure namespace exists
         ns = self._builder.build_namespace_object()
         self._ks.store_namespace_object(ns)
 
-        files = self.scan_object(scan_root, extensions=tuple(extensions))
+        files = self.scan_object(scan_root, extensions=tuple(extensions), recursive=bool(recursive))
         t0 = time.perf_counter()
 
         total_blocks = 0
@@ -886,6 +900,7 @@ class RepoIndexService:
 
         return {
             "scan_root": scan_root,
+            "recursive": bool(recursive),
             "files_found": len(files),
             "files_skipped": total_skipped,
             "total_blocks": total_blocks,
@@ -1069,6 +1084,7 @@ def run_repo_knowledge_operation(
     image_path: str | None,
     workers: int,
     extensions: list[str] | str | None,
+    recursive: bool,
     cleanup_before_build: bool,
     cleanup_namespace_ids: list[str] | str | None,
     cleanup_object_names: list[str] | str | None,
@@ -1126,7 +1142,12 @@ def run_repo_knowledge_operation(
             "operation": "scan",
             "root_dir": str(resolved_root),
             "extensions": list(normalized_extensions),
-            "files": service.scan_object(str(resolved_root), extensions=normalized_extensions),
+            "recursive": bool(recursive),
+            "files": service.scan_object(
+                str(resolved_root),
+                extensions=normalized_extensions,
+                recursive=bool(recursive),
+            ),
         }
     if normalized_operation == "build":
         cleanup_report = None
@@ -1137,7 +1158,11 @@ def run_repo_knowledge_operation(
                 owner_prefixes=normalized_cleanup_prefixes,
                 async_delete=bool(delete_async),
             )
-        result = service.index_repo_object(str(resolved_root), extensions=normalized_extensions)
+        result = service.index_repo_object(
+            str(resolved_root),
+            extensions=normalized_extensions,
+            recursive=bool(recursive),
+        )
         result["ok"] = True
         result["operation"] = "build"
         if cleanup_report is not None:
@@ -1159,7 +1184,11 @@ def run_repo_knowledge_operation(
             owner_prefixes=normalized_cleanup_prefixes,
             async_delete=bool(delete_async),
         )
-        result = service.index_repo_object(str(resolved_root), extensions=normalized_extensions)
+        result = service.index_repo_object(
+            str(resolved_root),
+            extensions=normalized_extensions,
+            recursive=bool(recursive),
+        )
         result["ok"] = True
         result["operation"] = "rebuild"
         result["cleanup"] = cleanup_report
@@ -1197,6 +1226,7 @@ def adb_worker(
     image_path: str | None = None,
     workers: int = 4,
     extensions: list[str] | str | None = None,
+    recursive: bool = True,
     cleanup_before_build: bool = False,
     cleanup_namespace_ids: list[str] | str | None = None,
     cleanup_object_names: list[str] | str | None = None,
@@ -1223,6 +1253,7 @@ def adb_worker(
             "image_path": image_path,
             "workers": workers,
             "extensions": extensions,
+            "recursive": recursive,
             "cleanup_before_build": cleanup_before_build,
             "cleanup_namespace_ids": cleanup_namespace_ids,
             "cleanup_object_names": cleanup_object_names,
@@ -1242,6 +1273,7 @@ def adb_worker(
                     "image_path": image_path,
                     "workers": workers,
                     "extensions": extensions,
+                    "recursive": recursive,
                     "cleanup_before_build": cleanup_before_build,
                     "cleanup_namespace_ids": cleanup_namespace_ids,
                     "cleanup_object_names": cleanup_object_names,
