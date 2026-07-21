@@ -274,6 +274,34 @@ def test_tree_data_persistence_service_defaults_to_memory_only(monkeypatch: pyte
     assert service.supports_push_stream() is False
 
 
+def test_tree_data_persistence_service_projects_gui_env_json_into_env_section(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("AI_IDE_TREE_MEMORY_ONLY", "0")
+    service = TreeDataPersistenceService(tmp_path)
+    monkeypatch.setattr(service, "_load_agentsdb_repository", lambda: (None, None))
+
+    gui_env_path = tmp_path / "gui_env.json"
+    gui_env_path.write_text(
+        json.dumps(
+            {
+                "format": "ai_ide_gui_env_v1",
+                "env": {
+                    "AI_IDE_CONTROL_PLANE_REFRESH_MS": "0",
+                    "AI_IDE_AGENTS_DB_TREE_POLL_MS": "5000",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded_data, backend_name, source = service.load_data()
+
+    assert backend_name == "memory"
+    assert source == "inmemory"
+    assert loaded_data["ENV"]["gui_env.json"]["format"] == "ai_ide_gui_env_v1"
+    assert loaded_data["ENV"]["gui_env.json"]["env"]["AI_IDE_CONTROL_PLANE_REFRESH_MS"] == "0"
+    assert loaded_data["ENV"]["gui_env.json"]["env"]["AI_IDE_AGENTS_DB_TREE_POLL_MS"] == "5000"
+
+
 def test_tree_data_persistence_service_memory_only_materializes_agentsdb_repository(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.delenv("AI_IDE_TREE_MEMORY_ONLY", raising=False)
     service = TreeDataPersistenceService(tmp_path)

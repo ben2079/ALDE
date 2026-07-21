@@ -42,6 +42,7 @@ from PySide6.QtGui import (
     QTextCursor,
 )
 from PySide6.QtWidgets import (
+    QLabel,
     QToolButton,
     QTextEdit,
     QTreeWidget,
@@ -76,6 +77,32 @@ except Exception:  # allow running as script from repo root
         from alde.chat_completion import ChatHistory  # type: ignore
     except Exception:  # pragma: no cover - optional dependency
         ChatHistory = None  # type: ignore
+
+try:
+    from .ui_glyphs import (
+        DROPDOWN_COLLAPSED_GLYPH,
+        DROPDOWN_COLLAPSED_PREFIX,
+        DROPDOWN_EXPANDED_GLYPH,
+        DROPDOWN_EXPANDED_PREFIX,
+        dropdown_prefix,
+    )
+except Exception:
+    try:
+        from alde.ui_glyphs import (
+            DROPDOWN_COLLAPSED_GLYPH,
+            DROPDOWN_COLLAPSED_PREFIX,
+            DROPDOWN_EXPANDED_GLYPH,
+            DROPDOWN_EXPANDED_PREFIX,
+            dropdown_prefix,
+        )
+    except Exception:  # pragma: no cover - keep imports resilient in direct-script mode
+        DROPDOWN_EXPANDED_GLYPH = "▾"
+        DROPDOWN_COLLAPSED_GLYPH = "▸"
+        DROPDOWN_EXPANDED_PREFIX = "▾ "
+        DROPDOWN_COLLAPSED_PREFIX = "▸ "
+
+        def dropdown_prefix(expanded: bool) -> str:
+            return DROPDOWN_EXPANDED_PREFIX if bool(expanded) else DROPDOWN_COLLAPSED_PREFIX
 
 
 def _load_optional_mongo_client_class() -> Any | None:
@@ -120,6 +147,7 @@ class TreeDataPersistenceService:
     )
     _PROJECTION_SOURCE_OBJECT_DEFINITION: tuple[dict[str, Any], ...] = (
         {"section": "ENV", "key": ".env", "kind": "env_file", "file_name": ".env"},
+        {"section": "ENV", "key": "gui_env.json", "kind": "json_file", "file_name": "gui_env.json"},
         {"section": "RUNTIME_VIEWS", "key": "runtime_tabs", "kind": "json_file", "file_name": "control_plane_runtime_tabs.json"},
         {"section": "DISPATCHER_DB", "key": "dispatcher_doc_db", "kind": "json_file", "file_name": "dispatcher_doc_db.json"},
         {"section": "DATABASES", "key": "agentsdb_connection", "kind": "json_file", "file_name": "agentsdb_connection.json"},
@@ -177,12 +205,12 @@ class TreeDataPersistenceService:
         return self._agentsdb_tree_sync_enabled()
 
     def live_sync_interval_ms(self) -> int:
-        raw_value = str(os.getenv("AI_IDE_AGENTS_DB_TREE_POLL_MS", "1200") or "1200").strip()
+        raw_value = str(os.getenv("AI_IDE_AGENTS_DB_TREE_POLL_MS", "5000") or "5000").strip()
         try:
             resolved_value = int(raw_value)
         except Exception:
-            resolved_value = 1200
-        return max(250, resolved_value)
+            resolved_value = 5000
+        return max(2000, resolved_value)
 
     def push_stream_enabled(self) -> bool:
         value = str(os.getenv("AI_IDE_AGENTS_DB_TREE_PUSH_STREAM", "")).strip().lower()
@@ -2773,6 +2801,7 @@ class JsonTreeWidgetWithToolbar(QWidget):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setObjectName("JsonTreeWidgetWithToolbar")
+        self.setAttribute(Qt.WA_StyledBackground, True)
         self.setMinimumSize(0, 0)
         self.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Expanding)
         
@@ -2992,8 +3021,10 @@ class JsonTreeWidget(QTreeWidget):
     )
     _SMALL_FONT_SECTION_NAMES: set[str] = {"PROJECTS", "CHAT_HISTORY"}
     _HISTORY_SECTION_NAMES: set[str] = {"CHAT_HISTORY", "HISTORY"}
+    _HIDDEN_ROOT_SECTION_NAMES: set[str] = {"PROJECTS"}
     _TREE_ICON_SIZE = QSize(18, 18)
-    _TREE_INDENTATION = 12
+    # Block-based layout: hierarchy is conveyed by grouped chips, not indentation.
+    _TREE_INDENTATION = 0
     _initial_load_async_result_ready = Signal(object)
 
     def minimumSizeHint(self) -> QSize:
@@ -3004,10 +3035,15 @@ class JsonTreeWidget(QTreeWidget):
     
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
+        self.setAttribute(Qt.WA_StyledBackground, True)
+        self.setAutoFillBackground(True)
         self.setMinimumSize(0, 0)
         self.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Expanding)
+        self.setFrameShape(QFrame.NoFrame)
         self.setHeaderHidden(True)
-        self.setUniformRowHeights(True)
+        self.viewport().setAutoFillBackground(True)
+        # Tree labels can have small vertical offsets between semantic groups.
+        self.setUniformRowHeights(False)
         self.setAnimated(True)
         self.setIconSize(self._TREE_ICON_SIZE)
         # Keep labels readable in narrow docks by reducing the default branch gap.
@@ -3051,20 +3087,45 @@ class JsonTreeWidget(QTreeWidget):
         self._linked_root_expand_sync_in_flight = False
 
         self._style_template = """
-               QTreeWidget, QTreeView {{
+               QTreeWidget, QTreeView, QAbstractItemView, QAbstractScrollArea {{
+                   background: {bg_color};
                    background-color:{bg_color};
                    color:{text_color};
                    font-family:'Fira Code', monospace;
-                   border: 1px solid #303030;
+                   border: 1px solid {frame_color};
                    border-top: none;
+                   border-top-left-radius: 0px;
+                   border-top-right-radius: 0px;
                    border-bottom-left-radius: 14px;
                    border-bottom-right-radius: 14px;
                    padding: 4px 0px 6px 0px;
                    outline: none;
                }}
-               QTreeWidget::item, QTreeView::item {{
-                   padding: 2px;
+               QTreeWidget::viewport, QTreeView::viewport {{
+                   background: {bg_color};
                    background-color:{bg_color};
+                   border: none;
+               }}
+               QTreeWidget::corner, QTreeView::corner {{
+                   background: {bg_color};
+                   border: none;
+               }}
+               QTreeWidget::item, QTreeView::item {{
+                   margin: 0px;
+                   padding: 0px;
+                   color:{text_color};
+                   border: none;
+                   background: transparent;
+               }}
+               QTreeWidget::item:selected,
+               QTreeView::item:selected,
+               QTreeWidget::item:selected:active,
+               QTreeView::item:selected:active,
+               QTreeWidget::item:selected:!active,
+               QTreeView::item:selected:!active {{
+                   color:{text_color};
+                   border: none;
+                   background: transparent;
                }}
                QTreeWidget::branch, QTreeView::branch {{ color:{branch_color}; }}
                QTreeWidget::branch:has-children:!adjoins-item,
@@ -3081,9 +3142,11 @@ class JsonTreeWidget(QTreeWidget):
                }}
                """
         self._branch_color = "#2d8cf0"
-        self._text_color = "#d4d4d4"
+        self._text_color = "#E3E3DE"
         self._bg_color = "#0b0b0b"
         self._accent_color = "#3a5fff"
+        self._frame_color = "#303030"
+        self._muted_color = "#9a9a95"
 
         # Typography
         self._section_header_font_size = 10
@@ -3102,6 +3165,9 @@ class JsonTreeWidget(QTreeWidget):
         self._initialize_root_sections()
 
         # Connect signal for handling item edits (after initial load).
+        self.setExpandsOnDoubleClick(False)
+        self.itemClicked.connect(self._on_item_single_clicked)
+        self.itemDoubleClicked.connect(self._on_item_double_clicked)
         self.itemExpanded.connect(self._on_item_expanded)
         self.itemCollapsed.connect(self._on_item_collapsed)
         self.itemChanged.connect(self._on_item_changed)
@@ -3289,6 +3355,10 @@ class JsonTreeWidget(QTreeWidget):
         with self._live_sync_diagnostic_lock:
             return dict(self._live_sync_diagnostic)
 
+    @classmethod
+    def _is_hidden_root_section_name(cls, section_name: str | None) -> bool:
+        return str(section_name or "").strip().upper() in cls._HIDDEN_ROOT_SECTION_NAMES
+
     def _reset_tree_view_state(self, *, expanded_sections: dict[str, bool] | None = None) -> None:
         self.clear()
         self._root_sections = {}
@@ -3304,10 +3374,12 @@ class JsonTreeWidget(QTreeWidget):
         for section_name, collapsed in self._DEFAULT_ROOT_SECTION_LAYOUT:
             if section_name not in allowed_sections:
                 continue
+            self._data[section_name] = {}
+            if self._is_hidden_root_section_name(section_name):
+                continue
             section = self._add_root_section(section_name, collapsed=collapsed)
             if isinstance(expanded_sections, dict) and section_name in expanded_sections:
                 section.setExpanded(bool(expanded_sections.get(section_name)))
-            self._data[section_name] = {}
 
     def _apply_loaded_tree_data(
         self,
@@ -3334,14 +3406,16 @@ class JsonTreeWidget(QTreeWidget):
             for section_name, section_data in normalized_loaded_data.items():
                 if section_name not in allowed_sections:
                     continue
+                if not isinstance(section_data, dict):
+                    section_data = {}
+                self._data[section_name] = dict(section_data)
+                if self._is_hidden_root_section_name(section_name):
+                    continue
                 if section_name not in self._root_sections:
                     section = self._add_root_section(section_name)
                     if section_name in expanded_sections:
                         section.setExpanded(bool(expanded_sections.get(section_name)))
                 section = self._root_sections.get(section_name)
-                if not isinstance(section_data, dict):
-                    section_data = {}
-                self._data[section_name] = dict(section_data)
                 if section is None:
                     continue
 
@@ -3362,6 +3436,7 @@ class JsonTreeWidget(QTreeWidget):
             self._update_root_section_header_styles()
             self._update_section_item_font_sizes()
             self._remember_tree_texts()
+            self._apply_board_card_item_widgets()
             self._initializing = False
 
         self._update_live_sync_cursor()
@@ -3750,6 +3825,7 @@ class JsonTreeWidget(QTreeWidget):
         self._sync_linked_root_section_expansion(item, expanded=True)
         lazy_payload = self._lazy_children.pop(item, None)
         if lazy_payload is None:
+            self._apply_board_card_item_widgets()
             return
 
         value, section_name = lazy_payload
@@ -3763,10 +3839,12 @@ class JsonTreeWidget(QTreeWidget):
                 item.addChild(self._build_item(index, child_value, section_name=section_name))
 
         self._remember_item_texts_recursive(item)
+        self._apply_board_card_item_widgets()
 
     @Slot(QTreeWidgetItem)
     def _on_item_collapsed(self, item: QTreeWidgetItem) -> None:
         self._sync_linked_root_section_expansion(item, expanded=False)
+        self._apply_board_card_item_widgets()
 
     def _sync_linked_root_section_expansion(self, item: QTreeWidgetItem, *, expanded: bool) -> None:
         if self._linked_root_expand_sync_in_flight:
@@ -3871,31 +3949,8 @@ class JsonTreeWidget(QTreeWidget):
         return "open_file.svg" if depth <= 1 else "menu_24dp_666666_FILL0_wght400_GRAD0_opsz24.svg"
 
     def _apply_item_icon(self, item: QTreeWidgetItem) -> None:
-        # Never override the section header icons.
-        if item in self._root_sections.values():
-            return
-
-        base = _icon(self._item_base_icon_name(item))
-        if base.isNull():
-            return
-
-        size = 18
-        # Neutral icon tint.
-        ico = _tinted_icon(base, color=self._text_color, size=size)
-
-        # HISTORY root items: show date badge instead of dot marker
-        badge = self._item_badge.get(item, "")
-        if badge:
-            ico = _icon_with_badge_text(
-                ico,
-                text=badge,
-                badge_color=self._accent_color,
-                text_color="#111111",
-                size=size,
-            )
-        else:
-            ico = _icon_with_marker(ico, marker_color=self._accent_color, size=size)
-        item.setIcon(0, ico)
+        # Tree view no longer uses item icons; keep the label-only grouped layout.
+        item.setData(0, Qt.DecorationRole, None)
 
     @staticmethod
     def _format_date_badge(date_str: str) -> str:
@@ -4046,20 +4101,47 @@ class JsonTreeWidget(QTreeWidget):
         if not color_str or color_str == self._accent_color:
             return
         self._accent_color = color_str
+        self._apply_stylesheet()
         self._update_root_section_header_styles()
         self._update_root_section_icons()
         self._refresh_item_icons_recursive()
+
+    @staticmethod
+    def _qss_rgba(color_value: QColor | str, alpha: int, *, fallback: str) -> str:
+        color = QColor(color_value) if isinstance(color_value, QColor) else QColor(str(color_value or ""))
+        if not color.isValid():
+            return fallback
+        alpha_clamped = max(0, min(255, int(alpha)))
+        return f"rgba({color.red()},{color.green()},{color.blue()},{alpha_clamped})"
     
     def _apply_stylesheet(self) -> None:
         """Apply the current colors to the QTreeWidget stylesheet."""
+        scrollbar_bg_override = (
+            "QTreeWidget QScrollBar:horizontal,"
+            "QTreeWidget QScrollBar:vertical,"
+            "QTreeView QScrollBar:horizontal,"
+            "QTreeView QScrollBar:vertical,"
+            "QAbstractScrollArea QScrollBar:horizontal,"
+            "QAbstractScrollArea QScrollBar:vertical {"
+            f"background: {self._bg_color};"
+            f"background-color: {self._bg_color};"
+            "}"
+        )
         self.setStyleSheet(
             self._style_template.format(
                 text_color=self._text_color,
                 bg_color=self._bg_color,
                 branch_color=self._branch_color,
+                frame_color=self._frame_color,
+                item_frame_color=self._qss_rgba(self._muted_color, 170, fallback="rgba(154,154,149,170)"),
+                item_bg_color=self._qss_rgba(self._bg_color, 34, fallback="rgba(11,11,11,34)"),
+                item_selected_frame_color=self._qss_rgba(self._accent_color, 214, fallback="rgba(58,95,255,214)"),
+                item_selected_bg_color=self._qss_rgba(self._accent_color, 56, fallback="rgba(58,95,255,56)"),
             )
             + SCROLLBAR_HOVER_ONLY_DARK
+            + scrollbar_bg_override
         )
+        self._apply_board_card_item_widgets()
 
     def set_text_color(self, color: QColor | str) -> None:
         """Expose text color change so other widgets can match their palette."""
@@ -4114,6 +4196,7 @@ class JsonTreeWidget(QTreeWidget):
         while root_item.childCount():
             self.addTopLevelItem(root_item.takeChild(0))
         self.expandToDepth(0)
+        self._apply_board_card_item_widgets()
 
     def _build_item(self, key: str | int, value: Any, *, section_name: str | None = None) -> QTreeWidgetItem:
         section_upper = (section_name or "").upper()
@@ -4266,6 +4349,10 @@ class JsonTreeWidget(QTreeWidget):
         if last_text is not None and last_text == new_text:
             return
 
+        original_item_key = ""
+        if isinstance(last_text, str) and last_text.strip():
+            original_item_key = self._extract_item_key_from_text(last_text)
+
         # Update early so repeated non-text itemChanged events don't re-enter.
         self._item_last_text[item] = new_text
         
@@ -4286,15 +4373,21 @@ class JsonTreeWidget(QTreeWidget):
 
         # Build the path from root to the edited item (skip section root)
         path_segments = self._item_path_segments(item, column, section_name=section_name)
+        if path_segments and original_item_key:
+            path_segments[-1] = original_item_key
+
+        item_kind = str(self._item_kind.get(item, "")).strip().lower()
+        is_scalar_item = item_kind not in {"dict", "list"}
+
+        if not path_segments:
+            return
+
         repository_binding = self._persistence_service.resolve_agentsdb_repository_binding(
             section_name=section_name,
             path_segments=path_segments,
         )
-        
-        if not path_segments:
-            return
 
-        if repository_binding is not None and ": " not in new_text:
+        if repository_binding is not None and ": " not in new_text and not is_scalar_item:
             self._reload_tree_from_persistence(log_message=False)
             return
 
@@ -4311,12 +4404,16 @@ class JsonTreeWidget(QTreeWidget):
         last_segment = path_segments[-1]
         key_obj = coerce_key(last_segment, parent_container)
 
-        if ": " not in new_text:
+        if ": " in new_text:
+            key_part, value_part = new_text.split(": ", 1)
+            key_part = key_part.strip()
+            value_part = value_part.strip()
+        elif is_scalar_item:
+            key_part = str(last_segment).strip() or original_item_key
+            value_part = new_text.strip()
+        else:
             return
 
-        key_part, value_part = new_text.split(": ", 1)
-        key_part = key_part.strip()
-        value_part = value_part.strip()
         parsed_value = parse_value(value_part)
 
         if isinstance(parent_container, dict):
@@ -4328,6 +4425,7 @@ class JsonTreeWidget(QTreeWidget):
                     parent_container[key_part] = parsed_value
                 key_obj = key_part
                 last_segment = key_part
+                self._item_to_key[item] = str(key_part)
             parent_container[key_obj] = parsed_value
         elif isinstance(parent_container, list):
             if not isinstance(key_obj, int) or not (0 <= key_obj < len(parent_container)):
@@ -4388,6 +4486,7 @@ class JsonTreeWidget(QTreeWidget):
         # Ensure root headers match current theme settings.
         self._update_root_section_header_styles()
         self._update_section_item_font_sizes()
+        self._apply_board_card_item_widgets()
 
     def _update_section_item_font_sizes(self) -> None:
         """Apply per-section font sizing to already-built items."""
@@ -4416,6 +4515,353 @@ class JsonTreeWidget(QTreeWidget):
             font.setPointSize(self._section_header_font_size)
             section.setFont(0, font)
             section.setForeground(0, QColor(self._accent_color))
+
+    @staticmethod
+    def _board_card_normalize_label(raw_text: str) -> str:
+        text = str(raw_text or "").strip()
+        if not text:
+            return ""
+        for prefix in (DROPDOWN_EXPANDED_PREFIX, DROPDOWN_COLLAPSED_PREFIX):
+            if text.startswith(prefix):
+                text = text[len(prefix):].strip()
+                break
+        if text.endswith(" {...}"):
+            text = text[:-5].strip()
+        if " [" in text and text.endswith("]"):
+            text = text.rsplit(" ", 1)[0].strip()
+        return text.strip()
+
+    @staticmethod
+    def _board_card_keyword_group(title_key: str) -> str | None:
+        text = str(title_key or "").strip().lower()
+        if not text:
+            return None
+
+        keyword_groups: tuple[tuple[str, tuple[str, ...]], ...] = (
+            ("alerts", ("error", "warn", "warning", "failed", "failure", "timeout", "retry", "critical", "panic")),
+            ("security", ("token", "secret", "credential", "password", "apikey", "api_key", "auth", "private key")),
+            ("integration", ("mcp", "server", "socket", "endpoint", "http", "https", "api", "tool", "bridge")),
+            ("data", ("database", "db", "collection", "record", "vector", "index", "table", "document")),
+            ("runtime", ("runtime", "worker", "queue", "job", "dispatcher", "session", "event", "stream")),
+            ("workspace", ("project", "workspace", "repo", "file", "path", "module", "template")),
+        )
+        for category, keywords in keyword_groups:
+            if any(keyword in text for keyword in keywords):
+                return category
+        return None
+
+    @staticmethod
+    def _board_card_env_mcp_group(section_name: str, title_key: str) -> str | None:
+        normalized_section = str(section_name or "").strip().upper()
+        text = str(title_key or "").strip().lower()
+        if not normalized_section:
+            return None
+
+        if normalized_section == "ENV":
+            if any(token in text for token in ("error", "warn", "failed", "timeout", "invalid")):
+                return "alerts"
+            if any(token in text for token in ("token", "secret", "password", "apikey", "api_key", "auth", "private", "credential")):
+                return "security"
+            if any(token in text for token in ("url", "uri", "endpoint", "host", "port", "socket")):
+                return "integration"
+            if any(token in text for token in ("path", "dir", "directory", "file", "workspace", "repo", "home")):
+                return "workspace"
+            if any(token in text for token in ("runtime", "worker", "queue", "model", "provider", "thread", "cache")):
+                return "runtime"
+            return "neutral"
+
+        if normalized_section == "MCP":
+            if any(token in text for token in ("error", "warn", "failed", "timeout", "retry", "unavailable")):
+                return "alerts"
+            if any(token in text for token in ("token", "secret", "apikey", "api_key", "auth", "credential", "key")):
+                return "security"
+            if any(token in text for token in ("server", "endpoint", "host", "port", "url", "uri", "socket", "transport", "bridge")):
+                return "integration"
+            if any(token in text for token in ("tool", "runtime", "worker", "event", "stream", "sync")):
+                return "runtime"
+            if any(token in text for token in ("path", "file", "workspace", "repo", "module")):
+                return "workspace"
+            return "integration"
+
+        return None
+
+    def _board_card_category(self, section_title: str, *, item: QTreeWidgetItem | None = None) -> str:
+        title_key = str(section_title or "").strip().lower()
+        if not title_key and isinstance(item, QTreeWidgetItem):
+            title_key = str(item.text(0) or "").strip().lower()
+
+        section_name = str(self._resolve_section_name_for_item(item) or "").strip().upper()
+        if not section_name and isinstance(item, QTreeWidgetItem) and item.parent() is None:
+            section_name = str(self._board_card_normalize_label(item.text(0)) or "").strip().upper()
+        section_palette: dict[str, str] = {
+            "PROJECTS": "workspace",
+            "RUNTIME": "runtime",
+            "DATABASES": "data",
+            "CHAT_HISTORY": "history",
+            "HISTORY": "history",
+        }
+        if section_name in {"ENV", "MCP"}:
+            env_mcp_group = self._board_card_env_mcp_group(section_name, title_key)
+            if env_mcp_group:
+                return env_mcp_group
+        if section_name in section_palette:
+            return section_palette[section_name]
+
+        item_kind = ""
+        if isinstance(item, QTreeWidgetItem):
+            item_kind = str(self._item_kind.get(item, "")).strip().lower()
+        if item_kind in {"dict", "list"}:
+            return "container"
+
+        keyword_group = self._board_card_keyword_group(title_key)
+        if keyword_group:
+            return keyword_group
+
+        if "/" in title_key or "\\" in title_key:
+            return "workspace"
+        if title_key.endswith((".py", ".json", ".md", ".toml", ".yaml", ".yml", ".txt")):
+            return "workspace"
+        if "history" in title_key or "chat" in title_key:
+            return "history"
+        return "neutral"
+
+    @staticmethod
+    def _board_card_palette(category: str) -> dict[str, str]:
+        palettes: dict[str, dict[str, str]] = {
+            "workspace": {
+                "label_fg": "#d8ecff",
+                "label_bg": "rgba(66, 120, 168, 0.24)",
+                "label_border": "rgba(66, 120, 168, 0.62)",
+            },
+            "runtime": {
+                "label_fg": "#d6ffe1",
+                "label_bg": "rgba(56, 150, 99, 0.24)",
+                "label_border": "rgba(56, 150, 99, 0.64)",
+            },
+            "data": {
+                "label_fg": "#ffe6cf",
+                "label_bg": "rgba(178, 118, 68, 0.24)",
+                "label_border": "rgba(178, 118, 68, 0.62)",
+            },
+            "integration": {
+                "label_fg": "#d0f5ff",
+                "label_bg": "rgba(47, 149, 168, 0.24)",
+                "label_border": "rgba(47, 149, 168, 0.60)",
+            },
+            "history": {
+                "label_fg": "#f0dfff",
+                "label_bg": "rgba(120, 102, 181, 0.24)",
+                "label_border": "rgba(120, 102, 181, 0.60)",
+            },
+            "security": {
+                "label_fg": "#ffe8e6",
+                "label_bg": "rgba(178, 48, 68, 0.34)",
+                "label_border": "rgba(227, 96, 116, 0.88)",
+            },
+            "alerts": {
+                "label_fg": "#fff3d8",
+                "label_bg": "rgba(212, 128, 18, 0.36)",
+                "label_border": "rgba(255, 175, 64, 0.86)",
+            },
+            "container": {
+                "label_fg": "#dbe4e7",
+                "label_bg": "rgba(105, 120, 127, 0.20)",
+                "label_border": "rgba(124, 141, 149, 0.54)",
+            },
+            "neutral": {
+                "label_fg": "#dce3e7",
+                "label_bg": "rgba(84, 96, 104, 0.20)",
+                "label_border": "rgba(113, 127, 136, 0.52)",
+            },
+        }
+        return palettes.get(str(category or "").strip().lower(), palettes["neutral"])
+
+    @staticmethod
+    def _board_card_group_top_margin(current_category: str, previous_category: str | None) -> int:
+        normalized_current = str(current_category or "").strip().lower()
+        normalized_previous = str(previous_category or "").strip().lower()
+        if not normalized_current or not normalized_previous:
+            return 0
+        if normalized_current != normalized_previous:
+            return 6
+        return 0
+
+    def _apply_board_card_label_style(
+        self,
+        label_widget: QLabel,
+        category: str,
+        *,
+        font_size_px: int,
+    ) -> None:
+        palette = self._board_card_palette(category)
+        label_widget.setStyleSheet(
+            (
+                f"color: {palette['label_fg']};"
+                "font-weight: 700;"
+                f"font-size: {max(9, int(font_size_px))}px;"
+                f"background: {palette['label_bg']};"
+                f"border: 1px solid {palette['label_border']};"
+                "border-radius: 6px;"
+                "padding: 2px 9px 3px 9px;"
+            )
+        )
+
+    def _apply_board_card_marker_style(self, marker_widget: QLabel, marker_text: str) -> None:
+        glyph = str(marker_text or "").strip()
+        if glyph == DROPDOWN_EXPANDED_GLYPH:
+            marker_color = self._accent_color
+        elif glyph == DROPDOWN_COLLAPSED_GLYPH:
+            marker_color = self._muted_color
+        else:
+            marker_color = "transparent"
+        marker_widget.setStyleSheet(
+            (
+                f"color: {marker_color};"
+                "font-weight: 700;"
+                "font-size: 13px;"
+                "background: transparent;"
+                "border: none;"
+                "padding: 0px;"
+            )
+        )
+
+    def _remove_board_card_item_widget(self, item: QTreeWidgetItem) -> None:
+        existing_widget = self.itemWidget(item, 0)
+        if isinstance(existing_widget, QWidget) and bool(existing_widget.property("board_card_widget")):
+            self.removeItemWidget(item, 0)
+            existing_widget.deleteLater()
+        item.setSizeHint(0, QSize())
+
+    def _iter_item_subtree(self, parent_item: QTreeWidgetItem):
+        yield parent_item
+        for child_index in range(parent_item.childCount()):
+            child_item = parent_item.child(child_index)
+            if isinstance(child_item, QTreeWidgetItem):
+                yield from self._iter_item_subtree(child_item)
+
+    def _iter_grouped_child_rows(self, parent_item: QTreeWidgetItem):
+        previous_child_category: str | None = None
+        for child_index in range(parent_item.childCount()):
+            child_item = parent_item.child(child_index)
+            if not isinstance(child_item, QTreeWidgetItem):
+                continue
+
+            normalized_label = self._board_card_normalize_label(child_item.text(0))
+            item_category = self._board_card_category(normalized_label, item=child_item)
+            row_margin_top = self._board_card_group_top_margin(item_category, previous_child_category)
+            previous_child_category = item_category
+
+            yield child_item, normalized_label, item_category, row_margin_top
+            yield from self._iter_grouped_child_rows(child_item)
+
+    @staticmethod
+    def _board_card_dropdown_marker(item: QTreeWidgetItem) -> str:
+        if item.childCount() <= 0:
+            return ""
+        return dropdown_prefix(item.isExpanded())
+
+    def _apply_board_card_item_row(
+        self,
+        item: QTreeWidgetItem,
+        *,
+        normalized_label: str,
+        item_category: str,
+        row_margin_top: int,
+    ) -> None:
+        container_widget = self.itemWidget(item, 0)
+        if not isinstance(container_widget, QWidget) or not bool(container_widget.property("board_card_widget")):
+            container_widget = QWidget(self)
+            container_widget.setProperty("board_card_widget", True)
+            container_widget.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+            container_layout = QHBoxLayout(container_widget)
+            container_layout.setContentsMargins(0, row_margin_top, 0, 0)
+            container_layout.setSpacing(0)
+
+            marker_widget = QLabel("", container_widget)
+            marker_widget.setObjectName("jsonTreeBoardCardMarker")
+            marker_widget.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+            marker_widget.setAlignment(Qt.AlignCenter)
+            marker_widget.setFixedWidth(13)
+            self._apply_board_card_marker_style(marker_widget, "")
+
+            label_widget = QLabel(normalized_label, container_widget)
+            label_widget.setObjectName("jsonTreeBoardCardLabel")
+            label_widget.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+            label_widget.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+            label_widget.setWordWrap(False)
+
+            container_layout.addWidget(marker_widget, 0, Qt.AlignLeft | Qt.AlignVCenter)
+            container_layout.addSpacing(3)
+            container_layout.addWidget(label_widget, 0, Qt.AlignLeft | Qt.AlignVCenter)
+            container_layout.addStretch(1)
+            self.setItemWidget(item, 0, container_widget)
+        else:
+            container_layout = container_widget.layout()
+            if isinstance(container_layout, QHBoxLayout):
+                container_layout.setContentsMargins(0, row_margin_top, 0, 0)
+            marker_widget = container_widget.findChild(QLabel, "jsonTreeBoardCardMarker")
+            if not isinstance(marker_widget, QLabel):
+                marker_widget = QLabel("", container_widget)
+                marker_widget.setObjectName("jsonTreeBoardCardMarker")
+                marker_widget.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+                marker_widget.setAlignment(Qt.AlignCenter)
+                marker_widget.setFixedWidth(13)
+                self._apply_board_card_marker_style(marker_widget, "")
+                if isinstance(container_layout, QHBoxLayout):
+                    container_layout.insertWidget(0, marker_widget, 0, Qt.AlignLeft | Qt.AlignVCenter)
+                    container_layout.insertSpacing(1, 3)
+            label_widget = container_widget.findChild(QLabel, "jsonTreeBoardCardLabel")
+            if not isinstance(label_widget, QLabel):
+                label_widget = QLabel(normalized_label, container_widget)
+                label_widget.setObjectName("jsonTreeBoardCardLabel")
+                label_widget.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+                label_widget.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+                label_widget.setWordWrap(False)
+                if isinstance(container_layout, QHBoxLayout):
+                    insert_index = max(0, container_layout.count() - 1)
+                    container_layout.insertWidget(insert_index, label_widget, 0, Qt.AlignLeft | Qt.AlignVCenter)
+
+        marker = self._board_card_dropdown_marker(item).strip()
+        marker_widget.setText(marker)
+        self._apply_board_card_marker_style(marker_widget, marker)
+        label_widget.setText(normalized_label)
+        label_widget.setToolTip(str(item.toolTip(0) or normalized_label))
+        self._apply_board_card_label_style(
+            label_widget,
+            item_category,
+            font_size_px=10,
+        )
+        desired_height = max(23, int(label_widget.sizeHint().height()) + row_margin_top)
+        item.setSizeHint(0, QSize(0, desired_height))
+
+    def _apply_board_card_item_widgets(self) -> None:
+        previous_top_level_category: str | None = None
+
+        for top_level_index in range(self.topLevelItemCount()):
+            top_item = self.topLevelItem(top_level_index)
+            if not isinstance(top_item, QTreeWidgetItem):
+                continue
+
+            top_label = self._board_card_normalize_label(top_item.text(0))
+            top_category = self._board_card_category(top_label, item=top_item)
+            top_margin = 0
+            top_margin = self._board_card_group_top_margin(top_category, previous_top_level_category)
+            previous_top_level_category = top_category
+
+            self._apply_board_card_item_row(
+                top_item,
+                normalized_label=top_label,
+                item_category=top_category,
+                row_margin_top=top_margin,
+            )
+
+            for child_item, child_label, child_category, child_margin in self._iter_grouped_child_rows(top_item):
+                self._apply_board_card_item_row(
+                    child_item,
+                    normalized_label=child_label,
+                    item_category=child_category,
+                    row_margin_top=child_margin,
+                )
     
     def _add_root_section(self, name: str, collapsed: bool = False) -> QTreeWidgetItem:
         """Add a new root section (like 'PROJECTS' or 'DATABASES' in VS Code)."""
@@ -4432,13 +4878,8 @@ class JsonTreeWidget(QTreeWidget):
         section.setFont(0, font)
         section.setForeground(0, QColor(self._accent_color))
 
-        # Accent-colored root icon + accent marker
-        icon_name = self._root_section_icon_name(name)
-        if icon_name:
-            base = _icon(icon_name)
-            if not base.isNull():
-                ico = _icon_with_marker(_tinted_icon(base, color=self._accent_color, size=16), marker_color=self._accent_color, size=16)
-                section.setIcon(0, ico)
+        # Root headers stay text-only to keep compact grouped blocks.
+        section.setData(0, Qt.DecorationRole, None)
         
         self.addTopLevelItem(section)
         self._root_sections[name] = section
@@ -4449,15 +4890,8 @@ class JsonTreeWidget(QTreeWidget):
         return section
 
     def _update_root_section_icons(self) -> None:
-        for name, section in self._root_sections.items():
-            icon_name = self._root_section_icon_name(name)
-            if not icon_name:
-                continue
-            base = _icon(icon_name)
-            if base.isNull():
-                continue
-            ico = _icon_with_marker(_tinted_icon(base, color=self._accent_color, size=16), marker_color=self._accent_color, size=16)
-            section.setIcon(0, ico)
+        for section in self._root_sections.values():
+            section.setData(0, Qt.DecorationRole, None)
     
     def add_to_section(self, section_name: str, key: str, value: Any, *, persist: bool = True) -> None:
         """Add data to a specific section (e.g., 'PROJECTS', 'DATABASES').
@@ -4465,27 +4899,46 @@ class JsonTreeWidget(QTreeWidget):
         Set persist=False for derived/ephemeral views (e.g. ChatHistory preview)
         to avoid bloating AppData/tree_data.json.
         """
-        section = self._root_sections.get(section_name)
+        normalized_section_name = str(section_name or "").strip().upper()
+        if not normalized_section_name:
+            return
+
+        section = self._root_sections.get(normalized_section_name)
         if section is None:
-            section = self._add_root_section(section_name)
-            self._data[section_name] = {}
+            if self._is_hidden_root_section_name(normalized_section_name):
+                section = None
+            else:
+                section = self._add_root_section(normalized_section_name)
+            self._data[normalized_section_name] = {}
         
         # Store the data in our internal structure
-        if section_name not in self._data:
-            self._data[section_name] = {}
-        self._data[section_name][key] = value
+        if normalized_section_name not in self._data:
+            self._data[normalized_section_name] = {}
+        self._data[normalized_section_name][key] = value
+
+        if section is None:
+            if persist:
+                self._save_data(
+                    change_event={
+                        "action": "upsert",
+                        "origin": "tree_widget",
+                        "section_name": normalized_section_name,
+                        "item_key": str(key),
+                    }
+                )
+            return
         
-        item = self._build_item(key, value, section_name=section_name)
+        item = self._build_item(key, value, section_name=normalized_section_name)
         section.addChild(item)
 
         # Remember baseline text for edit detection.
         self._remember_item_texts_recursive(item)
 
         # Ensure consistent font sizing for sections that use smaller typography.
-        if section_name.upper() in self._SMALL_FONT_SECTION_NAMES:
+        if normalized_section_name in self._SMALL_FONT_SECTION_NAMES:
             self._update_section_item_font_sizes()
 
-        if section_name.upper() in self._HISTORY_SECTION_NAMES:
+        if normalized_section_name in self._HISTORY_SECTION_NAMES:
             # Force history semantics for icon selection.
             self._item_kind[item] = "history"
             badge = self._extract_history_badge(value)
@@ -4494,10 +4947,11 @@ class JsonTreeWidget(QTreeWidget):
             self._apply_item_icon(item)
         
         # Track this item's section and key
-        self._item_to_section[item] = section_name
+        self._item_to_section[item] = normalized_section_name
         self._item_to_key[item] = key
         
         section.setExpanded(True)
+        self._apply_board_card_item_widgets()
         
         # Save after adding (unless this is a derived/ephemeral view)
         if persist:
@@ -4505,27 +4959,48 @@ class JsonTreeWidget(QTreeWidget):
                 change_event={
                     "action": "upsert",
                     "origin": "tree_widget",
-                    "section_name": section_name,
+                    "section_name": normalized_section_name,
                     "item_key": str(key),
                 }
             )
     
     def remove_from_section(self, section_name: str, item_name: str) -> bool:
         """Remove an item from a section by name."""
-        if self._is_agentsdb_repository_root_item(section_name=section_name, item_key=item_name):
+        normalized_section_name = str(section_name or "").strip().upper()
+        normalized_item_name = str(item_name or "").strip()
+        if not normalized_section_name or not normalized_item_name:
             return False
-        section = self._root_sections.get(section_name)
+
+        if self._is_agentsdb_repository_root_item(section_name=normalized_section_name, item_key=normalized_item_name):
+            return False
+
+        if self._is_hidden_root_section_name(normalized_section_name):
+            section_data = self._data.get(normalized_section_name)
+            if isinstance(section_data, dict) and normalized_item_name in section_data:
+                del section_data[normalized_item_name]
+                self._save_data(
+                    change_event={
+                        "action": "delete",
+                        "origin": "tree_widget",
+                        "section_name": normalized_section_name,
+                        "item_key": normalized_item_name,
+                    }
+                )
+                return True
+            return False
+
+        section = self._root_sections.get(normalized_section_name)
         if section is None:
             return False
         
         for i in range(section.childCount()):
             child = section.child(i)
-            if child and item_name in child.text(0):
+            if child and normalized_item_name in child.text(0):
                 section.removeChild(child)
                 
                 # Remove from data structure
-                if section_name in self._data and item_name in self._data[section_name]:
-                    del self._data[section_name][item_name]
+                if normalized_section_name in self._data and normalized_item_name in self._data[normalized_section_name]:
+                    del self._data[normalized_section_name][normalized_item_name]
                 
                 # Remove from tracking dicts
                 if child in self._item_to_section:
@@ -4535,13 +5010,15 @@ class JsonTreeWidget(QTreeWidget):
 
                 if child in self._item_last_text:
                     del self._item_last_text[child]
+
+                self._apply_board_card_item_widgets()
                 
                 self._save_data(
                     change_event={
                         "action": "delete",
                         "origin": "tree_widget",
-                        "section_name": section_name,
-                        "item_key": str(item_name),
+                        "section_name": normalized_section_name,
+                        "item_key": normalized_item_name,
                     }
                 )
                 return True
@@ -5331,8 +5808,8 @@ class JsonTreeWidget(QTreeWidget):
                 menu.addSeparator()
             
             # Rename
-            rename_action = QAction("✏️ Rename", self)
-            rename_action.triggered.connect(lambda: self.editItem(item, 0))
+            rename_action = QAction("✏️ Edit value", self)
+            rename_action.triggered.connect(lambda: self._context_edit_item(item))
             menu.addAction(rename_action)
             
             # Duplicate
@@ -5360,6 +5837,59 @@ class JsonTreeWidget(QTreeWidget):
             menu.addAction(delete_action)
         
         menu.exec(self.viewport().mapToGlobal(position))
+
+    @Slot(QTreeWidgetItem, int)
+    def _on_item_single_clicked(self, item: QTreeWidgetItem, _column: int) -> None:
+        if not isinstance(item, QTreeWidgetItem):
+            return
+        if item.childCount() <= 0:
+            return
+        item.setExpanded(not item.isExpanded())
+
+    @Slot(QTreeWidgetItem, int)
+    def _on_item_double_clicked(self, item: QTreeWidgetItem, _column: int) -> None:
+        if not isinstance(item, QTreeWidgetItem):
+            return
+        if item in self._root_sections.values():
+            return
+        self._context_edit_item(item)
+
+    def _context_edit_item(self, item: QTreeWidgetItem) -> None:
+        from PySide6.QtWidgets import QInputDialog
+
+        if not isinstance(item, QTreeWidgetItem):
+            return
+        if item in self._root_sections.values():
+            return
+
+        item_kind = str(self._item_kind.get(item, "")).strip().lower()
+        if item_kind in {"dict", "list"}:
+            return
+
+        item_text = str(item.text(0) or "").strip()
+        if not item_text:
+            return
+
+        key_part = self._extract_item_key_from_text(item_text)
+        if ": " in item_text:
+            current_value = item_text.split(": ", 1)[1].strip()
+        else:
+            current_value = ""
+
+        edited_value, ok = QInputDialog.getText(
+            self,
+            "Edit Value",
+            f"Enter value for {key_part}:",
+            text=current_value,
+        )
+        if not ok:
+            return
+
+        updated_text = f"{key_part}: {edited_value.strip()}"
+        if updated_text == item_text:
+            return
+
+        item.setText(0, updated_text)
     
     def _context_add_item(self, section_name: str) -> None:
         """Add new item to section via context menu."""
@@ -5473,6 +6003,7 @@ class JsonTreeWidget(QTreeWidget):
                 while section.childCount() > 0:
                     section.removeChild(section.child(0))
                 self._data[section_name] = {}
+                self._apply_board_card_item_widgets()
                 self._save_data(
                     change_event={
                         "action": "clear_section",

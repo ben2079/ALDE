@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import sys
 import unittest
@@ -9,7 +10,7 @@ from tempfile import TemporaryDirectory
 from PySide6.QtCore import QPoint, QPointF, QRect, Qt, QTimer
 from PySide6.QtGui import QWheelEvent
 from PySide6.QtWidgets import QHBoxLayout
-from PySide6.QtWidgets import QApplication, QLineEdit, QStackedWidget, QTabBar, QTabWidget, QToolButton, QWidget
+from PySide6.QtWidgets import QApplication, QGraphicsView, QLineEdit, QStackedWidget, QTabBar, QTabWidget, QToolButton, QTreeWidget, QTreeWidgetItem, QWidget
 
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -18,17 +19,21 @@ PKG_ROOT = Path(__file__).resolve().parents[1]
 if str(PKG_ROOT) not in sys.path:
     sys.path.insert(0, str(PKG_ROOT))
 
+import alde.ai_ide_v1756 as ai_ide_module
+
 from alde.ai_ide_v1756 import (
     ChatEditorPanel,
     ChatSegment,
     ChatWindow,
     CodeViewer,
-    ControlPlaneTabBar,
     ControlPlaneWidget,
     ExtensionsWorkspaceWidget,
     MsgWidget,
     _content_resize_icon,
 )
+
+
+ControlPlaneTabBar = getattr(ai_ide_module, "ControlPlaneTabBar", QTabBar)
 
 
 APP = QApplication.instance() or QApplication([])
@@ -788,6 +793,233 @@ class TestControlPlaneBoardHelpers(unittest.TestCase):
         self.assertIsNone(widget._control_tab_corner_widget)
         self.assertIsNone(widget._control_tab_corner_add_button)
         self.assertIsNone(widget._control_tab_corner_menu)
+
+    def test_board_page_adds_explorer_tree_and_canvas_sections(self) -> None:
+        scheme = {
+            "col1": "#3a5fff",
+            "col2": "#6280ff",
+            "col5": "#1a1a1a",
+            "col6": "#e3e3de",
+            "col7": "#0b0b0b",
+            "col8": "#9a9a95",
+            "col9": "#101010",
+            "col10": "#303030",
+        }
+        widget = ControlPlaneWidget(dict(scheme), dict(scheme))
+        self.addCleanup(widget.deleteLater)
+        widget._refresh_timer.stop()
+        widget._runtime_state_save_timer.stop()
+        widget._control_tab_hover_marquee_timer.stop()
+
+        with widget._board_context_scope(widget._primary_board_context):
+            section_titles = [
+                str(widget._config_monitor_section_state_for(section).get("title") or "")
+                for section in widget.config_monitor_sections
+            ]
+
+        board_context = widget._primary_board_context
+        self.assertNotIn("Explorer Tree", section_titles)
+        self.assertNotIn("Board Canvas", section_titles)
+        self.assertIsInstance(board_context.get("board_explorer_tree_widget"), QTreeWidget)
+        self.assertIsInstance(board_context.get("board_canvas_view"), QGraphicsView)
+
+    def test_board_canvas_renders_cards_for_primary_board_items(self) -> None:
+        scheme = {
+            "col1": "#3a5fff",
+            "col2": "#6280ff",
+            "col5": "#1a1a1a",
+            "col6": "#e3e3de",
+            "col7": "#0b0b0b",
+            "col8": "#9a9a95",
+            "col9": "#101010",
+            "col10": "#303030",
+        }
+        widget = ControlPlaneWidget(dict(scheme), dict(scheme))
+        self.addCleanup(widget.deleteLater)
+        widget._refresh_timer.stop()
+        widget._runtime_state_save_timer.stop()
+        widget._control_tab_hover_marquee_timer.stop()
+
+        board_context = widget._primary_board_context
+        canvas_view = board_context.get("board_canvas_view")
+
+        self.assertIsInstance(canvas_view, QGraphicsView)
+        APP.processEvents()
+        scene = canvas_view.scene()
+        text_items = [item.toPlainText() for item in scene.items() if hasattr(item, "toPlainText")]
+
+        self.assertIn("Monitoring Summary", text_items)
+        self.assertIn("Build", text_items)
+        self.assertIn("Open Monitoring Summary", text_items)
+        self.assertNotIn("Explorer Tree", text_items)
+        self.assertNotIn("Board Canvas", text_items)
+
+    def test_board_canvas_accepts_tree_items_into_combined_composition(self) -> None:
+        scheme = {
+            "col1": "#3a5fff",
+            "col2": "#6280ff",
+            "col5": "#1a1a1a",
+            "col6": "#e3e3de",
+            "col7": "#0b0b0b",
+            "col8": "#9a9a95",
+            "col9": "#101010",
+            "col10": "#303030",
+        }
+        widget = ControlPlaneWidget(dict(scheme), dict(scheme))
+        self.addCleanup(widget.deleteLater)
+        widget._refresh_timer.stop()
+        widget._runtime_state_save_timer.stop()
+        widget._control_tab_hover_marquee_timer.stop()
+
+        board_context = widget._primary_board_context
+        tree_widget = board_context.get("board_explorer_tree_widget")
+
+        self.assertIsInstance(tree_widget, QTreeWidget)
+
+        tree_item = QTreeWidgetItem(["OPENAI_API_KEY"])
+        tree_item.setData(0, Qt.UserRole, "ENV / OPENAI_API_KEY")
+        tree_item.setData(0, Qt.UserRole + 1, "Environment variable exposed from the explorer tree.")
+        tree_widget.addTopLevelItem(tree_item)
+
+        self.assertTrue(widget._add_tree_item_to_board_canvas(board_context, tree_item))
+
+        widget._render_board_canvas_surface(board_context)
+        APP.processEvents()
+
+        canvas_view = board_context.get("board_canvas_view")
+        scene = canvas_view.scene()
+        text_items = [item.toPlainText() for item in scene.items() if hasattr(item, "toPlainText")]
+        elements = board_context.get("board_canvas_elements")
+
+        self.assertIn("OPENAI_API_KEY", text_items)
+        self.assertIn("Focus OPENAI_API_KEY", text_items)
+        self.assertTrue(any(isinstance(element, dict) and element.get("source_kind") == "tree" for element in elements))
+
+    def test_runtime_layout_restore_persists_board_canvas_positions_and_extra_board_tabs(self) -> None:
+        scheme = {
+            "col1": "#3a5fff",
+            "col2": "#6280ff",
+            "col5": "#1a1a1a",
+            "col6": "#e3e3de",
+            "col7": "#0b0b0b",
+            "col8": "#9a9a95",
+            "col9": "#101010",
+            "col10": "#303030",
+        }
+        with TemporaryDirectory() as temp_dir:
+            layout_path = Path(temp_dir) / "board_layout.json"
+
+            widget = ControlPlaneWidget(dict(scheme), dict(scheme))
+            self.addCleanup(widget.deleteLater)
+            widget._refresh_timer.stop()
+            widget._runtime_state_save_timer.stop()
+            widget._control_tab_hover_marquee_timer.stop()
+            widget.set_runtime_layout_path(str(layout_path))
+
+            primary_board = widget._primary_board_context
+            primary_tree = primary_board.get("board_explorer_tree_widget")
+            self.assertIsInstance(primary_tree, QTreeWidget)
+
+            tree_item = QTreeWidgetItem(["OPENAI_API_KEY"])
+            tree_item.setData(0, Qt.UserRole, "ENV / OPENAI_API_KEY")
+            tree_item.setData(0, Qt.UserRole + 1, "Environment variable exposed from the explorer tree.")
+            primary_tree.addTopLevelItem(tree_item)
+
+            self.assertTrue(widget._add_tree_item_to_board_canvas(primary_board, tree_item))
+            tree_element_id = widget._board_canvas_element_id("tree", "ENV / OPENAI_API_KEY")
+            self.assertTrue(widget._set_board_canvas_element_position(primary_board, tree_element_id, 420.0, 180.0, persist=False))
+
+            extra_board_tab = widget._create_board_runtime_tab(activate=False, persist=False)
+            extra_board = widget._board_context_by_tab.get(extra_board_tab)
+            self.assertIsInstance(extra_board, dict)
+            summary_element_id = widget._board_canvas_element_id("board", "Monitoring Summary")
+            self.assertTrue(widget._set_board_canvas_element_position(extra_board, summary_element_id, 336.0, 244.0, persist=False))
+
+            persisted_path = widget.persist_runtime_tabs_state(force=True)
+            self.assertEqual(Path(str(persisted_path)), layout_path)
+
+            stale_payload = json.loads(layout_path.read_text(encoding="utf-8"))
+            stale_primary = stale_payload.get("primary_board") or {}
+            stale_elements = list(stale_primary.get("canvas_elements") or [])
+            stale_elements.insert(
+                2,
+                {
+                    "action_text": "Open Explorer Tree",
+                    "id": "board::Explorer Tree",
+                    "preview": "Board-owned snapshot copied from Board 1.",
+                    "source_kind": "board",
+                    "source_ref": "Explorer Tree",
+                    "title": "Explorer Tree",
+                    "x": 10.0,
+                    "y": 154.0,
+                },
+            )
+            stale_elements.insert(
+                3,
+                {
+                    "action_text": "Open Board Canvas",
+                    "id": "board::Board Canvas",
+                    "preview": "Board-owned snapshot copied from Board 1.",
+                    "source_kind": "board",
+                    "source_ref": "Board Canvas",
+                    "title": "Board Canvas",
+                    "x": 302.0,
+                    "y": 154.0,
+                },
+            )
+            stale_primary["canvas_elements"] = stale_elements
+            stale_payload["primary_board"] = stale_primary
+            layout_path.write_text(
+                json.dumps(stale_payload, ensure_ascii=False, indent=2, sort_keys=True),
+                encoding="utf-8",
+            )
+
+            restored_widget = ControlPlaneWidget(dict(scheme), dict(scheme))
+            self.addCleanup(restored_widget.deleteLater)
+            restored_widget._refresh_timer.stop()
+            restored_widget._runtime_state_save_timer.stop()
+            restored_widget._control_tab_hover_marquee_timer.stop()
+            restored_widget.set_runtime_layout_path(str(layout_path))
+            restored_widget._refresh_timer.stop()
+            restored_widget._runtime_state_save_timer.stop()
+            restored_widget._control_tab_hover_marquee_timer.stop()
+
+            restored_primary = restored_widget._primary_board_context
+            restored_titles = [
+                element.get("title")
+                for element in (restored_primary.get("board_canvas_elements") or [])
+                if isinstance(element, dict)
+            ]
+            restored_tree_element = restored_widget._board_canvas_element_by_id(restored_primary, tree_element_id)
+            self.assertIsInstance(restored_tree_element, dict)
+            self.assertEqual(restored_tree_element.get("source_kind"), "tree")
+            self.assertEqual(restored_tree_element.get("x"), 420.0)
+            self.assertEqual(restored_tree_element.get("y"), 180.0)
+            self.assertNotIn("Explorer Tree", restored_titles)
+            self.assertNotIn("Board Canvas", restored_titles)
+
+            restored_extra_board = next(
+                (
+                    context
+                    for tab_widget, context in restored_widget._board_context_by_tab.items()
+                    if tab_widget is not getattr(restored_widget, "_config_tab", None)
+                ),
+                None,
+            )
+            self.assertIsInstance(restored_extra_board, dict)
+            restored_summary_element = restored_widget._board_canvas_element_by_id(restored_extra_board, summary_element_id)
+            self.assertIsInstance(restored_summary_element, dict)
+            self.assertEqual(restored_summary_element.get("x"), 336.0)
+            self.assertEqual(restored_summary_element.get("y"), 244.0)
+
+            sanitized_payload = json.loads(layout_path.read_text(encoding="utf-8"))
+            sanitized_titles = [
+                element.get("title")
+                for element in ((sanitized_payload.get("primary_board") or {}).get("canvas_elements") or [])
+                if isinstance(element, dict)
+            ]
+            self.assertNotIn("Explorer Tree", sanitized_titles)
+            self.assertNotIn("Board Canvas", sanitized_titles)
 
     def test_open_section_in_new_tab_appends_clone_when_runtime_tab_exists(self) -> None:
         scheme = {

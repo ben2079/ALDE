@@ -427,3 +427,38 @@ comment on table alde.document_blocks is
 
 comment on table alde.embeddings is
 'Vector-Layer. `embedding` ist optional; die produktive Suche kann via FAISS ueber `index_*` referenziert werden.';
+
+
+-- ---------------------------------------------------------------------------
+-- Positions-Layer (UI / Graph)
+-- Trennt Layout-Koordinaten von Fachdaten, damit Relationen und Entitaeten
+-- unabhaengig vom Rendering neupositioniert werden koennen.
+-- x_ml / y_ml sind die ML-berechneten Canvas-Positionen eines Knotens.
+-- weight_pos wird aus der XY-Distanz zweier Knoten abgeleitet:
+--   dist       = sqrt((x2-x1)^2 + (y2-y1)^2)
+--   weight_pos = 1 / (1 + dist / d_max)
+-- layout_version signalisiert dem Renderer, ob Positionen aktuell sind.
+-- ---------------------------------------------------------------------------
+
+create table if not exists alde.graph_node_positions (
+    node_id varchar(256) not null,
+    namespace_id text not null references alde.knowledge_namespaces(id) on delete cascade,
+    x_ml double precision not null default 0.0,
+    y_ml double precision not null default 0.0,
+    layout_version varchar(32) not null default 'v1',
+    metadata_json jsonb not null default '{}'::jsonb,
+    created_at timestamptz not null default now(),
+    updated_at timestamptz not null default now(),
+    primary key (node_id, namespace_id, layout_version)
+);
+
+create index if not exists ix_graph_node_positions_namespace_id
+    on alde.graph_node_positions (namespace_id);
+
+create index if not exists ix_graph_node_positions_layout_version
+    on alde.graph_node_positions (namespace_id, layout_version);
+
+comment on table alde.graph_node_positions is
+'Positions-Layer fuer den Relation-Graph. Haelt XY-Koordinaten der Knoten getrennt von Fachdaten.
+weight_pos einer Kante n1->n2 = 1 / (1 + dist(n1,n2) / d_max).
+Composite weight = alpha * weight_pos + beta * confidence + gamma * evidence.';

@@ -1,11 +1,12 @@
-from __future__ import annotations    ## ai_ide_v1756.py
-
+from __future__ import annotations    
+## ai_ide_v1756.py
 # Maintainer contact: see repository README.
 from PySide6.QtCore import QObject, QEvent, QRect
 
 import os
 import sys
 import importlib
+import json
 import base64
 import binascii
 import uuid
@@ -18,6 +19,7 @@ import shutil
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from pathlib import Path
 from threading import Thread
 from urllib.parse import parse_qsl, quote, unquote, urlencode, urlparse, urlunparse
 
@@ -35,6 +37,121 @@ _projects_root = os.path.dirname(_workspace_root)
 if _projects_root not in sys.path:
     sys.path.insert(0, _projects_root)
 
+_GUI_ENV_CONFIG_ENV_NAME = "AI_IDE_GUI_ENV_CONFIG_PATH"
+_GUI_ENV_CONFIG_FILENAME = "gui_env.json"
+_GUI_ENV_CONFIG_FORMAT = "ai_ide_gui_env_v1"
+
+
+
+def _stringify_gui_env_value(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return "1" if value else "0"
+    if isinstance(value, (str, int, float)):
+        return str(value)
+    try:
+        return json.dumps(value, ensure_ascii=False)
+    except Exception:
+        return str(value)
+
+
+def _gui_env_candidate_paths() -> list[Path]:
+    explicit_path = str(os.getenv(_GUI_ENV_CONFIG_ENV_NAME, "") or "").strip()
+    candidate_paths: list[Path] = []
+    if explicit_path:
+        raw_path = Path(explicit_path)
+        if raw_path.is_absolute():
+            candidate_paths.append(raw_path)
+        else:
+            for base_dir in (Path(_workspace_root), Path(_repo_root)):
+                candidate_paths.append((base_dir / raw_path).resolve())
+    else:
+        for base_dir in (Path(_workspace_root) / "AppData", Path(_repo_root) / "AppData"):
+            candidate_paths.append((base_dir / _GUI_ENV_CONFIG_FILENAME).resolve())
+
+    unique_paths: list[Path] = []
+    seen_paths: set[str] = set()
+    for path in candidate_paths:
+        normalized_path = str(path)
+        if normalized_path in seen_paths:
+            continue
+        seen_paths.add(normalized_path)
+        unique_paths.append(path)
+    return unique_paths
+
+
+def _default_gui_env_payload() -> dict[str, Any]:
+    env_payload: dict[str, str] = {}
+    for env_name, default_value in _GUI_ENV_DEFAULTS.items():
+        env_payload[env_name] = _stringify_gui_env_value(os.getenv(env_name, default_value))
+    return {
+        "format": _GUI_ENV_CONFIG_FORMAT,
+        "description": "GUI environment configuration for ai_ide_v1756.py and jstree_widget.py.",
+        "env": env_payload,
+    }
+
+
+def _normalize_gui_env_entries(payload: Any) -> dict[str, str]:
+    if not isinstance(payload, dict):
+        return {}
+
+    env_payload = payload.get("env")
+    if not isinstance(env_payload, dict):
+        env_payload = payload.get("environment")
+    if not isinstance(env_payload, dict):
+        env_payload = payload
+
+    normalized_entries: dict[str, str] = {}
+    for env_name, raw_value in env_payload.items():
+        if not isinstance(env_name, str):
+            continue
+        normalized_name = env_name.strip()
+        if not normalized_name or re.fullmatch(r"[A-Z][A-Z0-9_]*", normalized_name) is None:
+            continue
+        normalized_entries[normalized_name] = _stringify_gui_env_value(raw_value)
+    return normalized_entries
+
+
+def _ensure_gui_env_config_file() -> Path | None:
+    candidate_paths = _gui_env_candidate_paths()
+    for path in candidate_paths:
+        if path.exists():
+            return path
+    if not candidate_paths:
+        return None
+
+    target_path = candidate_paths[0]
+    try:
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        target_path.write_text(
+            json.dumps(_default_gui_env_payload(), indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+        return target_path
+    except Exception:
+        return None
+
+
+def _load_gui_env_config_into_process() -> Path | None:
+    ensured_path = _ensure_gui_env_config_file()
+    for path in _gui_env_candidate_paths():
+        if not path.exists() or not path.is_file():
+            continue
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        for env_name, env_value in _normalize_gui_env_entries(payload).items():
+            if env_value == "":
+                continue
+            os.environ.setdefault(env_name, env_value)
+        return path
+    return ensured_path
+
+
+_GUI_ENV_CONFIG_PATH = _load_gui_env_config_into_process()
+
 # Workaround für GNOME GLib-GIO-ERROR mit antialiasing
 # Verhindert Crash durch fehlende GNOME-Settings-Keys
 os.environ.setdefault('GDK_BACKEND', 'x11')
@@ -43,7 +160,6 @@ os.environ.setdefault('QT_QPA_PLATFORM', 'xcb')
 # Unterdrücke GLib Warnings (optional, falls sie stören)
 import warnings
 warnings.filterwarnings('ignore', category=Warning)
-from pathlib import Path
 from typing import Any, Callable, Final, List, Mapping, Optional, Sequence
 from io import BytesIO
 import mimetypes
@@ -322,6 +438,36 @@ except ImportError as e:
 
 try:
     if __package__:
+        from .ui_glyphs import (  # type: ignore
+            DROPDOWN_COLLAPSED_GLYPH,
+            DROPDOWN_COLLAPSED_PREFIX,
+            DROPDOWN_EXPANDED_GLYPH,
+            DROPDOWN_EXPANDED_PREFIX,
+            dropdown_prefix,
+        )
+    else:
+        from alde.ui_glyphs import (  # type: ignore
+            DROPDOWN_COLLAPSED_GLYPH,
+            DROPDOWN_COLLAPSED_PREFIX,
+            DROPDOWN_EXPANDED_GLYPH,
+            DROPDOWN_EXPANDED_PREFIX,
+            dropdown_prefix,
+        )
+except ImportError as e:
+    msg = str(e)
+    if "attempted relative import" in msg or "no known parent package" in msg:
+        from ui_glyphs import (  # type: ignore
+            DROPDOWN_COLLAPSED_GLYPH,
+            DROPDOWN_COLLAPSED_PREFIX,
+            DROPDOWN_EXPANDED_GLYPH,
+            DROPDOWN_EXPANDED_PREFIX,
+            dropdown_prefix,
+        )
+    else:
+        raise
+
+try:
+    if __package__:
         from .agents_db import GraphViewService  # type: ignore
     else:
         from agents_db import GraphViewService  # type: ignore
@@ -553,8 +699,8 @@ QTabBar::tab {{
     border-bottom: none;
     border-top-left-radius: 0px;
     border-top-right-radius: 0px;
-    padding: 5px 10px;
-    min-height: 20px;
+    padding: 3px 10px;
+    min-height: 16px;
     }}
 
 QTabBar::tab:first {{
@@ -915,7 +1061,7 @@ import string                                  # already imported once – harml
 
 # --- 2.  apply also to the QApplication so that QMenu benefits --------------
 
-def _draw_fallback(symbol: str = "x") -> QIcon:
+def _draw_fallback(symbol: str = "x", stroke_color: str = "#ffffff") -> QIcon:
     """
     Paints a very small 32 × 32 px pixmap with simple fallback symbols.
     Used whenever no SVG file (and no theme-icon) exists.
@@ -924,7 +1070,7 @@ def _draw_fallback(symbol: str = "x") -> QIcon:
     pm = QPixmap(size, size)
     pm.fill(Qt.transparent)
 
-    pen = QPen(QColor("#ffffff"))
+    pen = QPen(QColor(str(stroke_color or "#ffffff")))
     pen.setWidth(4)
 
     p = QPainter(pm)
@@ -2214,6 +2360,7 @@ class EditorTabs(QTabWidget):
 
 class FileDropTextEdit(QTextEdit):
     filesDropped = Signal(list)
+    submitRequested = Signal()
 
     def __init__(self, *a, **kw):
         super().__init__(*a, **kw)
@@ -2233,6 +2380,13 @@ class FileDropTextEdit(QTextEdit):
             ev.acceptProposedAction()
         else:
             super().dropEvent(ev)
+
+    def keyPressEvent(self, ev) -> None:
+        if ev.key() in (Qt.Key_Return, Qt.Key_Enter) and bool(ev.modifiers() & Qt.ControlModifier):
+            self.submitRequested.emit()
+            ev.accept()
+            return
+        super().keyPressEvent(ev)
 
 # ═══════ << changes 09.11.2025
 '''DROP-IN PATCH – 1 px linke Rahmenlinie am Chat-Dock  
@@ -2298,7 +2452,7 @@ class ChatDock(QDockWidget):
 class AIWidget(QWidget):
     '''AI-Chat-Dock – fehlerbereinigte Version'''
 
-    _PROMPT_SNAP_HEIGHT = 90
+    _PROMPT_SNAP_HEIGHT = 80
     _PROMPT_MAX_HEIGHT = 260
     _PROMPT_AUTOFIT_PADDING = 12
     _PROMPT_COMPOSER_V_MARGIN = 10
@@ -2378,6 +2532,7 @@ class AIWidget(QWidget):
             prompt_edit.setStyleSheet(
                 f"""
                 QTextEdit#aiInput {{
+                    
                     font-size: 15px;
                     background: transparent;
                     color: {col6};
@@ -2426,6 +2581,7 @@ class AIWidget(QWidget):
         self.btn_send.setFixedSize(self._PROMPT_SEND_BUTTON_SIZE, self._PROMPT_SEND_BUTTON_SIZE)
         self.btn_send.setIconSize(QSize(ToolButton._ICON_SIZE - 2, ToolButton._ICON_SIZE - 2))
         self.btn_send.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        self.btn_send.setToolTip("Senden (Strg+Enter)")
 
         self.prompt_composer = QFrame(self)
         self.prompt_composer.setObjectName("chatPromptComposer")
@@ -2488,6 +2644,7 @@ class AIWidget(QWidget):
         # ---------------------------------------------------------------------------
     def _wire(self) -> None:
         self.prompt_edit.filesDropped.connect(self._remember_files)
+        self.prompt_edit.submitRequested.connect(self._send)
         self.prompt_edit.textChanged.connect(self._schedule_prompt_autofit)
         try:
             self.prompt_edit.document().documentLayout().documentSizeChanged.connect(
@@ -4843,7 +5000,7 @@ class _SplitterToggleGlyph(QLabel):
 
     def setExpanded(self, expanded: bool) -> None:
         self._expanded = bool(expanded)
-        self.setText("▾" if self._expanded else "▸")
+        self.setText(DROPDOWN_EXPANDED_GLYPH if self._expanded else DROPDOWN_COLLAPSED_GLYPH)
         self._apply_style()
 
     def enterEvent(self, event) -> None:  # noqa: N802
@@ -4868,6 +5025,234 @@ class _SplitterToggleGlyph(QLabel):
             f"background: transparent; border: none; color: {color}; font-size: 13px; font-weight: 700;"
         )
 
+
+class _BoardCanvasView(QGraphicsView):
+    CARD_MARGIN = 10.0
+    CARD_GAP = 12.0
+    CARD_WIDTH = 280.0
+    CARD_HEIGHT = 132.0
+
+    itemActivated = Signal(str)
+    itemMoved = Signal(str, float, float)
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setObjectName("boardCanvasView")
+        self.setFrameShape(QFrame.NoFrame)
+        self.setAlignment(Qt.AlignLeft | Qt.AlignTop)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.setRenderHint(QPainter.Antialiasing, True)
+        self.setScene(QGraphicsScene(self))
+        self.setMinimumHeight(240)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self._cards: list[dict[str, Any]] = []
+        self._surface_color = "#0b0b0b"
+        self._accent_color = "#3a5fff"
+        self._text_color = "#E3E3DE"
+        self._muted_color = "#9a9a95"
+        self._card_item_groups: dict[str, list[Any]] = {}
+        self._card_anchor_positions: dict[str, tuple[float, float]] = {}
+        self._drag_item_id = ""
+        self._drag_origin_anchor = QPointF()
+        self._drag_press_scene_pos = QPointF()
+        self._drag_origin_positions: list[tuple[Any, QPointF]] = []
+        self._drag_moved = False
+        self._apply_canvas_style()
+
+    def set_cards(
+        self,
+        cards: Sequence[Mapping[str, Any]],
+        *,
+        surface_color: str,
+        accent_color: str,
+        text_color: str,
+        muted_color: str,
+    ) -> None:
+        self._cards = [dict(card) for card in cards]
+        self._surface_color = str(surface_color or self._surface_color)
+        self._accent_color = str(accent_color or self._accent_color)
+        self._text_color = str(text_color or self._text_color)
+        self._muted_color = str(muted_color or self._muted_color)
+        self._apply_canvas_style()
+        self._render_cards()
+
+    def resizeEvent(self, event) -> None:  # noqa: N802
+        super().resizeEvent(event)
+        self._render_cards()
+
+    def mousePressEvent(self, event) -> None:  # noqa: N802
+        point = event.position().toPoint() if hasattr(event, "position") else event.pos()
+        item = self.itemAt(point)
+        item_title = str(item.data(0) or "").strip() if item is not None else ""
+        if item_title and event.button() == Qt.LeftButton:
+            self._drag_item_id = item_title
+            anchor_x, anchor_y = self._card_anchor_positions.get(item_title, (0.0, 0.0))
+            self._drag_origin_anchor = QPointF(anchor_x, anchor_y)
+            self._drag_press_scene_pos = self.mapToScene(point)
+            self._drag_origin_positions = [
+                (graphic_item, QPointF(graphic_item.pos()))
+                for graphic_item in self._card_item_groups.get(item_title, [])
+            ]
+            self._drag_moved = False
+            self.viewport().setCursor(Qt.ClosedHandCursor)
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:  # noqa: N802
+        if self._drag_item_id and bool(event.buttons() & Qt.LeftButton):
+            point = event.position().toPoint() if hasattr(event, "position") else event.pos()
+            scene_point = self.mapToScene(point)
+            delta = scene_point - self._drag_press_scene_pos
+            if not self._drag_moved:
+                travel = abs(delta.x()) + abs(delta.y())
+                if travel < float(QApplication.startDragDistance()):
+                    event.accept()
+                    return
+                self._drag_moved = True
+
+            clamped_delta_x = max(-self._drag_origin_anchor.x(), float(delta.x()))
+            clamped_delta_y = max(-self._drag_origin_anchor.y(), float(delta.y()))
+            delta_offset = QPointF(clamped_delta_x, clamped_delta_y)
+            for graphic_item, origin in self._drag_origin_positions:
+                graphic_item.setPos(origin + delta_offset)
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:  # noqa: N802
+        if self._drag_item_id and event.button() == Qt.LeftButton:
+            point = event.position().toPoint() if hasattr(event, "position") else event.pos()
+            scene_point = self.mapToScene(point)
+            delta = scene_point - self._drag_press_scene_pos
+            clamped_delta_x = max(-self._drag_origin_anchor.x(), float(delta.x()))
+            clamped_delta_y = max(-self._drag_origin_anchor.y(), float(delta.y()))
+            dragged_item_id = self._drag_item_id
+            moved = self._drag_moved and (abs(clamped_delta_x) > 0.01 or abs(clamped_delta_y) > 0.01)
+            new_x = max(0.0, self._drag_origin_anchor.x() + clamped_delta_x)
+            new_y = max(0.0, self._drag_origin_anchor.y() + clamped_delta_y)
+            self._reset_drag_state()
+            if moved:
+                self.itemMoved.emit(dragged_item_id, float(new_x), float(new_y))
+            else:
+                self.itemActivated.emit(dragged_item_id)
+            event.accept()
+            return
+        self._reset_drag_state()
+        super().mouseReleaseEvent(event)
+
+    def _apply_canvas_style(self) -> None:
+        self.setStyleSheet(
+            """
+            QGraphicsView#boardCanvasView {
+                border: 1px solid #303030;
+                border-radius: 14px;
+                background: transparent;
+            }
+            """
+        )
+        self.setBackgroundBrush(QColor(self._surface_color))
+
+    def _reset_drag_state(self) -> None:
+        self._drag_item_id = ""
+        self._drag_origin_anchor = QPointF()
+        self._drag_press_scene_pos = QPointF()
+        self._drag_origin_positions = []
+        self._drag_moved = False
+        self.viewport().unsetCursor()
+
+    @staticmethod
+    def _coordinate_value(value: Any, fallback: float) -> float:
+        try:
+            return float(value)
+        except Exception:
+            return float(fallback)
+
+    def _render_cards(self) -> None:
+        scene = self.scene()
+        if not isinstance(scene, QGraphicsScene):
+            return
+
+        self._reset_drag_state()
+        self._card_item_groups = {}
+        self._card_anchor_positions = {}
+        scene.clear()
+        cards = list(self._cards)
+        if not cards:
+            placeholder = scene.addText("Board canvas is waiting for sections.")
+            placeholder.setDefaultTextColor(QColor(self._muted_color))
+            placeholder.setPos(12, 12)
+            scene.setSceneRect(0, 0, max(280, self.viewport().width()), 72)
+            return
+
+        margin = self.CARD_MARGIN
+        gap = self.CARD_GAP
+        card_width = self.CARD_WIDTH
+        card_height = self.CARD_HEIGHT
+        available_width = max(float(self.viewport().width()) - (margin * 2.0), card_width)
+        column_count = max(1, int(max(1.0, (available_width + gap) // (card_width + gap))))
+        card_y_positions = [margin for _ in range(column_count)]
+        max_right = margin
+        max_bottom = margin
+
+        for index, card in enumerate(cards):
+            column_index = index % column_count
+            default_x = margin + column_index * (card_width + gap)
+            default_y = card_y_positions[column_index]
+            x = self._coordinate_value(card.get("x"), default_x)
+            y = self._coordinate_value(card.get("y"), default_y)
+            card_y_positions[column_index] = max(card_y_positions[column_index], y + card_height + gap)
+
+            element_id = str(card.get("id") or "").strip() or str(card.get("title") or "Section")
+            title = str(card.get("title") or "Section").strip() or "Section"
+            preview = str(card.get("preview") or "").strip()
+            action_text = str(card.get("action_text") or f"Open {title}").strip() or f"Open {title}"
+            selected = bool(card.get("selected"))
+
+            border_color = QColor(self._accent_color if selected else self._muted_color)
+            fill_color = QColor(self._surface_color)
+            fill_color.setAlpha(245)
+            if selected:
+                fill_color = QColor(self._accent_color)
+                fill_color.setAlpha(40)
+
+            rect_item = scene.addRect(
+                x,
+                y,
+                card_width,
+                card_height,
+                QPen(border_color, 2 if selected else 1),
+                QBrush(fill_color),
+            )
+            rect_item.setData(0, element_id)
+
+            title_item = scene.addText(title)
+            title_item.setDefaultTextColor(QColor(self._text_color))
+            title_item.setTextWidth(card_width - 28)
+            title_item.setPos(x + 14, y + 10)
+            title_item.setData(0, element_id)
+
+            preview_item = scene.addText(preview or "Board surface ready.")
+            preview_item.setDefaultTextColor(QColor(self._muted_color))
+            preview_item.setTextWidth(card_width - 28)
+            preview_item.setPos(x + 14, y + 38)
+            preview_item.setData(0, element_id)
+
+            action_item = scene.addText(action_text)
+            action_item.setDefaultTextColor(QColor(self._accent_color if selected else self._text_color))
+            action_item.setTextWidth(card_width - 28)
+            action_item.setPos(x + 14, y + card_height - 30)
+            action_item.setData(0, element_id)
+
+            self._card_item_groups[element_id] = [rect_item, title_item, preview_item, action_item]
+            self._card_anchor_positions[element_id] = (float(x), float(y))
+            max_right = max(max_right, float(x + card_width))
+            max_bottom = max(max_bottom, float(y + card_height))
+
+        scene_width = max(max_right + margin, float(self.viewport().width()))
+        scene_height = max(max_bottom + margin, max(card_y_positions) + margin - gap, 72.0)
+        scene.setSceneRect(0, 0, scene_width, scene_height)
+
 class ControlPlaneWidget(QWidget):
     snapshotChanged = Signal(dict)
     _operator_async_result_ready = Signal(object)
@@ -4883,6 +5268,22 @@ class ControlPlaneWidget(QWidget):
     _BUILD_RUNTIME_TAB_LABEL = "<Build>"
     _LEGACY_BUILD_RUNTIME_SLASH_LABEL = "</Build>"
     _LEGACY_BUILD_RUNTIME_TAB_LABEL = "Builder"
+
+    def _resolve_auto_refresh_interval_ms(self) -> int:
+        raw_value = str(os.getenv("AI_IDE_CONTROL_PLANE_REFRESH_MS", "0") or "0").strip()
+        try:
+            resolved_value = int(raw_value)
+        except Exception:
+            resolved_value = 0
+        return max(0, resolved_value)
+
+    def _auto_refresh_hint_text(self) -> str:
+        interval_ms = self._resolve_auto_refresh_interval_ms()
+        if interval_ms <= 0:
+            return "Auto refresh: off"
+        if interval_ms % 1000 == 0:
+            return f"Auto refresh: {interval_ms // 1000}s"
+        return f"Auto refresh: {interval_ms / 1000.0:.1f}s"
 
     def __init__(self, accent: dict[str, str], base: dict[str, str], parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -4928,9 +5329,11 @@ class ControlPlaneWidget(QWidget):
         self.update_scheme(accent, base)
 
         self._refresh_timer = QTimer(self)
-        self._refresh_timer.setInterval(15000)
         self._refresh_timer.timeout.connect(self.refresh_view)
-        self._refresh_timer.start()
+        refresh_interval_ms = self._resolve_auto_refresh_interval_ms()
+        if refresh_interval_ms > 0:
+            self._refresh_timer.setInterval(refresh_interval_ms)
+            self._refresh_timer.start()
         self.refresh_view()
 
     def set_external_tabs(self, tabs_widget: Any) -> None:
@@ -4985,6 +5388,14 @@ class ControlPlaneWidget(QWidget):
             "tree_stream_retry_value",
             "tree_stream_updated_value",
             "tree_stream_error_value",
+            "board_explorer_tree_panel",
+            "board_explorer_tree_widget",
+            "board_explorer_tree_status_label",
+            "board_canvas_panel",
+            "board_canvas_view",
+            "board_canvas_status_label",
+            "board_canvas_elements",
+            "board_canvas_selected_element_id",
             "btn_refresh_detail",
             "monitor_detail_view",
             "monitor_timeline_view",
@@ -5062,7 +5473,7 @@ class ControlPlaneWidget(QWidget):
         if primary or self._primary_board_context is None:
             self._primary_board_context = board_context
 
-    def _unregister_board_context(self, tab_widget: QWidget) -> None:
+    def _unregister_board_context(self, tab_widget: QWidget, *, persist: bool = True) -> None:
         board_context = self._board_context_by_tab.pop(tab_widget, None)
         if board_context is None:
             return
@@ -5070,6 +5481,8 @@ class ControlPlaneWidget(QWidget):
             self._board_contexts.remove(board_context)
         if self._primary_board_context is board_context:
             self._primary_board_context = self._board_contexts[0] if self._board_contexts else None
+        if persist:
+            self._schedule_runtime_state_save()
 
     def _board_contexts_in_display_order(self) -> list[dict[str, Any]]:
         ordered_contexts: list[dict[str, Any]] = []
@@ -5393,23 +5806,26 @@ class ControlPlaneWidget(QWidget):
             lines.append(f"<p>{html.escape(preview_text)}</p>")
         return "".join(lines)
 
-    def _focus_primary_board_item(self, item_title: str) -> None:
-        if not hasattr(self, "tabs"):
-            return
+    def _focus_board_section_in_context(
+        self,
+        board_context: dict[str, Any] | None,
+        item_title: str,
+        *,
+        activate_tab: bool = False,
+    ) -> bool:
+        if not hasattr(self, "tabs") or not isinstance(board_context, dict):
+            return False
 
-        config_tab = getattr(self, "_config_tab", None)
-        if isinstance(config_tab, QWidget):
-            config_index = self.tabs.indexOf(config_tab)
-            if config_index >= 0:
-                self.tabs.setCurrentIndex(config_index)
+        tab_widget = board_context.get("tab_widget")
+        if activate_tab and isinstance(tab_widget, QWidget):
+            tab_index = self.tabs.indexOf(tab_widget)
+            if tab_index >= 0:
+                self.tabs.setCurrentIndex(tab_index)
 
-        primary_board = self._primary_board_context
-        if not isinstance(primary_board, dict):
-            return
-        with self._board_context_scope(primary_board):
+        with self._board_context_scope(board_context):
             section = self._board_section_for_title(item_title)
             if section is None:
-                return
+                return False
 
             self._set_config_monitor_section_expanded(section, True)
             scroll_area = getattr(self, "config_monitor_scroll_area", None)
@@ -5418,6 +5834,23 @@ class ControlPlaneWidget(QWidget):
                     0,
                     lambda target_section=section, area=scroll_area: area.ensureWidgetVisible(target_section, 0, 18),
                 )
+        return True
+
+    def _focus_primary_board_item(self, item_title: str) -> None:
+        if not hasattr(self, "tabs"):
+            return
+
+        resolved_title = str(item_title or "").strip()
+        if resolved_title:
+            self._last_selected_board_item_title = resolved_title
+
+        primary_board = self._primary_board_context
+        if not isinstance(primary_board, dict):
+            return
+        primary_board["board_canvas_selected_element_id"] = self._board_canvas_element_id("board", resolved_title)
+        self._focus_board_section_in_context(primary_board, resolved_title, activate_tab=True)
+        self._schedule_runtime_state_save()
+        self._render_all_board_canvas_surfaces()
 
     def _next_board_tab_name(self) -> str:
         if not hasattr(self, "tabs"):
@@ -5453,8 +5886,14 @@ class ControlPlaneWidget(QWidget):
             return current_widget
         return None
 
-    def _create_board_runtime_tab(self, *, activate: bool = True) -> QWidget:
-        board_title = self._next_board_tab_name()
+    def _create_board_runtime_tab(
+        self,
+        *,
+        activate: bool = True,
+        board_title: str | None = None,
+        persist: bool = True,
+    ) -> QWidget:
+        board_title = str(board_title or "").strip() or self._next_board_tab_name()
         board_tab, board_context = self._create_board_page(board_title)
         board_index = self.tabs.addTab(board_tab, self._format_control_plane_tab_text(board_title))
         board_tab.setProperty("fullTabText", board_title)
@@ -5462,7 +5901,22 @@ class ControlPlaneWidget(QWidget):
         if activate:
             self.tabs.setCurrentIndex(board_index)
         self._render_board_context(board_context, include_drilldown=True)
+        if persist:
+            self._schedule_runtime_state_save()
         return board_tab
+
+    def _dispose_board_tab(self, tab_widget: QWidget, *, persist: bool = True) -> None:
+        primary_board_tab = getattr(self, "_config_tab", None)
+        if not isinstance(tab_widget, QWidget) or tab_widget is primary_board_tab:
+            return
+        index = self.tabs.indexOf(tab_widget)
+        if index >= 0:
+            self.tabs.removeTab(index)
+        self._unregister_board_context(tab_widget, persist=False)
+        tab_widget.setParent(None)
+        tab_widget.deleteLater()
+        if persist:
+            self._schedule_runtime_state_save()
 
     def _ensure_board_runtime_target(self, *, activate: bool = True) -> QWidget:
         active_board = self._active_board_runtime_tab()
@@ -5527,6 +5981,858 @@ class ControlPlaneWidget(QWidget):
             form.addRow(label, value)
             values[key] = value
         return panel, values
+
+    def _create_board_explorer_tree_panel(self, parent: QWidget) -> tuple[QWidget, QTreeWidget, QLabel]:
+        panel = QWidget(parent)
+        panel.setObjectName("controlPanel")
+
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(12, 10, 12, 10)
+        layout.setSpacing(8)
+
+        title = QLabel("<b>Explorer Tree</b>", panel)
+        title.setObjectName("controlMeta")
+        layout.addWidget(title)
+
+        status_label = QLabel("Waiting for the shared explorer tree.", panel)
+        status_label.setObjectName("controlMeta")
+        status_label.setWordWrap(True)
+        layout.addWidget(status_label)
+
+        tree_widget = QTreeWidget(panel)
+        tree_widget.setObjectName("boardExplorerTree")
+        tree_widget.setHeaderHidden(True)
+        tree_widget.setUniformRowHeights(False)
+        tree_widget.setAnimated(False)
+        tree_widget.setIndentation(0)
+        tree_widget.setMinimumHeight(180)
+        tree_widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        tree_widget.itemDoubleClicked.connect(self._handle_board_explorer_tree_item_double_clicked)
+        tree_widget.itemExpanded.connect(self._handle_board_explorer_tree_item_expanded)
+        tree_widget.itemCollapsed.connect(self._handle_board_explorer_tree_item_collapsed)
+        layout.addWidget(tree_widget, 1)
+        return panel, tree_widget, status_label
+
+    def _board_explorer_source_tree(self) -> QTreeWidget | None:
+        window = self.window()
+        explorer = getattr(window, "explorer", None) if window is not None else None
+        if explorer is None:
+            return None
+        tree_widget = getattr(explorer, "tree", explorer)
+        if isinstance(tree_widget, QTreeWidget):
+            return tree_widget
+        return None
+
+    def _clone_board_explorer_tree_item(
+        self,
+        source_item: QTreeWidgetItem,
+        *,
+        parent_path: Sequence[str] | None = None,
+    ) -> QTreeWidgetItem:
+        item_text = str(source_item.text(0) or "").strip()
+        path_segments = [segment for segment in (parent_path or ()) if str(segment or "").strip()]
+        if item_text:
+            path_segments.append(item_text)
+        item_path = " / ".join(path_segments)
+        child_count = int(source_item.childCount())
+        tooltip_text = str(source_item.toolTip(0) or "").strip()
+        preview_text = tooltip_text or (
+            f"Explorer tree node with {child_count} child entries." if child_count > 0 else f"Explorer tree leaf from {item_path or item_text or 'Explorer'}"
+        )
+
+        clone_item = QTreeWidgetItem([source_item.text(0)])
+        clone_item.setFlags(source_item.flags() & ~Qt.ItemIsEditable)
+        clone_item.setData(0, Qt.DecorationRole, None)
+        clone_item.setForeground(0, source_item.foreground(0))
+        clone_item.setFont(0, source_item.font(0))
+        clone_item.setToolTip(0, source_item.toolTip(0))
+        clone_item.setData(0, Qt.UserRole, item_path)
+        clone_item.setData(0, Qt.UserRole + 1, preview_text)
+        for child_index in range(source_item.childCount()):
+            child_item = source_item.child(child_index)
+            if child_item is None:
+                continue
+            cloned_child = self._clone_board_explorer_tree_item(child_item, parent_path=path_segments)
+            clone_item.addChild(cloned_child)
+            cloned_child.setExpanded(child_item.isExpanded())
+        return clone_item
+
+    def _apply_board_explorer_tree_card_style(self, tree_widget: QTreeWidget) -> None:
+        if not isinstance(tree_widget, QTreeWidget):
+            return
+
+        def _normalize_label(raw_text: str) -> str:
+            text = str(raw_text or "").strip()
+            if not text:
+                return ""
+            for prefix in (DROPDOWN_EXPANDED_PREFIX, DROPDOWN_COLLAPSED_PREFIX):
+                if text.startswith(prefix):
+                    text = text[len(prefix):].strip()
+                    break
+            if ": " in text:
+                text = text.split(": ", 1)[0].strip()
+            if text.endswith(" {...}"):
+                text = text[:-5].strip()
+            if " [" in text and text.endswith("]"):
+                text = text.rsplit(" ", 1)[0].strip()
+            return text.strip()
+
+        def _root_item_for(item: QTreeWidgetItem) -> QTreeWidgetItem:
+            current = item
+            parent = current.parent()
+            while parent is not None:
+                current = parent
+                parent = current.parent()
+            return current
+
+        def _item_category(item: QTreeWidgetItem) -> str:
+            title_key = _normalize_label(item.text(0)).lower()
+            root_key = _normalize_label(_root_item_for(item).text(0)).lower()
+
+            def _env_mcp_group(section_name: str, label_text: str) -> str | None:
+                section = str(section_name or "").strip().lower()
+                text = str(label_text or "").strip().lower()
+                if section == "env":
+                    if any(token in text for token in ("error", "warn", "failed", "timeout", "invalid")):
+                        return "alerts"
+                    if any(token in text for token in ("token", "secret", "password", "apikey", "api_key", "auth", "private", "credential")):
+                        return "security"
+                    if any(token in text for token in ("url", "uri", "endpoint", "host", "port", "socket")):
+                        return "integration"
+                    if any(token in text for token in ("path", "dir", "directory", "file", "workspace", "repo", "home")):
+                        return "workspace"
+                    if any(token in text for token in ("runtime", "worker", "queue", "model", "provider", "thread", "cache")):
+                        return "runtime"
+                    return "neutral"
+                if section == "mcp":
+                    if any(token in text for token in ("error", "warn", "failed", "timeout", "retry", "unavailable")):
+                        return "alerts"
+                    if any(token in text for token in ("token", "secret", "apikey", "api_key", "auth", "credential", "key")):
+                        return "security"
+                    if any(token in text for token in ("server", "endpoint", "host", "port", "url", "uri", "socket", "transport", "bridge")):
+                        return "integration"
+                    if any(token in text for token in ("tool", "runtime", "worker", "event", "stream", "sync")):
+                        return "runtime"
+                    if any(token in text for token in ("path", "file", "workspace", "repo", "module")):
+                        return "workspace"
+                    return "integration"
+                return None
+
+            section_category_map: tuple[tuple[str, str], ...] = (
+                ("projects", "workspace"),
+                ("runtime", "runtime"),
+                ("databases", "data"),
+                ("chat_history", "history"),
+                ("history", "history"),
+            )
+            if root_key in {"env", "mcp"}:
+                env_mcp_category = _env_mcp_group(root_key, title_key)
+                if env_mcp_category:
+                    return env_mcp_category
+            for section_name, category in section_category_map:
+                if root_key == section_name:
+                    return category
+
+            keyword_groups: tuple[tuple[str, tuple[str, ...]], ...] = (
+                ("alerts", ("error", "warn", "warning", "failed", "failure", "timeout", "retry", "critical", "panic")),
+                ("security", ("token", "secret", "credential", "password", "apikey", "api_key", "auth", "private key")),
+                ("integration", ("mcp", "server", "socket", "endpoint", "http", "https", "api", "tool", "bridge")),
+                ("data", ("database", "db", "collection", "record", "vector", "index", "table", "document")),
+                ("runtime", ("runtime", "worker", "queue", "job", "dispatcher", "session", "event", "stream")),
+                ("workspace", ("project", "workspace", "repo", "file", "path", "module", "template")),
+            )
+            for category, keywords in keyword_groups:
+                if any(keyword in title_key for keyword in keywords):
+                    return category
+
+            if item.childCount() > 0:
+                return "container"
+            if "/" in title_key or "\\" in title_key:
+                return "workspace"
+            if title_key.endswith((".py", ".json", ".md", ".toml", ".yaml", ".yml", ".txt")):
+                return "workspace"
+            return "neutral"
+
+        def _palette_for(category: str) -> dict[str, str]:
+            palettes: dict[str, dict[str, str]] = {
+                "workspace": {
+                    "label_fg": "#d8ecff",
+                    "label_bg": "rgba(66, 120, 168, 0.24)",
+                    "label_border": "rgba(66, 120, 168, 0.62)",
+                },
+                "runtime": {
+                    "label_fg": "#d6ffe1",
+                    "label_bg": "rgba(56, 150, 99, 0.24)",
+                    "label_border": "rgba(56, 150, 99, 0.64)",
+                },
+                "data": {
+                    "label_fg": "#ffe6cf",
+                    "label_bg": "rgba(178, 118, 68, 0.24)",
+                    "label_border": "rgba(178, 118, 68, 0.62)",
+                },
+                "integration": {
+                    "label_fg": "#d0f5ff",
+                    "label_bg": "rgba(47, 149, 168, 0.24)",
+                    "label_border": "rgba(47, 149, 168, 0.60)",
+                },
+                "history": {
+                    "label_fg": "#f0dfff",
+                    "label_bg": "rgba(120, 102, 181, 0.24)",
+                    "label_border": "rgba(120, 102, 181, 0.60)",
+                },
+                "security": {
+                    "label_fg": "#ffe8e6",
+                    "label_bg": "rgba(178, 48, 68, 0.34)",
+                    "label_border": "rgba(227, 96, 116, 0.88)",
+                },
+                "alerts": {
+                    "label_fg": "#fff3d8",
+                    "label_bg": "rgba(212, 128, 18, 0.36)",
+                    "label_border": "rgba(255, 175, 64, 0.86)",
+                },
+                "container": {
+                    "label_fg": "#dbe4e7",
+                    "label_bg": "rgba(105, 120, 127, 0.20)",
+                    "label_border": "rgba(124, 141, 149, 0.54)",
+                },
+                "neutral": {
+                    "label_fg": "#dce3e7",
+                    "label_bg": "rgba(84, 96, 104, 0.20)",
+                    "label_border": "rgba(113, 127, 136, 0.52)",
+                },
+            }
+            return palettes.get(str(category or "").strip().lower(), palettes["neutral"])
+
+        def _group_top_margin(current_category: str, previous_category: str | None) -> int:
+            normalized_current = str(current_category or "").strip().lower()
+            normalized_previous = str(previous_category or "").strip().lower()
+            if not normalized_current or not normalized_previous:
+                return 0
+            if normalized_current != normalized_previous:
+                return 6
+            return 0
+
+        def _apply_marker_style(marker_widget: QLabel, marker_text: str) -> None:
+            glyph = str(marker_text or "").strip()
+            if glyph == DROPDOWN_EXPANDED_GLYPH:
+                marker_color = str(self.scheme.get("col1") or "#3a5fff")
+            elif glyph == DROPDOWN_COLLAPSED_GLYPH:
+                marker_color = str(self.scheme.get("col8") or "#9a9a95")
+            else:
+                marker_color = "transparent"
+            marker_widget.setStyleSheet(
+                (
+                    f"color: {marker_color};"
+                    "font-weight: 700;"
+                    "font-size: 11px;"
+                    "background: transparent;"
+                    "border: none;"
+                    "padding: 0px;"
+                )
+            )
+
+        def _apply_label_style(label_widget: QLabel, category: str) -> None:
+            palette = _palette_for(category)
+            label_widget.setStyleSheet(
+                (
+                    f"color: {palette['label_fg']};"
+                    "font-weight: 700;"
+                    "font-size: 10px;"
+                    f"background: {palette['label_bg']};"
+                    f"border: 1px solid {palette['label_border']};"
+                    "border-radius: 6px;"
+                    "padding: 1px 9px;"
+                )
+            )
+
+        def _iter_grouped_child_rows(parent_item: QTreeWidgetItem):
+            previous_child_category: str | None = None
+            for child_index in range(parent_item.childCount()):
+                child_item = parent_item.child(child_index)
+                if not isinstance(child_item, QTreeWidgetItem):
+                    continue
+
+                child_title = _normalize_label(child_item.text(0))
+                child_category = _item_category(child_item)
+                child_margin_top = _group_top_margin(child_category, previous_child_category)
+                previous_child_category = child_category
+
+                yield child_item, child_title, child_category, child_margin_top
+                yield from _iter_grouped_child_rows(child_item)
+
+        def _dropdown_marker(item: QTreeWidgetItem) -> str:
+            if item.childCount() <= 0:
+                return ""
+            return dropdown_prefix(item.isExpanded())
+
+        def _apply_row(item: QTreeWidgetItem, item_title: str, item_category: str, row_margin_top: int) -> None:
+            safe_title = str(item_title or "").strip() or str(item.text(0) or "").strip()
+
+            container_widget = tree_widget.itemWidget(item, 0)
+            if not isinstance(container_widget, QWidget) or not bool(container_widget.property("board_explorer_tree_card_widget")):
+                container_widget = QWidget(tree_widget)
+                container_widget.setProperty("board_explorer_tree_card_widget", True)
+                container_widget.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+                container_layout = QHBoxLayout(container_widget)
+                container_layout.setContentsMargins(0, row_margin_top, 0, 0)
+                container_layout.setSpacing(0)
+
+                marker_widget = QLabel("", container_widget)
+                marker_widget.setObjectName("boardExplorerTreeCardMarker")
+                marker_widget.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+                marker_widget.setAlignment(Qt.AlignCenter)
+                marker_widget.setFixedWidth(11)
+                _apply_marker_style(marker_widget, "")
+
+                label_widget = QLabel(safe_title, container_widget)
+                label_widget.setObjectName("boardExplorerTreeCardLabel")
+                label_widget.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+                label_widget.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+                label_widget.setWordWrap(False)
+
+                container_layout.addWidget(marker_widget, 0, Qt.AlignLeft | Qt.AlignVCenter)
+                container_layout.addSpacing(2)
+                container_layout.addWidget(label_widget, 0, Qt.AlignLeft | Qt.AlignVCenter)
+                container_layout.addStretch(1)
+                tree_widget.setItemWidget(item, 0, container_widget)
+            else:
+                container_layout = container_widget.layout()
+                if isinstance(container_layout, QHBoxLayout):
+                    container_layout.setContentsMargins(0, row_margin_top, 0, 0)
+                marker_widget = container_widget.findChild(QLabel, "boardExplorerTreeCardMarker")
+                if not isinstance(marker_widget, QLabel):
+                    marker_widget = QLabel("", container_widget)
+                    marker_widget.setObjectName("boardExplorerTreeCardMarker")
+                    marker_widget.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+                    marker_widget.setAlignment(Qt.AlignCenter)
+                    marker_widget.setFixedWidth(11)
+                    _apply_marker_style(marker_widget, "")
+                    if isinstance(container_layout, QHBoxLayout):
+                        container_layout.insertWidget(0, marker_widget, 0, Qt.AlignLeft | Qt.AlignVCenter)
+                        container_layout.insertSpacing(1, 2)
+                label_widget = container_widget.findChild(QLabel, "boardExplorerTreeCardLabel")
+                if not isinstance(label_widget, QLabel):
+                    label_widget = QLabel(safe_title, container_widget)
+                    label_widget.setObjectName("boardExplorerTreeCardLabel")
+                    label_widget.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+                    label_widget.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+                    label_widget.setWordWrap(False)
+                    if isinstance(container_layout, QHBoxLayout):
+                        insert_index = max(0, container_layout.count() - 1)
+                        container_layout.insertWidget(insert_index, label_widget, 0, Qt.AlignLeft | Qt.AlignVCenter)
+
+            marker = _dropdown_marker(item).strip()
+            marker_widget.setText(marker)
+            _apply_marker_style(marker_widget, marker)
+            label_widget.setText(safe_title)
+            label_widget.setToolTip(str(item.toolTip(0) or safe_title))
+            _apply_label_style(label_widget, item_category)
+
+            desired_height = max(22, int(label_widget.sizeHint().height()) + row_margin_top)
+            item.setSizeHint(0, QSize(0, desired_height))
+
+        previous_top_level_category: str | None = None
+        for top_level_index in range(tree_widget.topLevelItemCount()):
+            top_item = tree_widget.topLevelItem(top_level_index)
+            if not isinstance(top_item, QTreeWidgetItem):
+                continue
+
+            top_title = _normalize_label(top_item.text(0))
+            top_category = _item_category(top_item)
+            top_margin = _group_top_margin(top_category, previous_top_level_category)
+            previous_top_level_category = top_category
+
+            _apply_row(top_item, top_title, top_category, top_margin)
+            for child_item, child_title, child_category, child_margin_top in _iter_grouped_child_rows(top_item):
+                _apply_row(child_item, child_title, child_category, child_margin_top)
+
+    @staticmethod
+    def _board_canvas_element_id(source_kind: str, source_ref: str) -> str:
+        return f"{str(source_kind or '').strip().lower()}::{str(source_ref or '').strip()}"
+
+    @staticmethod
+    def _board_canvas_tree_item_path(tree_item: QTreeWidgetItem | None) -> str:
+        if not isinstance(tree_item, QTreeWidgetItem):
+            return ""
+        return str(tree_item.data(0, Qt.UserRole) or "").strip()
+
+    @staticmethod
+    def _board_canvas_tree_item_preview(tree_item: QTreeWidgetItem | None) -> str:
+        if not isinstance(tree_item, QTreeWidgetItem):
+            return ""
+        preview_text = str(tree_item.data(0, Qt.UserRole + 1) or "").strip()
+        if preview_text:
+            return preview_text
+        child_count = int(tree_item.childCount())
+        if child_count > 0:
+            return f"Explorer tree node with {child_count} child entries."
+        label = str(tree_item.text(0) or "").strip()
+        return f"Explorer tree leaf from {label or 'Explorer'}"
+
+    def _board_canvas_element_for_board_title(self, item_title: str) -> dict[str, Any]:
+        resolved_title = str(item_title or "").strip()
+        return {
+            "id": self._board_canvas_element_id("board", resolved_title),
+            "title": resolved_title,
+            "preview": self._board_item_preview_text(resolved_title),
+            "source_kind": "board",
+            "source_ref": resolved_title,
+            "action_text": f"Open {resolved_title}",
+        }
+
+    def _board_canvas_element_for_tree_item(self, tree_item: QTreeWidgetItem | None) -> dict[str, Any] | None:
+        if not isinstance(tree_item, QTreeWidgetItem):
+            return None
+
+        item_path = self._board_canvas_tree_item_path(tree_item)
+        item_title = str(tree_item.text(0) or "").strip()
+        if not item_path or not item_title or "not attached to this window yet" in item_title.lower():
+            return None
+
+        return {
+            "id": self._board_canvas_element_id("tree", item_path),
+            "title": item_title,
+            "preview": self._board_canvas_tree_item_preview(tree_item),
+            "source_kind": "tree",
+            "source_ref": item_path,
+            "action_text": f"Focus {item_title}",
+        }
+
+    def _board_canvas_element_by_id(
+        self,
+        board_context: dict[str, Any] | None,
+        element_id: str,
+    ) -> dict[str, Any] | None:
+        if not isinstance(board_context, dict):
+            return None
+        elements = board_context.get("board_canvas_elements")
+        if not isinstance(elements, list):
+            return None
+        normalized_id = str(element_id or "").strip()
+        if not normalized_id:
+            return None
+        for element in elements:
+            if isinstance(element, dict) and str(element.get("id") or "").strip() == normalized_id:
+                return element
+        return None
+
+    @staticmethod
+    def _board_canvas_numeric_value(value: Any) -> float | None:
+        try:
+            return float(value)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _board_canvas_hidden_board_titles() -> set[str]:
+        return {
+            "explorer tree",
+            "board canvas",
+            "projects",
+        }
+
+    @staticmethod
+    def _board_canvas_default_origin_for_index(element_index: int) -> tuple[float, float]:
+        normalized_index = max(0, int(element_index))
+        column_count = 2
+        column_index = normalized_index % column_count
+        row_index = normalized_index // column_count
+        x = _BoardCanvasView.CARD_MARGIN + column_index * (_BoardCanvasView.CARD_WIDTH + _BoardCanvasView.CARD_GAP)
+        y = _BoardCanvasView.CARD_MARGIN + row_index * (_BoardCanvasView.CARD_HEIGHT + _BoardCanvasView.CARD_GAP)
+        return float(x), float(y)
+
+    def _board_canvas_element_position(self, element: Mapping[str, Any] | None) -> tuple[float, float] | None:
+        if not isinstance(element, Mapping):
+            return None
+        x_value = self._board_canvas_numeric_value(element.get("x"))
+        y_value = self._board_canvas_numeric_value(element.get("y"))
+        if x_value is None or y_value is None:
+            return None
+        return max(0.0, float(x_value)), max(0.0, float(y_value))
+
+    def _assign_default_positions_to_board_canvas_elements(self, elements: Sequence[dict[str, Any]]) -> None:
+        occupied_positions = {
+            (round(position[0], 3), round(position[1], 3))
+            for position in (self._board_canvas_element_position(element) for element in elements)
+            if position is not None
+        }
+        for element_index, element in enumerate(elements):
+            if not isinstance(element, dict):
+                continue
+            if self._board_canvas_element_position(element) is not None:
+                continue
+
+            candidate_index = element_index
+            while True:
+                x_value, y_value = self._board_canvas_default_origin_for_index(candidate_index)
+                marker = (round(x_value, 3), round(y_value, 3))
+                if marker not in occupied_positions:
+                    element["x"] = float(x_value)
+                    element["y"] = float(y_value)
+                    occupied_positions.add(marker)
+                    break
+                candidate_index += 1
+
+    def _next_board_canvas_origin(self, elements: Sequence[dict[str, Any]]) -> tuple[float, float]:
+        occupied_positions = {
+            (round(position[0], 3), round(position[1], 3))
+            for position in (self._board_canvas_element_position(element) for element in elements)
+            if position is not None
+        }
+        candidate_index = len([element for element in elements if isinstance(element, dict)])
+        while True:
+            x_value, y_value = self._board_canvas_default_origin_for_index(candidate_index)
+            marker = (round(x_value, 3), round(y_value, 3))
+            if marker not in occupied_positions:
+                return float(x_value), float(y_value)
+            candidate_index += 1
+
+    def _set_board_canvas_element_position(
+        self,
+        board_context: dict[str, Any] | None,
+        element_id: str,
+        x_value: float,
+        y_value: float,
+        *,
+        persist: bool = True,
+    ) -> bool:
+        if not isinstance(board_context, dict):
+            return False
+        self._ensure_board_canvas_elements(board_context)
+        element = self._board_canvas_element_by_id(board_context, element_id)
+        if not isinstance(element, dict):
+            return False
+        element["x"] = max(0.0, float(x_value))
+        element["y"] = max(0.0, float(y_value))
+        board_context["board_canvas_selected_element_id"] = str(element_id or "").strip()
+        if persist:
+            self._schedule_runtime_state_save()
+        return True
+
+    def _find_board_tree_item_by_path(self, tree_widget: QTreeWidget, tree_path: str) -> QTreeWidgetItem | None:
+        normalized_path = str(tree_path or "").strip()
+        if not normalized_path:
+            return None
+
+        stack: list[QTreeWidgetItem] = []
+        for item_index in range(tree_widget.topLevelItemCount() - 1, -1, -1):
+            item = tree_widget.topLevelItem(item_index)
+            if item is not None:
+                stack.append(item)
+
+        while stack:
+            item = stack.pop()
+            if self._board_canvas_tree_item_path(item) == normalized_path:
+                return item
+            for child_index in range(item.childCount() - 1, -1, -1):
+                child = item.child(child_index)
+                if child is not None:
+                    stack.append(child)
+        return None
+
+    def _ensure_board_canvas_elements(self, board_context: dict[str, Any] | None) -> list[dict[str, Any]]:
+        if not isinstance(board_context, dict):
+            return []
+
+        elements = board_context.get("board_canvas_elements")
+        if not isinstance(elements, list):
+            elements = []
+            board_context["board_canvas_elements"] = elements
+
+        hidden_titles = self._board_canvas_hidden_board_titles()
+        filtered_elements: list[dict[str, Any]] = []
+        for element in elements:
+            if not isinstance(element, dict):
+                continue
+            source_kind = str(element.get("source_kind") or "").strip().lower()
+            source_ref = str(element.get("source_ref") or element.get("title") or "").strip().lower()
+            if source_kind == "board" and source_ref in hidden_titles:
+                continue
+            filtered_elements.append(element)
+        if filtered_elements is not elements:
+            elements = filtered_elements
+            board_context["board_canvas_elements"] = elements
+
+        element_map: dict[str, dict[str, Any]] = {
+            str(element.get("id") or "").strip(): element
+            for element in elements
+            if isinstance(element, dict) and str(element.get("id") or "").strip()
+        }
+
+        for item_title in self._primary_board_item_titles():
+            if str(item_title or "").strip().lower() in hidden_titles:
+                continue
+            element = self._board_canvas_element_for_board_title(item_title)
+            existing = element_map.get(str(element.get("id") or ""))
+            if isinstance(existing, dict):
+                existing.update(element)
+            else:
+                elements.append(element)
+                element_map[str(element.get("id") or "")] = element
+
+        tree_widget = board_context.get("board_explorer_tree_widget")
+        if isinstance(tree_widget, QTreeWidget):
+            for element in list(elements):
+                if not isinstance(element, dict):
+                    continue
+                if str(element.get("source_kind") or "").strip().lower() != "tree":
+                    continue
+                tree_path = str(element.get("source_ref") or "").strip()
+                if not tree_path:
+                    continue
+                tree_item = self._find_board_tree_item_by_path(tree_widget, tree_path)
+                updated = self._board_canvas_element_for_tree_item(tree_item)
+                if isinstance(updated, dict):
+                    element.update(updated)
+
+        selected_id = str(board_context.get("board_canvas_selected_element_id") or "").strip()
+        if not selected_id:
+            selected_title = str(getattr(self, "_last_selected_board_item_title", "") or "").strip()
+            if selected_title:
+                selected_id = self._board_canvas_element_id("board", selected_title)
+        if selected_id not in element_map and elements:
+            selected_id = str(elements[0].get("id") or "").strip()
+        board_context["board_canvas_selected_element_id"] = selected_id
+        self._assign_default_positions_to_board_canvas_elements(elements)
+        return elements
+
+    def _focus_board_tree_item_in_context(
+        self,
+        board_context: dict[str, Any] | None,
+        tree_path: str,
+        *,
+        activate_tab: bool = False,
+    ) -> bool:
+        if not isinstance(board_context, dict):
+            return False
+        self._focus_board_section_in_context(board_context, "Explorer Tree", activate_tab=activate_tab)
+        tree_widget = board_context.get("board_explorer_tree_widget")
+        if not isinstance(tree_widget, QTreeWidget):
+            return False
+        target_item = self._find_board_tree_item_by_path(tree_widget, tree_path)
+        if not isinstance(target_item, QTreeWidgetItem):
+            return False
+
+        parent_item = target_item.parent()
+        while isinstance(parent_item, QTreeWidgetItem):
+            parent_item.setExpanded(True)
+            parent_item = parent_item.parent()
+        tree_widget.setCurrentItem(target_item)
+        tree_widget.scrollToItem(target_item)
+        return True
+
+    def _add_tree_item_to_board_canvas(
+        self,
+        board_context: dict[str, Any] | None,
+        tree_item: QTreeWidgetItem | None,
+    ) -> bool:
+        if not isinstance(board_context, dict):
+            return False
+        element = self._board_canvas_element_for_tree_item(tree_item)
+        if not isinstance(element, dict):
+            return False
+
+        elements = self._ensure_board_canvas_elements(board_context)
+        existing = self._board_canvas_element_by_id(board_context, str(element.get("id") or ""))
+        if isinstance(existing, dict):
+            existing.update(element)
+        else:
+            x_value, y_value = self._next_board_canvas_origin(elements)
+            element["x"] = float(x_value)
+            element["y"] = float(y_value)
+            elements.append(element)
+        board_context["board_canvas_selected_element_id"] = str(element.get("id") or "")
+        self._schedule_runtime_state_save()
+        return True
+
+    def _handle_board_explorer_tree_item_double_clicked(self, item: QTreeWidgetItem, _column: int) -> None:
+        tree_widget = self.sender()
+        board_context = self._board_context_from_object(tree_widget)
+        if not self._add_tree_item_to_board_canvas(board_context, item):
+            return
+        self._render_all_board_canvas_surfaces()
+
+    def _handle_board_explorer_tree_item_expanded(self, _item: QTreeWidgetItem) -> None:
+        tree_widget = self.sender()
+        if isinstance(tree_widget, QTreeWidget):
+            self._apply_board_explorer_tree_card_style(tree_widget)
+
+    def _handle_board_explorer_tree_item_collapsed(self, _item: QTreeWidgetItem) -> None:
+        tree_widget = self.sender()
+        if isinstance(tree_widget, QTreeWidget):
+            self._apply_board_explorer_tree_card_style(tree_widget)
+
+    def _handle_board_canvas_item_moved(self, item_id: str, x_value: float, y_value: float) -> None:
+        canvas_view = self.sender()
+        board_context = self._board_context_from_object(canvas_view)
+        if not self._set_board_canvas_element_position(board_context, item_id, x_value, y_value, persist=True):
+            return
+        self._render_board_canvas_surface(board_context)
+
+    def _sync_board_explorer_tree_panel(self, board_context: dict[str, Any]) -> None:
+        tree_widget = board_context.get("board_explorer_tree_widget")
+        status_label = board_context.get("board_explorer_tree_status_label")
+        if not isinstance(tree_widget, QTreeWidget):
+            return
+
+        surface_color = str(self.scheme.get("col7", "#0b0b0b"))
+        text_color = str(self.scheme.get("col6", "#E3E3DE"))
+        frame_color = str(self.scheme.get("col10", "#303030"))
+
+        tree_widget.setStyleSheet(
+            f"""
+            QTreeWidget#boardExplorerTree {{
+                background-color: {surface_color};
+                color: {text_color};
+                border: 1px solid {frame_color};
+                border-radius: 14px;
+                padding: 4px 0px 6px 0px;
+                outline: none;
+            }}
+            QTreeWidget#boardExplorerTree::item {{
+                margin: 0px;
+                padding: 0px;
+                color: {text_color};
+                border: none;
+                background: transparent;
+            }}
+            """
+        )
+
+        source_tree = self._board_explorer_source_tree()
+        tree_widget.blockSignals(True)
+        tree_widget.clear()
+        try:
+            if not isinstance(source_tree, QTreeWidget):
+                placeholder_item = QTreeWidgetItem(["Explorer tree is not attached to this window yet."])
+                placeholder_item.setFlags(placeholder_item.flags() & ~Qt.ItemIsEditable)
+                tree_widget.addTopLevelItem(placeholder_item)
+                if isinstance(status_label, QLabel):
+                    status_label.setText("Source unavailable. Open the shared explorer dock to mirror the live tree here.")
+                return
+
+            top_level_count = 0
+            for item_index in range(source_tree.topLevelItemCount()):
+                source_item = source_tree.topLevelItem(item_index)
+                if source_item is None:
+                    continue
+                cloned_item = self._clone_board_explorer_tree_item(source_item)
+                tree_widget.addTopLevelItem(cloned_item)
+                cloned_item.setExpanded(source_item.isExpanded())
+                top_level_count += 1
+
+            self._apply_board_explorer_tree_card_style(tree_widget)
+
+            diagnostic = self._load_tree_stream_diagnostic()
+            if isinstance(status_label, QLabel):
+                transport = str(diagnostic.get("transport") or "n/a").strip() or "n/a"
+                state = str(diagnostic.get("connection_state") or "unavailable").strip() or "unavailable"
+                status_label.setText(
+                    f"{top_level_count} root sections mirrored from the shared explorer | transport: {transport} | state: {state} | double-click adds nodes to the canvas"
+                )
+        finally:
+            tree_widget.blockSignals(False)
+
+    def _create_board_canvas_panel(self, parent: QWidget) -> tuple[QWidget, _BoardCanvasView, QLabel]:
+        panel = QWidget(parent)
+        panel.setObjectName("controlPanel")
+
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(12, 10, 12, 10)
+        layout.setSpacing(8)
+
+        title = QLabel("<b>Board Canvas</b>", panel)
+        title.setObjectName("controlMeta")
+        layout.addWidget(title)
+
+        status_label = QLabel(
+            f"Click a card to focus the source section on {self._PRIMARY_BOARD_TAB_LABEL}.",
+            panel,
+        )
+        status_label.setObjectName("controlMeta")
+        status_label.setWordWrap(True)
+        layout.addWidget(status_label)
+
+        canvas_view = _BoardCanvasView(panel)
+        canvas_view.itemActivated.connect(self._activate_board_canvas_item)
+        canvas_view.itemMoved.connect(self._handle_board_canvas_item_moved)
+        layout.addWidget(canvas_view, 1)
+        return panel, canvas_view, status_label
+
+    def _activate_board_canvas_item(self, item_title: str) -> None:
+        resolved_id = str(item_title or "").strip()
+        if not resolved_id:
+            return
+
+        board_context = self._active_board_context()
+        if not isinstance(board_context, dict):
+            board_context = self._primary_board_context
+        if not isinstance(board_context, dict):
+            return
+
+        board_context["board_canvas_selected_element_id"] = resolved_id
+        element = self._board_canvas_element_by_id(board_context, resolved_id)
+        if isinstance(element, dict):
+            source_kind = str(element.get("source_kind") or "").strip().lower()
+            source_ref = str(element.get("source_ref") or element.get("title") or "").strip()
+            if source_kind == "tree":
+                self._focus_board_tree_item_in_context(board_context, source_ref, activate_tab=True)
+            else:
+                self._last_selected_board_item_title = source_ref
+                self._focus_board_section_in_context(board_context, source_ref, activate_tab=True)
+            self._schedule_runtime_state_save()
+        self._render_all_board_canvas_surfaces()
+
+    def _render_all_board_canvas_surfaces(self) -> None:
+        board_contexts = self._board_contexts_in_display_order()
+        if not board_contexts and isinstance(self._primary_board_context, dict):
+            board_contexts = [self._primary_board_context]
+        for board_context in board_contexts:
+            self._render_board_canvas_surface(board_context)
+
+    def _render_board_canvas_surface(self, board_context: dict[str, Any]) -> None:
+        canvas_view = board_context.get("board_canvas_view")
+        status_label = board_context.get("board_canvas_status_label")
+        if not isinstance(canvas_view, _BoardCanvasView):
+            return
+
+        elements = self._ensure_board_canvas_elements(board_context)
+        selected_id = str(board_context.get("board_canvas_selected_element_id") or "").strip()
+        cards = [
+            {
+                "id": str(element.get("id") or "").strip(),
+                "title": str(element.get("title") or "").strip() or "Element",
+                "preview": str(element.get("preview") or "").strip(),
+                "action_text": str(element.get("action_text") or "").strip(),
+                "x": element.get("x"),
+                "y": element.get("y"),
+                "selected": str(element.get("id") or "").strip() == selected_id,
+            }
+            for element in elements
+            if isinstance(element, dict)
+        ]
+        canvas_view.set_cards(
+            cards,
+            surface_color=str(self.scheme.get("col7", "#0b0b0b")),
+            accent_color=str(self.scheme.get("col1", "#3a5fff")),
+            text_color=str(self.scheme.get("col6", "#E3E3DE")),
+            muted_color=str(self.scheme.get("col8", "#9a9a95")),
+        )
+
+        if isinstance(status_label, QLabel):
+            if cards:
+                board_count = sum(1 for element in elements if isinstance(element, dict) and str(element.get("source_kind") or "").strip().lower() == "board")
+                tree_count = sum(1 for element in elements if isinstance(element, dict) and str(element.get("source_kind") or "").strip().lower() == "tree")
+                selected_card = next(
+                    (card for card in cards if str(card.get("id") or "").strip() == selected_id),
+                    cards[0],
+                )
+                selected_note = str(selected_card.get("title") or cards[0]["title"]).strip()
+                status_label.setText(
+                    f"{board_count} board surfaces + {tree_count} tree elements on the canvas. Active focus: {selected_note}. Double-click tree nodes to extend the composition."
+                )
+            else:
+                status_label.setText(f"No board surfaces are available in {self._PRIMARY_BOARD_TAB_LABEL} yet.")
 
     def _create_board_build_section(self, parent: QWidget) -> QWidget:
         panel = QFrame(parent)
@@ -5670,6 +6976,8 @@ class ControlPlaneWidget(QWidget):
             "_config_monitor_host_threat_flow_size": 220,
             "config_monitor_host_splitter_toggle": None,
             "config_monitor_host_splitter_label": None,
+            "board_canvas_elements": [],
+            "board_canvas_selected_element_id": "",
         }
 
         board_context["config_summary_view"] = self._create_board_browser(config_tab)
@@ -5724,6 +7032,16 @@ class ControlPlaneWidget(QWidget):
         board_context["tree_stream_retry_value"] = tree_stream_values["retry"]
         board_context["tree_stream_updated_value"] = tree_stream_values["updated"]
         board_context["tree_stream_error_value"] = tree_stream_values["error"]
+
+        explorer_tree_panel, explorer_tree_widget, explorer_tree_status_label = self._create_board_explorer_tree_panel(config_tab)
+        board_context["board_explorer_tree_panel"] = explorer_tree_panel
+        board_context["board_explorer_tree_widget"] = explorer_tree_widget
+        board_context["board_explorer_tree_status_label"] = explorer_tree_status_label
+
+        board_canvas_panel, board_canvas_view, board_canvas_status_label = self._create_board_canvas_panel(config_tab)
+        board_context["board_canvas_panel"] = board_canvas_panel
+        board_context["board_canvas_view"] = board_canvas_view
+        board_context["board_canvas_status_label"] = board_canvas_status_label
 
         detail_panel = QWidget(config_tab)
         detail_layout = QVBoxLayout(detail_panel)
@@ -5888,6 +7206,8 @@ class ControlPlaneWidget(QWidget):
             if include_drilldown and configuration_snapshot:
                 self._refresh_drilldown_views_for_context()
             self._render_operator_log()
+            self._sync_board_explorer_tree_panel(board_context)
+            self._render_board_canvas_surface(board_context)
 
     def _render_all_board_contexts(self, *, include_drilldown: bool = False) -> None:
         board_contexts = self._board_contexts_in_display_order()
@@ -5937,6 +7257,7 @@ class ControlPlaneWidget(QWidget):
             return None
 
         self._last_selected_board_item_title = resolved_title
+        self._render_all_board_canvas_surfaces()
         target_tab = self._ensure_board_runtime_target(activate=True)
         board_context = self._board_context_by_tab.get(target_tab)
         if isinstance(board_context, dict):
@@ -6320,12 +7641,15 @@ class ControlPlaneWidget(QWidget):
         self._update_code_tab_button_visibility(self.tabs.currentIndex())
         return str(self._runtime_layout_path)
 
+    def _runtime_hint_text(self) -> str:
+        path_name = self._runtime_layout_path.name or str(self._runtime_layout_path)
+        return f"Runtime layout: {path_name} | {self._auto_refresh_hint_text()}"
+
     def _update_runtime_layout_hint(self) -> None:
         hint_label = getattr(self, "_runtime_hint_label", None)
         if hint_label is None:
             return
-        path_name = self._runtime_layout_path.name or str(self._runtime_layout_path)
-        hint_label.setText(f"Runtime layout: {path_name}")
+        hint_label.setText(self._runtime_hint_text())
 
     def _select_runtime_layout_path(self) -> None:
         start_path = str(self._runtime_layout_path)
@@ -6517,6 +7841,92 @@ class ControlPlaneWidget(QWidget):
             return text_editor.toPlainText()
         return ""
 
+    def _serialize_board_canvas_element(self, element: Mapping[str, Any]) -> dict[str, Any]:
+        payload: dict[str, Any] = {}
+        for key in ("id", "title", "preview", "source_kind", "source_ref", "action_text"):
+            value = str(element.get(key) or "").strip()
+            if value:
+                payload[key] = value
+        position = self._board_canvas_element_position(element)
+        if position is not None:
+            payload["x"] = round(position[0], 3)
+            payload["y"] = round(position[1], 3)
+        return payload
+
+    def _serialize_board_context_state(self, board_context: dict[str, Any] | None) -> dict[str, Any]:
+        if not isinstance(board_context, dict):
+            return {
+                "canvas_elements": [],
+                "selected_element_id": "",
+            }
+
+        elements = self._ensure_board_canvas_elements(board_context)
+        return {
+            "canvas_elements": [
+                self._serialize_board_canvas_element(element)
+                for element in elements
+                if isinstance(element, Mapping)
+            ],
+            "selected_element_id": str(board_context.get("board_canvas_selected_element_id") or "").strip(),
+        }
+
+    def _restore_board_context_state(
+        self,
+        board_context: dict[str, Any] | None,
+        payload: Mapping[str, Any] | None,
+    ) -> None:
+        if not isinstance(board_context, dict):
+            return
+        if not isinstance(payload, Mapping):
+            board_context["board_canvas_elements"] = []
+            board_context["board_canvas_selected_element_id"] = ""
+            self._ensure_board_canvas_elements(board_context)
+            return
+
+        restored_elements: list[dict[str, Any]] = []
+        for element_payload in payload.get("canvas_elements") or []:
+            if not isinstance(element_payload, Mapping):
+                continue
+
+            restored_element: dict[str, Any] = {}
+            element_id = str(element_payload.get("id") or "").strip()
+            source_kind = str(element_payload.get("source_kind") or "").strip().lower()
+            source_ref = str(element_payload.get("source_ref") or "").strip()
+            title = str(element_payload.get("title") or "").strip()
+            preview = str(element_payload.get("preview") or "").strip()
+            action_text = str(element_payload.get("action_text") or "").strip()
+
+            if not element_id:
+                if source_kind and source_ref:
+                    element_id = self._board_canvas_element_id(source_kind, source_ref)
+                elif title:
+                    element_id = self._board_canvas_element_id("board", title)
+            if not element_id:
+                continue
+
+            restored_kind, _separator, restored_ref = element_id.partition("::")
+            restored_element["id"] = element_id
+            restored_element["source_kind"] = source_kind or restored_kind or "board"
+            restored_element["source_ref"] = source_ref or restored_ref or title
+            if title:
+                restored_element["title"] = title
+            if preview:
+                restored_element["preview"] = preview
+            if action_text:
+                restored_element["action_text"] = action_text
+
+            x_value = self._board_canvas_numeric_value(element_payload.get("x"))
+            y_value = self._board_canvas_numeric_value(element_payload.get("y"))
+            if x_value is not None:
+                restored_element["x"] = max(0.0, float(x_value))
+            if y_value is not None:
+                restored_element["y"] = max(0.0, float(y_value))
+            restored_elements.append(restored_element)
+
+        board_context["board_canvas_elements"] = restored_elements
+        board_context["board_canvas_selected_element_id"] = str(payload.get("selected_element_id") or "").strip()
+        self._ensure_board_canvas_elements(board_context)
+
     def _serialize_runtime_widget_panel(self, panel: QWidget) -> dict[str, Any]:
         widget_kind = str(panel.property("runtime_widget_kind") or "code_json").strip().lower() or "code_json"
         title = str(panel.property("runtime_widget_title") or "runtime_widget")
@@ -6545,9 +7955,27 @@ class ControlPlaneWidget(QWidget):
     def _serialize_runtime_tabs_state(self) -> dict[str, Any]:
         serialized_tabs: list[dict[str, Any]] = []
         active_runtime_tab = ""
+        active_tab = ""
+        primary_board_state = self._serialize_board_context_state(self._primary_board_context)
 
         for index in range(self.tabs.count()):
             tab_widget = self.tabs.widget(index)
+            tab_name = self._control_plane_tab_full_text(index)
+            if self.tabs.currentWidget() is tab_widget:
+                active_tab = tab_name
+
+            if tab_widget in self._board_context_by_tab:
+                if tab_widget is getattr(self, "_config_tab", None):
+                    continue
+                serialized_tabs.append(
+                    {
+                        "tab_kind": "board",
+                        "name": tab_name,
+                        "board_state": self._serialize_board_context_state(self._board_context_by_tab.get(tab_widget)),
+                    }
+                )
+                continue
+
             if tab_widget not in self._runtime_tab_records:
                 continue
 
@@ -6564,6 +7992,7 @@ class ControlPlaneWidget(QWidget):
 
             serialized_tabs.append(
                 {
+                    "tab_kind": "runtime",
                     "name": self._control_plane_tab_full_text(index),
                     "default_widget_kind": default_widget_kind,
                     "widgets": widget_payloads,
@@ -6579,7 +8008,9 @@ class ControlPlaneWidget(QWidget):
 
         return {
             "schema": self._RUNTIME_LAYOUT_SCHEMA,
+            "primary_board": primary_board_state,
             "tabs": serialized_tabs,
+            "active_tab": active_tab,
             "active_runtime_tab": active_runtime_tab,
         }
 
@@ -6632,6 +8063,16 @@ class ControlPlaneWidget(QWidget):
                 self._builder_runtime_tab = None
             self._dispose_runtime_tab(tab_widget, persist=False)
 
+    def _clear_dynamic_board_tabs(self) -> None:
+        primary_board_tab = getattr(self, "_config_tab", None)
+        board_tabs = [
+            self.tabs.widget(index)
+            for index in range(self.tabs.count())
+            if self.tabs.widget(index) in self._board_context_by_tab and self.tabs.widget(index) is not primary_board_tab
+        ]
+        for tab_widget in board_tabs:
+            self._dispose_board_tab(tab_widget, persist=False)
+
     def _restore_runtime_tabs_state(self) -> None:
         path = self._runtime_layout_path
         if not path.exists():
@@ -6644,7 +8085,8 @@ class ControlPlaneWidget(QWidget):
             return
 
         try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
+            existing_payload_text = path.read_text(encoding="utf-8")
+            payload = json.loads(existing_payload_text)
         except Exception:
             return
         if not isinstance(payload, dict):
@@ -6656,13 +8098,27 @@ class ControlPlaneWidget(QWidget):
 
         self._runtime_restore_active = True
         try:
+            self._clear_dynamic_board_tabs()
             self._clear_runtime_tabs()
+            self._restore_board_context_state(self._primary_board_context, payload.get("primary_board"))
 
             for tab_entry in tabs_payload:
                 if not isinstance(tab_entry, dict):
                     continue
 
+                tab_kind = str(tab_entry.get("tab_kind") or "runtime").strip().lower() or "runtime"
                 tab_name = str(tab_entry.get("name") or "").strip() or f"Runtime {self._runtime_tab_counter + 1}"
+                if tab_kind == "board":
+                    board_tab = self._create_board_runtime_tab(
+                        activate=False,
+                        board_title=tab_name,
+                        persist=False,
+                    )
+                    board_context = self._board_context_by_tab.get(board_tab)
+                    self._restore_board_context_state(board_context, tab_entry.get("board_state"))
+                    self._render_board_canvas_surface(board_context)
+                    continue
+
                 tab_widget = self.create_runtime_tab(
                     tab_name,
                     activate=False,
@@ -6713,11 +8169,11 @@ class ControlPlaneWidget(QWidget):
                         persist=False,
                     )
 
-            active_name = str(payload.get("active_runtime_tab") or "").strip().lower()
+            active_name = str(payload.get("active_tab") or payload.get("active_runtime_tab") or "").strip().lower()
             if active_name:
                 for index in range(self.tabs.count()):
                     tab_widget = self.tabs.widget(index)
-                    if tab_widget in self._runtime_tab_records and self._control_plane_tab_full_text(index).strip().lower() == active_name:
+                    if self._control_plane_tab_full_text(index).strip().lower() == active_name:
                         self.tabs.setCurrentIndex(index)
                         break
         finally:
@@ -6725,12 +8181,21 @@ class ControlPlaneWidget(QWidget):
 
         self._runtime_tab_counter = max(self._runtime_tab_counter, len(self._runtime_tab_records))
         self._ensure_builder_runtime_tab(activate=False, persist=False)
-        self._runtime_state_last_saved_payload = json.dumps(
+        serialized_payload = json.dumps(
             self._serialize_runtime_tabs_state(),
             ensure_ascii=False,
             indent=2,
             sort_keys=True,
         )
+        self._runtime_state_last_saved_payload = serialized_payload
+        if serialized_payload != existing_payload_text:
+            try:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                temp_path = path.with_suffix(path.suffix + ".tmp")
+                temp_path.write_text(serialized_payload, encoding="utf-8")
+                temp_path.replace(path)
+            except Exception:
+                pass
 
     def _build_ui(self) -> None:
         root = QVBoxLayout(self)
@@ -6776,7 +8241,7 @@ class ControlPlaneWidget(QWidget):
         header_meta.setSpacing(4)
         self._last_refresh_label = QLabel("Refresh pending", hero)
         self._last_refresh_label.setObjectName("controlMeta")
-        self._runtime_hint_label = QLabel("Auto refresh: 15s", hero)
+        self._runtime_hint_label = QLabel(self._runtime_hint_text(), hero)
         self._runtime_hint_label.setObjectName("controlMeta")
         header_meta.addWidget(self._last_refresh_label, 0, Qt.AlignRight)
         header_meta.addWidget(self._runtime_hint_label, 0, Qt.AlignRight)
@@ -7013,6 +8478,13 @@ class ControlPlaneWidget(QWidget):
 
         tree_stream_layout.addLayout(tree_stream_form)
         drilldown_layout.addWidget(self.tree_stream_panel)
+
+        self.board_explorer_tree_panel, self.board_explorer_tree_widget, self.board_explorer_tree_status_label = self._create_board_explorer_tree_panel(config_tab)
+        drilldown_layout.addWidget(self.board_explorer_tree_panel, 1)
+
+        self.board_canvas_panel, self.board_canvas_view, self.board_canvas_status_label = self._create_board_canvas_panel(config_tab)
+        self.board_canvas_elements: list[dict[str, Any]] = []
+        self.board_canvas_selected_element_id = ""
 
         detail_action_row = QHBoxLayout()
         detail_action_row.setContentsMargins(0, 0, 0, 0)
@@ -7258,6 +8730,8 @@ class ControlPlaneWidget(QWidget):
         config_tab_index = self.tabs.addTab(config_tab, self._PRIMARY_BOARD_TAB_LABEL)
         self._set_control_plane_tab_text(config_tab_index, self._PRIMARY_BOARD_TAB_LABEL)
         self._register_board_context(config_tab, self._capture_current_board_context(config_tab), primary=True)
+        self._sync_board_explorer_tree_panel(self._primary_board_context)
+        self._render_board_canvas_surface(self._primary_board_context)
 
         # Builder-tab symbol button removed per UX request.
         self._code_tab_new_button = None
@@ -9092,7 +10566,7 @@ class ControlPlaneWidget(QWidget):
             " margin: 0px 2px 4px 0px;"
             " margin-bottom: 4px;"
             " min-width: 0px;"
-            " min-height: 18px;"
+            " min-height: 16px;"
             "}"
             "QTabBar#extensionsEmbeddedTabBar::tab:hover {"
             f" color: {palette['label_fg']};"
@@ -10120,8 +11594,8 @@ class ControlPlaneWidget(QWidget):
                 border-bottom: none;
                 border-top-left-radius: 0px;
                 border-top-right-radius: 0px;
-                padding: 5px 10px;
-                min-height: 20px;
+                padding: 3px 10px;
+                min-height: 16px;
             }}
             QTabWidget#controlPlaneTabs QTabBar::tab:first {{
                 border-left: 1px solid {self.scheme['col10']};
@@ -10345,10 +11819,10 @@ class ControlPlaneWidget(QWidget):
                 border-radius: 6px;
                 font-size: 10px;
                 font-weight: 700;
-                padding: 4px 10px;
+                padding: 3px 10px;
                 margin: 0px 2px 0px 0px;
                 min-width: 45px;
-                min-height: 18px;
+                min-height: 16px;
             }}
             QTabBar#extensionsEmbeddedTabBar::tab:hover {{
                 color: {self.scheme['col8']};
@@ -12125,12 +13599,12 @@ class ExtensionsWorkspaceTabBar(QTabBar):
         self,
         *args,
         text_formatter: Callable[[str], str] | None = None,
-        tab_row_height: int = 18,
+        tab_row_height: int = 16,
         **kwargs,
     ) -> None:
         super().__init__(*args, **kwargs)
         self._text_formatter = text_formatter
-        self._tab_row_height = max(18, int(tab_row_height))
+        self._tab_row_height = max(16, int(tab_row_height))
         self._titlebar_uri_mouse_target: QLineEdit | None = None
         self.setLayoutDirection(Qt.RightToLeft)
 
@@ -12140,7 +13614,7 @@ class ExtensionsWorkspaceTabBar(QTabBar):
         self.update()
 
     def set_tab_row_height(self, value: int) -> None:
-        resolved_height = max(18, int(value))
+        resolved_height = max(16, int(value))
         if resolved_height == self._tab_row_height:
             return
         self._tab_row_height = resolved_height
@@ -12820,6 +14294,12 @@ class ExtensionsWorkspaceWidget(QWidget):
                     for source_index, tab_text in enumerate(tab_texts)
                     if not self._hide_titlebar_proxy_tab_for_text(tab_text)
                 ]
+                visible_source_indices = [entry for entry in proxy_entries if isinstance(entry, int)]
+                if visible_source_indices and current_index not in visible_source_indices:
+                    fallback_source_index = int(visible_source_indices[0])
+                    if 0 <= fallback_source_index < self.extensions_tabs.count():
+                        self.extensions_tabs.setCurrentIndex(fallback_source_index)
+                        return
             if titlebar_uri_mode:
                 uri_slot_index = max(0, min(uri_slot_index, len(tab_texts)))
                 proxy_entries = list(range(uri_slot_index)) + [ExtensionsWorkspaceTabBar.URI_PROXY_DATA] + list(range(uri_slot_index, len(tab_texts)))
@@ -13010,7 +14490,7 @@ class ExtensionsWorkspaceWidget(QWidget):
         proxy_layout = QHBoxLayout(proxy_host)
         proxy_layout.setContentsMargins(0, 0, 0, 0)
         proxy_layout.setSpacing(0)
-        titlebar_tab_height = max(18, int(CustomWindowTitleBar._HEIGHT) - 4)
+        titlebar_tab_height = max(16, int(CustomWindowTitleBar._HEIGHT) - 6)
 
         proxy_bar = ExtensionsWorkspaceTabBar(
             proxy_host,
@@ -13021,7 +14501,7 @@ class ExtensionsWorkspaceWidget(QWidget):
         proxy_bar.setProperty("extensions_embedded_tab_bar", True)
         proxy_bar.setProperty("extensions_titlebar_proxy_bar", True)
         proxy_bar.setProperty("extensions_titlebar_uri_mode", True)
-        proxy_bar.setProperty("extensions_titlebar_uri_fill", "#101010")
+        proxy_bar.setProperty("extensions_titlebar_uri_fill", str(self.scheme.get("col5") or "#101010"))
         proxy_bar.setProperty("extensions_titlebar_uri_slot_index", 0)
         proxy_bar.setDocumentMode(True)
         proxy_bar.setMovable(True)
@@ -13340,10 +14820,21 @@ class ExtensionsWorkspaceWidget(QWidget):
         return close_button
 
     def _update_hover_close_buttons(self, tab_bar: QTabBar, hover_index: int) -> None:
+        force_visible = bool(tab_bar.property("extensions_titlebar_proxy_bar"))
+        try:
+            source_tab_bar = self.extensions_tabs.tabBar()
+        except RuntimeError:
+            source_tab_bar = None
         for index in range(tab_bar.count()):
             close_button = tab_bar.tabButton(index, QTabBar.RightSide)
             if isinstance(close_button, QToolButton) and bool(close_button.property("extensions_close_button")):
-                show_button = index == hover_index and self._is_extension_tab_closable(index)
+                if isinstance(source_tab_bar, QTabBar) and tab_bar is source_tab_bar:
+                    resolved_source_index = index
+                else:
+                    tab_data = tab_bar.tabData(index)
+                    resolved_source_index = int(tab_data) if isinstance(tab_data, int) else -1
+                is_closable = resolved_source_index >= 0 and self._is_extension_tab_closable(resolved_source_index)
+                show_button = bool(is_closable and (force_visible or index == hover_index))
                 close_button.setFixedSize(16, 16) if show_button else close_button.setFixedSize(0, 0)
                 close_button.setVisible(show_button)
 
@@ -13581,18 +15072,39 @@ class ExtensionsWorkspaceWidget(QWidget):
         if not isinstance(moved_source_index, int):
             return None
 
-        split_role = str(proxy_bar.property("extensions_titlebar_split_role") or "").strip().lower()
-        raw_split_slot_index = proxy_bar.property("extensions_titlebar_split_slot_index")
-        try:
-            split_slot_index = int(raw_split_slot_index) if raw_split_slot_index is not None and str(raw_split_slot_index).strip() != "" else 0
-        except Exception:
-            split_slot_index = 0
+        visible_source_order: list[int] = []
+        for proxy_index in range(proxy_bar.count()):
+            tab_data = proxy_bar.tabData(proxy_index)
+            if isinstance(tab_data, int):
+                visible_source_order.append(int(tab_data))
 
-        if split_role == "left":
+        try:
+            total_tabs = int(self.extensions_tabs.count())
+        except RuntimeError:
+            total_tabs = 0
+        if total_tabs <= 0:
+            return None
+
+        visible_source_set = set(visible_source_order)
+        source_order = list(range(total_tabs))
+        visible_positions = [
+            source_position
+            for source_position, source_index in enumerate(source_order)
+            if source_index in visible_source_set
+        ]
+        if not visible_positions:
             return int(moved_source_index), int(proxy_to_index)
-        if split_role == "right":
-            return int(moved_source_index), int(split_slot_index + proxy_to_index)
-        return int(moved_source_index), int(proxy_to_index)
+
+        desired_source_order = list(source_order)
+        for source_position, source_index in zip(visible_positions, visible_source_order):
+            desired_source_order[source_position] = int(source_index)
+
+        try:
+            target_source_index = int(desired_source_order.index(int(moved_source_index)))
+        except ValueError:
+            return int(moved_source_index), int(proxy_to_index)
+
+        return int(moved_source_index), int(target_source_index)
 
     def _handle_extensions_tab_moved(self, _from_index: int, _to_index: int) -> None:
         sender_object = self.sender()
@@ -14031,6 +15543,13 @@ class ExtensionsWorkspaceWidget(QWidget):
             34,
             fallback=extension_tab_palette.get("handle_bg_pressed", "rgba(32,32,32,34)"),
         )
+        uri_surface_bg = str(self.scheme.get("col5") or self.scheme.get("col7") or "#0b0b0b")
+        uri_border_idle = str(self.scheme.get("col10") or "#1f1f1f")
+        uri_frame_color = str(self.scheme.get("col1") or self.scheme.get("col2") or uri_border_idle)
+        uri_glow_hover = str(self.scheme.get("col2") or self.scheme.get("col1") or "#58ed5b")
+        uri_glow_focus = str(self.scheme.get("col1") or self.scheme.get("col2") or "#0fe913")
+        uri_hover_bg = _color_with_alpha(uri_glow_hover, 20, fallback=uri_surface_bg)
+        uri_focus_bg = _color_with_alpha(uri_glow_focus, 28, fallback=uri_surface_bg)
         self.setStyleSheet(
             f"""
 QWidget#extensionsSessionControlPage,
@@ -14067,11 +15586,11 @@ QTabWidget#extensionsTabs QTabBar::tab {{
     border-radius: 6px;
     font-size: 10px;
     font-weight: 700;
-    padding: 1px 28px 1px 9px;
+    padding: 0px 28px 0px 9px;
     margin: 0px 2px 4px 0px;
     margin-bottom: 4px;
     min-width: 0px;
-    min-height: 18px;
+    min-height: 16px;
 }}
 QTabWidget#extensionsTabs QTabBar::tab:hover {{
     color: {extension_tab_palette['label_fg']};
@@ -14110,17 +15629,21 @@ QToolButton#extensionsTabCloseButton:hover {{
 }}
 QLineEdit#extensionsGraphUriInput {{
     color: {self.scheme.get('col6', '#E3E3DE')};
-    background: {self.scheme.get('col9', '#101010')};
-    border: 1px solid {self.scheme.get('col10', '#1f1f1f')};
+    background: {uri_surface_bg};
+    border: 1px solid {uri_frame_color};
     border-radius: 8px;
     padding: 4px 8px;
     min-height: 30px;
+    selection-background-color: {uri_glow_focus};
+    selection-color: {self.scheme.get('col6', '#E3E3DE')};
 }}
 QLineEdit#extensionsGraphUriInput:hover {{
-    border-color: {self.scheme.get('col2', '#58ed5b')};
+    background: {uri_hover_bg};
+    border-color: {uri_frame_color};
 }}
 QLineEdit#extensionsGraphUriInput:focus {{
-    border-color: {self.scheme.get('col1', '#0fe913')};
+    background: {uri_focus_bg};
+    border-color: {uri_frame_color};
 }}
 QToolButton#extensionsUriPresetButton {{
     color: {self.scheme.get('col8', '#9a9a9a')};
@@ -15138,10 +16661,13 @@ class CustomWindowTitleBar(QWidget):
         uri_width = self._resolved_external_uri_host_width()
         self._rebuild_uri_tab_slot_rects(available_width, uri_width)
         max_left = max(0, available_width - uri_width)
+        # Position the URI/input bar according to the persisted anchor: use the
+        # nearest tab slot when real tabs are present, otherwise fall back to
+        # the ratio-based anchor (0.5 = centered, matching the default state).
         if self._uri_tab_slot_rects and self._uses_uri_tab_slot_layout():
             desired_left = self._tab_slot_left_from_index(self._uri_tab_slot_index)
         else:
-            desired_left = self._resolved_titlebar_centered_uri_left(max_left, uri_width)
+            desired_left = self._uri_left_from_anchor_ratio(self._uri_anchor_ratio, max_left, uri_width)
         desired_left = max(0, min(desired_left, max_left))
         left_spacing = max(0, int(self._tab_strip_host_layout.spacing()))
         left_spacer_width = max(0, desired_left - left_spacing)
@@ -15225,10 +16751,12 @@ class CustomWindowTitleBar(QWidget):
         uri_bg = str(scheme.get("col9") or "#101010")
         titlebar_surface_bg = str(scheme.get("col5") or bg or "#000000")
         uri_border = str(scheme.get("col10") or "#1f1f1f")
-        uri_hover_bg = str(scheme.get("col7") or uri_bg)
-        uri_hover_border = str(scheme.get("col10") or uri_border)
-        uri_focus_border = str(scheme.get("col2") or scheme.get("col1") or uri_hover_border)
-        titlebar_tab_height = max(18, int(self._HEIGHT) - 10)
+        uri_frame_color = str(scheme.get("col1") or scheme.get("col2") or uri_border)
+        uri_glow_hover = str(scheme.get("col2") or scheme.get("col1") or "#58ed5b")
+        uri_glow_focus = str(scheme.get("col1") or scheme.get("col2") or uri_glow_hover)
+        uri_hover_bg = _color_with_alpha(uri_glow_hover, 20, fallback=titlebar_surface_bg)
+        uri_focus_bg = _color_with_alpha(uri_glow_focus, 28, fallback=titlebar_surface_bg)
+        titlebar_tab_height = max(16, int(self._HEIGHT) - 12)
         self.setStyleSheet(
             f"""
             QWidget#windowFrameTitleBar {{
@@ -15362,22 +16890,22 @@ class CustomWindowTitleBar(QWidget):
                 color: {fg};
                 background: {titlebar_surface_bg};
                 background-color: {titlebar_surface_bg};
-                border: 1px solid {uri_border};
+                border: 1px solid {uri_frame_color};
                 border-radius: 8px;
                 padding: 4px 8px;
                 min-height: 18px;
-                selection-background-color: {scheme.get('col2') or uri_focus_border};
+                selection-background-color: {uri_glow_focus};
                 selection-color: {fg};
             }}
             QLineEdit#extensionsGraphUriInput:hover {{
-                background: {titlebar_surface_bg};
-                background-color: {titlebar_surface_bg};
-                border-color: {scheme.get('col2') or uri_hover_border};
+                background: {uri_hover_bg};
+                background-color: {uri_hover_bg};
+                border-color: {uri_frame_color};
             }}
             QLineEdit#extensionsGraphUriInput:focus {{
-                background: {titlebar_surface_bg};
-                background-color: {titlebar_surface_bg};
-                border-color: {scheme.get('col1') or uri_focus_border};
+                background: {uri_focus_bg};
+                background-color: {uri_focus_bg};
+                border-color: {uri_frame_color};
             }}
             QLineEdit#extensionsGraphUriInput QToolButton {{
                 background: transparent;
@@ -15388,6 +16916,12 @@ class CustomWindowTitleBar(QWidget):
             }}
             """
         )
+        for proxy_tab_bar in self.findChildren(QTabBar, _WINDOW_FRAME_EMBEDDED_TAB_BAR_OBJECT_NAME):
+            try:
+                proxy_tab_bar.setProperty("extensions_titlebar_uri_fill", titlebar_surface_bg)
+                proxy_tab_bar.update()
+            except RuntimeError:
+                continue
         self._min_btn.setIcon(_draw_window_control_icon("minimize", size=14, color=fg))
         self._close_btn.setIcon(_draw_window_control_icon("close", size=14, color=fg))
         self._fullscreen_btn.setIcon(_icon("open_in_full_26dp_999999_FILL0_wght500_GRAD0_opsz24.svg"))
@@ -15549,6 +17083,11 @@ class MainAIEditor(QMainWindow):
     APP_NAME: Final = "A.I.M"
     WINDOW_TITLE: Final = "A.I.M"
     _SCHEMA:  Final = 2
+    _EXPLORER_WIDTH_SNAP_OFFSET_PX: Final = 60
+    _EXPLORER_WIDTH_MIN_PX: Final = 120
+    _EXPLORER_WIDTH_EXPAND_PX: Final = 40
+    _BOARD_WIDTH_SNAP_OFFSET_PX: Final = 100
+    _BOARD_WIDTH_MIN_PX: Final = 160
 
     # ---------------------------------------------------------------- init --
 
@@ -15557,7 +17096,7 @@ class MainAIEditor(QMainWindow):
         self._accent_name = "green"
         self._accent, self._base = _accent_from_name(self._accent_name), SCHEME_DARK
         self._tab_docks: List[QDockWidget] = []          # store all tab docks
-        self._workspace_column_widths: list[int] = [280, 760, 460, 340]
+        self._workspace_column_widths: list[int] = [260, 760, 460, 180]
         self._explorer_splitter_sizes: list[int] = [380, 130]
         self._explorer_database_panel_visible: bool = False
         self._window_menu_bar: QMenuBar | None = None
@@ -16074,7 +17613,7 @@ class MainAIEditor(QMainWindow):
         except RuntimeError:
             source_tab_bar = None
 
-        target_height = max(18, int(titlebar_widget.height()) - 10)
+        target_height = max(16, int(titlebar_widget.height()) - 12)
         titlebar_widget.set_uri_tab_slot_count(max(0, extensions_widget.extensions_tabs.count()))
         titlebar_widget.set_uri_tab_slot_index(self._window_titlebar_uri_tab_slot_index)
         uri_proxy.setLayoutDirection(Qt.LeftToRight)
@@ -16741,12 +18280,11 @@ class MainAIEditor(QMainWindow):
             self.explorer = JsonTreeWidgetWithToolbar()
             self.explorer.setMinimumSize(0, 0)
             self.explorer.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Expanding)
+            self._bind_explorer_initial_load_refresh()
             if hasattr(self.explorer, "tree") and isinstance(self.explorer.tree, QTreeWidget):
                 self.explorer.tree.setMinimumSize(0, 0)
                 self.explorer.tree.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Expanding)
-            self.explorer.tree.setEditTriggers(
-                QTreeWidget.DoubleClicked | QTreeWidget.EditKeyPressed
-            )
+            self.explorer.tree.setEditTriggers(QTreeWidget.NoEditTriggers)
             self.explorer_splitter = None
             self.explorer_database_panel = None
             self.btn_explorer_database_submit = None
@@ -16852,19 +18390,38 @@ class MainAIEditor(QMainWindow):
         
         # Add current project
         project_path = os.path.dirname(os.path.abspath(__file__))
-        project_name = os.path.basename(os.path.dirname(project_path))
-
-        self._upsert_explorer_item("PROJECTS", project_name, {
-            "path": project_path,
-            "files": ["ai_ide_v1756.py", "jstree_widget.py", "chat_completion.py", "agents_runtime.py"],
-            "type": "Python Project",
-            "runtime_projection_ref": "PROJECTS/agents_runtime",
-        })
 
         agents_runtime_path = Path(project_path) / "agents_runtime.py"
         runtime_projection = self._load_agents_runtime_projection(agents_runtime_path)
+        remove_from_section = getattr(self.explorer, "remove_from_section", None)
+        if callable(remove_from_section):
+            while bool(remove_from_section("PROJECTS", "agents_runtime")):
+                pass
         if runtime_projection:
-            self._upsert_explorer_item("PROJECTS", "agents_runtime", runtime_projection)
+            self._upsert_explorer_item("RUNTIME", "agents_runtime", runtime_projection)
+
+    def _bind_explorer_initial_load_refresh(self) -> None:
+        explorer = getattr(self, "explorer", None)
+        tree_widget = getattr(explorer, "tree", None)
+        load_signal = getattr(tree_widget, "_initial_load_async_result_ready", None)
+        if load_signal is None:
+            return
+        try:
+            load_signal.connect(self._on_explorer_initial_load_result)
+        except Exception:
+            pass
+
+    @Slot(object)
+    def _on_explorer_initial_load_result(self, _payload: object) -> None:
+        explorer = getattr(self, "explorer", None)
+        tree_widget = getattr(explorer, "tree", None)
+        load_signal = getattr(tree_widget, "_initial_load_async_result_ready", None)
+        if load_signal is not None:
+            try:
+                load_signal.disconnect(self._on_explorer_initial_load_result)
+            except Exception:
+                pass
+        self._initialize_explorer_workspace()
 
     def _upsert_explorer_item(self, section_name: str, key: str, value: Any) -> None:
         explorer = getattr(self, "explorer", None)
@@ -16906,6 +18463,7 @@ class MainAIEditor(QMainWindow):
         try:
             if sync_ok:
                 self.statusBar().showMessage("Explorer /sync completed", 2500)
+                self._initialize_explorer_workspace()
             else:
                 self.statusBar().showMessage("Explorer /sync failed", 4500)
         except Exception:
@@ -16994,9 +18552,9 @@ class MainAIEditor(QMainWindow):
         self.main_split.setStretchFactor(1, 3)
         self.main_split.setStretchFactor(2, 2)
         self.main_split.setStretchFactor(3, 2)
-        default_sizes = list(getattr(self, "_workspace_column_widths", [280, 760, 460, 340]))
+        default_sizes = list(getattr(self, "_workspace_column_widths", [260, 760, 460, 180]))
         if len(default_sizes) != 4:
-            default_sizes = [280, 760, 460, 340]
+            default_sizes = [260, 760, 460, 180]
         self.main_split.setSizes(self._normalize_splitter_sizes(default_sizes, total=1000))
         self.main_split.splitterMoved.connect(self._remember_workspace_column_widths)
         self._remember_workspace_column_widths()
@@ -17096,6 +18654,82 @@ class MainAIEditor(QMainWindow):
     def _add_initial_tab_dock(self):
         self._clone_tab_dock(set_current = True)
 
+    def _chat_symbol_icon(self) -> QIcon:
+        scheme = _build_scheme(self._accent, self._base)
+        prompt_border_color = str(scheme.get("col2") or scheme.get("col1") or "#58ed5b")
+        bubble_icon = _icon("chat_bubble_24dp_B7B7B7_FILL0_wght400_GRAD0_opsz24.svg")
+        if not bubble_icon.isNull():
+            return bubble_icon
+        return _draw_fallback("(/)", prompt_border_color)
+
+    def _tinted_symbol_icon(self, symbol_name: str, color_value: str, *, content_scale: float = 1.0) -> QIcon:
+        source_icon = _icon(symbol_name)
+        source_pixmap = source_icon.pixmap(24, 24)
+        if source_pixmap.isNull():
+            return source_icon
+        tinted_pixmap = QPixmap(source_pixmap.size())
+        tinted_pixmap.fill(Qt.transparent)
+        painter = QPainter(tinted_pixmap)
+        draw_width = source_pixmap.width()
+        draw_height = source_pixmap.height()
+        try:
+            scale_value = float(content_scale)
+        except Exception:
+            scale_value = 1.0
+        if scale_value <= 0.0:
+            scale_value = 1.0
+        draw_width = max(1, int(round(draw_width * scale_value)))
+        draw_height = max(1, int(round(draw_height * scale_value)))
+        draw_x = int((tinted_pixmap.width() - draw_width) / 2)
+        draw_y = int((tinted_pixmap.height() - draw_height) / 2)
+        painter.drawPixmap(QRect(draw_x, draw_y, draw_width, draw_height), source_pixmap)
+        painter.setCompositionMode(QPainter.CompositionMode_SourceIn)
+        painter.fillRect(tinted_pixmap.rect(), QColor(str(color_value or "#58ed5b")))
+        painter.end()
+        return QIcon(tinted_pixmap)
+
+    def _scaled_symbol_icon(self, symbol_name: str, *, content_scale: float = 1.0) -> QIcon:
+        source_icon = _icon(symbol_name)
+        source_pixmap = source_icon.pixmap(24, 24)
+        if source_pixmap.isNull():
+            return source_icon
+        if abs(float(content_scale) - 1.0) < 0.001:
+            return source_icon
+
+        scaled_pixmap = QPixmap(source_pixmap.size())
+        scaled_pixmap.fill(Qt.transparent)
+        painter = QPainter(scaled_pixmap)
+        draw_width = source_pixmap.width()
+        draw_height = source_pixmap.height()
+        try:
+            scale_value = float(content_scale)
+        except Exception:
+            scale_value = 1.0
+        if scale_value <= 0.0:
+            scale_value = 1.0
+        draw_width = max(1, int(round(draw_width * scale_value)))
+        draw_height = max(1, int(round(draw_height * scale_value)))
+        draw_x = int((scaled_pixmap.width() - draw_width) / 2)
+        draw_y = int((scaled_pixmap.height() - draw_height) / 2)
+        painter.drawPixmap(QRect(draw_x, draw_y, draw_width, draw_height), source_pixmap)
+        painter.end()
+        return QIcon(scaled_pixmap)
+
+    def _explorer_toolbar_icon(self) -> QIcon:
+        return self._scaled_symbol_icon(
+            "network_intel_node_24dp_B7B7B7_FILL0_wght400_GRAD0_opsz24.svg",
+            content_scale=1.18,
+        )
+
+    def _refresh_chat_toggle_icons(self) -> None:
+        chat_icon = self._chat_symbol_icon()
+        if hasattr(self, "act_toggle_chat") and isinstance(self.act_toggle_chat, QAction):
+            self.act_toggle_chat.setIcon(chat_icon)
+        if hasattr(self, "act_toggle_control_plane_left") and isinstance(self.act_toggle_control_plane_left, QAction):
+            self.act_toggle_control_plane_left.setIcon(chat_icon)
+        if hasattr(self, "act_toggle_explorer") and isinstance(self.act_toggle_explorer, QAction):
+            self.act_toggle_explorer.setIcon(self._explorer_toolbar_icon())
+
     # ================================================= actions ============
     
     def _create_actions(self):
@@ -17158,7 +18792,7 @@ class MainAIEditor(QMainWindow):
         # ---------- NEU: Chat-Toggle --------------- # <– 10.07.2025 ---------
 
         self.act_toggle_chat = QAction(
-            _draw_fallback("(/)"),
+            self._chat_symbol_icon(),
             "Chat", self, 
             checkable = True, 
             checked = True
@@ -17199,10 +18833,8 @@ class MainAIEditor(QMainWindow):
         self.act_toggle_right_dock.setToolTip("Dashboard anzeigen/ausblenden")
         self.act_toggle_right_dock.toggled.connect(self.extensions_dock.setVisible)
 
-        chat_icon_path = Path(__file__).with_name("chat.svg")
-        chat_icon = QIcon(str(chat_icon_path)) if chat_icon_path.is_file() else _icon("chat.svg")
         self.act_toggle_control_plane_left = QAction(
-            chat_icon,
+            self._chat_symbol_icon(),
             "Chat",
             self,
             checkable=True,
@@ -17224,7 +18856,7 @@ class MainAIEditor(QMainWindow):
         
         # ---- project-overview / explorer ---------------------------------
         self.act_toggle_explorer = QAction(
-            _icon("stack_hexagon_25dp_B7B7B7_FILL0_wght500_GRAD0_opsz24.svg"),
+            self._explorer_toolbar_icon(),
             "Explorer", self,
             checkable=True, checked=True
         )
@@ -17232,7 +18864,10 @@ class MainAIEditor(QMainWindow):
         self.act_toggle_explorer.setToolTip("Project-Explorer anzeigen")
 
         self.act_graph_placeholder = QAction(
-            _icon("graph_7_25dp_B7B7B7_FILL0_wght500_GRAD0_opsz24.svg"),
+            self._scaled_symbol_icon(
+                "network_intel_node_24dp_B7B7B7_FILL0_wght400_GRAD0_opsz24.svg",
+                content_scale=1.18,
+            ),
             "Extensions 1",
             self,
             checkable=True,
@@ -17533,6 +19168,7 @@ class MainAIEditor(QMainWindow):
 
         for toolbar_action in (
             getattr(self, "act_refresh_control_plane", None),
+            getattr(self, "act_toggle_explorer", None),
             getattr(self, "act_toggle_control_plane_left", None),
         ):
             if isinstance(toolbar_action, QAction):
@@ -18358,7 +19994,7 @@ class MainAIEditor(QMainWindow):
             return
 
         if len(getattr(self, "_workspace_column_widths", [])) != 4:
-            self._workspace_column_widths = [280, 760, 460, 340]
+            self._workspace_column_widths = [260, 760, 460, 180]
 
         left_widget = getattr(self, "files_dock", None)
         middle_widget = getattr(self, "chat_dock", None)
@@ -18389,6 +20025,64 @@ class MainAIEditor(QMainWindow):
         if extensions_widget is not None and extensions_widget.isVisible() and extensions_size > 0:
             self._workspace_column_widths[3] = extensions_size
 
+    def _expand_explorer_column_width(self, delta_px: int) -> None:
+        splitter = getattr(self, "main_split", None)
+        if not isinstance(splitter, QSplitter):
+            return
+
+        boost_px = max(0, int(delta_px))
+        if boost_px <= 0:
+            return
+
+        left_widget = getattr(self, "files_dock", None)
+        left_index = splitter.indexOf(left_widget) if isinstance(left_widget, QWidget) else -1
+        if left_index < 0:
+            return
+        if isinstance(left_widget, QDockWidget) and not left_widget.isVisible():
+            return
+
+        sizes = [max(0, int(value)) for value in splitter.sizes()]
+        if left_index >= len(sizes):
+            return
+
+        donor_candidates: list[QWidget] = []
+        middle_widget = getattr(self, "chat_dock", None)
+        if isinstance(middle_widget, QWidget):
+            donor_candidates.append(middle_widget)
+        donor_candidates.extend(self._right_workspace_split_widgets())
+        extensions_widget = getattr(self, "extensions_dock", None)
+        if isinstance(extensions_widget, QWidget):
+            donor_candidates.append(extensions_widget)
+
+        donor_indices: list[int] = []
+        seen_indices: set[int] = {left_index}
+        for candidate in donor_candidates:
+            idx = splitter.indexOf(candidate)
+            if idx < 0 or idx >= len(sizes) or idx in seen_indices:
+                continue
+            if not candidate.isVisible():
+                continue
+            donor_indices.append(idx)
+            seen_indices.add(idx)
+
+        remaining = boost_px
+        for idx in donor_indices:
+            available = max(0, sizes[idx] - 1)
+            if available <= 0:
+                continue
+            take = min(available, remaining)
+            sizes[idx] -= take
+            sizes[left_index] += take
+            remaining -= take
+            if remaining <= 0:
+                break
+
+        if remaining >= boost_px:
+            return
+
+        splitter.setSizes(sizes)
+        self._remember_workspace_column_widths()
+
     def _rebalance_workspace_columns(self) -> None:
         splitter = getattr(self, "main_split", None)
         if splitter is None:
@@ -18396,7 +20090,7 @@ class MainAIEditor(QMainWindow):
 
         self._remember_workspace_column_widths()
 
-        fallback_widths = [280, 760, 460, 340]
+        fallback_widths = [260, 760, 460, 180]
         preferred_widths = list(getattr(self, "_workspace_column_widths", fallback_widths))
         if len(preferred_widths) != 4:
             preferred_widths = fallback_widths
@@ -18998,6 +20692,7 @@ class MainAIEditor(QMainWindow):
     def _sync_chat_scheme(self) -> None:
         """Keep AI chat dock, prompt frame and history synced after scheme changes."""
         try:
+            self._refresh_chat_toggle_icons()
             chat_dock = getattr(self, "chat_dock", None)
             updater = getattr(chat_dock, "update_scheme", None)
             if callable(updater):
@@ -19066,16 +20761,49 @@ class MainAIEditor(QMainWindow):
         self._sync_chat_scheme()
         self._sync_window_titlebar_scheme()
 
-        stored_widths = s.value("workspaceColumnWidths", [280, 760, 460, 340])
+        explorer_expand_delta_px = 0
+
+        stored_widths = s.value("workspaceColumnWidths", [260, 760, 460, 180])
         if isinstance(stored_widths, (list, tuple)):
             try:
                 parsed_widths = [int(value) for value in list(stored_widths)[:4]]
             except Exception:
                 parsed_widths = []
             if len(parsed_widths) == 3 and all(value > 0 for value in parsed_widths):
-                parsed_widths.append(340)
+                parsed_widths.append(180)
             if len(parsed_widths) == 4 and all(value > 0 for value in parsed_widths):
                 self._workspace_column_widths = parsed_widths
+
+        snap_offset_applied = s.value("explorerWidthSnapOffsetAppliedV2", True, bool)
+        if not snap_offset_applied and len(self._workspace_column_widths) == 4:
+            current_left_width = int(self._workspace_column_widths[0])
+            snapped_left_width = max(self._EXPLORER_WIDTH_MIN_PX, current_left_width - self._EXPLORER_WIDTH_SNAP_OFFSET_PX)
+            self._workspace_column_widths[0] = snapped_left_width
+            s.setValue("explorerWidthSnapOffsetAppliedV2", True)
+
+        board_snap_offset_applied = s.value("boardWidthSnapOffsetAppliedV1", False, bool)
+        if not board_snap_offset_applied and len(self._workspace_column_widths) == 4:
+            current_board_width = int(self._workspace_column_widths[3])
+            snapped_board_width = max(self._BOARD_WIDTH_MIN_PX, current_board_width - self._BOARD_WIDTH_SNAP_OFFSET_PX)
+            self._workspace_column_widths[3] = snapped_board_width
+            s.setValue("boardWidthSnapOffsetAppliedV1", True)
+
+        explorer_expand_applied = s.value("explorerWidthExpandAppliedV1", False, bool)
+        if not explorer_expand_applied and len(self._workspace_column_widths) == 4:
+            self._workspace_column_widths[0] = max(
+                self._EXPLORER_WIDTH_MIN_PX,
+                int(self._workspace_column_widths[0]) + 40,
+            )
+            s.setValue("explorerWidthExpandAppliedV1", True)
+
+        explorer_expand_applied_v2 = s.value("explorerWidthExpandAppliedV2", False, bool)
+        if not explorer_expand_applied_v2 and len(self._workspace_column_widths) == 4:
+            self._workspace_column_widths[0] = max(
+                self._EXPLORER_WIDTH_MIN_PX,
+                int(self._workspace_column_widths[0]) + self._EXPLORER_WIDTH_EXPAND_PX,
+            )
+            explorer_expand_delta_px = self._EXPLORER_WIDTH_EXPAND_PX
+            s.setValue("explorerWidthExpandAppliedV2", True)
 
         stored_explorer_sizes = s.value("explorerSplitterSizes", [380, 130])
         if isinstance(stored_explorer_sizes, (list, tuple)):
@@ -19105,6 +20833,8 @@ class MainAIEditor(QMainWindow):
             d.setVisible(False)
 
         self._rebalance_workspace_columns()
+        if explorer_expand_delta_px > 0:
+            self._expand_explorer_column_width(explorer_expand_delta_px)
 
         # Tabs rekonstruieren (optional)
 

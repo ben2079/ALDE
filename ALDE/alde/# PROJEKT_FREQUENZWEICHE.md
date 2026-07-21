@@ -1,0 +1,4 @@
+# PROJEKT FREQUENZWEICHE
+
+- 4, 3, 2 Wege-Weiche
+- 

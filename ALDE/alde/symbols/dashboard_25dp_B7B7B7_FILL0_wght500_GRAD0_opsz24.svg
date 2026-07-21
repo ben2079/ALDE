@@ -1,1 +1,62 @@
-<svg xmlns="http://www.w3.org/2000/svg" height="24px" viewBox="0 -960 960 960" width="24px" fill="#B7B7B7"><path d="M518.09-603.35v-251h336.26v251H518.09ZM105.65-433.78v-420.57h336.26v420.57H105.65Zm412.44 327.41v-420.56h336.26v420.56H518.09Zm-412.44 0v-251h336.26v251H105.65Zm91-418.41h154.26v-238.57H196.65v238.57Zm412.44 327.41h154.26v-238.56H609.09v238.56Zm0-496.98h154.26v-69H609.09v69ZM196.65-197.37h154.26v-69H196.65v69Zm154.26-327.41Zm258.18-169.57Zm0 258.42ZM350.91-266.37Z"/></svg>
+<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" role="img" aria-label="Dashboard">
+  <defs>
+    <!-- Complete board-tab palette per category: hover + label + pressed + border glow -->
+    <linearGradient id="bg-orange" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="rgb(255, 140, 0)" stop-opacity="0.14"/>
+      <stop offset="55%" stop-color="rgb(255, 140, 0)" stop-opacity="0.24"/>
+      <stop offset="100%" stop-color="rgb(255, 140, 0)" stop-opacity="0.20"/>
+    </linearGradient>
+    <linearGradient id="bg-blue" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="rgb(49, 132, 255)" stop-opacity="0.14"/>
+      <stop offset="55%" stop-color="rgb(49, 132, 255)" stop-opacity="0.24"/>
+      <stop offset="100%" stop-color="rgb(49, 132, 255)" stop-opacity="0.20"/>
+    </linearGradient>
+    <linearGradient id="bg-turquoise" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="rgb(34, 211, 196)" stop-opacity="0.14"/>
+      <stop offset="55%" stop-color="rgb(34, 211, 196)" stop-opacity="0.24"/>
+      <stop offset="100%" stop-color="rgb(34, 211, 196)" stop-opacity="0.20"/>
+    </linearGradient>
+    <linearGradient id="bg-magenta" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="rgb(225, 64, 205)" stop-opacity="0.14"/>
+      <stop offset="55%" stop-color="rgb(225, 64, 205)" stop-opacity="0.24"/>
+      <stop offset="100%" stop-color="rgb(225, 64, 205)" stop-opacity="0.20"/>
+    </linearGradient>
+
+    <filter id="glow-orange" x="-30%" y="-30%" width="160%" height="160%">
+      <feDropShadow dx="0" dy="0" stdDeviation="0.5" flood-color="rgb(255,140,0)" flood-opacity="0.76"/>
+      <feDropShadow dx="0" dy="0" stdDeviation="0.2" flood-color="rgb(255,140,0)" flood-opacity="0.88"/>
+    </filter>
+    <filter id="glow-blue" x="-30%" y="-30%" width="160%" height="160%">
+      <feDropShadow dx="0" dy="0" stdDeviation="0.5" flood-color="rgb(49,132,255)" flood-opacity="0.76"/>
+      <feDropShadow dx="0" dy="0" stdDeviation="0.2" flood-color="rgb(49,132,255)" flood-opacity="0.88"/>
+    </filter>
+    <filter id="glow-turquoise" x="-30%" y="-30%" width="160%" height="160%">
+      <feDropShadow dx="0" dy="0" stdDeviation="0.5" flood-color="rgb(34,211,196)" flood-opacity="0.78"/>
+      <feDropShadow dx="0" dy="0" stdDeviation="0.2" flood-color="rgb(34,211,196)" flood-opacity="0.90"/>
+    </filter>
+    <filter id="glow-magenta" x="-30%" y="-30%" width="160%" height="160%">
+      <feDropShadow dx="0" dy="0" stdDeviation="0.5" flood-color="rgb(225,64,205)" flood-opacity="0.76"/>
+      <feDropShadow dx="0" dy="0" stdDeviation="0.2" flood-color="rgb(225,64,205)" flood-opacity="0.88"/>
+    </filter>
+  </defs>
+
+  <g filter="url(#glow-orange)">
+    <rect x="3" y="3" width="10.667" height="8" rx="1.8" fill="url(#bg-orange)" stroke="rgb(255, 140, 0)" stroke-opacity="0.58" stroke-width="0.9"/>
+    <rect x="3.45" y="3.45" width="9.767" height="7.1" rx="1.45" fill="none" stroke="rgb(255, 140, 0)" stroke-opacity="0.76" stroke-width="0.45"/>
+  </g>
+
+  <g filter="url(#glow-blue)">
+    <rect x="15.667" y="3" width="5.333" height="8" rx="1.8" fill="url(#bg-blue)" stroke="rgb(49, 132, 255)" stroke-opacity="0.58" stroke-width="0.9"/>
+    <rect x="16.117" y="3.45" width="4.433" height="7.1" rx="1.45" fill="none" stroke="rgb(49, 132, 255)" stroke-opacity="0.76" stroke-width="0.45"/>
+  </g>
+
+  <g filter="url(#glow-turquoise)">
+    <rect x="3" y="13" width="5.333" height="8" rx="1.8" fill="url(#bg-turquoise)" stroke="rgb(34, 211, 196)" stroke-opacity="0.60" stroke-width="0.9"/>
+    <rect x="3.45" y="13.45" width="4.433" height="7.1" rx="1.45" fill="none" stroke="rgb(34, 211, 196)" stroke-opacity="0.78" stroke-width="0.45"/>
+  </g>
+
+  <g filter="url(#glow-magenta)">
+    <rect x="10.333" y="13" width="10.667" height="8" rx="1.8" fill="url(#bg-magenta)" stroke="rgb(225, 64, 205)" stroke-opacity="0.58" stroke-width="0.9"/>
+    <rect x="10.783" y="13.45" width="9.767" height="7.1" rx="1.45" fill="none" stroke="rgb(225, 64, 205)" stroke-opacity="0.76" stroke-width="0.45"/>
+  </g>
+</svg>

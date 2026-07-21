@@ -14,6 +14,7 @@ import socket
 import socketserver
 import threading
 import time
+from collections import Counter
 from contextlib import contextmanager, nullcontext
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
@@ -787,6 +788,113 @@ class DispatcherRunObject:
 
 
 @dataclass(slots=True)
+class GraphNodePositionObject:
+    """UI/Graph positions-layer.
+
+    Separates layout coordinates from domain data so that the graph layout
+    can be recomputed independently from entity or relation semantics.
+    ``x_ml`` and ``y_ml`` are the ML-computed canvas positions for a node
+    identified by ``node_id``.  ``layout_version`` lets the rendering layer
+    detect stale positions without touching domain objects.
+    """
+
+    node_id: str
+    x_ml: float
+    y_ml: float
+    namespace_id: str = ""
+    layout_version: str = "v1"
+    metadata: dict[str, Any] = field(default_factory=dict)
+    created_at: datetime = field(default_factory=_now_utc)
+    updated_at: datetime = field(default_factory=_now_utc)
+
+
+@dataclass(slots=True)
+class GraphEdgeWeightObject:
+    """Composite weight for a directed graph edge ``source_node_id -> target_node_id``.
+
+    ``weight_pos`` is derived from the XY-distance of the two node positions:
+        dist        = sqrt((x2-x1)^2 + (y2-y1)^2)
+        weight_pos  = 1 / (1 + dist / d_max)
+
+    The final ``weight`` combines positional, confidence, and evidence signals:
+        weight = alpha * weight_pos + beta * confidence + gamma * evidence
+    with alpha + beta + gamma == 1.0.
+    """
+
+    source_node_id: str
+    target_node_id: str
+    dist: float
+    weight_pos: float
+    confidence: float
+    evidence: float
+    alpha: float
+    beta: float
+    gamma: float
+    weight: float
+
+
+@dataclass(slots=True)
+class TaskStepObject:
+    """Single step inside an agentic multi-step plan.
+
+    ``input_template`` may reference earlier step outputs via
+    ``{{ steps.<step_name>.result }}`` placeholders.
+    ``output_key`` is the key under which the step result is stored so later
+    steps can reference it.
+    """
+
+    step_name: str
+    tool: str
+    job: str
+    input_template: dict[str, Any] = field(default_factory=dict)
+    output_key: str = ""
+    condition: str = ""
+
+
+@dataclass(slots=True)
+class TaskPlanObject:
+    """Ordered list of steps produced by :class:`AgenticTaskPlannerService`."""
+
+    query: str
+    agent_label: str
+    steps: list[TaskStepObject] = field(default_factory=list)
+    metadata: dict[str, Any] = field(default_factory=dict)
+    created_at: datetime = field(default_factory=_now_utc)
+
+
+@dataclass(slots=True)
+class AgentContextStackObject:
+    """Layered context for ML-guided agentic task execution.
+
+    Models the nesting described in ``a-I-m-l.md``:
+
+        Runtime
+        └── Prompts(skills, instructions, hints, jobs, tools,
+            └── parameters(queries, results, retrievals,
+                └── AGENT MEMORY  ← innermost, most specific layer
+                ))
+
+    Used as the single input to :class:`AgenticTaskPlannerService` and
+    :class:`MultiStepExecutorService` so every component has full context.
+    """
+
+    agent_label: str
+    runtime_config: dict[str, Any]
+    # --- prompt layer ---
+    skills: list[str] = field(default_factory=list)
+    instructions: list[str] = field(default_factory=list)
+    hints: list[str] = field(default_factory=list)
+    jobs: list[str] = field(default_factory=list)
+    tools: list[str] = field(default_factory=list)
+    # --- parameter layer ---
+    query: str = ""
+    results: list[dict[str, Any]] = field(default_factory=list)
+    retrievals: list[dict[str, Any]] = field(default_factory=list)
+    # --- innermost: memory ---
+    agent_memory: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
 class RuntimeConfigObject:
     agents_db_uri: str
     database_name: str = "alde_knowledge"
@@ -1358,6 +1466,7 @@ class AgentDbSocketRepository:
     _OBJECT_COLLECTION_MAP = KnowledgeRepository._OBJECT_COLLECTION_MAP
     _DEFAULT_APPLY_OPERATIONS_BATCH_SIZE = 64
     _DEFAULT_WRITE_TIMEOUT_SECONDS = 20.0
+    _DEFAULT_READ_TIMEOUT_SECONDS = 20.0
     _DEFAULT_SOCKET_TIMEOUT_SECONDS = 90.0
     _DEFAULT_REQUEST_RETRY_ATTEMPTS = 3
     _DEFAULT_REQUEST_RETRY_LOG_ENABLED = True
@@ -1383,6 +1492,7 @@ class AgentDbSocketRepository:
         self._pending_write_operations: list[dict[str, Any]] = []
         self._apply_operations_batch_size = self._load_apply_operations_batch_size()
         self._write_timeout_seconds = self._load_write_timeout_seconds()
+        self._read_timeout_seconds = self._load_read_timeout_seconds()
         self._request_retry_attempts = self._load_request_retry_attempts()
         self._request_retry_log_enabled = self._load_request_retry_log_enabled()
 
@@ -1414,6 +1524,21 @@ class AgentDbSocketRepository:
             resolved_value = float(raw_value)
         except Exception:
             resolved_value = cls._DEFAULT_WRITE_TIMEOUT_SECONDS
+        return max(0.5, resolved_value)
+
+    @classmethod
+    def _load_read_timeout_seconds(cls) -> float:
+        raw_value = str(
+            os.getenv(
+                "AI_IDE_KNOWLEDGE_AGENTS_DB_SOCKET_READ_TIMEOUT_SECONDS",
+                str(cls._DEFAULT_READ_TIMEOUT_SECONDS),
+            )
+            or str(cls._DEFAULT_READ_TIMEOUT_SECONDS)
+        ).strip()
+        try:
+            resolved_value = float(raw_value)
+        except Exception:
+            resolved_value = cls._DEFAULT_READ_TIMEOUT_SECONDS
         return max(0.5, resolved_value)
 
     @classmethod
@@ -1559,6 +1684,8 @@ class AgentDbSocketRepository:
         command_name = str(request_payload.get("cmd") or "").strip().lower()
         if command_name in {"upsert_object", "apply_operations", "delete_object"}:
             default_timeout_seconds = max(default_timeout_seconds, float(self._write_timeout_seconds))
+        if command_name in {"load_objects"}:
+            default_timeout_seconds = max(default_timeout_seconds, float(self._read_timeout_seconds))
         if command_name in {"health", "ping", "status"} or self._is_dispatcher_healthcheck_request(request_payload):
             return min(default_timeout_seconds, self._load_healthcheck_timeout_seconds())
         return default_timeout_seconds
@@ -3608,6 +3735,7 @@ class KnowledgeObjectService:
                 embedding_object.owner_type,
                 embedding_object.owner_id,
                 embedding_object.model_id,
+                embedding_object.content_sha256,
             ],
         )
         return self.store_object(
@@ -4201,6 +4329,192 @@ class EntityRelationEmbeddingService:
             Status report dict (see store_object).
         """
         return self.store_object(object_name, obj, owner_id=owner_id)
+
+
+class LocalRelationEmbeddingService:
+    """Local hash+IDF embedding service without third-party model dependencies.
+
+    Pattern: Domain -> Object -> Function
+    - Domain:    relation/entity embedding from existing data
+    - Object:    LocalRelationEmbeddingService
+    - Functions: fit_namespace_idf, build_object_text, embed_object, store_object, process_namespace_objects
+    """
+
+    _DEFAULT_MODEL_ID = "local-hash-idf-v1"
+    _DEFAULT_DIMENSION = 256
+    _TOKEN_PATTERN = re.compile(r"[a-zA-Z0-9_]+")
+
+    def __init__(
+        self,
+        knowledge_service: KnowledgeObjectService,
+        runtime_config: RuntimeConfigObject,
+        *,
+        dimension: int | None = None,
+        model_id: str | None = None,
+    ) -> None:
+        self._knowledge_service = knowledge_service
+        self._runtime_config = runtime_config
+        configured_dimension = int(
+            dimension
+            if dimension is not None
+            else os.getenv("AI_IDE_LOCAL_EMBEDDING_DIMENSION", "").strip() or self._DEFAULT_DIMENSION
+        )
+        self._dimension = max(8, configured_dimension)
+        self._model_id = str(model_id or self._DEFAULT_MODEL_ID).strip() or self._DEFAULT_MODEL_ID
+        self._idf_by_token: dict[str, float] = {}
+        self._text_builder_service = EntityRelationEmbeddingService(knowledge_service, runtime_config)
+
+    def build_object_text(self, object_name: str, obj: dict[str, Any]) -> str:
+        return self._text_builder_service.build_object_text(object_name, obj)
+
+    def _tokenize_text(self, text: str) -> list[str]:
+        normalized = str(text or "").lower()
+        return [token for token in self._TOKEN_PATTERN.findall(normalized) if token]
+
+    def fit_namespace_idf(
+        self,
+        *,
+        object_name: str = "relation",
+        namespace_id: str | None = None,
+        limit: int = 10000,
+    ) -> dict[str, float]:
+        resolved_object_name = str(object_name or "relation").strip().lower()
+        if resolved_object_name not in {"entity", "relation"}:
+            resolved_object_name = "relation"
+        resolved_namespace_id = str(namespace_id or self._runtime_config.namespace_id).strip() or self._runtime_config.namespace_id
+        object_payload_list = self._knowledge_service._repository.load_objects(
+            resolved_object_name,
+            {"namespace_id": resolved_namespace_id},
+            limit=max(1, int(limit)),
+        )
+        text_list: list[str] = []
+        for object_payload in object_payload_list:
+            if not isinstance(object_payload, Mapping):
+                continue
+            canonical_text = self.build_object_text(resolved_object_name, dict(object_payload))
+            if canonical_text.strip():
+                text_list.append(canonical_text)
+        document_count = len(text_list)
+        if document_count <= 0:
+            self._idf_by_token = {}
+            return {}
+        token_document_frequency: Counter[str] = Counter()
+        for text in text_list:
+            token_document_frequency.update(set(self._tokenize_text(text)))
+        self._idf_by_token = {
+            token: math.log((1.0 + float(document_count)) / (1.0 + float(doc_freq))) + 1.0
+            for token, doc_freq in token_document_frequency.items()
+            if token
+        }
+        return dict(self._idf_by_token)
+
+    def _token_to_index(self, token: str) -> int:
+        digest = hashlib.sha256(token.encode("utf-8")).hexdigest()
+        return int(digest, 16) % self._dimension
+
+    def embed_object(self, object_name: str, text: str) -> list[float]:
+        _ = object_name
+        token_counter: Counter[str] = Counter(self._tokenize_text(text))
+        if not token_counter:
+            return [0.0] * self._dimension
+        vector = [0.0] * self._dimension
+        for token, token_count in token_counter.items():
+            token_index = self._token_to_index(token)
+            token_weight = float(token_count) * float(self._idf_by_token.get(token, 1.0))
+            vector[token_index] += token_weight
+        norm = math.sqrt(sum(value * value for value in vector))
+        if norm <= 0.0:
+            return vector
+        return [value / norm for value in vector]
+
+    def store_object(
+        self,
+        object_name: str,
+        obj: dict[str, Any],
+        *,
+        owner_id: str,
+    ) -> dict[str, Any]:
+        canonical_text = self.build_object_text(object_name, obj)
+        if not canonical_text.strip():
+            return {"stored": False, "reason": "empty_text", "owner_id": owner_id}
+        vector = self.embed_object(object_name, canonical_text)
+        content_sha256 = hashlib.sha256(canonical_text.encode("utf-8")).hexdigest()
+        embedding_object = EmbeddingObject(
+            tenant_id=self._runtime_config.tenant_id,
+            namespace_id=self._runtime_config.namespace_id,
+            model_id=self._model_id,
+            owner_type=object_name,
+            owner_id=owner_id,
+            content_sha256=content_sha256,
+            dimension=len(vector),
+            index_namespace=self._runtime_config.namespace_id,
+            index_item_key=f"{object_name}:{owner_id}",
+            embedding=vector,
+            metadata={"source_text": canonical_text[:400], "embedding_backend": "local_hash_idf"},
+        )
+        result_payload = self._knowledge_service.store_embedding_object(embedding_object)
+        return {
+            "stored": True,
+            "owner_id": owner_id,
+            "object_name": object_name,
+            "dimension": len(vector),
+            "model_id": self._model_id,
+            "result": dict(result_payload or {}),
+        }
+
+    def process_object(
+        self,
+        object_name: str,
+        obj: dict[str, Any],
+        *,
+        owner_id: str,
+    ) -> dict[str, Any]:
+        return self.store_object(object_name, obj, owner_id=owner_id)
+
+    def process_namespace_objects(
+        self,
+        *,
+        object_name: str = "relation",
+        namespace_id: str | None = None,
+        limit: int = 10000,
+    ) -> dict[str, Any]:
+        resolved_object_name = str(object_name or "relation").strip().lower()
+        if resolved_object_name not in {"entity", "relation"}:
+            resolved_object_name = "relation"
+        resolved_namespace_id = str(namespace_id or self._runtime_config.namespace_id).strip() or self._runtime_config.namespace_id
+        self.fit_namespace_idf(
+            object_name=resolved_object_name,
+            namespace_id=resolved_namespace_id,
+            limit=limit,
+        )
+        object_payload_list = self._knowledge_service._repository.load_objects(
+            resolved_object_name,
+            {"namespace_id": resolved_namespace_id},
+            limit=max(1, int(limit)),
+        )
+        stored_count = 0
+        for object_payload in object_payload_list:
+            if not isinstance(object_payload, Mapping):
+                continue
+            owner_id = str(object_payload.get("id") or object_payload.get("_id") or "").strip()
+            if not owner_id:
+                continue
+            report = self.process_object(
+                resolved_object_name,
+                dict(object_payload),
+                owner_id=owner_id,
+            )
+            if bool(report.get("stored")):
+                stored_count += 1
+        return {
+            "ok": True,
+            "object_name": resolved_object_name,
+            "namespace_id": resolved_namespace_id,
+            "dimension": self._dimension,
+            "model_id": self._model_id,
+            "idf_vocab_size": len(self._idf_by_token),
+            "stored_count": stored_count,
+        }
 
 
 class PipelineService:
@@ -4959,6 +5273,28 @@ class ObjectMappingService:
             self._knowledge_service.store_entity_object(entity_object)
         for relation_object in relation_objects:
             self._knowledge_service.store_relation_object(relation_object)
+        embedding_service = EntityRelationEmbeddingService(
+            self._knowledge_service,
+            self._build_namespace_runtime_config(namespace_object=namespace_object),
+        )
+        entity_embedding_count = 0
+        relation_embedding_count = 0
+        for entity_object in entity_objects:
+            embedding_report = embedding_service.process_object(
+                "entity",
+                _dataclass_payload(entity_object),
+                owner_id=entity_object.id,
+            )
+            if bool(embedding_report.get("stored")):
+                entity_embedding_count += 1
+        for relation_object in relation_objects:
+            embedding_report = embedding_service.process_object(
+                "relation",
+                _dataclass_payload(relation_object),
+                owner_id=relation_object.id,
+            )
+            if bool(embedding_report.get("stored")):
+                relation_embedding_count += 1
         return {
             "ok": True,
             "stored": True,
@@ -4968,7 +5304,26 @@ class ObjectMappingService:
             "document_id": document_object.id,
             "entity_count": len(entity_objects),
             "relation_count": len(relation_objects),
+            "entity_embedding_count": entity_embedding_count,
+            "relation_embedding_count": relation_embedding_count,
         }
+
+    def _build_namespace_runtime_config(
+        self,
+        *,
+        namespace_object: NamespaceObject,
+    ) -> RuntimeConfigObject:
+        return RuntimeConfigObject(
+            agents_db_uri=self._runtime_config.agents_db_uri,
+            database_name=self._runtime_config.database_name,
+            tenant_id=str(namespace_object.tenant_id or self._runtime_config.tenant_id),
+            namespace_id=str(namespace_object.id or self._runtime_config.namespace_id),
+            namespace_slug=str(namespace_object.slug or self._runtime_config.namespace_slug),
+            namespace_name=str(namespace_object.name or self._runtime_config.namespace_name),
+            default_embedding_model=self._runtime_config.default_embedding_model,
+            default_embedding_dimension=self._runtime_config.default_embedding_dimension,
+            index_backend=self._runtime_config.index_backend,
+        )
 
     def load_object_pattern(self, *, object_name: str) -> dict[str, Any] | None:
         return _deepcopy_object(OBJECT_MAPPING_PATTERN_BY_NAME.get(_normalize_document_object_name(object_name)))
@@ -9560,3 +9915,1006 @@ class GraphViewService:
             else:
                 raise
         return AgentDbRepositoryFactory, AgentDbRepositoryFactoryConfig, load_agentsdb_runtime_config_from_env
+
+
+# ---------------------------------------------------------------------------
+# Semantic Model — DataStack / Retriever foundation
+# Implements the 5-layer model from a-I-m-l.md:
+#   Core-Entities → Relation-Graph → Positions-Layer → Weight → Retrieval-Layer
+# ---------------------------------------------------------------------------
+
+
+@dataclass(slots=True)
+class HybridRetrievalResultObject:
+    """Result from semantic retriever combining vector + graph + lexical signals.
+
+    ``hybrid_score`` is the normalized combination of all three retrieval sources.
+    Each source contributes independently, so a result can appear in multiple rankings
+    and accumulate score signals.
+    """
+
+    result_id: str
+    result_type: str
+    rank_no: int
+    vector_score: float = 0.0
+    graph_score: float = 0.0
+    lexical_score: float = 0.0
+    hybrid_score: float = 0.0
+    source_stages: list[str] = field(default_factory=list)
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+class GraphEdgeWeightService:
+    """Computes composite edge weights from XY node positions.
+
+    Weight formula:
+        dist(n1, n2)  = sqrt((x2-x1)^2 + (y2-y1)^2)
+        weight_pos    = 1 / (1 + dist / d_max)
+        weight        = alpha * weight_pos + beta * confidence + gamma * evidence
+
+    alpha + beta + gamma must equal 1.0.  Default split: 0.5 / 0.3 / 0.2.
+    """
+
+    DEFAULT_ALPHA: float = 0.5
+    DEFAULT_BETA: float = 0.3
+    DEFAULT_GAMMA: float = 0.2
+
+    def compute_object_weight(
+        self,
+        *,
+        source_position: GraphNodePositionObject,
+        target_position: GraphNodePositionObject,
+        confidence: float = 1.0,
+        evidence: float = 1.0,
+        d_max: float | None = None,
+        alpha: float | None = None,
+        beta: float | None = None,
+        gamma: float | None = None,
+    ) -> GraphEdgeWeightObject:
+        resolved_alpha = float(alpha if alpha is not None else self.DEFAULT_ALPHA)
+        resolved_beta = float(beta if beta is not None else self.DEFAULT_BETA)
+        resolved_gamma = float(gamma if gamma is not None else self.DEFAULT_GAMMA)
+
+        dist = math.sqrt(
+            (target_position.x_ml - source_position.x_ml) ** 2
+            + (target_position.y_ml - source_position.y_ml) ** 2
+        )
+        resolved_d_max = float(d_max or max(dist, 1.0))
+        weight_pos = 1.0 / (1.0 + dist / resolved_d_max)
+        weight = (
+            resolved_alpha * weight_pos
+            + resolved_beta * max(0.0, min(1.0, float(confidence)))
+            + resolved_gamma * max(0.0, min(1.0, float(evidence)))
+        )
+        return GraphEdgeWeightObject(
+            source_node_id=source_position.node_id,
+            target_node_id=target_position.node_id,
+            dist=round(dist, 6),
+            weight_pos=round(weight_pos, 6),
+            confidence=float(confidence),
+            evidence=float(evidence),
+            alpha=resolved_alpha,
+            beta=resolved_beta,
+            gamma=resolved_gamma,
+            weight=round(weight, 6),
+        )
+
+    def build_weight_map(
+        self,
+        *,
+        positions: Sequence[GraphNodePositionObject],
+        relation_objects: Sequence[Mapping[str, Any]],
+        confidence_map: Mapping[str, float] | None = None,
+        evidence_map: Mapping[str, float] | None = None,
+        alpha: float | None = None,
+        beta: float | None = None,
+        gamma: float | None = None,
+    ) -> dict[tuple[str, str], GraphEdgeWeightObject]:
+        """Builds a weight object for every (source, target) relation pair.
+
+        ``positions`` is a flat list of :class:`GraphNodePositionObject`.
+        Returns a dict keyed by ``(source_node_id, target_node_id)``.
+        """
+        position_by_id = {p.node_id: p for p in positions}
+        if not position_by_id:
+            return {}
+
+        all_x = [p.x_ml for p in positions]
+        all_y = [p.y_ml for p in positions]
+        d_max = math.sqrt(
+            (max(all_x) - min(all_x)) ** 2 + (max(all_y) - min(all_y)) ** 2
+        ) or 1.0
+
+        weight_map: dict[tuple[str, str], GraphEdgeWeightObject] = {}
+        for relation in relation_objects:
+            source_id = str(relation.get("source_entity_id") or relation.get("source") or "").strip()
+            target_id = str(relation.get("target_entity_id") or relation.get("target") or "").strip()
+            if not source_id or not target_id:
+                continue
+            source_pos = position_by_id.get(source_id)
+            target_pos = position_by_id.get(target_id)
+            if source_pos is None or target_pos is None:
+                continue
+            relation_id = str(relation.get("id") or f"{source_id}|{target_id}")
+            confidence = self._resolve_scalar_strength(
+                (confidence_map or {}).get(relation_id),
+                relation.get("confidence"),
+                default=1.0,
+            )
+            evidence = self._resolve_scalar_strength(
+                (evidence_map or {}).get(relation_id),
+                relation.get("evidence"),
+                default=1.0,
+            )
+            edge_weight = self.compute_object_weight(
+                source_position=source_pos,
+                target_position=target_pos,
+                confidence=confidence,
+                evidence=evidence,
+                d_max=d_max,
+                alpha=alpha,
+                beta=beta,
+                gamma=gamma,
+            )
+            weight_map[(source_id, target_id)] = edge_weight
+        return weight_map
+
+    @staticmethod
+    def _resolve_scalar_strength(
+        override_value: Any,
+        fallback_value: Any,
+        *,
+        default: float = 1.0,
+    ) -> float:
+        """Coerces confidence/evidence signals into a scalar strength value.
+
+        Relation payloads may store ``evidence`` as a list of evidence-span
+        records (``[{"block_id": ..., "evidence_role": ...}, ...]``) rather
+        than a scalar. This normalizes both list-shaped and scalar signals
+        into a single float, using evidence-count as a proxy strength when
+        the source is a list.
+        """
+        for candidate in (override_value, fallback_value):
+            if candidate is None:
+                continue
+            if isinstance(candidate, (list, tuple, set)):
+                if len(candidate) > 0:
+                    return float(min(1.0, 0.5 + 0.1 * len(candidate)))
+                continue
+            try:
+                return float(candidate)
+            except (TypeError, ValueError):
+                continue
+        return float(default)
+
+
+class SemanticRetrieverService:
+    """Unified retriever combining Vector + Graph-Weights + Lexical signals.
+
+    Single entry-point for hybrid retrieval that balances:
+    - **Vector**: Cosine similarity over embeddings (from ``KnowledgeObjectService``)
+    - **Graph**: Entity relation traversal + XY-position weights (from ``GraphEdgeWeightService``)
+    - **Lexical**: Keyword/token overlap (Volltext-ähnlich)
+
+    Each source produces independent rankings; final ``hybrid_score`` normalizes
+    and combines all signals. Results retain individual scores so callers can
+    inspect contribution per source.
+    """
+
+    def __init__(
+        self,
+        knowledge_service: KnowledgeObjectService,
+        graph_weight_service: GraphEdgeWeightService,
+        runtime_config: RuntimeConfigObject,
+    ) -> None:
+        self._knowledge_service = knowledge_service
+        self._graph_weight_service = graph_weight_service
+        self._runtime_config = runtime_config
+
+    def retrieve(
+        self,
+        *,
+        query: str,
+        namespace_id: str,
+        owner_type: str = "block",
+        limit: int = 10,
+        strategy: str = "hybrid",
+        vector_weight: float = 0.5,
+        graph_weight: float = 0.3,
+        lexical_weight: float = 0.2,
+    ) -> list[HybridRetrievalResultObject]:
+        """Retrieve results using the specified strategy.
+
+        Args:
+            query: Search query string
+            namespace_id: Knowledge namespace ID
+            owner_type: "block", "entity", or "relation"
+            limit: Max number of results per strategy
+            strategy: "vector", "graph", "lexical", or "hybrid"
+            vector_weight, graph_weight, lexical_weight: Combination weights (sum=1.0)
+        Returns:
+            Ranked list of HybridRetrievalResultObjects with combined scores.
+        """
+        resolved_strategy = str(strategy or "hybrid").lower().strip() or "hybrid"
+        if resolved_strategy not in {"vector", "graph", "lexical", "hybrid"}:
+            resolved_strategy = "hybrid"
+
+        results_by_id: dict[str, HybridRetrievalResultObject] = {}
+
+        if resolved_strategy in {"vector", "hybrid"}:
+            vector_results = self._retrieve_vector(
+                query=query,
+                namespace_id=namespace_id,
+                owner_type=owner_type,
+                limit=limit,
+            )
+            for rank_no, result in enumerate(vector_results, 1):
+                result_id = result.result_id
+                if result_id not in results_by_id:
+                    results_by_id[result_id] = HybridRetrievalResultObject(
+                        result_id=result_id,
+                        result_type=result.result_type,
+                        rank_no=rank_no,
+                    )
+                results_by_id[result_id].vector_score = max(
+                    results_by_id[result_id].vector_score,
+                    result.vector_score,
+                )
+                if "vector" not in results_by_id[result_id].source_stages:
+                    results_by_id[result_id].source_stages.append("vector")
+
+        if resolved_strategy in {"graph", "hybrid"}:
+            graph_results = self._retrieve_graph(
+                query=query,
+                namespace_id=namespace_id,
+                owner_type=owner_type,
+                limit=limit,
+            )
+            for rank_no, result in enumerate(graph_results, 1):
+                result_id = result.result_id
+                if result_id not in results_by_id:
+                    results_by_id[result_id] = HybridRetrievalResultObject(
+                        result_id=result_id,
+                        result_type=result.result_type,
+                        rank_no=rank_no,
+                    )
+                results_by_id[result_id].graph_score = max(
+                    results_by_id[result_id].graph_score,
+                    result.graph_score,
+                )
+                if "graph" not in results_by_id[result_id].source_stages:
+                    results_by_id[result_id].source_stages.append("graph")
+
+        if resolved_strategy in {"lexical", "hybrid"}:
+            lexical_results = self._retrieve_lexical(
+                query=query,
+                namespace_id=namespace_id,
+                owner_type=owner_type,
+                limit=limit,
+            )
+            for rank_no, result in enumerate(lexical_results, 1):
+                result_id = result.result_id
+                if result_id not in results_by_id:
+                    results_by_id[result_id] = HybridRetrievalResultObject(
+                        result_id=result_id,
+                        result_type=result.result_type,
+                        rank_no=rank_no,
+                    )
+                results_by_id[result_id].lexical_score = max(
+                    results_by_id[result_id].lexical_score,
+                    result.lexical_score,
+                )
+                if "lexical" not in results_by_id[result_id].source_stages:
+                    results_by_id[result_id].source_stages.append("lexical")
+
+        # Compute hybrid scores and rank
+        for result in results_by_id.values():
+            result.hybrid_score = (
+                vector_weight * result.vector_score
+                + graph_weight * result.graph_score
+                + lexical_weight * result.lexical_score
+            )
+
+        ranked = sorted(results_by_id.values(), key=lambda r: r.hybrid_score, reverse=True)[:limit]
+        for rank_no, result in enumerate(ranked, 1):
+            result.rank_no = rank_no
+
+        return ranked
+
+    def _retrieve_vector(
+        self,
+        *,
+        query: str,
+        namespace_id: str,
+        owner_type: str,
+        limit: int,
+    ) -> list[HybridRetrievalResultObject]:
+        """Vector similarity retrieval using stored embeddings.
+
+        Tries the configured HuggingFace encoder first; when unavailable
+        (no third-party model installed), falls back to the local
+        hash+IDF embedding space so ``owner_type="relation"``/``"entity"``
+        embeddings produced by :class:`LocalRelationEmbeddingService`
+        remain queryable without external dependencies.
+        """
+        query_embedding = self._embed_query_for_vector_search(query=query, owner_type=owner_type)
+        if not query_embedding:
+            return []
+
+        try:
+            vector_candidates = self._knowledge_service.build_vector_candidate_pipeline(
+                query_vector=query_embedding,
+                namespace_id=namespace_id,
+                owner_type=owner_type,
+                limit=limit,
+            )
+        except Exception:
+            return []
+
+        results: list[HybridRetrievalResultObject] = []
+        for rank_no, candidate in enumerate(vector_candidates, 1):
+            payload = candidate.get("payload") or {}
+            result_id = str(
+                candidate.get("result_id")
+                or candidate.get("id")
+                or payload.get("id")
+                or payload.get("_id")
+                or ""
+            ).strip()
+            if not result_id:
+                continue
+            vector_score = float(candidate.get("score") or candidate.get("vector_score") or 0.0)
+            results.append(
+                HybridRetrievalResultObject(
+                    result_id=result_id,
+                    result_type=str(candidate.get("result_type") or payload.get("result_type") or owner_type),
+                    rank_no=rank_no,
+                    vector_score=max(0.0, min(1.0, vector_score)),
+                    source_stages=["vector"],
+                    metadata=dict(candidate),
+                )
+            )
+        return results
+
+    def _embed_query_for_vector_search(self, *, query: str, owner_type: str) -> list[float] | None:
+        """Embeds ``query`` for vector search, preferring the HuggingFace encoder.
+
+        Falls back to :class:`LocalRelationEmbeddingService` (hash+IDF, no
+        third-party dependency) when the transformer backend cannot be
+        loaded, e.g. because ``langchain_huggingface``/``langchain_community``
+        are not installed in the current environment.
+        """
+        try:
+            return list(self._knowledge_service._load_encoder().embed_query(query))
+        except Exception:
+            pass
+
+        try:
+            local_service = LocalRelationEmbeddingService(
+                knowledge_service=self._knowledge_service,
+                runtime_config=self._runtime_config,
+            )
+            resolved_object_name = "entity" if owner_type == "entity" else "relation"
+            local_service.fit_namespace_idf(
+                object_name=resolved_object_name,
+                namespace_id=self._runtime_config.namespace_id,
+            )
+            return local_service.embed_object(resolved_object_name, query)
+        except Exception:
+            return None
+
+    def _retrieve_graph(
+        self,
+        *,
+        query: str,
+        namespace_id: str,
+        owner_type: str,
+        limit: int,
+    ) -> list[HybridRetrievalResultObject]:
+        """Graph-based retrieval via entity relations + XY-position weights."""
+        results: list[HybridRetrievalResultObject] = []
+
+        query_tokens = set(query.lower().split())
+        if not query_tokens:
+            return results
+
+        try:
+            # Load relation graph (relations mention entities)
+            relation_objects = self._knowledge_service._repository.load_objects(
+                "relation",
+                {"namespace_id": namespace_id} if namespace_id else None,
+                limit=100,
+            )
+            if not relation_objects:
+                relation_objects = []
+        except Exception:
+            return results
+
+        try:
+            # Load entity payloads
+            entity_objects = self._knowledge_service._repository.load_objects(
+                "entity",
+                {"namespace_id": namespace_id} if namespace_id else None,
+                limit=100,
+            )
+            if not entity_objects:
+                entity_objects = []
+        except Exception:
+            entity_objects = []
+
+        entity_text_map: dict[str, str] = {}
+        for entity in entity_objects:
+            if not isinstance(entity, Mapping):
+                continue
+            entity_id = str(entity.get("id") or "").strip()
+            canonical_name = str(entity.get("canonical_name") or "").strip()
+            entity_type = str(entity.get("entity_type") or "").strip()
+            if entity_id:
+                entity_text_map[entity_id] = f"{entity_type} {canonical_name}".lower()
+
+        entity_scores: dict[str, float] = {}
+        for entity_id, entity_text in entity_text_map.items():
+            entity_tokens = set(entity_text.split())
+            overlap = len(entity_tokens & query_tokens)
+            score = overlap / max(1, len(entity_tokens))
+            if score > 0.0:
+                entity_scores[entity_id] = score
+
+        positions = self._build_graph_node_position_list(
+            entity_objects=entity_objects,
+            relation_objects=relation_objects,
+            namespace_id=namespace_id,
+        )
+        weight_map = self._graph_weight_service.build_weight_map(
+            positions=positions,
+            relation_objects=relation_objects,
+        )
+        if weight_map and entity_scores:
+            propagated_scores = dict(entity_scores)
+            for (source_id, target_id), edge_weight_object in weight_map.items():
+                source_score = float(entity_scores.get(source_id) or 0.0)
+                if source_score <= 0.0:
+                    continue
+                propagated_score = max(
+                    0.0,
+                    min(1.0, source_score * float(edge_weight_object.weight)),
+                )
+                existing_target_score = float(propagated_scores.get(target_id) or 0.0)
+                if propagated_score > existing_target_score:
+                    propagated_scores[target_id] = propagated_score
+            entity_scores = propagated_scores
+
+        rank_no = 1
+        for entity_id, score in sorted(entity_scores.items(), key=lambda x: x[1], reverse=True)[:limit]:
+            results.append(
+                HybridRetrievalResultObject(
+                    result_id=entity_id,
+                    result_type="entity",
+                    rank_no=rank_no,
+                    graph_score=max(0.0, min(1.0, score)),
+                    source_stages=["graph"],
+                )
+            )
+            rank_no += 1
+
+        return results
+
+    def _build_graph_node_position_list(
+        self,
+        *,
+        entity_objects: Sequence[Mapping[str, Any]],
+        relation_objects: Sequence[Mapping[str, Any]],
+        namespace_id: str,
+    ) -> list[GraphNodePositionObject]:
+        """Build node positions for graph weighting.
+
+        Uses explicit per-entity ``x_ml``/``y_ml`` values when available.
+        For entities without coordinates, uses a deterministic ring fallback
+        so graph-weight propagation stays active even without persisted layout.
+        """
+
+        def _float_or_none(value: Any) -> float | None:
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return None
+
+        positions: list[GraphNodePositionObject] = []
+        positioned_ids: set[str] = set()
+        for entity in entity_objects:
+            if not isinstance(entity, Mapping):
+                continue
+            node_id = str(entity.get("id") or "").strip()
+            if not node_id:
+                continue
+            metadata_payload = entity.get("metadata")
+            metadata = metadata_payload if isinstance(metadata_payload, Mapping) else {}
+            x_value = _float_or_none(entity.get("x_ml"))
+            y_value = _float_or_none(entity.get("y_ml"))
+            if x_value is None:
+                x_value = _float_or_none(metadata.get("x_ml"))
+            if y_value is None:
+                y_value = _float_or_none(metadata.get("y_ml"))
+            if x_value is None or y_value is None:
+                continue
+            positions.append(
+                GraphNodePositionObject(
+                    node_id=node_id,
+                    x_ml=x_value,
+                    y_ml=y_value,
+                    namespace_id=namespace_id,
+                    layout_version=str(metadata.get("layout_version") or "inline"),
+                )
+            )
+            positioned_ids.add(node_id)
+
+        unresolved_ids: set[str] = set()
+        for entity in entity_objects:
+            if not isinstance(entity, Mapping):
+                continue
+            node_id = str(entity.get("id") or "").strip()
+            if node_id and node_id not in positioned_ids:
+                unresolved_ids.add(node_id)
+        for relation in relation_objects:
+            if not isinstance(relation, Mapping):
+                continue
+            source_id = str(relation.get("source_entity_id") or relation.get("source") or "").strip()
+            target_id = str(relation.get("target_entity_id") or relation.get("target") or "").strip()
+            if source_id and source_id not in positioned_ids:
+                unresolved_ids.add(source_id)
+            if target_id and target_id not in positioned_ids:
+                unresolved_ids.add(target_id)
+
+        unresolved_node_id_list = sorted(unresolved_ids)
+        unresolved_count = len(unresolved_node_id_list)
+        if unresolved_count <= 0:
+            return positions
+        ring_radius = 1.0
+        for index_no, node_id in enumerate(unresolved_node_id_list):
+            angle = (2.0 * math.pi * float(index_no)) / float(max(1, unresolved_count))
+            positions.append(
+                GraphNodePositionObject(
+                    node_id=node_id,
+                    x_ml=math.cos(angle) * ring_radius,
+                    y_ml=math.sin(angle) * ring_radius,
+                    namespace_id=namespace_id,
+                    layout_version="ring-fallback-v1",
+                )
+            )
+        return positions
+
+    def _retrieve_lexical(
+        self,
+        *,
+        query: str,
+        namespace_id: str,
+        owner_type: str,
+        limit: int,
+    ) -> list[HybridRetrievalResultObject]:
+        """Lexical/keyword retrieval via token overlap on blocks or entities."""
+        results: list[HybridRetrievalResultObject] = []
+        query_tokens = set(query.lower().split())
+        if not query_tokens:
+            return results
+
+        try:
+            candidates = self._knowledge_service._repository.load_objects(
+                owner_type if owner_type in {"block", "entity", "relation"} else "block",
+                {"namespace_id": namespace_id} if namespace_id else None,
+                limit=100,
+            )
+            if not candidates:
+                candidates = []
+        except Exception:
+            return results
+
+        scored: list[tuple[str, str, float]] = []
+        for candidate in candidates:
+            if not isinstance(candidate, Mapping):
+                continue
+            candidate_id = str(candidate.get("id") or candidate.get("block_id") or "").strip()
+            if not candidate_id:
+                continue
+            # Build searchable text (owner-type specific field set)
+            if owner_type == "relation":
+                text_parts = [
+                    str(candidate.get("relation_type") or "").lower(),
+                    str(candidate.get("relation_description") or "").lower(),
+                    str(candidate.get("source_entity_id") or "").lower(),
+                    str(candidate.get("target_entity_id") or "").lower(),
+                ]
+            else:
+                text_parts = [
+                    str(candidate.get("content") or candidate.get("canonical_name") or "").lower(),
+                    str(candidate.get("heading") or candidate.get("summary") or "").lower(),
+                ]
+            candidate_text = " ".join(text_parts)
+            candidate_tokens = set(candidate_text.split())
+            overlap = len(candidate_tokens & query_tokens)
+            score = overlap / max(1, len(candidate_tokens))
+            if score > 0.0:
+                scored.append((candidate_id, str(candidate.get("result_type") or owner_type), score))
+
+        for rank_no, (result_id, result_type, score) in enumerate(
+            sorted(scored, key=lambda x: x[2], reverse=True)[:limit], 1
+        ):
+            results.append(
+                HybridRetrievalResultObject(
+                    result_id=result_id,
+                    result_type=result_type,
+                    rank_no=rank_no,
+                    lexical_score=max(0.0, min(1.0, score)),
+                    source_stages=["lexical"],
+                )
+            )
+
+        return results
+
+
+class ContextStackService:
+    """Builds a fully populated :class:`AgentContextStackObject`.
+
+    Loads skills, instructions, hints, jobs, and tools from the existing
+    ``agents_config`` constants.  Writes retrieval results into the agent
+    memory layer via :class:`AgentMemoryService` so the innermost context
+    layer reflects the current retrieval state (Retrieval → Memory bridge).
+    """
+
+    def build_context_stack(
+        self,
+        *,
+        agent_label: str,
+        job_name: str,
+        query: str,
+        runtime_config: dict[str, Any] | None = None,
+        retrievals: list[dict[str, Any]] | None = None,
+        results: list[dict[str, Any]] | None = None,
+        memory_service: AgentMemoryService | None = None,
+    ) -> AgentContextStackObject:
+        resolved_runtime_config = dict(runtime_config or {})
+        resolved_retrievals = list(retrievals or [])
+        resolved_results = list(results or [])
+
+        skills, instructions, hints, jobs, tools = self._load_object_prompt_components(
+            agent_label=agent_label,
+            job_name=job_name,
+        )
+
+        agent_memory = self._build_object_memory(
+            agent_label=agent_label,
+            job_name=job_name,
+            query=query,
+            retrievals=resolved_retrievals,
+            memory_service=memory_service,
+        )
+
+        return AgentContextStackObject(
+            agent_label=agent_label,
+            runtime_config=resolved_runtime_config,
+            skills=skills,
+            instructions=instructions,
+            hints=hints,
+            jobs=jobs,
+            tools=tools,
+            query=query,
+            results=resolved_results,
+            retrievals=resolved_retrievals,
+            agent_memory=agent_memory,
+        )
+
+    def _load_object_prompt_components(
+        self,
+        *,
+        agent_label: str,
+        job_name: str,
+    ) -> tuple[list[str], list[str], list[str], list[str], list[str]]:
+        skills: list[str] = []
+        instructions: list[str] = []
+        hints: list[str] = []
+        jobs: list[str] = [job_name] if job_name else []
+        tools: list[str] = []
+
+        try:
+            from . import agents_config as _cfg  # type: ignore
+        except ImportError:
+            try:
+                from alde import agents_config as _cfg  # type: ignore
+            except ImportError:
+                return skills, instructions, hints, jobs, tools
+
+        agent_skill_profiles = getattr(_cfg, "AGENT_SKILL_PROFILES", {})
+        agent_config = agent_skill_profiles.get(agent_label) or {}
+        raw_skills = agent_config.get("skills") or []
+        if isinstance(raw_skills, (list, tuple)):
+            skills = [str(s) for s in raw_skills if s]
+
+        prompt_fragment_configs = getattr(_cfg, "PROMPT_FRAGMENT_CONFIGS", {})
+        for fragment_key, fragment in prompt_fragment_configs.items():
+            if not isinstance(fragment, Mapping):
+                continue
+            fragment_type = str(fragment.get("type") or "").lower()
+            text = str(fragment.get("text") or fragment.get("content") or "").strip()
+            if not text:
+                continue
+            if fragment_type == "instruction":
+                instructions.append(text)
+            elif fragment_type == "hint":
+                hints.append(text)
+
+        tool_group_configs = getattr(_cfg, "TOOL_GROUP_CONFIGS", {})
+        tool_configs_raw = getattr(_cfg, "TOOL_CONFIGS", []) or []
+        tool_configs: dict[str, Any] = {}
+        if isinstance(tool_configs_raw, Mapping):
+            tool_configs = dict(tool_configs_raw)
+        elif isinstance(tool_configs_raw, (list, tuple)):
+            for item in tool_configs_raw:
+                if isinstance(item, Mapping):
+                    name = str(item.get("name") or item.get("tool_name") or "").strip()
+                    if name:
+                        tool_configs[name] = item
+        job_config = (getattr(_cfg, "JOB_PROMPT_CONFIGS", {}) or {}).get(job_name) or {}
+        allowed_tool_groups: list[str] = list(job_config.get("tool_groups") or [])
+        for group_name in allowed_tool_groups:
+            group = tool_group_configs.get(group_name) or {}
+            group_tools: list[Any] = list(group.get("tools") or [])
+            tools.extend(str(t) for t in group_tools if t)
+        if not tools:
+            tools = [str(k) for k in list(tool_configs.keys())[:12]]
+
+        return skills, instructions, hints, jobs, tools
+
+    def _build_object_memory(
+        self,
+        *,
+        agent_label: str,
+        job_name: str,
+        query: str,
+        retrievals: list[dict[str, Any]],
+        memory_service: AgentMemoryService | None,
+    ) -> dict[str, Any]:
+        if memory_service is None:
+            return {}
+
+        scope_key = memory_service.load_session_scope_key()
+        memory_slot = memory_service.load_amemo_slot(job_name=job_name)
+
+        # Retrieval → Memory bridge: write retrieval results into memory slot
+        if retrievals:
+            memory_service.store_amemo(
+                agent_label=agent_label,
+                memory_slot=memory_slot,
+                scope_key=scope_key,
+                object_memory={
+                    "query": query,
+                    "retrieval_count": len(retrievals),
+                    "retrievals": retrievals[:memory_service.MAX_MESSAGE_CONTEXT_ENTRIES],
+                },
+            )
+
+        return memory_service.load_amemo(
+            agent_label=agent_label,
+            memory_slot=memory_slot,
+            scope_key=scope_key,
+        )
+
+
+class AgenticTaskPlannerService:
+    """Produces a :class:`TaskPlanObject` from a query and a context stack.
+
+    Uses the existing ``TOOL_CONFIGS`` and ``JOB_PROMPT_CONFIGS`` constants as
+    the candidate pool.  The planner scores each tool/job against the query
+    and the available context (skills, hints, memory) and builds an ordered
+    sequence of :class:`TaskStepObject` instances.
+
+    This is intentionally a deterministic baseline planner.  The ML scoring
+    layer can be injected via ``score_fn`` to replace the default keyword-
+    overlap heuristic without changing the planner interface.
+    """
+
+    def plan_object(
+        self,
+        *,
+        query: str,
+        context_stack: AgentContextStackObject,
+        max_steps: int = 5,
+        score_fn: Any | None = None,
+    ) -> TaskPlanObject:
+        candidate_steps = self._load_object_candidates(context_stack)
+        scored = self._score_object_candidates(
+            query=query,
+            candidates=candidate_steps,
+            context_stack=context_stack,
+            score_fn=score_fn,
+        )
+        selected = sorted(scored, key=lambda item: item[1], reverse=True)[:max_steps]
+        steps = [step for step, _ in selected]
+
+        return TaskPlanObject(
+            query=query,
+            agent_label=context_stack.agent_label,
+            steps=steps,
+            metadata={
+                "candidate_count": len(candidate_steps),
+                "selected_count": len(steps),
+                "jobs": context_stack.jobs,
+                "skills": context_stack.skills,
+            },
+        )
+
+    def _load_object_candidates(
+        self,
+        context_stack: AgentContextStackObject,
+    ) -> list[TaskStepObject]:
+        candidates: list[TaskStepObject] = []
+        try:
+            from . import agents_config as _cfg  # type: ignore
+        except ImportError:
+            try:
+                from alde import agents_config as _cfg  # type: ignore
+            except ImportError:
+                return candidates
+
+        tool_configs_raw = getattr(_cfg, "TOOL_CONFIGS", []) or []
+        tool_configs: dict[str, Any] = {}
+        if isinstance(tool_configs_raw, Mapping):
+            tool_configs = dict(tool_configs_raw)
+        elif isinstance(tool_configs_raw, (list, tuple)):
+            for item in tool_configs_raw:
+                if isinstance(item, Mapping):
+                    name = str(item.get("name") or item.get("tool_name") or "").strip()
+                    if name:
+                        tool_configs[name] = item
+        job_prompt_configs = getattr(_cfg, "JOB_PROMPT_CONFIGS", {}) or {}
+
+        allowed_tools = set(context_stack.tools) if context_stack.tools else set(tool_configs.keys())
+        allowed_jobs = set(context_stack.jobs) if context_stack.jobs else set(job_prompt_configs.keys())
+
+        seen_keys: set[str] = set()
+        for tool_name, tool_config in tool_configs.items():
+            if not isinstance(tool_config, Mapping):
+                continue
+            if tool_name not in allowed_tools:
+                continue
+            job = str(tool_config.get("job_name") or tool_config.get("job") or "").strip()
+            if job and job not in allowed_jobs:
+                continue
+            step_key = f"{tool_name}|{job}"
+            if step_key in seen_keys:
+                continue
+            seen_keys.add(step_key)
+            candidates.append(
+                TaskStepObject(
+                    step_name=str(tool_config.get("name") or tool_name),
+                    tool=tool_name,
+                    job=job,
+                    input_template=dict(tool_config.get("input_template") or {}),
+                    output_key=str(tool_config.get("output_key") or tool_name),
+                )
+            )
+        return candidates
+
+    def _score_object_candidates(
+        self,
+        *,
+        query: str,
+        candidates: list[TaskStepObject],
+        context_stack: AgentContextStackObject,
+        score_fn: Any | None,
+    ) -> list[tuple[TaskStepObject, float]]:
+        if callable(score_fn):
+            return [(step, float(score_fn(query, step, context_stack))) for step in candidates]
+
+        query_tokens = set(query.lower().split())
+        memory_tokens = set(
+            " ".join(str(v) for v in context_stack.agent_memory.values()).lower().split()
+        )
+        skill_tokens = set(" ".join(context_stack.skills).lower().split())
+        context_tokens = query_tokens | memory_tokens | skill_tokens
+
+        scored: list[tuple[TaskStepObject, float]] = []
+        for step in candidates:
+            step_tokens = set(
+                f"{step.tool} {step.job} {step.step_name}".lower().replace("_", " ").split()
+            )
+            overlap = len(step_tokens & context_tokens)
+            score = overlap / max(1, len(step_tokens))
+            scored.append((step, score))
+        return scored
+
+
+class MultiStepExecutorService:
+    """Executes a :class:`TaskPlanObject` step-by-step with output feedback.
+
+    Each step's result is stored under ``step.output_key`` and injected into
+    subsequent steps via ``_resolve_input``.  Individual step failures are
+    captured and do not abort the whole plan unless ``raise_on_step_error``
+    is set.
+    """
+
+    def execute_plan(
+        self,
+        *,
+        task_plan: TaskPlanObject,
+        context_stack: AgentContextStackObject,
+        execute_step_fn: Any | None = None,
+        raise_on_step_error: bool = False,
+    ) -> dict[str, Any]:
+        accumulated_results: dict[str, Any] = {}
+        step_errors: dict[str, str] = {}
+
+        for step in task_plan.steps:
+            resolved_input = self._resolve_object_input(step.input_template, accumulated_results)
+            try:
+                step_result = self._execute_object_step(
+                    step=step,
+                    input_payload=resolved_input,
+                    context_stack=context_stack,
+                    execute_step_fn=execute_step_fn,
+                )
+            except Exception as exc:
+                if raise_on_step_error:
+                    raise
+                step_errors[step.step_name] = f"{type(exc).__name__}: {exc}"
+                step_result = {"error": step_errors[step.step_name]}
+
+            output_key = str(step.output_key or step.step_name or step.tool)
+            accumulated_results[output_key] = step_result
+
+        return {
+            "query": task_plan.query,
+            "agent_label": task_plan.agent_label,
+            "steps_executed": len(task_plan.steps),
+            "results": accumulated_results,
+            "errors": step_errors,
+        }
+
+    def _resolve_object_input(
+        self,
+        input_template: dict[str, Any],
+        accumulated_results: dict[str, Any],
+    ) -> dict[str, Any]:
+        resolved: dict[str, Any] = {}
+        for key, value in input_template.items():
+            if not isinstance(value, str):
+                resolved[key] = value
+                continue
+            if value.startswith("{{ steps.") and value.endswith(" }}"):
+                path = value[3:-3].strip()
+                parts = path.split(".")
+                lookup_key = parts[1] if len(parts) > 1 else ""
+                sub_key = parts[2] if len(parts) > 2 else "result"
+                step_result = accumulated_results.get(lookup_key) or {}
+                resolved[key] = step_result.get(sub_key, step_result) if isinstance(step_result, dict) else step_result
+            else:
+                resolved[key] = value
+        return resolved
+
+    def _execute_object_step(
+        self,
+        *,
+        step: TaskStepObject,
+        input_payload: dict[str, Any],
+        context_stack: AgentContextStackObject,
+        execute_step_fn: Any | None,
+    ) -> Any:
+        if callable(execute_step_fn):
+            return execute_step_fn(step, input_payload, context_stack)
+
+        try:
+            from . import agents_factory as _factory  # type: ignore
+        except ImportError:
+            try:
+                from alde import agents_factory as _factory  # type: ignore
+            except ImportError:
+                return {"status": "skipped", "reason": "agents_factory not available"}
+
+        execute_tool_payload = getattr(_factory, "execute_tool_payload", None)
+        if not callable(execute_tool_payload):
+            return {"status": "skipped", "reason": "execute_tool_payload not callable"}
+
+        payload = {
+            "tool": step.tool,
+            "job_name": step.job,
+            **input_payload,
+        }
+        return execute_tool_payload(step.tool, payload)
