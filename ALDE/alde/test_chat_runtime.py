@@ -94,6 +94,21 @@ class TestChatRuntimeServiceLoadProvider(unittest.TestCase):
 
 
 class TestChatCompletionGitHubToken(unittest.TestCase):
+    def test_read_env_var_returns_value(self) -> None:
+        from ALDE.alde.agents_ccomp import ChatCompletion
+
+        with patch.dict(os.environ, {"MY_TEST_VAR": "hello"}):
+            value = ChatCompletion._read_env_var("MY_TEST_VAR")
+        self.assertEqual(value, "hello")
+
+    def test_read_env_var_missing_raises(self) -> None:
+        from ALDE.alde.agents_ccomp import ChatCompletion
+
+        env_without = {k: v for k, v in os.environ.items() if k != "MY_MISSING_VAR"}
+        with patch.dict(os.environ, env_without, clear=True):
+            with self.assertRaises(RuntimeError):
+                ChatCompletion._read_env_var("MY_MISSING_VAR")
+
     def test_read_github_token_from_env(self) -> None:
         from ALDE.alde.agents_ccomp import ChatCompletion
 
@@ -136,6 +151,34 @@ class TestChatCompletionGitHubToken(unittest.TestCase):
             self.assertIs(client, mock_openai)
         finally:
             ChatCompletion._github_client = original
+
+    def test_build_openai_client_without_base_url(self) -> None:
+        from ALDE.alde.agents_ccomp import ChatCompletion
+
+        mock_openai = MagicMock()
+        with patch("ALDE.alde.agents_ccomp.OpenAI", return_value=mock_openai) as mock_cls, \
+             patch.object(ChatCompletion, "_http_client", None):
+            client = ChatCompletion._build_openai_client(api_key="sk-test")
+
+        call_kwargs = mock_cls.call_args.kwargs
+        self.assertEqual(call_kwargs["api_key"], "sk-test")
+        self.assertNotIn("base_url", call_kwargs)
+        self.assertIs(client, mock_openai)
+
+    def test_build_openai_client_with_base_url(self) -> None:
+        from ALDE.alde.agents_ccomp import ChatCompletion
+
+        mock_openai = MagicMock()
+        with patch("ALDE.alde.agents_ccomp.OpenAI", return_value=mock_openai) as mock_cls, \
+             patch.object(ChatCompletion, "_http_client", None):
+            client = ChatCompletion._build_openai_client(
+                api_key="tok",
+                base_url="https://custom.example.com",
+            )
+
+        call_kwargs = mock_cls.call_args.kwargs
+        self.assertEqual(call_kwargs["base_url"], "https://custom.example.com")
+        self.assertIs(client, mock_openai)
 
 
 if __name__ == "__main__":

@@ -173,27 +173,7 @@ Citizen
 class ChatCompletion():
 
     @staticmethod
-    def _read_api_key() -> str:
-            __root_env = Path(__file__).resolve().parents[1] / ".env"
-            __local_env = Path(__file__).with_suffix(".env")
-
-            for f in (__root_env, __local_env):
-                if f.exists():
-                    load_dotenv(f, override=False)
-                    break
-
-            load_dotenv()                     # fallback
-            __key = os.getenv("OPENAI_API_KEY")
-            if not __key:
-                raise RuntimeError(
-                    "OPENAI_API_KEY not found – supply it via .env or environment."
-                )
-            return __key
-    
-    GITHUB_MODELS_BASE_URL = "https://models.inference.ai.azure.com"
-
-    @staticmethod
-    def _read_github_token() -> str:
+    def _read_env_var(var_name: str) -> str:
         __root_env = Path(__file__).resolve().parents[1] / ".env"
         __local_env = Path(__file__).with_suffix(".env")
 
@@ -203,12 +183,22 @@ class ChatCompletion():
                 break
 
         load_dotenv()
-        __token = os.getenv("GITHUB_TOKEN")
-        if not __token:
+        __value = os.getenv(var_name)
+        if not __value:
             raise RuntimeError(
-                "GITHUB_TOKEN not found – supply it via .env or environment."
+                f"{var_name} not found – supply it via .env or environment."
             )
-        return __token
+        return __value
+
+    @staticmethod
+    def _read_api_key() -> str:
+        return ChatCompletion._read_env_var("OPENAI_API_KEY")
+
+    GITHUB_MODELS_BASE_URL = "https://models.inference.ai.azure.com"
+
+    @staticmethod
+    def _read_github_token() -> str:
+        return ChatCompletion._read_env_var("GITHUB_TOKEN")
 
     # Single shared OpenAI client instance for this module.
     # Lazily initialized so imports work without OPENAI_API_KEY set.
@@ -257,56 +247,47 @@ class ChatCompletion():
             cls._http_client = None
 
     @classmethod
+    def _build_openai_client(cls, api_key: str, base_url: str | None = None) -> OpenAI:
+        """Create an OpenAI-compatible client, reusing the shared HTTP transport."""
+        try:
+            import atexit
+        except Exception:
+            atexit = None  # type: ignore
+
+        if cls._http_client is None:
+            try:
+                cls._http_client = cls._build_http_client()
+            except Exception:
+                cls._http_client = None
+
+        kwargs: dict[str, Any] = {"api_key": api_key, "http_client": cls._http_client}
+        if base_url is not None:
+            kwargs["base_url"] = base_url
+
+        client = OpenAI(**kwargs)
+
+        try:
+            if atexit is not None:
+                atexit.register(cls._close_clients)
+        except Exception:
+            pass
+
+        return client
+
+    @classmethod
     def _get_client(cls) -> OpenAI:
         if cls._client is None:
-            try:
-                import atexit
-                import httpx
-            except Exception:
-                atexit = None  # type: ignore
-                httpx = None  # type: ignore
-
-            if cls._http_client is None:
-                try:
-                    cls._http_client = cls._build_http_client()  # type: ignore[arg-type]
-                except Exception:
-                    cls._http_client = None
-
-            cls._client = OpenAI(api_key=cls._read_api_key(), http_client=cls._http_client)
-
-            try:
-                if atexit is not None:
-                    atexit.register(cls._close_clients)
-            except Exception:
-                pass
+            cls._client = cls._build_openai_client(api_key=cls._read_api_key())
         return cls._client
 
     @classmethod
     def _get_github_client(cls) -> OpenAI:
         """Return a lazily-initialised OpenAI-compatible client for GitHub Models."""
         if cls._github_client is None:
-            try:
-                import atexit
-            except Exception:
-                atexit = None  # type: ignore
-
-            if cls._http_client is None:
-                try:
-                    cls._http_client = cls._build_http_client()
-                except Exception:
-                    cls._http_client = None
-
-            cls._github_client = OpenAI(
+            cls._github_client = cls._build_openai_client(
                 api_key=cls._read_github_token(),
                 base_url=cls.GITHUB_MODELS_BASE_URL,
-                http_client=cls._http_client,
             )
-
-            try:
-                if atexit is not None:
-                    atexit.register(cls._close_clients)
-            except Exception:
-                pass
         return cls._github_client
 
 

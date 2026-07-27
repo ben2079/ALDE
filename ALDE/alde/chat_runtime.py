@@ -50,6 +50,11 @@ class OpenAIChatProvider:
 
 
 class GitHubModelsChatProvider:
+    """OpenAI-compatible provider targeting the GitHub Models inference endpoint.
+
+    Conforms to :class:`ChatProviderProtocol` via structural subtyping.
+    """
+
     provider_name = "github"
 
     def create_chat_completion(
