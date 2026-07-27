@@ -190,9 +190,30 @@ class ChatCompletion():
                 )
             return __key
     
+    GITHUB_MODELS_BASE_URL = "https://models.inference.ai.azure.com"
+
+    @staticmethod
+    def _read_github_token() -> str:
+        __root_env = Path(__file__).resolve().parents[1] / ".env"
+        __local_env = Path(__file__).with_suffix(".env")
+
+        for f in (__root_env, __local_env):
+            if f.exists():
+                load_dotenv(f, override=False)
+                break
+
+        load_dotenv()
+        __token = os.getenv("GITHUB_TOKEN")
+        if not __token:
+            raise RuntimeError(
+                "GITHUB_TOKEN not found – supply it via .env or environment."
+            )
+        return __token
+
     # Single shared OpenAI client instance for this module.
     # Lazily initialized so imports work without OPENAI_API_KEY set.
     _client: OpenAI | None = None
+    _github_client: OpenAI | None = None
     _http_client: httpx.Client | None = None
 
     @classmethod
@@ -218,6 +239,14 @@ class ChatCompletion():
             pass
         finally:
             cls._client = None
+
+        try:
+            if cls._github_client is not None:
+                cls._github_client.close()
+        except Exception:
+            pass
+        finally:
+            cls._github_client = None
 
         try:
             if cls._http_client is not None:
@@ -251,6 +280,34 @@ class ChatCompletion():
             except Exception:
                 pass
         return cls._client
+
+    @classmethod
+    def _get_github_client(cls) -> OpenAI:
+        """Return a lazily-initialised OpenAI-compatible client for GitHub Models."""
+        if cls._github_client is None:
+            try:
+                import atexit
+            except Exception:
+                atexit = None  # type: ignore
+
+            if cls._http_client is None:
+                try:
+                    cls._http_client = cls._build_http_client()
+                except Exception:
+                    cls._http_client = None
+
+            cls._github_client = OpenAI(
+                api_key=cls._read_github_token(),
+                base_url=cls.GITHUB_MODELS_BASE_URL,
+                http_client=cls._http_client,
+            )
+
+            try:
+                if atexit is not None:
+                    atexit.register(cls._close_clients)
+            except Exception:
+                pass
+        return cls._github_client
 
 
 class Caller(ChatCompletion):
