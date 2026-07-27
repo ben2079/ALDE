@@ -1516,6 +1516,44 @@ class TestWorkflowIntegration(unittest.TestCase):
             self.assertEqual(legacy_agent_result.get("errors"), [])
             self.assertEqual(target_agent_result.get("errors"), [])
 
+    def test_agent_xworker_tree_upsert_tool_spec_resolves_alias_and_writes_active_explorer(self) -> None:
+        tool_spec = tools_mod.get_tool_spec("agent.xworker.tree.upsert")
+
+        self.assertIsNotNone(tool_spec)
+        self.assertEqual(tool_spec.name, "agent_xworker_tree_upsert")
+
+        captured_calls: list[tuple[str, str, object, bool]] = []
+
+        class _FakeExplorer:
+            def add_to_section(self, section_name: str, key: str, value: object, *, persist: bool = True) -> None:
+                captured_calls.append((section_name, key, value, persist))
+
+        class _FakeWindow:
+            explorer = _FakeExplorer()
+
+        fake_app = SimpleNamespace(topLevelWidgets=lambda: [_FakeWindow()])
+        fake_qapplication = SimpleNamespace(instance=lambda: fake_app)
+
+        with patch.object(tools_mod, "QApplication", fake_qapplication):
+            result_text = tools_mod.agent_xworker_tree_upsert(
+                section_name="DATABASES",
+                key="tree_projection_sources",
+                value='{"sources": [{"section": "ENV", "key": ".env"}] }',
+                persist=True,
+            )
+
+        result_payload = json.loads(result_text)
+
+        self.assertTrue(result_payload["ok"])
+        self.assertEqual(result_payload["section_name"], "DATABASES")
+        self.assertEqual(result_payload["key"], "tree_projection_sources")
+        self.assertEqual(result_payload["value_type"], "dict")
+        self.assertEqual(len(captured_calls), 1)
+        self.assertEqual(captured_calls[0][0], "DATABASES")
+        self.assertEqual(captured_calls[0][1], "tree_projection_sources")
+        self.assertIsInstance(captured_calls[0][2], dict)
+        self.assertTrue(captured_calls[0][3])
+
     def test_read_document_uses_pypdf_extractor_for_pdf_files(self) -> None:
         with tempfile.NamedTemporaryFile("wb", suffix=".pdf", delete=False) as tmp:
             pdf_path = tmp.name

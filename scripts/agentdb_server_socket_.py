@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import shlex
 import sys
@@ -23,10 +24,84 @@ class EnvFileService:
     def __init__(self, env_file_path: Path) -> None:
         self._env_file_path = env_file_path
 
+    @staticmethod
+    def _stringify_env_value(value: object) -> str:
+        if value is None:
+            return ""
+        if isinstance(value, bool):
+            return "1" if value else "0"
+        if isinstance(value, (str, int, float)):
+            return str(value)
+        try:
+            return json.dumps(value, ensure_ascii=False)
+        except Exception:
+            return str(value)
+
+    def _load_structured_variable_map(self) -> dict[str, str] | None:
+        suffix = str(self._env_file_path.suffix or "").strip().lower()
+        if suffix not in {".json", ".yaml", ".yml", ".toml"}:
+            return None
+
+        try:
+            file_text = self._env_file_path.read_text(encoding="utf-8")
+        except Exception:
+            return {}
+
+        parsed_payload: object
+        if suffix == ".json":
+            try:
+                parsed_payload = json.loads(file_text)
+            except Exception:
+                return {}
+        elif suffix in {".yaml", ".yml"}:
+            try:
+                import yaml  # type: ignore
+            except Exception:
+                return {}
+            try:
+                parsed_payload = yaml.safe_load(file_text)
+            except Exception:
+                return {}
+        else:  # .toml
+            toml_module = None
+            try:
+                import tomllib as toml_module  # type: ignore
+            except Exception:
+                try:
+                    import tomli as toml_module  # type: ignore
+                except Exception:
+                    toml_module = None
+            if toml_module is None:
+                return {}
+            try:
+                parsed_payload = toml_module.loads(file_text)
+            except Exception:
+                return {}
+
+        if not isinstance(parsed_payload, dict):
+            return {}
+        env_payload = parsed_payload.get("env") if isinstance(parsed_payload.get("env"), dict) else parsed_payload
+        if not isinstance(env_payload, dict):
+            env_payload = {}
+
+        variable_map: dict[str, str] = {}
+        for raw_key, raw_value in env_payload.items():
+            key = str(raw_key or "").strip()
+            if not key:
+                continue
+            value = self._stringify_env_value(raw_value)
+            if value == "":
+                continue
+            variable_map[key] = value
+        return variable_map
+
     def load_variable_map(self) -> dict[str, str]:
         variable_map: dict[str, str] = {}
         if not self._env_file_path.exists():
             return variable_map
+        structured_variable_map = self._load_structured_variable_map()
+        if structured_variable_map is not None:
+            return structured_variable_map
         for raw_line in self._env_file_path.read_text(encoding="utf-8").splitlines():
             stripped_line = raw_line.strip()
             if not stripped_line or stripped_line.startswith("#") or "=" not in stripped_line:
@@ -72,26 +147,34 @@ class AgentDbSocketServerRunner:
 
     def _backend_available(self, backend_uri: str) -> bool:
         normalized_backend_uri = str(backend_uri or "").strip().lower()
-        if normalized_backend_uri.startswith(("agentsdb://", "memory://", "inmemory://")):
+        if not normalized_backend_uri:
+            return False
+        if normalized_backend_uri.startswith("agentsdb://"):
+            return False
+        if normalized_backend_uri.startswith(("agentsmem://", "memory://", "inmemory://")):
             return True
+        return True
      
     def _ensure_runtime_backend(self) -> None:
         backend_uri = str(os.getenv("AI_IDE_KNOWLEDGE_AGENTS_DB_BACKEND_URI", "")).strip()
         if not backend_uri:
-            backend_uri = "agentsdb://localhost:2331"
+            backend_uri = "agentsmem://local"
         if self._backend_available(backend_uri):
             os.environ["AI_IDE_KNOWLEDGE_AGENTS_DB_BACKEND_URI"] = backend_uri
             if backend_uri.lower().startswith(("agentsmem://", "memory://", "inmemory://")):
+                preferred_image_path = str(os.getenv("AI_IDE_KNOWLEDGE_AGENTS_IMAGE_PATH", "")).strip()
+                if not preferred_image_path:
+                    preferred_image_path = str((REPO_ROOT / "AppData" / "agentsdb.json").resolve())
                 os.environ.setdefault(
                     "AI_IDE_KNOWLEDGE_AGENTS_DB_IMAGE_PATH",
-                    str((REPO_ROOT / "AppData" / "agentsdb_image.json").resolve()),
+                    preferred_image_path,
                 )
             return
 
         os.environ["AI_IDE_KNOWLEDGE_AGENTS_DB_URI"] = "agentsdb://localhost:2331"
         os.environ.setdefault(
             "AI_IDE_KNOWLEDGE_AGENTS_IMAGE_PATH",
-            str((REPO_ROOT / "AppData" / "agentsdb_image.json").resolve()),
+            str((REPO_ROOT / "AppData" / "agentsdb.json").resolve()),
         )
         print("[WARNING] AgentsDB backend unavailable; agentsdb switched to in-memory backend.")
 
@@ -102,10 +185,10 @@ class AgentDbSocketServerRunner:
 
 
 def _load_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Start the local agent server socket using ALDE .env configuration.")
+    parser = argparse.ArgumentParser(description="Start the local agent server socket using ALDE env configuration.")
     parser.add_argument(
         "--env-file",
-        default=os.getenv("AI_IDE_STARTUP_ENV_FILE_PATH", "ALDE/.env"),
+        default=os.getenv("AI_IDE_STARTUP_ENV_FILE_PATH", "ALDE/.env.json"),
         help="Path to env file used for startup variables.",
     )
     parser.add_argument(

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from queue import Empty, Queue
 from threading import Event, Lock, Thread
 from typing import Any, Callable, Generic, TypeVar
@@ -94,7 +95,9 @@ class AgentRuntimeCoreService:
 
         normalized_target = normalize_agent_label(target_agent)
         if normalized_target == "_xplaner_xrouter":
-            model = str(model_name or (get_agent_config(normalized_target) or {}).get("model") or "gpt-4o")
+            env_model = str(os.getenv("AI_IDE_CHAT_MODEL") or "").strip().lstrip("/")
+            configured_model = str((get_agent_config(normalized_target) or {}).get("model") or "").strip().lstrip("/")
+            model = str(model_name or env_model or configured_model or "qwen2.5-coder:7b")
             chat_kwargs: dict[str, Any] = {
                 "_model": model,
                 "_input_text": prompt,

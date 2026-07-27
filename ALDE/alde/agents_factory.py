@@ -16,7 +16,6 @@ import time
 from types import SimpleNamespace
 from typing import Any
 from datetime import datetime
-from pyexpat import model
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 
@@ -140,7 +139,19 @@ _MAX_TOOL_DEPTH = 50
 _TOOL_CACHE: dict[str, str] = {}
 _WORKFLOW_SESSION_CACHE: dict[str, dict[str, Any]] = {}
 _MODEL = "gpt-4.1-mini-2025-04-14"
-model = _MODEL
+model = str(os.getenv("AI_IDE_CHAT_MODEL") or "").strip() or _MODEL
+
+
+def _resolve_runtime_chat_model(configured_model: Any = None) -> str:
+    # Bootstrap env values from .env/.env.json when this module resolves models
+    # before chat calls initialize the OpenAI client.
+    try:
+        ChatCompletion._read_api_key()
+    except Exception:
+        pass
+    env_model = str(os.getenv("AI_IDE_CHAT_MODEL") or "").strip().lstrip("/")
+    configured = str(configured_model or "").strip().lstrip("/")
+    return env_model or configured or _MODEL
 
 
 def _default_cover_letter_output_dir() -> str:
@@ -1395,6 +1406,47 @@ def _workflow_event_name_matches(event_kind: str, expected_name: Any, actual_nam
 
 def _message_indicates_failure(value: Any) -> bool:
     return WORKFLOW_TRANSITION_MATCH_SERVICE.message_indicates_failure(value)
+
+
+def _extract_pseudo_tool_call_payload(value: Any) -> dict[str, Any] | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+
+    if text.startswith("```"):
+        lines = text.splitlines()
+        if len(lines) >= 3 and lines[0].startswith("```") and lines[-1].strip() == "```":
+            text = "\n".join(lines[1:-1]).strip()
+
+    if not (text.startswith("{") and text.endswith("}")):
+        return None
+
+    try:
+        payload = json.loads(text)
+    except Exception:
+        return None
+
+    if not isinstance(payload, dict):
+        return None
+
+    name = str(
+        payload.get("name")
+        or payload.get("function_name")
+        or payload.get("tool_name")
+        or payload.get("function")
+        or ""
+    ).strip()
+    arguments = payload.get("arguments")
+    if arguments is None:
+        arguments = payload.get("args")
+    if arguments is None:
+        arguments = payload.get("parameters")
+    if not name or not isinstance(arguments, dict):
+        return None
+    return {
+        "name": name,
+        "arguments": arguments,
+    }
 
 
 def _workflow_transition_matches(
@@ -2791,7 +2843,7 @@ class AgentRoutingRequestService:
             'messages': messages,
             'agent_label': target,
             'tools': resolved_tools,
-            'model': target_config.get("model") or model,
+            'model': _resolve_runtime_chat_model(target_config.get("model")),
             'include_history': bool(target_history_policy.get("include_routed_history")),
             'history_depth': int(target_history_policy.get("routed_history_depth") or 0),
             'handoff': handoff,
@@ -5959,7 +6011,10 @@ class ToolCallFollowupService:
                     )
                 )
             followup_tools = ROUTING_REQUEST_VIEW_SERVICE.load_tools(routing_request)
-            followup_model = ROUTING_REQUEST_VIEW_SERVICE.load_model(routing_request, model)
+            followup_model = ROUTING_REQUEST_VIEW_SERVICE.load_model(
+                routing_request,
+                _resolve_runtime_chat_model(),
+            )
             return {
                 'messages': followup_messages,
                 'tools': followup_tools,
@@ -5969,7 +6024,7 @@ class ToolCallFollowupService:
         current_agent_config = _get_runtime_agent_config(agent_label)
         current_history_policy = _agent_history_policy(agent_label)
         followup_tools = get_agent_runtime_tools(agent_label)
-        followup_model = current_agent_config.get('model') or model
+        followup_model = _resolve_runtime_chat_model(current_agent_config.get('model'))
         followup_messages = history._insert(
             tool=True,
             f_depth=int(current_history_policy.get('followup_history_depth') or 15),
@@ -6026,8 +6081,19 @@ class ToolCallFollowupService:
         if not followup_messages:
             followup_messages = [{"role": "user", "content": ""}]
 
+        if str(os.getenv("AI_IDE_VERBOSE_TERMINAL_LOGS") or "0").strip().lower() in {"1", "true", "yes", "on"}:
+            print(
+                "FOLLOWUP MODEL RESOLVE:",
+                {
+                    "request_model": request.get('model'),
+                    "resolved_model": _resolve_runtime_chat_model(request.get('model')),
+                    "provider": os.getenv("AI_IDE_MODEL_PROVIDER"),
+                    "base_url": os.getenv("OPENAI_BASE_URL"),
+                },
+            )
+
         c = ChatComE(
-            _model=request.get('model') or model,
+            _model=request.get('model') or _resolve_runtime_chat_model(),
             _messages=followup_messages,
             tools=followup_tools,
             tool_choice='auto'
@@ -6214,6 +6280,14 @@ class AssistantResponseService:
         workflow_session: dict[str, Any] | None,
         tool_results: list[str],
     ) -> str:
+        pseudo_tool_payload = _extract_pseudo_tool_call_payload(text)
+        if pseudo_tool_payload is not None:
+            for tool_result in reversed(tool_results or []):
+                candidate = str(tool_result or "").strip()
+                if candidate and _extract_pseudo_tool_call_payload(candidate) is None:
+                    text = candidate
+                    break
+
         text = self._coerce_text_against_tool_failures(
             text=text,
             tool_results=tool_results,

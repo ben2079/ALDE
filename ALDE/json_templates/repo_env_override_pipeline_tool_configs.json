@@ -1,0 +1,229 @@
+{
+  "description": "IDE tool-call templates for repo knowledge indexing with environment override extraction (entities -> relations -> embeddings)",
+  "presets": {
+    "preferred_defaults": {
+      "root_dir": "/home/ben/Vs_Code_Projects/Projects/ALDE_Projekt/ALDE",
+      "workers": 6,
+      "extensions": [
+        ".py",
+        ".md",
+        ".json"
+      ],
+      "recursive": true,
+      "cleanup_namespace_ids": [
+        "ns_repo_knowledge",
+        "ns_alde_default"
+      ],
+      "cleanup_object_names": [
+        "embedding",
+        "relation",
+        "entity",
+        "document"
+      ],
+      "cleanup_owner_prefixes": [
+        "blk:repo:"
+      ],
+      "delete_async": true,
+      "query_namespace_id": "ns_repo_knowledge",
+      "query_limit": 20
+    },
+    "quick_code_defaults": {
+      "root_dir": "/home/ben/Vs_Code_Projects/Projects/ALDE_Projekt/ALDE/alde",
+      "workers": 4,
+      "extensions": [
+        ".py"
+      ],
+      "recursive": true
+    },
+    "fast_delta_defaults": {
+      "root_dir": "/home/ben/Vs_Code_Projects/Projects/ALDE_Projekt/ALDE/alde",
+      "workers": 2,
+      "extensions": [
+        ".py"
+      ],
+      "recursive": true,
+      "cleanup_before_build": false,
+      "run_async": false
+    }
+  },
+  "calls": {
+    "build_sync_preferred_defaults": {
+      "preset": "preferred_defaults",
+      "tool": "repo_knowledge_worker",
+      "arguments": {
+        "operation": "build",
+        "root_dir": "/home/ben/Vs_Code_Projects/Projects/ALDE_Projekt/ALDE",
+        "workers": 6,
+        "extensions": [
+          ".py",
+          ".md",
+          ".json"
+        ],
+        "recursive": true,
+        "cleanup_before_build": false,
+        "run_async": false
+      }
+    },
+    "rebuild_async_preferred_defaults": {
+      "preset": "preferred_defaults",
+      "tool": "repo_knowledge_worker",
+      "arguments": {
+        "operation": "rebuild",
+        "root_dir": "/home/ben/Vs_Code_Projects/Projects/ALDE_Projekt/ALDE",
+        "workers": 6,
+        "extensions": [
+          ".py",
+          ".md",
+          ".json"
+        ],
+        "recursive": true,
+        "cleanup_namespace_ids": [
+          "ns_repo_knowledge",
+          "ns_alde_default"
+        ],
+        "cleanup_object_names": [
+          "embedding",
+          "relation",
+          "entity",
+          "document"
+        ],
+        "cleanup_owner_prefixes": [
+          "blk:repo:"
+        ],
+        "delete_async": true,
+        "run_async": true,
+        "job_id": "repo-env-overrides-rebuild-preferred"
+      }
+    },
+    "build_sync": {
+      "preset": "quick_code_defaults",
+      "tool": "repo_knowledge_worker",
+      "arguments": {
+        "operation": "build",
+        "root_dir": "/home/ben/Vs_Code_Projects/Projects/ALDE_Projekt/ALDE/alde",
+        "workers": 4,
+        "extensions": [
+          ".py"
+        ],
+        "recursive": true,
+        "cleanup_before_build": false,
+        "run_async": false
+      }
+    },
+    "build_sync_fast_delta": {
+      "preset": "fast_delta_defaults",
+      "tool": "repo_knowledge_worker",
+      "arguments": {
+        "operation": "delta_build",
+        "root_dir": "/home/ben/Vs_Code_Projects/Projects/ALDE_Projekt/ALDE/alde",
+        "workers": 2,
+        "extensions": [
+          ".py"
+        ],
+        "recursive": true,
+        "cleanup_before_build": false,
+        "run_async": false
+      }
+    },
+    "build_async_fast_delta": {
+      "preset": "fast_delta_defaults",
+      "tool": "repo_knowledge_worker",
+      "arguments": {
+        "operation": "delta_build",
+        "root_dir": "/home/ben/Vs_Code_Projects/Projects/ALDE_Projekt/ALDE/alde",
+        "workers": 2,
+        "extensions": [
+          ".py"
+        ],
+        "recursive": true,
+        "cleanup_before_build": false,
+        "run_async": true,
+        "job_id": "repo-env-overrides-fast-delta"
+      }
+    },
+    "rebuild_async": {
+      "preset": "quick_code_defaults",
+      "tool": "repo_knowledge_worker",
+      "arguments": {
+        "operation": "rebuild",
+        "root_dir": "/home/ben/Vs_Code_Projects/Projects/ALDE_Projekt/ALDE/alde",
+        "workers": 4,
+        "extensions": [
+          ".py"
+        ],
+        "recursive": true,
+        "cleanup_namespace_ids": [
+          "ns_repo_knowledge",
+          "ns_alde_default"
+        ],
+        "cleanup_object_names": [
+          "embedding",
+          "relation",
+          "entity",
+          "document"
+        ],
+        "cleanup_owner_prefixes": [
+          "blk:repo:"
+        ],
+        "delete_async": true,
+        "run_async": true,
+        "job_id": "repo-env-overrides-rebuild"
+      }
+    },
+    "status": {
+      "tool": "repo_knowledge_worker",
+      "arguments": {
+        "operation": "status",
+        "job_id": "repo-env-overrides-rebuild"
+      }
+    },
+    "status_preferred_defaults": {
+      "tool": "repo_knowledge_worker",
+      "arguments": {
+        "operation": "status",
+        "job_id": "repo-env-overrides-rebuild-preferred"
+      }
+    },
+    "status_fast_delta": {
+      "tool": "repo_knowledge_worker",
+      "arguments": {
+        "operation": "status",
+        "job_id": "repo-env-overrides-fast-delta"
+      }
+    },
+    "query_env_overrides": {
+      "tool": "adb_query",
+      "arguments": {
+        "query": "environment override AI_IDE",
+        "owner_types": [
+          "entity",
+          "relation"
+        ],
+        "namespace_id": "ns_repo_knowledge",
+        "limit": 20,
+        "use_vector": true
+      }
+    },
+    "route_to_xworker": {
+      "tool": "route_to_agent",
+      "arguments": {
+        "target_agent": "_xworker",
+        "tool_name": "repo_knowledge_worker",
+        "tools": [
+          "repo_knowledge_worker"
+        ],
+        "handoff_protocol": "agent_handoff_v1",
+        "handoff_payload": {
+          "operation": "build",
+          "root_dir": "/home/ben/Vs_Code_Projects/Projects/ALDE_Projekt/ALDE/alde",
+          "workers": 4,
+          "extensions": [
+            ".py"
+          ],
+          "recursive": true,
+          "run_async": false
+        }
+      }
+    }
+  }
+}

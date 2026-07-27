@@ -147,6 +147,60 @@ def _extract_tool_call_names(tool_calls: Any) -> list[str]:
     return names
 
 
+def _extract_pseudo_tool_call_payload(content: Any) -> dict[str, Any] | None:
+    text = str(content or "").strip()
+    if not text:
+        return None
+
+    if text.startswith("```"):
+        lines = text.splitlines()
+        if len(lines) >= 3 and lines[0].startswith("```") and lines[-1].strip() == "```":
+            text = "\n".join(lines[1:-1]).strip()
+
+    if not (text.startswith("{") and text.endswith("}")):
+        return None
+
+    try:
+        payload = json.loads(text)
+    except Exception:
+        return None
+
+    if not isinstance(payload, dict):
+        return None
+
+    tool_name = str(
+        payload.get("name")
+        or payload.get("function_name")
+        or payload.get("tool_name")
+        or payload.get("function")
+        or ""
+    ).strip()
+    if not tool_name:
+        return None
+
+    arguments = payload.get("arguments")
+    if arguments is None:
+        arguments = payload.get("args")
+    if arguments is None:
+        arguments = payload.get("parameters")
+    if isinstance(arguments, str):
+        arg_text = arguments.strip()
+        if arg_text.startswith("{") and arg_text.endswith("}"):
+            try:
+                arguments = json.loads(arg_text)
+            except Exception:
+                arguments = {}
+        else:
+            arguments = {}
+    if not isinstance(arguments, dict):
+        arguments = {}
+
+    return {
+        "name": tool_name,
+        "arguments": arguments,
+    }
+
+
 
 """
     '''
@@ -169,11 +223,142 @@ Citizen
     _HISTORY = ChatHistory()  # eager instantiation
     """
 
+def _normalize_github_models_base_url(base_url: Any) -> str:
+    text = str(base_url or "").strip()
+    if not text:
+        return "https://models.github.ai/inference"
+    lowered = text.rstrip("/").lower()
+    if lowered.startswith("https://github.com/models"):
+        return "https://models.github.ai/inference"
+    if lowered.startswith("https://models.github.ai/inference"):
+        return "https://models.github.ai/inference"
+    return text.rstrip("/")
+
+
+def _normalize_chat_model_name(model_name: Any, provider: str | None = None) -> str:
+    text = str(model_name or "").strip().lstrip("/")
+    if not text:
+        return ""
+    text = " ".join(text.split()).replace(" ", "-").lower()
+    provider_name = str(provider or os.getenv("AI_IDE_MODEL_PROVIDER") or "").strip().lower()
+    if provider_name in {"github", "github_models", "github-models"} and "/" not in text:
+        return f"openai/{text}"
+    return text
+
+
    # This is the main class that is used to generate a chat response
 class ChatCompletion():
 
     @staticmethod
+    def _provider_fallback_name(provider: str | None = None) -> str:
+            current_provider = str(provider or os.getenv("AI_IDE_MODEL_PROVIDER") or "").strip().lower()
+            configured_fallback = str(os.getenv("AI_IDE_MODEL_PROVIDER_FALLBACK") or "").strip().lower()
+            if configured_fallback:
+                return configured_fallback
+            if current_provider in {"github", "github_models", "github-models"}:
+                return "ollama"
+            return ""
+
+    @staticmethod
+    def _switch_chat_provider_profile(provider: str | None = None) -> bool:
+            fallback = ChatCompletion._provider_fallback_name(provider)
+            if not fallback:
+                return False
+
+            current_provider = str(provider or os.getenv("AI_IDE_MODEL_PROVIDER") or "").strip().lower()
+            if fallback == current_provider:
+                return False
+
+            os.environ["AI_IDE_MODEL_PROVIDER"] = fallback
+            try:
+                for cls_obj in (ChatCompletion, globals().get("ChatCom"), globals().get("ChatComE")):
+                    if cls_obj is None:
+                        continue
+                    try:
+                        cls_obj._close_clients()
+                    except Exception:
+                        try:
+                            if hasattr(cls_obj, "_client"):
+                                cls_obj._client = None  # type: ignore[attr-defined]
+                            if hasattr(cls_obj, "_http_client"):
+                                cls_obj._http_client = None  # type: ignore[attr-defined]
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+            ChatCompletion._apply_chat_provider_profile()
+            return True
+
+    @staticmethod
+    def _apply_chat_provider_profile() -> None:
+            provider = str(os.getenv("AI_IDE_MODEL_PROVIDER") or "").strip().lower()
+            if not provider:
+                return
+
+            def _set_if_value(env_name: str, value: Any) -> None:
+                text = str(value or "").strip().lstrip("/")
+                if text:
+                    os.environ[env_name] = text
+
+            if provider in {"ollama", "ollama_local", "local_ollama"}:
+                _set_if_value("OPENAI_BASE_URL", os.getenv("AI_IDE_OLLAMA_BASE_URL") or "http://127.0.0.1:11434/v1")
+                _set_if_value("OPENAI_API_KEY", os.getenv("AI_IDE_OLLAMA_API_KEY") or "ollama-local")
+                _set_if_value("AI_IDE_CHAT_MODEL", _normalize_chat_model_name(os.getenv("AI_IDE_OLLAMA_CHAT_MODEL") or "qwen2.5-coder:7b", provider=provider))
+                return
+
+            if provider in {"github", "github_models", "github-models"}:
+                _set_if_value(
+                    "OPENAI_BASE_URL",
+                    _normalize_github_models_base_url(
+                        os.getenv("AI_IDE_GITHUB_MODELS_BASE_URL")
+                        or os.getenv("AI_IDE_GITHUB_MODELS_URL")
+                        or "https://models.github.ai/inference"
+                    ),
+                )
+                _set_if_value(
+                    "OPENAI_API_KEY",
+                    os.getenv("AI_IDE_GITHUB_MODELS_API_KEY")
+                    or os.getenv("GITHUB_MODELS_API_KEY")
+                    or os.getenv("GITHUB_TOKEN")
+                    or os.getenv("GH_TOKEN"),
+                )
+                _set_if_value("AI_IDE_CHAT_MODEL", _normalize_chat_model_name(os.getenv("AI_IDE_GITHUB_CHAT_MODEL") or "openai/gpt-4.1-mini", provider=provider))
+                return
+
+            if provider in {"openai", "openai_cloud", "openai-api"}:
+                _set_if_value("OPENAI_BASE_URL", os.getenv("AI_IDE_OPENAI_BASE_URL") or os.getenv("OPENAI_BASE_URL"))
+                _set_if_value("OPENAI_API_KEY", os.getenv("AI_IDE_OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY"))
+                _set_if_value("AI_IDE_CHAT_MODEL", _normalize_chat_model_name(os.getenv("AI_IDE_OPENAI_CHAT_MODEL") or os.getenv("AI_IDE_CHAT_MODEL") or "gpt-4.1-mini", provider=provider))
+                return
+
+    @staticmethod
     def _read_api_key() -> str:
+            __root_env_json = Path(__file__).resolve().parents[1] / ".env.json"
+            __local_env_json = Path(__file__).with_suffix(".env.json")
+            for __json_file in (__root_env_json, __local_env_json):
+                if not __json_file.exists():
+                    continue
+                try:
+                    __payload = json.loads(__json_file.read_text(encoding="utf-8"))
+                except Exception:
+                    continue
+                __env_payload = __payload.get("env") if isinstance(__payload, dict) and isinstance(__payload.get("env"), dict) else __payload
+                if not isinstance(__env_payload, dict):
+                    continue
+                for __key, __value in __env_payload.items():
+                    __name = str(__key or "").strip()
+                    if not __name:
+                        continue
+                    if isinstance(__value, (dict, list)):
+                        __text = json.dumps(__value, ensure_ascii=False)
+                    else:
+                        __text = str(__value)
+                    if __text.strip() == "":
+                        continue
+                    if __name in {"AI_IDE_CHAT_MODEL", "AI_IDE_OLLAMA_CHAT_MODEL", "AI_IDE_GITHUB_CHAT_MODEL", "AI_IDE_OPENAI_CHAT_MODEL"}:
+                        __text = __text.strip().lstrip("/")
+                    os.environ.setdefault(__name, __text)
+
             __root_env = Path(__file__).resolve().parents[1] / ".env"
             __local_env = Path(__file__).with_suffix(".env")
 
@@ -183,10 +368,16 @@ class ChatCompletion():
                     break
 
             load_dotenv()                     # fallback
+            ChatCompletion._apply_chat_provider_profile()
             __key = os.getenv("OPENAI_API_KEY")
             if not __key:
+                __provider = str(os.getenv("AI_IDE_MODEL_PROVIDER") or "").strip().lower()
+                if __provider in {"github", "github_models", "github-models"}:
+                    raise RuntimeError(
+                        "GitHub Models key missing – set AI_IDE_GITHUB_MODELS_API_KEY or GITHUB_TOKEN (scope: models:read)."
+                    )
                 raise RuntimeError(
-                    "OPENAI_API_KEY not found – supply it via .env or environment."
+                    "OPENAI_API_KEY not found – supply it via .env.json/.env or environment."
                 )
             return __key
     
@@ -243,7 +434,12 @@ class ChatCompletion():
                 except Exception:
                     cls._http_client = None
 
-            cls._client = OpenAI(api_key=cls._read_api_key(), http_client=cls._http_client)
+            _api_key = cls._read_api_key()
+            _base_url = str(os.getenv("OPENAI_BASE_URL") or "").strip()
+            if _base_url:
+                cls._client = OpenAI(api_key=_api_key, base_url=_base_url, http_client=cls._http_client)
+            else:
+                cls._client = OpenAI(api_key=_api_key, http_client=cls._http_client)
 
             try:
                 if atexit is not None:
@@ -1738,11 +1934,15 @@ class ChatCom(ChatCompletion,ChatHistory):
            
             """Return the full OpenAI response (choices/tool_calls live here)."""
             # Ensure we pass the object list expected by the API (not a single string).
+            attempted_provider_fallback = False
             try:
-                model = (_agent_cfg.get("model") if isinstance(_agent_cfg, dict) else None) or self._model
+                env_model = str(os.getenv("AI_IDE_CHAT_MODEL") or "").strip()
+                explicit_model = str(getattr(self, "_model", "") or "").strip().lstrip("/")
+                config_model = str((_agent_cfg.get("model") if isinstance(_agent_cfg, dict) else "") or "").strip().lstrip("/")
+                model = explicit_model or env_model or config_model or "qwen2.5-coder:7b"
                 print(f"Using model: {model}")
             except Exception:
-                model ='123456'
+                model = str(os.getenv("AI_IDE_CHAT_MODEL") or "").strip().lstrip("/") or "qwen2.5-coder:7b"
 
 
             try:
@@ -1758,6 +1958,8 @@ class ChatCom(ChatCompletion,ChatHistory):
                     tools = get_agent_tools(_agent_cfg.get("tools") )
                 except Exception:
                     tools = None
+
+            model = _normalize_chat_model_name(model, provider=os.getenv("AI_IDE_MODEL_PROVIDER"))
            
             try:
                 _chat.log(
@@ -1779,6 +1981,32 @@ class ChatCom(ChatCompletion,ChatHistory):
                     tool_choice="auto",
                 )
             except Exception as exc:
+                err_text = str(exc)
+                base_url = str(os.getenv("OPENAI_BASE_URL") or "").strip().lower()
+                is_ollama_endpoint = "127.0.0.1:11434" in base_url or "localhost:11434" in base_url
+                should_retry_without_tools = bool(tools) and is_ollama_endpoint and "invalid request" in err_text.lower()
+                if should_retry_without_tools:
+                    try:
+                        _chat.log(
+                            _role="tool",
+                            _content="openai.chat.completions.create retry_without_tools",
+                            _obj="model",
+                            _data={"model": model, "error": err_text},
+                            _thread_name="model",
+                            _name_tool="openai.chat.completions.create",
+                        )
+                    except Exception:
+                        pass
+                    response = self._get_client().chat.completions.create(
+                        model=model,
+                        messages=_input,
+                    )
+                    return response
+                if not attempted_provider_fallback and any(token in err_text.lower() for token in ("no_access", "unknown_model")):
+                    if ChatCompletion._switch_chat_provider_profile(str(os.getenv("AI_IDE_MODEL_PROVIDER") or "")):
+                        attempted_provider_fallback = True
+                        tools = None
+                        return _response(_input)
                 try:
                     _chat.log(
                         _role="tool",
@@ -1818,9 +2046,12 @@ class ChatCom(ChatCompletion,ChatHistory):
             try:
                 _resp = _response(_input)
             except Exception as exc:
+                active_model = str(getattr(self, "_model", "") or "").strip() or "(unset)"
+                active_base_url = str(os.getenv("OPENAI_BASE_URL") or "(default OpenAI)").strip()
                 err_text = (
                     "OpenAI chat call failed: "
-                    f"{exc}. Check OPENAI_API_KEY and network connectivity."
+                    f"{exc}. model={active_model} base_url={active_base_url}. "
+                    "Check OPENAI_API_KEY, OPENAI_BASE_URL, and model availability."
                 )
                 self.assistant_msg_content = err_text
                 self.assistant_msg = SimpleNamespace(content=err_text, tool_calls=None)
@@ -1834,6 +2065,46 @@ class ChatCom(ChatCompletion,ChatHistory):
                 return
             self.assistant_msg = _resp.choices[0].message
             self.assistant_msg_content = (getattr(self.assistant_msg, 'content', '') or "")
+
+            if not getattr(self.assistant_msg, 'tool_calls', None):
+                pseudo_tool_call = _extract_pseudo_tool_call_payload(self.assistant_msg_content)
+                available_tool_names = set(_extract_tool_names(tools)) if isinstance(tools, list) else set()
+
+                if pseudo_tool_call and available_tool_names:
+                    pseudo_name = str(pseudo_tool_call.get("name") or "").strip()
+                    pseudo_arguments = pseudo_tool_call.get("arguments") if isinstance(pseudo_tool_call.get("arguments"), dict) else {}
+
+                    if pseudo_name in available_tool_names:
+                        synthetic_tool_call = SimpleNamespace(
+                            id=f"pseudo_call_{int(time.time() * 1000)}",
+                            type="function",
+                            function=SimpleNamespace(
+                                name=pseudo_name,
+                                arguments=json.dumps(pseudo_arguments, ensure_ascii=False),
+                            ),
+                        )
+                        self.assistant_msg = SimpleNamespace(content="", tool_calls=[synthetic_tool_call])
+                        self.assistant_msg_content = ""
+                    else:
+                        try:
+                            retry_model = _normalize_chat_model_name(getattr(self, "_model", "") or os.getenv("AI_IDE_CHAT_MODEL") or "qwen2.5-coder:7b", provider=os.getenv("AI_IDE_MODEL_PROVIDER"))
+                            plain_text_retry = self._get_client().chat.completions.create(
+                                model=retry_model,
+                                messages=[
+                                    *_input,
+                                    {
+                                        "role": "system",
+                                        "content": (
+                                            "Answer as plain text only. "
+                                            "Do not output JSON tool/function call objects."
+                                        ),
+                                    },
+                                ],
+                            )
+                            self.assistant_msg = plain_text_retry.choices[0].message
+                            self.assistant_msg_content = (getattr(self.assistant_msg, 'content', '') or "")
+                        except Exception:
+                            pass
 
         #print(f"USER INPUT:\n\n{_msg_user_text}\n\nMODEL RESPONSE\n\n{self.assistant_msg_content}")
         # -------------------------------------- log response to context cache -
@@ -2088,7 +2359,7 @@ class ChatComE(ChatCompletion,ChatHistory):
             tools:list[dict],
             tool_choice:str
             ):
-            self.model:str = _model
+            self.model:str = _normalize_chat_model_name(_model or os.getenv("AI_IDE_CHAT_MODEL") or "qwen2.5-coder:7b", provider=os.getenv("AI_IDE_MODEL_PROVIDER"))
             self._messages:list = _messages
             self.tools:list[dict] = tools
             self.tool_choice:str = tool_choice
@@ -2110,7 +2381,7 @@ class ChatComE(ChatCompletion,ChatHistory):
             #self.file = file 
             self.editor = "editor"
             self.model 
-            self.client = OpenAI(api_key= api_key)
+            self.client = self._get_client()
             """self.messages_chat.append([
                        {
                  "role":"system", "content":self.system_message
@@ -2128,6 +2399,16 @@ class ChatComE(ChatCompletion,ChatHistory):
        
         def _response(self):
                 tool_choice = getattr(self, "tool_choice", None) or "auto"
+                if _verbose_terminal_logs_enabled():
+                    print(
+                        "FOLLOWUP CHAT RESPONSE MODEL:",
+                        {
+                            "model": self.model,
+                            "provider": os.getenv("AI_IDE_MODEL_PROVIDER"),
+                            "base_url": os.getenv("OPENAI_BASE_URL"),
+                            "client_base_url": str(getattr(self.client, "base_url", "")),
+                        },
+                    )
                 try:
                     self.log(
                         _role="tool",
@@ -2147,6 +2428,23 @@ class ChatComE(ChatCompletion,ChatHistory):
                         tool_choice=tool_choice,
                     )
                 except Exception as exc:
+                    err_text = str(exc)
+                    base_url = str(os.getenv("OPENAI_BASE_URL") or "").strip().lower()
+                    is_ollama_endpoint = "127.0.0.1:11434" in base_url or "localhost:11434" in base_url
+                    should_retry_without_tools = bool(self.tools) and is_ollama_endpoint and "invalid request" in err_text.lower()
+                    if should_retry_without_tools:
+                        self.response = self.client.chat.completions.create(
+                            model=self.model,
+                            messages=self._messages,
+                        )
+                        return self.response
+                    if any(token in err_text.lower() for token in ("no_access", "unknown_model")):
+                        if ChatCompletion._switch_chat_provider_profile(str(os.getenv("AI_IDE_MODEL_PROVIDER") or "")):
+                            self.client = self._get_client()
+                            self.model = _normalize_chat_model_name(os.getenv("AI_IDE_CHAT_MODEL") or self.model, provider=os.getenv("AI_IDE_MODEL_PROVIDER")) or self.model
+                            self.tools = []
+                            self.tool_choice = "none"
+                            return self._response()
                     try:
                         self.log(
                             _role="tool",

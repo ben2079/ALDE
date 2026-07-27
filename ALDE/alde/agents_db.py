@@ -3042,16 +3042,20 @@ class AgentDbSocketServerService:
     @classmethod
     def load_from_env(cls) -> AgentDbSocketServerService:
         connection_config = _load_agentsdb_connection_config()
-        backend_uri = str(
-            os.getenv("AI_IDE_KNOWLEDGE_AGENTS_DB_BACKEND_URI", "")
-            or os.getenv("AI_IDE_KNOWLEDGE_AGENTS_DB_URI", ""),
-        ).strip()
+        backend_uri = str(os.getenv("AI_IDE_KNOWLEDGE_AGENTS_DB_BACKEND_URI", "")).strip()
+        if not backend_uri:
+            fallback_uri = str(os.getenv("AI_IDE_KNOWLEDGE_AGENTS_DB_URI", "")).strip()
+            if fallback_uri and not _is_agentsdb_socket_uri(fallback_uri):
+                backend_uri = fallback_uri
         if not backend_uri:
             backend_uri = _connection_config_value(connection_config, ("backend_uri", "agents_db_backend_uri", "storage_uri", "storage_backend_uri"))
+        if _is_agentsdb_socket_uri(backend_uri):
+            backend_uri = "agentsmem://local"
         if not backend_uri:
             backend_uri = "agentsmem://local"
         memory_image_path = str(
             os.getenv("AI_IDE_KNOWLEDGE_AGENTS_DB_MEMORY_IMAGE_PATH", "")
+            or os.getenv("AI_IDE_KNOWLEDGE_AGENTS_IMAGE_PATH", "")
             or os.getenv("AI_IDE_KNOWLEDGE_AGENTS_DB_FLUSH_IMAGE_PATH", "")
             or os.path.join("AppData", "agentsdb.json"),
         ).strip()

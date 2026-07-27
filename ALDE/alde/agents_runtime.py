@@ -876,7 +876,7 @@ JOB_PROMPTS: dict[str, dict[str, Any]] = {
         },
         "output_schema": {
             "ok": True,
-            "operation": "scan|build|cleanup|delete|rebuild|status|repair_namespace",
+            "operation": "scan|delta_build|build|cleanup|delete|rebuild|status|repair_namespace",
             "async": False,
             "job_id": None,
             "status": "queued|running|completed|failed",
@@ -1018,7 +1018,7 @@ JOB_PROMPTS: dict[str, dict[str, Any]] = {
             "target_agent": "_xworker",
             "job_name": "adb_worker",
             "tool_name": "repo_knowledge_worker",
-            "operation": "scan|build|cleanup|delete|rebuild|status|repair_namespace",
+            "operation": "scan|delta_build|build|cleanup|delete|rebuild|status|repair_namespace",
             "run_async": True,
             "max_agents": 4,
             "job_id": "repo-job-...",
@@ -1213,7 +1213,7 @@ JOB_CONFIGS: dict[str, dict[str, Any]] = {
             },
         },
     },
-  
+
     "mail_agent_runtime": {
         "runtime_agent": "_xworker",
         "skill_profile": "xworker_mail_agent_runtime",
@@ -1308,6 +1308,7 @@ def _tool_skill_profiles_for_agent(agent_label: str) -> dict[str, str]:
         "upsert_object_record": "xworker_dispatch",
         "ingest_object": "xworker_dispatch",
         "store_object_result": "xworker_dispatch",
+        "agent_xworker_tree_upsert": "xworker_dispatch",
         "adb_operation": "xworker_core",
         "relation_graph_view": "xworker_graph_view_service",
         "relation_graph_analysis": "xworker_graph_analysis_service",
@@ -1366,6 +1367,7 @@ AGENT_RUNTIME: dict[str, dict[str, Any]] = {
             "route_to_agent",
             "execute_action_request",
             "upsert_object_record",
+            "agent_xworker_tree_upsert",
             "ingest_object",
             "store_object_result",
             "adb_operation",
@@ -2102,7 +2104,7 @@ TOOL_CONFIGS: list[dict[str, Any]] = [
         "name": "repo_knowledge_worker",
         "description": "Scan, cleanup, rebuild, and async-run repository knowledge as AgentsDB document, entity, relation, and embedding objects.",
         "parameters": [
-            {"name": "operation", "type": "string", "description": "Operation to run: scan|build|cleanup|delete|rebuild|status|repair_namespace.", "required": True, "enum": ["scan", "build", "cleanup", "delete", "rebuild", "status", "repair_namespace"]},
+            {"name": "operation", "type": "string", "description": "Operation to run: scan|delta_build|build|cleanup|delete|rebuild|status|repair_namespace.", "required": True, "enum": ["scan", "delta_build", "build", "cleanup", "delete", "rebuild", "status", "repair_namespace"]},
             {"name": "root_dir", "type": "string", "description": "Repository root directory to parse. Default: current ALDE workspace root."},
             {"name": "image_path", "type": "string", "description": "Optional snapshot path when the runtime falls back to an in-memory AgentsDB backend."},
             {"name": "workers", "type": "integer", "description": "Number of indexing workers.", "default": 4},
@@ -2340,6 +2342,16 @@ TOOL_CONFIGS: list[dict[str, Any]] = [
         ],
     },
     {
+        "name": "agent_xworker_tree_upsert",
+        "description": "Upsert a key/value entry in the active explorer tree, preserving structured dict/list values so the Tree Explorer stays editable.",
+        "parameters": [
+            {"name": "section_name", "type": "string", "description": "Explorer section to update, such as ENV or DATABASES.", "required": True},
+            {"name": "key", "type": "string", "description": "Tree item key to add or replace.", "required": True},
+            {"name": "value", "type": "object", "description": "Structured value or JSON-like payload to store in the tree.", "required": True},
+            {"name": "persist", "type": "boolean", "description": "Persist the change to the configured backend and projections.", "required": False, "default": True},
+        ],
+    },
+    {
         "name": "store_object_result",
         "description": "Persist a normalized or parser-style object result directly into the selected object store.",
         "parameters": [
@@ -2434,6 +2446,10 @@ TOOL_NAMES: dict[str, str] = {
     "store_profile_result": "store_object_result",
     "store_document_result": "store_object_result",
     "upsert_object_record": "upsert_object_record",
+    "agent.xworker.tree.upsert": "agent_xworker_tree_upsert",
+    "agent_xworker_tree_upsert": "agent_xworker_tree_upsert",
+    "agent.xworker.tree.upsert": "agent_xworker_tree_upsert",
+    "agent_xworker_tree_upsert": "agent_xworker_tree_upsert",
     "upsert_dispatcher_job_record": "upsert_object_record",
     "upsert_job_record": "upsert_object_record",
     "batch_document_generator": "dispatch_documents",
@@ -2499,7 +2515,7 @@ TOOL_GROUPS: dict[str, list[str]] = {
     "web": ["fetch_url", "fetch_data", "call_api"],
     "comms": ["send_mail", "run_mail_agent", "calendar", "call", "accept_call", "reject_call"],
     "code": ["code_tool", "iter_documents"],
-    "dispatcher": ["dispatch_documents", "execute_action_request", "upsert_object_record", "ingest_object", "store_object_result", "vdb_worker", "repo_knowledge_worker"],
+    "dispatcher": ["dispatch_documents", "execute_action_request", "upsert_object_record", "agent_xworker_tree_upsert", "ingest_object", "store_object_result", "vdb_worker", "repo_knowledge_worker"],
     "agentdb": ["adb_operation", "relation_graph_view", "relation_graph_analysis", "repo_knowledge_worker", "adb_query"],
     "repo_knowledge": ["adb_operation", "relation_graph_view", "relation_graph_analysis", "repo_knowledge_worker", "adb_query", "load_context"],
 }

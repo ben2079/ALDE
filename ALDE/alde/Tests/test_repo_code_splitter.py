@@ -519,6 +519,112 @@ class TestRepoCodeSplitter(unittest.TestCase):
             self.assertIn("defines_class", {entity.get("is_relational") for entity in target_entities})
             self.assertIn("imports_module", {entity.get("is_relational") for entity in target_entities})
 
+    def test_repo_module_parser_extracts_environment_override_entities(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            module_path = root / "env_sample.py"
+            module_path.write_text(
+                "\n".join(
+                    [
+                        "import os",
+                        "from os import getenv as env_get",
+                        "",
+                        "API_KEY = os.getenv('AI_IDE_API_KEY')",
+                        "EMBED_MODEL = os.getenv('AI_IDE_EMBEDDING_MODEL', 'text-embedding-3-large')",
+                        "SOCKET_TIMEOUT = os.environ.get('AI_IDE_SOCKET_TIMEOUT_SECONDS', 30)",
+                        "REQUIRED_NAMESPACE = os.environ['AI_IDE_NAMESPACE_ID']",
+                        "ALT = env_get('AI_IDE_ALT_ENDPOINT')",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            parser = RepoModuleParser()
+            payload = parser.parse_object(str(module_path), repo_root=str(root))
+
+            entity_objects = list(payload.get("entity_objects") or [])
+            env_entities = [
+                entity for entity in entity_objects if entity.get("entity_type") == "environment_override"
+            ]
+            env_names = {entity.get("canonical_name") for entity in env_entities}
+            module_entities = [entity for entity in entity_objects if entity.get("entity_type") == "module"]
+            self.assertEqual(len(module_entities), 1)
+
+            self.assertIn("AI_IDE_API_KEY", env_names)
+            self.assertIn("AI_IDE_EMBEDDING_MODEL", env_names)
+            self.assertIn("AI_IDE_SOCKET_TIMEOUT_SECONDS", env_names)
+            self.assertIn("AI_IDE_NAMESPACE_ID", env_names)
+            self.assertIn("AI_IDE_ALT_ENDPOINT", env_names)
+
+            for env_entity in env_entities:
+                self.assertEqual(env_entity.get("is_relational"), "uses_environment_override")
+                self.assertEqual(env_entity.get("source_entity"), "subject")
+                attributes = env_entity.get("attributes") if isinstance(env_entity.get("attributes"), dict) else {}
+                self.assertTrue(int(attributes.get("occurrence_count") or 0) >= 1)
+                self.assertIsInstance(attributes.get("access_paths") or [], list)
+
+            module_attributes = module_entities[0].get("attributes") if isinstance(module_entities[0].get("attributes"), dict) else {}
+            self.assertGreaterEqual(int(module_attributes.get("environment_override_count") or 0), 5)
+            self.assertGreaterEqual(int(module_attributes.get("environment_override_occurrence_count") or 0), 5)
+            self.assertIsInstance(module_attributes.get("environment_override_names") or [], list)
+            self.assertIn("AI_IDE_NAMESPACE_ID", set(module_attributes.get("environment_override_names") or []))
+            self.assertIsInstance(module_attributes.get("environment_overrides") or [], list)
+
+            parse_payload = payload.get("parse") if isinstance(payload.get("parse"), dict) else {}
+            self.assertGreaterEqual(int(parse_payload.get("environment_override_count") or 0), 5)
+
+    def test_index_repo_includes_environment_override_relations_and_embeddings(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            (root / "env_index.py").write_text(
+                "\n".join(
+                    [
+                        "import os",
+                        "",
+                        "def build_runtime():",
+                        "    model = os.getenv('AI_IDE_EMBEDDING_MODEL', 'text-embedding-3-large')",
+                        "    ns = os.environ['AI_IDE_NAMESPACE_ID']",
+                        "    return model, ns",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            repo = AgentDbInMemoryRepository(str(root / "agentsdb_env_image.json"))
+            repo.ensure_index_objects()
+            knowledge_service = KnowledgeObjectService(repo)
+            embedding_service = _FakeEmbeddingService()
+            service = RepoIndexService(
+                repo,
+                knowledge_service,
+                embedding_service,
+                workers=1,
+                runtime_config=_build_default_runtime_config(),
+            )
+
+            report = service.index_repo_object(str(root), extensions=(".py",))
+
+            self.assertEqual(report["files_found"], 1)
+
+            entities = repo.load_objects("entity", limit=200)
+            relations = repo.load_objects("relation", limit=200)
+            env_entities = [entity for entity in entities if entity.get("entity_type") == "environment_override"]
+            env_entity_ids = {str(entity.get("_id") or entity.get("id") or "") for entity in env_entities}
+            env_relations = [
+                relation
+                for relation in relations
+                if relation.get("relation_type") == "uses_environment_override"
+                and str(relation.get("target_entity_id") or "") in env_entity_ids
+            ]
+
+            self.assertGreaterEqual(len(env_entities), 2)
+            self.assertGreaterEqual(len(env_relations), 2)
+
+            embedded_entity_ids = {
+                owner_id for owner_type, owner_id in embedding_service.calls if owner_type == "entity"
+            }
+            self.assertTrue(env_entity_ids.issubset(embedded_entity_ids))
+
     def test_format_repo_knowledge_chunks_includes_relation_description(self) -> None:
         chunks = repo_code_splitter_mod._format_repo_knowledge_chunks(
             [
@@ -845,6 +951,88 @@ class TestRepoCodeSplitter(unittest.TestCase):
             self.assertEqual(normalized.namespace_id, "ns_repo_knowledge")
             self.assertEqual(normalized.namespace_slug, "repo-knowledge")
             self.assertEqual(normalized.namespace_name, "ALDE Repository Knowledge")
+
+    def test_repo_knowledge_worker_delta_build_indexes_only_changed_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            (root / "alpha.py").write_text("VALUE = 1\n", encoding="utf-8")
+            (root / "beta.py").write_text("VALUE = 2\n", encoding="utf-8")
+
+            image_path = str(root / "agentsdb_delta_build_image.json")
+            delta_state_path = str(root / "repo_delta_state.json")
+
+            def _fake_index_object(self, source_path: str, *, repo_root: str) -> dict[str, object]:
+                rel_path = str(Path(source_path).relative_to(repo_root))
+                return {
+                    "path": source_path,
+                    "doc_id": f"doc:fake:{rel_path}",
+                    "blocks": 1,
+                    "entities": 1,
+                    "relations": 1,
+                    "embedded": 3,
+                    "skipped": False,
+                }
+
+            with patch.dict("os.environ", {"ALDE_REPO_INDEX_STATE_PATH": delta_state_path}, clear=False), patch(
+                "alde.repo_code_splitter.load_agentsdb_runtime_config_from_env", return_value=None
+            ), patch.object(repo_code_splitter_mod.RepoIndexService, "index_object", _fake_index_object):
+                first_result = repo_knowledge_worker(
+                    "delta_build",
+                    root_dir=str(root),
+                    image_path=image_path,
+                    workers=1,
+                    extensions=[".py"],
+                    recursive=True,
+                )
+
+                second_result = repo_knowledge_worker(
+                    "delta_build",
+                    root_dir=str(root),
+                    image_path=image_path,
+                    workers=1,
+                    extensions=[".py"],
+                    recursive=True,
+                )
+
+                (root / "beta.py").write_text("VALUE = 20\n", encoding="utf-8")
+
+                third_result = repo_knowledge_worker(
+                    "delta_build",
+                    root_dir=str(root),
+                    image_path=image_path,
+                    workers=1,
+                    extensions=[".py"],
+                    recursive=True,
+                )
+
+            self.assertTrue(first_result["ok"])
+            self.assertEqual(first_result["operation"], "delta_build")
+            self.assertEqual(int(first_result.get("files_found", 0)), 2)
+            self.assertEqual(int(first_result.get("files_changed", 0)), 2)
+            self.assertEqual(int(first_result.get("files_unchanged", 0)), 0)
+            self.assertEqual(int(first_result.get("files_input", 0)), 2)
+            self.assertEqual(int(first_result.get("files_indexed", 0)), 2)
+
+            self.assertTrue(second_result["ok"])
+            self.assertEqual(second_result["operation"], "delta_build")
+            self.assertEqual(int(second_result.get("files_found", 0)), 2)
+            self.assertEqual(int(second_result.get("files_changed", 0)), 0)
+            self.assertEqual(int(second_result.get("files_unchanged", 0)), 2)
+            self.assertEqual(int(second_result.get("files_input", 0)), 0)
+            self.assertEqual(int(second_result.get("files_indexed", 0)), 0)
+
+            self.assertTrue(third_result["ok"])
+            self.assertEqual(third_result["operation"], "delta_build")
+            self.assertEqual(int(third_result.get("files_found", 0)), 2)
+            self.assertEqual(int(third_result.get("files_changed", 0)), 1)
+            self.assertEqual(int(third_result.get("files_unchanged", 0)), 1)
+            self.assertEqual(int(third_result.get("files_input", 0)), 1)
+            self.assertEqual(int(third_result.get("files_indexed", 0)), 1)
+
+            delta_state = third_result.get("delta_state") if isinstance(third_result, dict) else {}
+            self.assertIsInstance(delta_state, dict)
+            self.assertTrue(delta_state.get("ok"))
+            self.assertTrue(Path(delta_state_path).is_file())
 
     def test_repo_knowledge_worker_cleanup_deletes_repo_embeddings_only(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:

@@ -24,6 +24,11 @@ from dataclasses import dataclass, field
 import multiprocessing
 from copy import deepcopy
 
+try:
+    from PySide6.QtWidgets import QApplication
+except Exception:
+    QApplication = None  # type: ignore[assignment]
+
 
 _THIS_MODULE = sys.modules.get(__name__)
 if _THIS_MODULE is not None:
@@ -92,6 +97,95 @@ def _noop_sync_retrieval_run_to_agentsdb_knowledge(**_: Any) -> None:
 
 def _noop_sync_parser_result_to_agentsdb_knowledge(**_: Any) -> None:
     return None
+
+
+def _parse_tree_upsert_value(value: Any) -> Any:
+    if not isinstance(value, str):
+        return value
+
+    stripped_value = value.strip()
+    if not stripped_value:
+        return value
+
+    candidate_payload_list = [stripped_value]
+    if len(stripped_value) >= 2 and stripped_value[0] == stripped_value[-1] and stripped_value[0] in {"'", '"'}:
+        candidate_payload_list.append(stripped_value[1:-1].strip())
+
+    for candidate_payload in candidate_payload_list:
+        if not candidate_payload:
+            continue
+        if not (
+            (candidate_payload.startswith("{") and candidate_payload.endswith("}"))
+            or (candidate_payload.startswith("[") and candidate_payload.endswith("]"))
+        ):
+            continue
+        try:
+            parsed_payload = json.loads(candidate_payload)
+        except Exception:
+            continue
+        if isinstance(parsed_payload, (dict, list)):
+            return parsed_payload
+
+    return value
+
+
+def _find_active_explorer_window() -> Any | None:
+    if QApplication is None:
+        return None
+
+    app = QApplication.instance()
+    if app is None:
+        return None
+
+    for top_level_widget in app.topLevelWidgets():
+        upsert_callable = getattr(top_level_widget, "_upsert_explorer_item", None)
+        explorer_widget = getattr(top_level_widget, "explorer", None)
+        explorer_add_callable = getattr(explorer_widget, "add_to_section", None) if explorer_widget is not None else None
+        if callable(upsert_callable) or callable(explorer_add_callable):
+            return top_level_widget
+    return None
+
+
+def agent_xworker_tree_upsert(
+    section_name: str,
+    key: str,
+    value: Any,
+    persist: bool = True,
+) -> str:
+    normalized_section_name = str(section_name or "").strip().upper()
+    normalized_key = str(key or "").strip()
+    if not normalized_section_name or not normalized_key:
+        return json.dumps({"ok": False, "error": "missing_section_or_key"}, ensure_ascii=False)
+
+    parsed_value = _parse_tree_upsert_value(value)
+    window = _find_active_explorer_window()
+    if window is None:
+        return json.dumps({"ok": False, "error": "explorer_window_unavailable"}, ensure_ascii=False)
+
+    explorer_widget = getattr(window, "explorer", None)
+    add_to_section = getattr(explorer_widget, "add_to_section", None) if explorer_widget is not None else None
+    upsert_callable = getattr(window, "_upsert_explorer_item", None)
+
+    try:
+        if callable(add_to_section):
+            add_to_section(normalized_section_name, normalized_key, parsed_value, persist=bool(persist))
+        elif callable(upsert_callable):
+            upsert_callable(normalized_section_name, normalized_key, parsed_value)
+        else:
+            return json.dumps({"ok": False, "error": "explorer_upsert_unavailable"}, ensure_ascii=False)
+    except Exception as exc:
+        return json.dumps({"ok": False, "error": "tree_upsert_failed", "detail": str(exc)}, ensure_ascii=False)
+
+    return json.dumps(
+        {
+            "ok": True,
+            "section_name": normalized_section_name,
+            "key": normalized_key,
+            "persist": bool(persist),
+            "value_type": type(parsed_value).__name__,
+        },
+        ensure_ascii=False,
+    )
 
 
 try:
@@ -1061,6 +1155,58 @@ def _payload_value(payload: dict[str, Any], key: str) -> Any:
 def _agentsdb_pipeline_strict_mode() -> bool:
     value = str(os.getenv("AI_IDE_AGENTS_DB_PIPELINE_STRICT", "1")).strip().lower()
     return value not in {"0", "false", "no", "off"}
+
+
+def _agentsdb_sources_config_payload() -> tuple[dict[str, Any] | list[Any] | None, bool]:
+    raw_payload = ""
+    for env_name in ("AI_IDE_AGENTS_DB_SOURCES", "AI_IDE_AGENTS_DB_SOURCES_JSON"):
+        candidate = str(os.getenv(env_name, "") or "").strip()
+        if candidate:
+            raw_payload = candidate
+            break
+    if not raw_payload:
+        return None, False
+
+    try:
+        parsed_payload = json.loads(raw_payload)
+    except Exception:
+        return None, True
+
+    if isinstance(parsed_payload, (dict, list)):
+        return parsed_payload, True
+    return None, True
+
+
+def _agentsdb_pipeline_strict_enforced_mode() -> bool:
+    if not _agentsdb_pipeline_strict_mode():
+        return False
+    parsed_payload, has_config = _agentsdb_sources_config_payload()
+    if isinstance(parsed_payload, dict) and "strict" in parsed_payload:
+        strict_value = str(parsed_payload.get("strict") or "").strip().lower()
+        if strict_value:
+            return strict_value in {"1", "true", "yes", "on", "strict"}
+        return bool(parsed_payload.get("strict"))
+    return has_config
+
+
+def _agentsdb_strict_import_source_allowlist() -> set[str]:
+    parsed_payload, _has_config = _agentsdb_sources_config_payload()
+    if not isinstance(parsed_payload, dict):
+        return set()
+
+    allowlist_payload = parsed_payload.get("allowlist") if isinstance(parsed_payload.get("allowlist"), dict) else {}
+    raw_allowlist_values = (
+        allowlist_payload.get("import_sources")
+        if isinstance(allowlist_payload.get("import_sources"), (list, tuple, set))
+        else parsed_payload.get("import_sources")
+    )
+    if not isinstance(raw_allowlist_values, (list, tuple, set)):
+        return set()
+    return {
+        str(source_name).strip().lower()
+        for source_name in raw_allowlist_values
+        if str(source_name).strip()
+    }
 
 
 class DocumentRepository:
@@ -3465,6 +3611,17 @@ class RequestObjectResolutionService:
         file_sources: set[str] | None = None,
         inline_sources: set[str] | None = None,
     ) -> dict[str, set[str]]:
+        if _agentsdb_pipeline_strict_enforced_mode():
+            strict_store_sources = self._normalize_source_set(store_sources or set(spec.store_sources))
+            strict_allowlist = _agentsdb_strict_import_source_allowlist()
+            if strict_allowlist:
+                strict_store_sources = strict_store_sources.intersection(strict_allowlist)
+            return {
+                "result": set(),
+                "store": strict_store_sources,
+                "file": set(),
+                "inline": set(),
+            }
         return {
             "result": self._normalize_source_set(spec.result_sources),
             "store": self._normalize_source_set(store_sources or set(spec.store_sources)),
@@ -3790,6 +3947,8 @@ class RequestObjectResolutionService:
         result = DOCUMENT_REPOSITORY.get_document(correlation_id, db_path=db_path, obj_name=obj_name)
         if isinstance(result, dict):
             return result
+        if _agentsdb_pipeline_strict_enforced_mode():
+            return None
         return self._load_result_from_legacy_db_file(
             correlation_id=correlation_id,
             obj_name=obj_name,
@@ -3797,6 +3956,8 @@ class RequestObjectResolutionService:
         )
 
     def load_result_from_file(self, *, source_path: str, obj_name: str) -> dict[str, Any] | None:
+        if _agentsdb_pipeline_strict_enforced_mode():
+            return None
         resolved_path = os.path.abspath(os.path.expanduser(source_path))
         if not os.path.isfile(resolved_path):
             return None
@@ -7978,6 +8139,7 @@ _TOOL_IMPLEMENTATIONS: dict[str, Callable | None] = {
     "call": call,
     "accept_call": accept_call,
     "reject_call": reject_call,
+    "agent_xworker_tree_upsert": agent_xworker_tree_upsert,
     "route_to_agent": None,
 }
 

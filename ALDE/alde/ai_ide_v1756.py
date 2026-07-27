@@ -37,9 +37,164 @@ _projects_root = os.path.dirname(_workspace_root)
 if _projects_root not in sys.path:
     sys.path.insert(0, _projects_root)
 
+try:
+    from dotenv import load_dotenv as _bootstrap_load_dotenv  # type: ignore
+except Exception:
+    def _bootstrap_load_dotenv(*_args, **_kwargs):
+        return False
+
+
+_STARTUP_ENV_NAME_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _stringify_startup_env_value(value: object) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return "1" if value else "0"
+    if isinstance(value, (str, int, float)):
+        return str(value)
+    try:
+        return json.dumps(value, ensure_ascii=False)
+    except Exception:
+        return str(value)
+
+
+def _extract_startup_env_mapping(payload: object) -> dict[str, object]:
+    if not isinstance(payload, dict):
+        return {}
+
+    env_payload = payload.get("env")
+    if not isinstance(env_payload, dict):
+        env_payload = payload.get("environment")
+
+    if not isinstance(env_payload, dict):
+        sections_payload = payload.get("sections")
+        if isinstance(sections_payload, dict):
+            derived_mapping: dict[str, object] = {}
+            for section_payload in sections_payload.values():
+                if not isinstance(section_payload, dict):
+                    continue
+                for raw_name, raw_field_payload in section_payload.items():
+                    env_name = str(raw_name or "").strip()
+                    if not env_name or _STARTUP_ENV_NAME_PATTERN.fullmatch(env_name) is None:
+                        continue
+                    if isinstance(raw_field_payload, dict):
+                        if not bool(raw_field_payload.get("enabled", True)):
+                            continue
+                        derived_mapping[env_name] = raw_field_payload.get("value")
+                    else:
+                        derived_mapping[env_name] = raw_field_payload
+            env_payload = derived_mapping
+        else:
+            env_payload = payload
+
+    normalized_mapping: dict[str, object] = {}
+    for raw_name, raw_value in env_payload.items():
+        env_name = str(raw_name or "").strip()
+        if not env_name or _STARTUP_ENV_NAME_PATTERN.fullmatch(env_name) is None:
+            continue
+        normalized_mapping[env_name] = raw_value
+    return normalized_mapping
+
+
+def _load_structured_startup_env_file(env_path: Path) -> bool:
+    suffix = str(env_path.suffix or "").strip().lower()
+    if suffix not in {".json", ".yaml", ".yml", ".toml"}:
+        return False
+
+    try:
+        file_text = env_path.read_text(encoding="utf-8")
+    except Exception:
+        return False
+
+    parsed_payload: object
+    if suffix == ".json":
+        try:
+            parsed_payload = json.loads(file_text)
+        except Exception:
+            return False
+    elif suffix in {".yaml", ".yml"}:
+        try:
+            import yaml  # type: ignore
+        except Exception:
+            return False
+        try:
+            parsed_payload = yaml.safe_load(file_text)
+        except Exception:
+            return False
+    else:  # .toml
+        toml_module = None
+        try:
+            import tomllib as toml_module  # type: ignore
+        except Exception:
+            try:
+                import tomli as toml_module  # type: ignore
+            except Exception:
+                toml_module = None
+        if toml_module is None:
+            return False
+        try:
+            parsed_payload = toml_module.loads(file_text)
+        except Exception:
+            return False
+
+    env_mapping = _extract_startup_env_mapping(parsed_payload)
+    if not env_mapping:
+        return False
+
+    for env_name, env_value in env_mapping.items():
+        env_value_text = _stringify_startup_env_value(env_value)
+        if env_value_text == "":
+            continue
+        os.environ.setdefault(env_name, env_value_text)
+    return True
+
+
+def _load_startup_dotenv_into_process() -> None:
+    candidate_paths = (
+        Path(_repo_root) / ".env.json",
+        Path(_workspace_root) / ".env.json",
+        Path(__file__).with_suffix(".env.json"),
+        Path(_repo_root) / ".env",
+        Path(_workspace_root) / ".env",
+        Path(__file__).with_suffix(".env"),
+        Path(_repo_root) / ".env.yaml",
+        Path(_workspace_root) / ".env.yaml",
+        Path(__file__).with_suffix(".env.yaml"),
+        Path(_repo_root) / ".env.toml",
+        Path(_workspace_root) / ".env.toml",
+        Path(__file__).with_suffix(".env.toml"),
+    )
+    seen_paths: set[str] = set()
+    for candidate_path in candidate_paths:
+        try:
+            resolved_path = candidate_path.expanduser().resolve()
+        except Exception:
+            resolved_path = candidate_path.expanduser()
+        normalized_path = str(resolved_path)
+        if normalized_path in seen_paths:
+            continue
+        seen_paths.add(normalized_path)
+        if resolved_path.exists():
+            if _load_structured_startup_env_file(resolved_path):
+                continue
+            _bootstrap_load_dotenv(resolved_path, override=False)
+    _bootstrap_load_dotenv(override=False)
+
+
+_load_startup_dotenv_into_process()
+
 _GUI_ENV_CONFIG_ENV_NAME = "AI_IDE_GUI_ENV_CONFIG_PATH"
 _GUI_ENV_CONFIG_FILENAME = "gui_env.json"
 _GUI_ENV_CONFIG_FORMAT = "ai_ide_gui_env_v1"
+_GUI_ENV_DEFAULTS: dict[str, str] = {
+    "GDK_BACKEND": "x11",
+    "QT_QPA_PLATFORM": "xcb",
+    "AI_IDE_TREE_MEMORY_ONLY": "1",
+    "AI_IDE_AGENTS_DB_TREE_STRICT": "1",
+    "AI_IDE_AGENTS_DB_TREE_SYNC": "1",
+}
 
 
 
@@ -2447,6 +2602,29 @@ class ChatDock(QDockWidget):
         if callable(updater):
             updater(accent, base)
 
+
+def _normalize_github_models_base_url(base_url: Any) -> str:
+    text = str(base_url or "").strip()
+    if not text:
+        return "https://models.github.ai/inference"
+    lowered = text.rstrip("/").lower()
+    if lowered.startswith("https://github.com/models"):
+        return "https://models.github.ai/inference"
+    if lowered.startswith("https://models.github.ai/inference"):
+        return "https://models.github.ai/inference"
+    return text.rstrip("/")
+
+
+def _normalize_chat_model_name(model_name: Any, provider: str | None = None) -> str:
+    text = str(model_name or "").strip().lstrip("/")
+    if not text:
+        return ""
+    text = " ".join(text.split()).replace(" ", "-").lower()
+    provider_name = str(provider or os.getenv("AI_IDE_MODEL_PROVIDER") or "").strip().lower()
+    if provider_name in {"github", "github_models", "github-models"} and "/" not in text:
+        return f"openai/{text}"
+    return text
+
 # ═══════════════════════  AI chat dock  ═══════════════════════════════════
 
 class AIWidget(QWidget):
@@ -2471,7 +2649,19 @@ class AIWidget(QWidget):
 
         self.api_key: str = self._read_api_key()
         self._api_key_missing: bool = not bool(self.api_key)
-        self._model:   str = "o3-2025-04-16"                 # <<< zentrales Modell
+        provider = str(os.getenv("AI_IDE_MODEL_PROVIDER") or "").strip().lower()
+        provider_model = ""
+        if provider in {"github", "github_models", "github-models"}:
+            provider_model = _normalize_chat_model_name(os.getenv("AI_IDE_GITHUB_CHAT_MODEL") or "", provider=provider)
+        elif provider in {"ollama", "ollama_local", "local_ollama"}:
+            provider_model = _normalize_chat_model_name(os.getenv("AI_IDE_OLLAMA_CHAT_MODEL") or "", provider=provider)
+        elif provider in {"openai", "openai_cloud", "openai-api"}:
+            provider_model = _normalize_chat_model_name(os.getenv("AI_IDE_OPENAI_CHAT_MODEL") or "", provider=provider)
+        self._model: str = (
+            _normalize_chat_model_name(os.getenv("AI_IDE_CHAT_MODEL") or "", provider=provider)
+            or provider_model
+            or "qwen2.5-coder:7b"
+        )
         self._dropped_files: List[str] = []
         self._runtime_context_entries: list[dict[str, str]] = []
         self.scheme = _build_scheme(accent, base)                # Farbschema mergen
@@ -2545,14 +2735,42 @@ class AIWidget(QWidget):
     # ---------------------------------------------------------------- ENV
     @staticmethod
     def _read_api_key() -> str:
-        root_env  = Path(__file__).resolve().parents[1] / ".env"
-        local_env = Path(__file__).with_suffix(".env")
-        for f in (root_env, local_env):
-            if f.exists():
-                load_dotenv(f, override=False)
-                
+        _load_startup_dotenv_into_process()
         load_dotenv()
+        provider = str(os.getenv("AI_IDE_MODEL_PROVIDER") or "").strip().lower()
         key = (os.getenv("OPENAI_API_KEY") or "").strip()
+
+        if provider in {"github", "github_models", "github-models"}:
+            key = key or str(os.getenv("AI_IDE_GITHUB_MODELS_API_KEY") or "").strip() or str(os.getenv("GITHUB_MODELS_API_KEY") or "").strip() or str(os.getenv("GITHUB_TOKEN") or "").strip() or str(os.getenv("GH_TOKEN") or "").strip()
+            base_url = _normalize_github_models_base_url(
+                os.getenv("AI_IDE_GITHUB_MODELS_BASE_URL")
+                or os.getenv("AI_IDE_GITHUB_MODELS_URL")
+                or "https://models.github.ai/inference"
+            )
+            os.environ["OPENAI_BASE_URL"] = base_url
+            if key:
+                os.environ["OPENAI_API_KEY"] = key
+            model_name = _normalize_chat_model_name(os.getenv("AI_IDE_GITHUB_CHAT_MODEL") or "openai/gpt-4.1-mini", provider=provider)
+            os.environ["AI_IDE_CHAT_MODEL"] = model_name
+            return key
+
+        if provider in {"ollama", "ollama_local", "local_ollama"}:
+            key = key or str(os.getenv("AI_IDE_OLLAMA_API_KEY") or "").strip() or "ollama-local"
+            os.environ["OPENAI_API_KEY"] = key
+            if not str(os.getenv("OPENAI_BASE_URL") or "").strip():
+                os.environ["OPENAI_BASE_URL"] = str(os.getenv("AI_IDE_OLLAMA_BASE_URL") or "").strip() or "http://127.0.0.1:11434/v1"
+            os.environ["AI_IDE_CHAT_MODEL"] = _normalize_chat_model_name(os.getenv("AI_IDE_OLLAMA_CHAT_MODEL") or "qwen2.5-coder:7b", provider=provider)
+            return key
+
+        if provider in {"openai", "openai_cloud", "openai-api"}:
+            if key:
+                os.environ["OPENAI_API_KEY"] = key
+            base_url = str(os.getenv("AI_IDE_OPENAI_BASE_URL") or "").strip() or str(os.getenv("OPENAI_BASE_URL") or "").strip()
+            if base_url:
+                os.environ["OPENAI_BASE_URL"] = base_url
+            os.environ["AI_IDE_CHAT_MODEL"] = _normalize_chat_model_name(os.getenv("AI_IDE_OPENAI_CHAT_MODEL") or os.getenv("AI_IDE_CHAT_MODEL") or "gpt-4.1-mini", provider=provider)
+            return key
+
         return key
     
     def _build_ui(self) -> None:
@@ -11461,6 +11679,16 @@ class ControlPlaneWidget(QWidget):
         self._base = base
         self.scheme = _build_scheme(accent, base)
         handle_idle, handle_hover, handle_pressed = _splitter_handle_palette(self.scheme)
+        control_scrollbar_hover = _color_with_alpha(
+            self.scheme.get("col10", "#1f1f1f"),
+            132,
+            fallback="rgba(31,31,31,132)",
+        )
+        control_scrollbar_pressed = _color_with_alpha(
+            self.scheme.get("col2", "#58ed5b"),
+            164,
+            fallback="rgba(88,237,91,164)",
+        )
         self.setStyleSheet(
             f"""
             QFrame#controlHero, QFrame#controlMetricCard {{
@@ -11567,7 +11795,7 @@ class ControlPlaneWidget(QWidget):
             }}
             QTabWidget#controlPlaneTabs::pane {{
                 background: {self.scheme['col7']};
-                border-left: 1px solid {self.scheme['col10']};
+                border-left: none;
                 border-right: 1px solid {self.scheme['col10']};
                 border-bottom: 1px solid {self.scheme['col10']};
                 border-top: none;
@@ -11589,16 +11817,16 @@ class ControlPlaneWidget(QWidget):
                 background: {self.scheme['col7']};
                 color: {self.scheme['col6']};
                 border-top: 1px solid {self.scheme['col10']};
-                border-left: none;
-                border-right: none;
-                border-bottom: none;
+                border-left: 0px;
+                border-right: 0px;
+                border-bottom: 0px;
                 border-top-left-radius: 0px;
                 border-top-right-radius: 0px;
                 padding: 3px 10px;
                 min-height: 16px;
             }}
             QTabWidget#controlPlaneTabs QTabBar::tab:first {{
-                border-left: 1px solid {self.scheme['col10']};
+                border-left: none;
                 border-top-left-radius: 14px;
             }}
             QTabWidget#controlPlaneTabs QTabBar::tab:last {{
@@ -11606,7 +11834,7 @@ class ControlPlaneWidget(QWidget):
                 border-top-right-radius: 14px;
             }}
             QTabWidget#controlPlaneTabs QTabBar::tab:only-one {{
-                border-left: 1px solid {self.scheme['col10']};
+                border-left: 0px;
                 border-right: 1px solid {self.scheme['col10']};
                 border-top-left-radius: 14px;
                 border-top-right-radius: 14px;
@@ -11614,19 +11842,19 @@ class ControlPlaneWidget(QWidget):
             QTabWidget#controlPlaneTabs QTabBar::tab:hover {{
                 background: {self.scheme['col7']};
                 border-top: 1px solid {self.scheme['col10']};
-                border-left: none;
-                border-right: none;
-                border-bottom: none;
+                border-left: 0px;
+                border-right: 0px;
+                border-bottom: 0px;
             }}
             QTabWidget#controlPlaneTabs QTabBar::tab:selected {{
                 background: {self.scheme['col9']};
                 color: {self.scheme['col1']};
                 border: 1px solid {self.scheme['col1']};
-                border-left: 1px solid {self.scheme['col1']};
-                border-bottom: none;
+                border-left: 0px;
+                border-bottom: 0px;
             }}
             QTabWidget#controlPlaneTabs QTabBar::tab:first:hover {{
-                border-left: 1px solid {self.scheme['col10']};
+                border-left: 0px;
                 border-top-left-radius: 14px;
             }}
             QTabWidget#controlPlaneTabs QTabBar::tab:last:hover {{
@@ -11634,20 +11862,20 @@ class ControlPlaneWidget(QWidget):
                 border-top-right-radius: 14px;
             }}
             QTabWidget#controlPlaneTabs QTabBar::tab:only-one:hover {{
-                border-left: 1px solid {self.scheme['col10']};
+                border-left: 0px;
                 border-right: 1px solid {self.scheme['col10']};
                 border-top-left-radius: 14px;
                 border-top-right-radius: 14px;
             }}
             QTabWidget#controlPlaneTabs QTabBar::tab:first:selected {{
-                border-left: 1px solid {self.scheme['col1']};
-                border-top-left-radius: 14px;
+                border-left: 0px;
+                border-top-left-radius: 0px;
             }}
             QTabWidget#controlPlaneTabs QTabBar::tab:last:selected {{
                 border-top-right-radius: 14px;
             }}
             QTabWidget#controlPlaneTabs QTabBar::tab:only-one:selected {{
-                border-left: 1px solid {self.scheme['col1']};
+                border-left: 0px;
                 border-top-left-radius: 14px;
                 border-top-right-radius: 14px;
             }}
@@ -11686,7 +11914,7 @@ class ControlPlaneWidget(QWidget):
                 border: none;
             }}
             QTextBrowser#controlBrowser QScrollBar:vertical {{
-                width: 6px;
+                width: 1px;
             }}
             QTextBrowser#controlBrowser QScrollBar:horizontal {{
                 height: 6px;
@@ -11707,13 +11935,13 @@ class ControlPlaneWidget(QWidget):
             QTextBrowser#controlBrowser QScrollBar::handle:horizontal:hover,
             QTextBrowser#controlBrowser QScrollBar::handle:hover:vertical,
             QTextBrowser#controlBrowser QScrollBar::handle:hover:horizontal {{
-                background: {self.scheme['col10']};
+                background: {control_scrollbar_hover};
             }}
             QTextBrowser#controlBrowser QScrollBar::handle:vertical:pressed,
             QTextBrowser#controlBrowser QScrollBar::handle:horizontal:pressed,
             QTextBrowser#controlBrowser QScrollBar::handle:pressed:vertical,
             QTextBrowser#controlBrowser QScrollBar::handle:pressed:horizontal {{
-                background: {self.scheme['col2']};
+                background: {control_scrollbar_pressed};
             }}
             QTextBrowser#controlBrowser QScrollBar::add-line,
             QTextBrowser#controlBrowser QScrollBar::sub-line,
@@ -12048,6 +12276,14 @@ class ControlPlaneWidget(QWidget):
         providers: list[str] = []
         if os.getenv("OPENAI_API_KEY"):
             providers.append("OpenAI")
+        if (
+            str(os.getenv("AI_IDE_MODEL_PROVIDER") or "").strip().lower() in {"github", "github_models", "github-models"}
+            or os.getenv("GITHUB_TOKEN")
+            or os.getenv("GH_TOKEN")
+            or os.getenv("AI_IDE_GITHUB_MODELS_API_KEY")
+            or os.getenv("GITHUB_MODELS_API_KEY")
+        ):
+            providers.append("GitHub Models")
         if os.getenv("ANTHROPIC_API_KEY"):
             providers.append("Anthropic")
         if os.getenv("AZURE_OPENAI_API_KEY") or os.getenv("AZURE_OPENAI_ENDPOINT"):
@@ -13771,6 +14007,17 @@ class ExtensionsWorkspaceTabBar(QTabBar):
             return
         super().mouseReleaseEvent(event)
 
+    def mouseDoubleClickEvent(self, event):  # noqa: N802
+        if event.button() == Qt.LeftButton:
+            uri_target = self._resolve_titlebar_uri_mouse_target(event.pos())
+            if uri_target is not None:
+                line_edit, _line_local_pos = uri_target
+                if isinstance(line_edit, ExtensionsExternalUriLineEdit):
+                    line_edit.menuRequested.emit()
+                    event.accept()
+                    return
+        super().mouseDoubleClickEvent(event)
+
 
 class ExtensionsExternalUriLineEdit(QLineEdit):
     menuRequested = Signal()
@@ -13875,6 +14122,13 @@ class ExtensionsExternalUriLineEdit(QLineEdit):
         super().mouseReleaseEvent(event)
         if popup_requested:
             self.menuRequested.emit()
+
+    def mouseDoubleClickEvent(self, event):  # noqa: N802
+        if event.button() == Qt.LeftButton and self._titlebar_tab_edit_mode_enabled():
+            self.menuRequested.emit()
+            event.accept()
+            return
+        super().mouseDoubleClickEvent(event)
 
 
 class ExtensionsWorkspaceWidget(QWidget):
@@ -13996,6 +14250,7 @@ class ExtensionsWorkspaceWidget(QWidget):
         self._hover_tab_marquee_timer = QTimer(self)
         self._hover_tab_marquee_timer.setInterval(160)
         self._hover_tab_marquee_timer.timeout.connect(self._tick_tab_hover_marquee)
+        self._hidden_primary_board_tab_text = ""
         self._pending_preview_session_state: dict[str, Any] | None = None
         self._preview_refresh_timer = QTimer(self)
         self._preview_refresh_timer.setSingleShot(True)
@@ -14505,7 +14760,7 @@ class ExtensionsWorkspaceWidget(QWidget):
         proxy_bar.setProperty("extensions_titlebar_uri_slot_index", 0)
         proxy_bar.setDocumentMode(True)
         proxy_bar.setMovable(True)
-        proxy_bar.setTabsClosable(False)
+        proxy_bar.setTabsClosable(True)
         proxy_bar.setUsesScrollButtons(False)
         proxy_bar.setExpanding(False)
         proxy_bar.setElideMode(Qt.ElideNone)
@@ -14557,6 +14812,7 @@ class ExtensionsWorkspaceWidget(QWidget):
         if not selection_menu.actions():
             return False
         try:
+            selection_menu.setMinimumWidth(max(0, int(anchor_widget.width())))
             popup_point = anchor_widget.mapToGlobal(QPoint(0, anchor_widget.height()))
         except RuntimeError:
             return False
@@ -14597,6 +14853,21 @@ class ExtensionsWorkspaceWidget(QWidget):
         if isinstance(active_state, dict):
             self._load_extension_into_session(active_state, fit_view=True)
 
+    @staticmethod
+    def _style_line_edit_action_button(line_edit: QLineEdit, action: QAction, object_name: str) -> None:
+        if not isinstance(line_edit, QLineEdit) or not isinstance(action, QAction):
+            return
+        for button in line_edit.findChildren(QToolButton):
+            try:
+                default_action = button.defaultAction()
+            except RuntimeError:
+                continue
+            if default_action is action:
+                button.setObjectName(object_name)
+                button.setAutoRaise(True)
+                button.setCursor(Qt.PointingHandCursor)
+                break
+
     def create_external_uri_proxy(self, parent: QWidget | None = None) -> QLineEdit:
         proxy_input = ExtensionsExternalUriLineEdit(parent or self)
         proxy_input.setObjectName("extensionsGraphUriInput")
@@ -14604,8 +14875,12 @@ class ExtensionsWorkspaceWidget(QWidget):
         proxy_input.setLayoutDirection(Qt.LeftToRight)
         proxy_input.setAttribute(Qt.WA_StyledBackground, True)
         proxy_input.setAutoFillBackground(True)
-        proxy_input.setMinimumHeight(28)
+        proxy_input.setMinimumHeight(30)
         proxy_input.setPlaceholderText("agentsdb://127.0.0.1:2331/tools:graph_view")
+        proxy_font = proxy_input.font()
+        if proxy_font.pointSize() > 0:
+            proxy_font.setPointSize(proxy_font.pointSize() + 1)
+            proxy_input.setFont(proxy_font)
         load_icon_idle = _icon_with_opacity("load_content.svg", opacity=0.72)
         add_tab_icon_idle = _icon_with_opacity("plus_custombar_24.svg", opacity=0.72)
         load_action = proxy_input.addAction(load_icon_idle, QLineEdit.TrailingPosition)
@@ -14617,6 +14892,8 @@ class ExtensionsWorkspaceWidget(QWidget):
         proxy_input.returnPressed.connect(self._load_active_session_widget)
         load_action.triggered.connect(self._load_active_session_widget)
         add_tab_action.triggered.connect(lambda: self.open_new_connection_tab(activate=True))
+        self._style_line_edit_action_button(proxy_input, load_action, "extensionsGraphControlButton")
+        self._style_line_edit_action_button(proxy_input, add_tab_action, "extensionsGraphControlButton")
         self._external_uri_proxies.append(proxy_input)
         proxy_input.destroyed.connect(lambda *_args: self._sync_external_uri_proxies())
         self._sync_external_uri_proxies()
@@ -14778,7 +15055,93 @@ class ExtensionsWorkspaceWidget(QWidget):
         # Initialize the control plane widget
         if hasattr(self._control_plane_widget, "refresh_view"):
             self._control_plane_widget.refresh_view()
+        self._sync_tab_close_buttons()
+        self._sync_main_toolbar_visibility_for_active_tab()
         self._sync_embedded_tab_bar_proxies()
+
+    def _primary_board_tab_widget(self) -> QWidget | None:
+        control_plane = getattr(self, "_control_plane_widget", None)
+        if control_plane is None:
+            return None
+        primary_board = getattr(control_plane, "_config_tab", None)
+        if isinstance(primary_board, QWidget):
+            return primary_board
+        return None
+
+    def _is_primary_board_tab_widget(self, tab_widget: QWidget | None) -> bool:
+        if not isinstance(tab_widget, QWidget):
+            return False
+        primary_board = self._primary_board_tab_widget()
+        return isinstance(primary_board, QWidget) and tab_widget is primary_board
+
+    def _sync_main_toolbar_visibility_for_active_tab(self) -> None:
+        top_level = self.window()
+        toolbar = getattr(top_level, "tb_right", None)
+        if not isinstance(toolbar, QToolBar):
+            return
+        extensions_dock = getattr(top_level, "extensions_dock", None)
+        workspace_visible = not isinstance(extensions_dock, QDockWidget) or extensions_dock.isVisible()
+        board_active = workspace_visible and self._is_primary_board_tab_widget(self.extensions_tabs.currentWidget())
+        toolbar.setVisible(not board_active)
+
+    def _ensure_primary_board_close_button_visible(self) -> None:
+        primary_board = self._primary_board_tab_widget()
+        if not isinstance(primary_board, QWidget):
+            return
+        if self.extensions_tabs.currentWidget() is not primary_board:
+            return
+
+        board_index = self.extensions_tabs.indexOf(primary_board)
+        if board_index < 0:
+            return
+
+        tab_bar = self.extensions_tabs.tabBar()
+        close_button = tab_bar.tabButton(board_index, QTabBar.RightSide)
+        if isinstance(close_button, QToolButton) and bool(close_button.property("extensions_close_button")):
+            close_button.setFixedSize(16, 16)
+            close_button.setVisible(True)
+
+    def open_primary_board_tab(self, *, activate: bool = True) -> bool:
+        primary_board = self._primary_board_tab_widget()
+        if not isinstance(primary_board, QWidget):
+            return False
+
+        board_index = self.extensions_tabs.indexOf(primary_board)
+        if board_index < 0:
+            board_title = str(self._hidden_primary_board_tab_text or "").strip()
+            if not board_title:
+                control_plane = getattr(self, "_control_plane_widget", None)
+                board_title = str(getattr(control_plane, "_PRIMARY_BOARD_TAB_LABEL", "Board 1") or "Board 1").strip()
+            board_index = self.extensions_tabs.insertTab(0, primary_board, board_title)
+            self._set_extensions_tab_text(self.extensions_tabs.tabBar(), board_index, board_title)
+            self._set_tab_close_button(primary_board)
+
+        if activate and board_index >= 0:
+            self.extensions_tabs.setCurrentIndex(board_index)
+
+        self._sync_tab_close_buttons()
+        self._ensure_primary_board_close_button_visible()
+        self._sync_embedded_tab_bar_proxies()
+        self._sync_external_uri_proxies()
+        self._sync_main_toolbar_visibility_for_active_tab()
+        self.widgetStateChanged.emit()
+        return True
+
+    def _close_primary_board_tab_view(self, tab_index: int) -> None:
+        if tab_index < 0 or tab_index >= self.extensions_tabs.count():
+            return
+
+        # Closing the primary board should currently close the entire
+        # extensions workspace instead of switching focus to another runtime tab.
+        top_level = self.window()
+        extensions_dock = getattr(top_level, "extensions_dock", None)
+        if isinstance(extensions_dock, QDockWidget):
+            extensions_dock.setVisible(False)
+
+        self._sync_tab_close_buttons()
+        self._sync_embedded_tab_bar_proxies()
+        self._sync_external_uri_proxies()
+        self._sync_main_toolbar_visibility_for_active_tab()
 
     def open_new_connection_tab(self, *, activate: bool = True) -> None:
         self._add_extension_tab(activate=activate)
@@ -14825,6 +15188,7 @@ class ExtensionsWorkspaceWidget(QWidget):
             source_tab_bar = self.extensions_tabs.tabBar()
         except RuntimeError:
             source_tab_bar = None
+        active_source_index = self.extensions_tabs.currentIndex()
         for index in range(tab_bar.count()):
             close_button = tab_bar.tabButton(index, QTabBar.RightSide)
             if isinstance(close_button, QToolButton) and bool(close_button.property("extensions_close_button")):
@@ -14834,7 +15198,9 @@ class ExtensionsWorkspaceWidget(QWidget):
                     tab_data = tab_bar.tabData(index)
                     resolved_source_index = int(tab_data) if isinstance(tab_data, int) else -1
                 is_closable = resolved_source_index >= 0 and self._is_extension_tab_closable(resolved_source_index)
-                show_button = bool(is_closable and (force_visible or index == hover_index))
+                source_widget = self.extensions_tabs.widget(resolved_source_index) if resolved_source_index >= 0 else None
+                primary_board_active = self._is_primary_board_tab_widget(source_widget) and resolved_source_index == active_source_index
+                show_button = bool(is_closable and (force_visible or index == hover_index or primary_board_active))
                 close_button.setFixedSize(16, 16) if show_button else close_button.setFixedSize(0, 0)
                 close_button.setVisible(show_button)
 
@@ -14962,6 +15328,8 @@ class ExtensionsWorkspaceWidget(QWidget):
         if control_plane is not None:
             primary_board = getattr(control_plane, "_config_tab", None)
             if tab_widget is primary_board:
+                self._close_primary_board_tab_view(tab_index)
+                self.widgetStateChanged.emit()
                 return
 
             runtime_records = getattr(control_plane, "_runtime_tab_records", None)
@@ -15024,8 +15392,11 @@ class ExtensionsWorkspaceWidget(QWidget):
     def _handle_active_tab_changed(self, _tab_index: int) -> None:
         self._stop_tab_hover_marquee()
         self.setProperty("runtime_source_path", self.current_widget_uri())
+        self._sync_tab_close_buttons()
+        self._ensure_primary_board_close_button_visible()
         self._sync_embedded_tab_bar_proxies()
         self._sync_external_uri_proxies()
+        self._sync_main_toolbar_visibility_for_active_tab()
         self._persist_local_widget_state()
         self.widgetStateChanged.emit()
 
@@ -15177,6 +15548,7 @@ class ExtensionsWorkspaceWidget(QWidget):
 
             def eventFilter(self, obj, event):  # noqa: N802
                 if obj is uri_input and event.type() == QEvent.MouseButtonPress:
+                    self._menu.setMinimumWidth(max(0, int(uri_input.width())))
                     self._menu.popup(uri_input.mapToGlobal(QPoint(0, uri_input.height())))
                 return super().eventFilter(obj, event)
 
@@ -15550,6 +15922,16 @@ class ExtensionsWorkspaceWidget(QWidget):
         uri_glow_focus = str(self.scheme.get("col1") or self.scheme.get("col2") or "#0fe913")
         uri_hover_bg = _color_with_alpha(uri_glow_hover, 20, fallback=uri_surface_bg)
         uri_focus_bg = _color_with_alpha(uri_glow_focus, 28, fallback=uri_surface_bg)
+        extensions_scrollbar_hover = _color_with_alpha(
+            self.scheme.get("col10", "#1f1f1f"),
+            132,
+            fallback="rgba(31,31,31,132)",
+        )
+        extensions_scrollbar_pressed = _color_with_alpha(
+            self.scheme.get("col2", "#58ed5b"),
+            164,
+            fallback="rgba(88,237,91,164)",
+        )
         self.setStyleSheet(
             f"""
 QWidget#extensionsSessionControlPage,
@@ -15569,8 +15951,10 @@ QLabel#extensionsHostPlaceholder {{
     font-size: 13px;
 }}
 QTabWidget#extensionsTabs::pane {{
-    border: 1px solid {self.scheme.get('col10', '#2a3350')};
     border-top: 0;
+    border-right: 1px solid {self.scheme.get('col10', '#2a3350')};
+    border-bottom: 1px solid {self.scheme.get('col10', '#2a3350')};
+    border-left: none;
     background: {self.scheme.get('col7', '#0b0b0b')};
 }}
 QTabWidget#extensionsTabs QTabBar {{
@@ -15672,7 +16056,7 @@ QTextBrowser#extensionsConnectionsPreviewBrowser QScrollBar:horizontal {{
     border: none;
 }}
 QTextBrowser#extensionsConnectionsPreviewBrowser QScrollBar:vertical {{
-    width: 6px;
+    width: 1px;
 }}
 QTextBrowser#extensionsConnectionsPreviewBrowser QScrollBar:horizontal {{
     height: 6px;
@@ -15693,13 +16077,13 @@ QTextBrowser#extensionsConnectionsPreviewBrowser QScrollBar::handle:vertical:hov
 QTextBrowser#extensionsConnectionsPreviewBrowser QScrollBar::handle:horizontal:hover,
 QTextBrowser#extensionsConnectionsPreviewBrowser QScrollBar::handle:hover:vertical,
 QTextBrowser#extensionsConnectionsPreviewBrowser QScrollBar::handle:hover:horizontal {{
-    background: {self.scheme.get('col10', '#1f1f1f')};
+    background: {extensions_scrollbar_hover};
 }}
 QTextBrowser#extensionsConnectionsPreviewBrowser QScrollBar::handle:vertical:pressed,
 QTextBrowser#extensionsConnectionsPreviewBrowser QScrollBar::handle:horizontal:pressed,
 QTextBrowser#extensionsConnectionsPreviewBrowser QScrollBar::handle:pressed:vertical,
 QTextBrowser#extensionsConnectionsPreviewBrowser QScrollBar::handle:pressed:horizontal {{
-    background: {self.scheme.get('col2', '#58ed5b')};
+    background: {extensions_scrollbar_pressed};
 }}
 QTextBrowser#extensionsConnectionsPreviewBrowser QScrollBar::add-line,
 QTextBrowser#extensionsConnectionsPreviewBrowser QScrollBar::sub-line,
@@ -16247,13 +16631,13 @@ class CustomWindowTitleBar(QWidget):
     sectionOrderChanged = Signal(object)
     uriAnchorRatioChanged = Signal(float)
     uriTabSlotIndexChanged = Signal(int)
-    _HEIGHT = 34
+    _HEIGHT = 35
     _SECTION_ORDER_DEFAULT = ("tab_strip", "external_uri")
 
     def __init__(self, window: "MainAIEditor") -> None:
         super().__init__(window)
         self._window = window
-        self._drag_active = False
+        self._drag_active = True
         self._drag_start_global = QPoint()
         self._drag_start_window = QPoint()
 
@@ -16262,7 +16646,7 @@ class CustomWindowTitleBar(QWidget):
         self.setAttribute(Qt.WA_StyledBackground, True)
 
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(8, 4, 8, 4)
+        layout.setContentsMargins(8, 1, 8, 2)
         layout.setSpacing(6)
 
         self._title_label = QLabel(window.windowTitle(), self)
@@ -16291,21 +16675,26 @@ class CustomWindowTitleBar(QWidget):
         self._sections_layout.setSpacing(6)
         layout.addWidget(self._sections_container, 1, Qt.AlignVCenter)
 
-        self._uri_anchor_ratio = 0.5
+        self._uri_anchor_ratio = 3
         self._uri_tab_slot_index = 0
-        self._uri_anchor_drag_active = False
-        self._uri_anchor_drag_moved = False
+        self._uri_anchor_drag_active =True
+        self._uri_anchor_drag_moved = True
         self._uri_tab_slot_count = 0
         self._uri_tab_slot_rects: list[QRect] = []
-        self._uri_anchor_layout_update_pending = False
+        self._uri_anchor_layout_update_pending = True
         self._tab_strip_host = QWidget(self)
         self._tab_strip_host.setObjectName("windowFrameTabStripHost")
         self._tab_strip_host.setAttribute(Qt.WA_StyledBackground, True)
         self._tab_strip_host.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self._tab_strip_host_layout = QHBoxLayout(self._tab_strip_host)
         self._tab_strip_host_layout.setContentsMargins(0, 0, 0, 0)
-        self._tab_strip_host_layout.setSpacing(6)
+        self._tab_strip_host_layout.setSpacing(6
+
+                                               )
+        self._tab_strip_host.setMaximumHeight(32
+                                              )
         self._tab_strip_host.setMinimumWidth(220)
+
         self._tab_strip_host.setVisible(False)
         self._tab_strip_handle = self._new_section_handle("tab_strip", "Tab-Leiste umpositionieren")
         self._tab_strip_handle.setVisible(False)
@@ -16325,6 +16714,9 @@ class CustomWindowTitleBar(QWidget):
         self._tab_strip_right_layout = QHBoxLayout(self._tab_strip_right_host)
         self._tab_strip_right_layout.setContentsMargins(0, 0, 0, 0)
         self._tab_strip_right_layout.setSpacing(0)
+
+
+
 
         self._external_uri_widget: QWidget | None = None
         self._external_uri_host = QWidget(self._tab_strip_host)
@@ -16911,6 +17303,30 @@ class CustomWindowTitleBar(QWidget):
                 background: transparent;
                 border: none;
             }}
+            QToolButton#extensionsUriPresetButton {{
+                color: {fg};
+                background: transparent;
+                border: 1px solid {uri_frame_color};
+                border-radius: 6px;
+                padding: 0px 4px;
+                min-width: 16px;
+            }}
+            QToolButton#extensionsUriPresetButton:hover {{
+                background: {uri_hover_bg};
+                border-color: {uri_frame_color};
+            }}
+            QToolButton#extensionsGraphControlButton {{
+                color: {fg};
+                background: transparent;
+                border: 1px solid transparent;
+                border-radius: 6px;
+                padding: 0px 2px;
+                min-width: 16px;
+            }}
+            QToolButton#extensionsGraphControlButton:hover {{
+                background: {uri_hover_bg};
+                border-color: {uri_frame_color};
+            }}
             QToolButton:disabled {{
                 color: {border};
             }}
@@ -17088,6 +17504,10 @@ class MainAIEditor(QMainWindow):
     _EXPLORER_WIDTH_EXPAND_PX: Final = 40
     _BOARD_WIDTH_SNAP_OFFSET_PX: Final = 100
     _BOARD_WIDTH_MIN_PX: Final = 160
+    _SIDE_WIDGET_START_WIDTH_PX: Final = 140
+    _WORKSPACE_COLUMN_SNAP_TOLERANCE_PX: Final = 18
+    _WORKSPACE_COLUMN_SNAP_DEBOUNCE_MS: Final = 90
+    _DEFAULT_WORKSPACE_COLUMN_WIDTHS: Final = (140, 760, 460, 140)
 
     # ---------------------------------------------------------------- init --
 
@@ -17096,7 +17516,7 @@ class MainAIEditor(QMainWindow):
         self._accent_name = "green"
         self._accent, self._base = _accent_from_name(self._accent_name), SCHEME_DARK
         self._tab_docks: List[QDockWidget] = []          # store all tab docks
-        self._workspace_column_widths: list[int] = [260, 760, 460, 180]
+        self._workspace_column_widths: list[int] = list(self._DEFAULT_WORKSPACE_COLUMN_WIDTHS)
         self._explorer_splitter_sizes: list[int] = [380, 130]
         self._explorer_database_panel_visible: bool = False
         self._window_menu_bar: QMenuBar | None = None
@@ -17126,6 +17546,10 @@ class MainAIEditor(QMainWindow):
         self._toolbar_left_user_visible = True
         self._toolbar_right_user_visible = True
         self._was_maximized_before_fullscreen = False
+        self._workspace_column_snap_timer = QTimer(self)
+        self._workspace_column_snap_timer.setSingleShot(True)
+        self._workspace_column_snap_timer.setInterval(self._WORKSPACE_COLUMN_SNAP_DEBOUNCE_MS)
+        self._workspace_column_snap_timer.timeout.connect(self._apply_workspace_column_snap)
 
         # Crash-isolation helper: progressively enable init steps.
         # Default is "full" (999). Smaller numbers build less UI.
@@ -18552,11 +18976,14 @@ class MainAIEditor(QMainWindow):
         self.main_split.setStretchFactor(1, 3)
         self.main_split.setStretchFactor(2, 2)
         self.main_split.setStretchFactor(3, 2)
-        default_sizes = list(getattr(self, "_workspace_column_widths", [260, 760, 460, 180]))
+        default_sizes = list(getattr(self, "_workspace_column_widths", list(self._DEFAULT_WORKSPACE_COLUMN_WIDTHS)))
         if len(default_sizes) != 4:
-            default_sizes = [260, 760, 460, 180]
+            default_sizes = list(self._DEFAULT_WORKSPACE_COLUMN_WIDTHS)
+        default_sizes[0] = self._SIDE_WIDGET_START_WIDTH_PX
+        default_sizes[3] = self._SIDE_WIDGET_START_WIDTH_PX
         self.main_split.setSizes(self._normalize_splitter_sizes(default_sizes, total=1000))
         self.main_split.splitterMoved.connect(self._remember_workspace_column_widths)
+        self.main_split.splitterMoved.connect(self._schedule_workspace_column_snap)
         self._remember_workspace_column_widths()
         self._apply_main_splitter_style()
 
@@ -18818,6 +19245,14 @@ class MainAIEditor(QMainWindow):
         )
         self.act_refresh_control_plane.setToolTip("Control Plane aktualisieren")
 
+        self.act_open_board = QAction(
+            _icon("open_file.svg"),
+            "Board",
+            self,
+            triggered=self._open_primary_board_tab,
+        )
+        self.act_open_board.setToolTip("Board öffnen")
+
         # ---------- Sichtbarkeit verknüpfen --------- # <– 10.07.2025 --------
         self.act_toggle_chat.toggled.connect(self.chat_dock.setVisible)
 
@@ -18831,7 +19266,7 @@ class MainAIEditor(QMainWindow):
             checked=True,
         )
         self.act_toggle_right_dock.setToolTip("Dashboard anzeigen/ausblenden")
-        self.act_toggle_right_dock.toggled.connect(self.extensions_dock.setVisible)
+        self.act_toggle_right_dock.toggled.connect(self._handle_dashboard_toggle)
 
         self.act_toggle_control_plane_left = QAction(
             self._chat_symbol_icon(),
@@ -19491,6 +19926,31 @@ class MainAIEditor(QMainWindow):
         self.control_plane_widget.refresh_view()
         self.statusBar().showMessage("Control Plane refreshed", 2500)
 
+    @Slot(bool)
+    def _handle_dashboard_toggle(self, visible: bool) -> None:
+        if not hasattr(self, "extensions_dock") or not isinstance(self.extensions_dock, QDockWidget):
+            return
+        if not bool(visible):
+            self.extensions_dock.setVisible(False)
+            return
+        self.extensions_dock.setVisible(True)
+        self._open_primary_board_tab()
+
+    @Slot()
+    def _open_primary_board_tab(self) -> None:
+        extensions_widget = getattr(self, "extensions_widget", None)
+        if not isinstance(extensions_widget, ExtensionsWorkspaceWidget):
+            self.statusBar().showMessage("Board not available", 2500)
+            return
+
+        if hasattr(self, "extensions_dock") and isinstance(self.extensions_dock, QDockWidget):
+            if not self.extensions_dock.isVisible():
+                self.extensions_dock.show()
+
+        opened = extensions_widget.open_primary_board_tab(activate=True)
+        if not opened:
+            self.statusBar().showMessage("Board not available", 2500)
+
     @Slot()
    
 
@@ -19994,7 +20454,7 @@ class MainAIEditor(QMainWindow):
             return
 
         if len(getattr(self, "_workspace_column_widths", [])) != 4:
-            self._workspace_column_widths = [260, 760, 460, 180]
+            self._workspace_column_widths = list(self._DEFAULT_WORKSPACE_COLUMN_WIDTHS)
 
         left_widget = getattr(self, "files_dock", None)
         middle_widget = getattr(self, "chat_dock", None)
@@ -20024,6 +20484,112 @@ class MainAIEditor(QMainWindow):
             self._workspace_column_widths[2] = right_size
         if extensions_widget is not None and extensions_widget.isVisible() and extensions_size > 0:
             self._workspace_column_widths[3] = extensions_size
+
+    def _schedule_workspace_column_snap(self, *_args: Any) -> None:
+        timer = getattr(self, "_workspace_column_snap_timer", None)
+        if isinstance(timer, QTimer):
+            timer.start(self._WORKSPACE_COLUMN_SNAP_DEBOUNCE_MS)
+
+    def _workspace_snap_compensation_index(self, splitter: QSplitter, side_index: int, sizes: Sequence[int]) -> int:
+        middle_widget = getattr(self, "chat_dock", None)
+        middle_index = splitter.indexOf(middle_widget) if isinstance(middle_widget, QWidget) else -1
+        if 0 <= middle_index < len(sizes) and middle_index != side_index:
+            middle_size = max(0, int(sizes[middle_index]))
+            middle_visible = bool(isinstance(middle_widget, QWidget) and middle_widget.isVisible())
+            if middle_visible and middle_size > 1:
+                return middle_index
+
+        for index in range(splitter.count()):
+            if index == side_index or index >= len(sizes):
+                continue
+            candidate_widget = splitter.widget(index)
+            if isinstance(candidate_widget, QWidget) and not candidate_widget.isVisible():
+                continue
+            if int(sizes[index]) > 1:
+                return index
+        return -1
+
+    def _snap_workspace_column_width(
+        self,
+        splitter: QSplitter,
+        sizes: list[int],
+        *,
+        side_index: int,
+        target_width: int,
+        tolerance_px: int,
+    ) -> bool:
+        if side_index < 0 or side_index >= len(sizes):
+            return False
+
+        side_widget = splitter.widget(side_index)
+        if isinstance(side_widget, QWidget) and not side_widget.isVisible():
+            return False
+
+        current_width = max(0, int(sizes[side_index]))
+        if current_width <= 0:
+            return False
+
+        target = max(0, int(target_width))
+        tolerance = max(0, int(tolerance_px))
+        if abs(current_width - target) > tolerance:
+            return False
+
+        delta = target - current_width
+        if delta == 0:
+            return False
+
+        compensation_index = self._workspace_snap_compensation_index(splitter, side_index, sizes)
+        if compensation_index < 0:
+            return False
+
+        compensation_width = max(0, int(sizes[compensation_index]))
+        if delta > 0:
+            max_reducible = max(0, compensation_width - 1)
+            if max_reducible <= 0:
+                return False
+            delta = min(delta, max_reducible)
+
+        sizes[side_index] = current_width + delta
+        sizes[compensation_index] = compensation_width - delta
+        return delta != 0
+
+    def _apply_workspace_column_snap(self) -> None:
+        splitter = getattr(self, "main_split", None)
+        if not isinstance(splitter, QSplitter):
+            return
+
+        sizes = [max(0, int(value)) for value in splitter.sizes()]
+        if len(sizes) < 4:
+            return
+
+        left_widget = getattr(self, "files_dock", None)
+        extensions_widget = getattr(self, "extensions_dock", None)
+        left_index = splitter.indexOf(left_widget) if isinstance(left_widget, QWidget) else -1
+        right_index = splitter.indexOf(extensions_widget) if isinstance(extensions_widget, QWidget) else -1
+
+        snap_target = int(self._SIDE_WIDGET_START_WIDTH_PX)
+        snap_tolerance = int(self._WORKSPACE_COLUMN_SNAP_TOLERANCE_PX)
+        changed = False
+        changed = self._snap_workspace_column_width(
+            splitter,
+            sizes,
+            side_index=left_index,
+            target_width=snap_target,
+            tolerance_px=snap_tolerance,
+        ) or changed
+        changed = self._snap_workspace_column_width(
+            splitter,
+            sizes,
+            side_index=right_index,
+            target_width=snap_target,
+            tolerance_px=snap_tolerance,
+        ) or changed
+
+        if not changed:
+            return
+
+        splitter.setSizes(sizes)
+        self._remember_workspace_column_widths()
 
     def _expand_explorer_column_width(self, delta_px: int) -> None:
         splitter = getattr(self, "main_split", None)
@@ -20090,10 +20656,12 @@ class MainAIEditor(QMainWindow):
 
         self._remember_workspace_column_widths()
 
-        fallback_widths = [260, 760, 460, 180]
+        fallback_widths = list(self._DEFAULT_WORKSPACE_COLUMN_WIDTHS)
         preferred_widths = list(getattr(self, "_workspace_column_widths", fallback_widths))
         if len(preferred_widths) != 4:
             preferred_widths = fallback_widths
+        preferred_widths[0] = self._SIDE_WIDGET_START_WIDTH_PX
+        preferred_widths[3] = self._SIDE_WIDGET_START_WIDTH_PX
 
         left_visible = bool(getattr(self, "files_dock", None) and self.files_dock.isVisible())
         middle_visible = bool(getattr(self, "chat_dock", None) and self.chat_dock.isVisible())
@@ -20152,6 +20720,11 @@ class MainAIEditor(QMainWindow):
             return
 
         splitter.setSizes(normalized_sizes)
+        self._schedule_workspace_column_snap()
+
+    def resizeEvent(self, event):  # noqa: N802
+        super().resizeEvent(event)
+        self._schedule_workspace_column_snap()
 
     # ------------------------------------------------ tab-dock clone ------
 
@@ -20630,7 +21203,7 @@ class MainAIEditor(QMainWindow):
             return
 
         tabs.setCurrentIndex(idx)
-        self._update_status_encoding()
+        self._update_status_encoding()  
 
 
     # ------------------------------------------------ about --------------
@@ -20763,14 +21336,14 @@ class MainAIEditor(QMainWindow):
 
         explorer_expand_delta_px = 0
 
-        stored_widths = s.value("workspaceColumnWidths", [260, 760, 460, 180])
+        stored_widths = s.value("workspaceColumnWidths", list(self._DEFAULT_WORKSPACE_COLUMN_WIDTHS))
         if isinstance(stored_widths, (list, tuple)):
             try:
                 parsed_widths = [int(value) for value in list(stored_widths)[:4]]
             except Exception:
                 parsed_widths = []
             if len(parsed_widths) == 3 and all(value > 0 for value in parsed_widths):
-                parsed_widths.append(180)
+                parsed_widths.append(self._SIDE_WIDGET_START_WIDTH_PX)
             if len(parsed_widths) == 4 and all(value > 0 for value in parsed_widths):
                 self._workspace_column_widths = parsed_widths
 
@@ -20804,6 +21377,12 @@ class MainAIEditor(QMainWindow):
             )
             explorer_expand_delta_px = self._EXPLORER_WIDTH_EXPAND_PX
             s.setValue("explorerWidthExpandAppliedV2", True)
+
+        if len(self._workspace_column_widths) == 4:
+            # Keep startup behavior consistent: both side widgets use the same target width.
+            self._workspace_column_widths[0] = self._SIDE_WIDGET_START_WIDTH_PX
+            self._workspace_column_widths[3] = self._SIDE_WIDGET_START_WIDTH_PX
+            explorer_expand_delta_px = 0
 
         stored_explorer_sizes = s.value("explorerSplitterSizes", [380, 130])
         if isinstance(stored_explorer_sizes, (list, tuple)):

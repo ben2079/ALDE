@@ -154,6 +154,103 @@ def _update_repo_worker_job(job_id: str, **updates: Any) -> dict[str, Any]:
     job_state.update(updates)
     return _store_repo_worker_job(str(job_id or "").strip(), job_state)
 
+
+class RepoDeltaStateService:
+    """Persist file hashes for incremental delta builds."""
+
+    _STORAGE_PATH_ENV = "ALDE_REPO_INDEX_STATE_PATH"
+
+    def __init__(self, *, storage_path: Path | None = None) -> None:
+        self._storage_path = Path(storage_path) if storage_path is not None else None
+        self._lock = threading.RLock()
+
+    def _resolve_storage_path(self) -> Path:
+        configured_path = str(os.getenv(self._STORAGE_PATH_ENV, "") or "").strip()
+        if configured_path:
+            return Path(os.path.abspath(os.path.expanduser(configured_path)))
+        if self._storage_path is not None:
+            return Path(self._storage_path)
+        return _HERE.parent / "AppData" / "repo_delta_state.json"
+
+    def _load_state_payload(self) -> dict[str, Any]:
+        storage_path = self._resolve_storage_path()
+        if not storage_path.is_file():
+            return {}
+        try:
+            payload = json.loads(storage_path.read_text(encoding="utf-8") or "{}")
+        except Exception:
+            return {}
+        return dict(payload) if isinstance(payload, Mapping) else {}
+
+    def _store_state_payload(self, payload: Mapping[str, Any]) -> None:
+        storage_path = self._resolve_storage_path()
+        storage_path.parent.mkdir(parents=True, exist_ok=True)
+        temp_path = storage_path.with_suffix(f"{storage_path.suffix}.tmp")
+        temp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(temp_path, storage_path)
+
+    def load_object_file_hashes(self, repo_root: str) -> dict[str, str]:
+        normalized_root = str(os.path.abspath(os.path.expanduser(repo_root or ""))).strip()
+        if not normalized_root:
+            return {}
+
+        with self._lock:
+            state_payload = self._load_state_payload()
+
+        roots_payload = state_payload.get("roots") if isinstance(state_payload.get("roots"), Mapping) else {}
+        root_payload = roots_payload.get(normalized_root) if isinstance(roots_payload.get(normalized_root), Mapping) else {}
+        files_payload = root_payload.get("files") if isinstance(root_payload.get("files"), Mapping) else {}
+        return {
+            str(rel_path): str(file_hash)
+            for rel_path, file_hash in files_payload.items()
+            if str(rel_path).strip() and str(file_hash).strip()
+        }
+
+    def store_object_file_hashes(self, repo_root: str, file_hashes: Mapping[str, str]) -> dict[str, Any]:
+        normalized_root = str(os.path.abspath(os.path.expanduser(repo_root or ""))).strip()
+        if not normalized_root:
+            return {"ok": False, "error": "missing_repo_root"}
+
+        normalized_hashes = {
+            str(rel_path): str(file_hash)
+            for rel_path, file_hash in dict(file_hashes or {}).items()
+            if str(rel_path).strip() and str(file_hash).strip()
+        }
+
+        with self._lock:
+            state_payload = self._load_state_payload()
+            roots_payload = state_payload.get("roots") if isinstance(state_payload.get("roots"), Mapping) else {}
+            mutable_roots = {
+                str(root_key): dict(root_value)
+                for root_key, root_value in roots_payload.items()
+                if isinstance(root_value, Mapping)
+            }
+            mutable_roots[normalized_root] = {
+                "updated_at": time.time(),
+                "files": normalized_hashes,
+            }
+            state_payload.update(
+                {
+                    "schema": "repo_delta_state_v1",
+                    "updated_at": time.time(),
+                    "roots": mutable_roots,
+                }
+            )
+            self._store_state_payload(state_payload)
+
+        return {
+            "ok": True,
+            "repo_root": normalized_root,
+            "files": len(normalized_hashes),
+            "state_path": str(self._resolve_storage_path()),
+        }
+
+    def load_storage_path(self) -> str:
+        return str(self._resolve_storage_path())
+
+
+_REPO_DELTA_STATE_STORE = RepoDeltaStateService()
+
 from agents_db import (  # type: ignore
     AgentDbInMemoryRepository,
     BlockObject,
@@ -369,6 +466,407 @@ class PythonCodeSplitter:
         return chunks
 
 
+class RepoEnvironmentOverrideParser:
+    """Extract environment override accesses from Python source modules.
+
+    Produces parser-compatible entity payloads so overrides flow through the
+    existing AgentsDB mapping pipeline (entity -> relation -> embedding).
+    """
+
+    _ENV_NAME_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+    def parse_object(
+        self,
+        *,
+        source: str,
+        rel_path: str,
+        code_blocks: Sequence[CodeBlock],
+    ) -> list[dict[str, Any]]:
+        try:
+            tree = ast.parse(source)
+        except SyntaxError:
+            return []
+
+        os_aliases, getenv_aliases, environ_aliases = self._load_os_symbol_sets(tree)
+        symbol_value_map = self._load_symbol_value_map(tree)
+        line_offsets = self._build_line_offsets(source)
+
+        occurrence_payload_list: list[dict[str, Any]] = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call):
+                occurrence_payload = self._extract_occurrence_from_call(
+                    node,
+                    os_aliases=os_aliases,
+                    getenv_aliases=getenv_aliases,
+                    environ_aliases=environ_aliases,
+                    symbol_value_map=symbol_value_map,
+                    line_offsets=line_offsets,
+                    code_blocks=code_blocks,
+                )
+                if occurrence_payload:
+                    occurrence_payload_list.append(occurrence_payload)
+            elif isinstance(node, ast.Subscript):
+                occurrence_payload = self._extract_occurrence_from_subscript(
+                    node,
+                    os_aliases=os_aliases,
+                    environ_aliases=environ_aliases,
+                    symbol_value_map=symbol_value_map,
+                    line_offsets=line_offsets,
+                    code_blocks=code_blocks,
+                )
+                if occurrence_payload:
+                    occurrence_payload_list.append(occurrence_payload)
+
+        return self._build_environment_entity_payloads(
+            occurrence_payload_list=occurrence_payload_list,
+            rel_path=rel_path,
+        )
+
+    def _load_os_symbol_sets(self, tree: ast.AST) -> tuple[set[str], set[str], set[str]]:
+        os_aliases = {"os"}
+        getenv_aliases: set[str] = set()
+        environ_aliases: set[str] = set()
+
+        for node in getattr(tree, "body", []):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    if str(alias.name or "").strip() == "os":
+                        os_aliases.add(str(alias.asname or "os").strip())
+            elif isinstance(node, ast.ImportFrom) and str(node.module or "").strip() == "os":
+                for alias in node.names:
+                    imported_name = str(alias.name or "").strip()
+                    local_name = str(alias.asname or imported_name).strip()
+                    if imported_name == "getenv":
+                        getenv_aliases.add(local_name)
+                    elif imported_name == "environ":
+                        environ_aliases.add(local_name)
+        return os_aliases, getenv_aliases, environ_aliases
+
+    def _load_symbol_value_map(self, tree: ast.AST) -> dict[str, str]:
+        symbol_value_map: dict[str, str] = {}
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Assign):
+                normalized_target = node.targets[0] if len(node.targets) == 1 else None
+            elif isinstance(node, ast.AnnAssign):
+                normalized_target = node.target
+            else:
+                normalized_target = None
+            if not isinstance(normalized_target, ast.Name):
+                continue
+            if isinstance(node, ast.Assign):
+                value_node = node.value
+            elif isinstance(node, ast.AnnAssign):
+                value_node = node.value
+            else:
+                value_node = None
+            if value_node is None:
+                continue
+            resolved_value = self._resolve_env_name_from_node(value_node, symbol_value_map={})
+            if resolved_value:
+                symbol_value_map[str(normalized_target.id)] = resolved_value
+        return symbol_value_map
+
+    def _build_line_offsets(self, source: str) -> list[int]:
+        lines = source.splitlines(keepends=True)
+        offsets: list[int] = []
+        position = 0
+        for line in lines:
+            offsets.append(position)
+            position += len(line)
+        offsets.append(position)
+        return offsets
+
+    def _is_environ_node(self, node: ast.AST, *, os_aliases: set[str], environ_aliases: set[str]) -> bool:
+        if isinstance(node, ast.Name):
+            return str(node.id or "").strip() in environ_aliases
+        if isinstance(node, ast.Attribute):
+            return (
+                str(node.attr or "").strip() == "environ"
+                and isinstance(node.value, ast.Name)
+                and str(node.value.id or "").strip() in os_aliases
+            )
+        return False
+
+    def _resolve_env_name_from_node(
+        self,
+        node: ast.AST | None,
+        *,
+        symbol_value_map: Mapping[str, str],
+    ) -> str:
+        if node is None:
+            return ""
+
+        candidate = ""
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            candidate = str(node.value or "").strip()
+        elif isinstance(node, ast.Name):
+            candidate = str(symbol_value_map.get(str(node.id or ""), "")).strip()
+
+        if not candidate:
+            return ""
+        if not self._ENV_NAME_PATTERN.match(candidate):
+            return ""
+        return candidate
+
+    def _load_call_argument(
+        self,
+        call_node: ast.Call,
+        index: int,
+        keyword_names: Sequence[str],
+    ) -> ast.AST | None:
+        if len(call_node.args) > index:
+            return call_node.args[index]
+        normalized_keyword_name_set = {str(name).strip() for name in keyword_names if str(name).strip()}
+        for keyword in call_node.keywords:
+            if str(keyword.arg or "").strip() in normalized_keyword_name_set:
+                return keyword.value
+        return None
+
+    def _load_default_payload(self, default_node: ast.AST | None) -> tuple[Any, str]:
+        if default_node is None:
+            return None, "none"
+        try:
+            literal_value = ast.literal_eval(default_node)
+            return literal_value, "literal"
+        except Exception:
+            try:
+                expression_text = ast.unparse(default_node).strip()
+            except Exception:
+                expression_text = ""
+            return expression_text or str(default_node), "expression"
+
+    def _load_section_key(
+        self,
+        *,
+        line_no: int,
+        line_offsets: Sequence[int],
+        code_blocks: Sequence[CodeBlock],
+    ) -> str:
+        if line_no <= 0 or not code_blocks:
+            return "block_1"
+        line_index = max(0, min(int(line_no) - 1, len(line_offsets) - 1))
+        char_start = int(line_offsets[line_index]) if line_offsets else 0
+        for block in code_blocks:
+            if int(block.char_start) <= char_start <= max(int(block.char_start), int(block.char_end)):
+                return f"block_{int(block.block_no)}"
+        return "block_1"
+
+    def _extract_occurrence_from_call(
+        self,
+        call_node: ast.Call,
+        *,
+        os_aliases: set[str],
+        getenv_aliases: set[str],
+        environ_aliases: set[str],
+        symbol_value_map: Mapping[str, str],
+        line_offsets: Sequence[int],
+        code_blocks: Sequence[CodeBlock],
+    ) -> dict[str, Any] | None:
+        func_node = call_node.func
+        env_name_node: ast.AST | None = None
+        default_node: ast.AST | None = None
+        access_path = ""
+        required = False
+
+        if isinstance(func_node, ast.Name) and str(func_node.id or "").strip() in getenv_aliases:
+            env_name_node = self._load_call_argument(call_node, 0, ("key", "name"))
+            default_node = self._load_call_argument(call_node, 1, ("default",))
+            access_path = "os.getenv"
+            required = False
+        elif isinstance(func_node, ast.Attribute):
+            attr_name = str(func_node.attr or "").strip()
+            if attr_name == "getenv" and isinstance(func_node.value, ast.Name) and str(func_node.value.id or "").strip() in os_aliases:
+                env_name_node = self._load_call_argument(call_node, 0, ("key", "name"))
+                default_node = self._load_call_argument(call_node, 1, ("default",))
+                access_path = "os.getenv"
+                required = False
+            elif attr_name in {"get", "setdefault", "pop"} and self._is_environ_node(
+                func_node.value,
+                os_aliases=os_aliases,
+                environ_aliases=environ_aliases,
+            ):
+                env_name_node = self._load_call_argument(call_node, 0, ("key", "name"))
+                default_node = self._load_call_argument(call_node, 1, ("default",))
+                access_path = f"os.environ.{attr_name}"
+                if attr_name == "get":
+                    required = False
+                elif attr_name == "setdefault":
+                    required = False
+                else:
+                    required = default_node is None
+
+        env_name = self._resolve_env_name_from_node(env_name_node, symbol_value_map=symbol_value_map)
+        if not env_name:
+            return None
+
+        default_value, default_kind = self._load_default_payload(default_node)
+        if default_node is None and access_path in {"os.getenv", "os.environ.get"}:
+            default_kind = "implicit_none"
+            default_value = None
+
+        line_no = int(getattr(call_node, "lineno", 0) or 0)
+        column_no = int(getattr(call_node, "col_offset", 0) or 0)
+        section_key = self._load_section_key(
+            line_no=line_no,
+            line_offsets=line_offsets,
+            code_blocks=code_blocks,
+        )
+
+        return {
+            "env_name": env_name,
+            "access_path": access_path,
+            "required": bool(required),
+            "line_no": line_no,
+            "column_no": column_no,
+            "section_key": section_key,
+            "default_value": default_value,
+            "default_kind": default_kind,
+        }
+
+    def _extract_occurrence_from_subscript(
+        self,
+        node: ast.Subscript,
+        *,
+        os_aliases: set[str],
+        environ_aliases: set[str],
+        symbol_value_map: Mapping[str, str],
+        line_offsets: Sequence[int],
+        code_blocks: Sequence[CodeBlock],
+    ) -> dict[str, Any] | None:
+        if not self._is_environ_node(node.value, os_aliases=os_aliases, environ_aliases=environ_aliases):
+            return None
+
+        env_name = self._resolve_env_name_from_node(node.slice, symbol_value_map=symbol_value_map)
+        if not env_name:
+            return None
+
+        line_no = int(getattr(node, "lineno", 0) or 0)
+        column_no = int(getattr(node, "col_offset", 0) or 0)
+        section_key = self._load_section_key(
+            line_no=line_no,
+            line_offsets=line_offsets,
+            code_blocks=code_blocks,
+        )
+        return {
+            "env_name": env_name,
+            "access_path": "os.environ[]",
+            "required": True,
+            "line_no": line_no,
+            "column_no": column_no,
+            "section_key": section_key,
+            "default_value": None,
+            "default_kind": "none",
+        }
+
+    def _build_environment_entity_payloads(
+        self,
+        *,
+        occurrence_payload_list: Sequence[Mapping[str, Any]],
+        rel_path: str,
+    ) -> list[dict[str, Any]]:
+        grouped_occurrence_payloads: dict[str, list[dict[str, Any]]] = {}
+        for occurrence_payload in occurrence_payload_list:
+            env_name = str(occurrence_payload.get("env_name") or "").strip()
+            if not env_name:
+                continue
+            grouped_occurrence_payloads.setdefault(env_name, []).append(dict(occurrence_payload))
+
+        module_name = Path(rel_path).stem
+        entity_payload_list: list[dict[str, Any]] = []
+        for env_name in sorted(grouped_occurrence_payloads.keys()):
+            env_occurrences = grouped_occurrence_payloads[env_name]
+            if not env_occurrences:
+                continue
+
+            access_paths = sorted(
+                {
+                    str(occurrence_payload.get("access_path") or "").strip()
+                    for occurrence_payload in env_occurrences
+                    if str(occurrence_payload.get("access_path") or "").strip()
+                }
+            )
+            default_value_labels: set[str] = set()
+            required_access_count = 0
+            normalized_occurrence_payload_list: list[dict[str, Any]] = []
+
+            for occurrence_payload in env_occurrences:
+                is_required = bool(occurrence_payload.get("required"))
+                if is_required:
+                    required_access_count += 1
+                default_value = occurrence_payload.get("default_value")
+                default_kind = str(occurrence_payload.get("default_kind") or "none")
+                if default_kind == "implicit_none":
+                    default_value_labels.add("None")
+                elif default_kind == "literal":
+                    if isinstance(default_value, (dict, list, tuple)):
+                        try:
+                            default_value_labels.add(json.dumps(default_value, ensure_ascii=False, sort_keys=True))
+                        except Exception:
+                            default_value_labels.add(str(default_value))
+                    elif default_value is None:
+                        default_value_labels.add("None")
+                    else:
+                        default_value_labels.add(str(default_value))
+                elif default_kind == "expression" and str(default_value or "").strip():
+                    default_value_labels.add(str(default_value).strip())
+
+                normalized_occurrence_payload_list.append(
+                    {
+                        "line_no": int(occurrence_payload.get("line_no") or 0),
+                        "column_no": int(occurrence_payload.get("column_no") or 0),
+                        "section_key": str(occurrence_payload.get("section_key") or "block_1"),
+                        "access_path": str(occurrence_payload.get("access_path") or ""),
+                        "required": is_required,
+                        "default_kind": default_kind,
+                        "default_value": default_value,
+                    }
+                )
+
+            total_occurrence_count = len(env_occurrences)
+            optional_access_count = max(0, total_occurrence_count - required_access_count)
+            section_key = str(normalized_occurrence_payload_list[0].get("section_key") or "block_1") if normalized_occurrence_payload_list else "block_1"
+            default_value_list = sorted(default_value_labels)
+            summary = f"Environment override {env_name} referenced in {rel_path}."
+            if default_value_list:
+                summary = f"{summary} Defaults: {', '.join(default_value_list[:3])}."
+
+            source_field = access_paths[0] if access_paths else "os.getenv"
+            relation_description = f"{module_name} uses environment override {env_name}."
+            entity_payload_list.append(
+                {
+                    "entity_key": f"environment_override:{env_name}",
+                    "entity_type": "environment_override",
+                    "canonical_name": env_name,
+                    "mention_text": env_name,
+                    "section_key": section_key,
+                    "summary": summary,
+                    "is_target": True,
+                    "source_entity": "subject",
+                    "is_relational": "uses_environment_override",
+                    "explicit_description": relation_description,
+                    "metadata": {
+                        "mapped_from": "repo_env_override_parser",
+                        "source_field": source_field,
+                        "source_path": rel_path,
+                        "relation_description": relation_description,
+                        "occurrence_count": total_occurrence_count,
+                    },
+                    "attributes": {
+                        "env_var_name": env_name,
+                        "source_path": rel_path,
+                        "occurrence_count": total_occurrence_count,
+                        "required_access_count": required_access_count,
+                        "optional_access_count": optional_access_count,
+                        "access_paths": access_paths,
+                        "default_values": default_value_list,
+                        "occurrences": normalized_occurrence_payload_list,
+                    },
+                }
+            )
+
+        return entity_payload_list
+
+
 def _build_default_runtime_config() -> RuntimeConfigObject:
     return RuntimeConfigObject(
         agents_db_uri="mongodb://unused",
@@ -408,6 +906,7 @@ class RepoModuleParser:
 
     def __init__(self, splitter: PythonCodeSplitter | None = None) -> None:
         self._splitter = splitter or PythonCodeSplitter()
+        self._environment_override_parser = RepoEnvironmentOverrideParser()
 
     def parse_object(self, source_path: str, *, repo_root: str) -> dict[str, Any]:
         path = Path(source_path)
@@ -440,6 +939,14 @@ class RepoModuleParser:
         entity_objects, relation_objects = self._build_entity_relation_payloads(
             source=source,
             rel_path=rel_path,
+            code_blocks=blocks,
+        )
+        environment_override_count = len(
+            [
+                entity_payload
+                for entity_payload in entity_objects
+                if str(entity_payload.get("entity_type") or "").strip() == "environment_override"
+            ]
         )
 
         return {
@@ -469,6 +976,7 @@ class RepoModuleParser:
                 "is_repo_module": True,
                 "language": "python",
                 "extraction_quality": "high",
+                "environment_override_count": environment_override_count,
                 "errors": [],
                 "warnings": [],
             },
@@ -504,18 +1012,25 @@ class RepoModuleParser:
             },
         }
 
-    def _build_entity_relation_payloads(self, *, source: str, rel_path: str) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    def _build_entity_relation_payloads(
+        self,
+        *,
+        source: str,
+        rel_path: str,
+        code_blocks: Sequence[CodeBlock],
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         module_name = Path(rel_path).stem
+        subject_entity: dict[str, Any] = {
+            "entity_key": "subject",
+            "entity_type": "module",
+            "canonical_name": module_name,
+            "mention_text": module_name,
+            "section_key": "block_1",
+            "summary": f"Python module {rel_path}",
+            "metadata": {"role": "subject", "source_field": "document.title", "source_path": rel_path},
+        }
         entity_objects: list[dict[str, Any]] = [
-            {
-                "entity_key": "subject",
-                "entity_type": "module",
-                "canonical_name": module_name,
-                "mention_text": module_name,
-                "section_key": "block_1",
-                "summary": f"Python module {rel_path}",
-                "metadata": {"role": "subject", "source_field": "document.title", "source_path": rel_path},
-            }
+            subject_entity
         ]
         relation_objects: list[dict[str, Any]] = []
 
@@ -596,7 +1111,83 @@ class RepoModuleParser:
                     source_field="ast.ImportFrom.module",
                 )
 
+        environment_entity_payload_list = self._environment_override_parser.parse_object(
+            source=source,
+            rel_path=rel_path,
+            code_blocks=code_blocks,
+        )
+        for environment_entity_payload in environment_entity_payload_list:
+            env_entity_key = str(environment_entity_payload.get("entity_key") or "").strip()
+            if not env_entity_key or env_entity_key in seen_entity_keys:
+                continue
+            entity_objects.append(dict(environment_entity_payload))
+            seen_entity_keys.add(env_entity_key)
+
+        self._apply_module_environment_attributes(
+            subject_entity=subject_entity,
+            environment_entity_payload_list=environment_entity_payload_list,
+        )
+
         return entity_objects, relation_objects
+
+    def _apply_module_environment_attributes(
+        self,
+        *,
+        subject_entity: dict[str, Any],
+        environment_entity_payload_list: Sequence[Mapping[str, Any]],
+    ) -> None:
+        environment_names: list[str] = []
+        access_path_set: set[str] = set()
+        total_occurrence_count = 0
+        total_required_access_count = 0
+        total_optional_access_count = 0
+        environment_details: list[dict[str, Any]] = []
+
+        for environment_entity_payload in environment_entity_payload_list:
+            if str(environment_entity_payload.get("entity_type") or "").strip() != "environment_override":
+                continue
+            env_name = str(environment_entity_payload.get("canonical_name") or "").strip()
+            attributes_payload = (
+                environment_entity_payload.get("attributes")
+                if isinstance(environment_entity_payload.get("attributes"), Mapping)
+                else {}
+            )
+
+            if env_name:
+                environment_names.append(env_name)
+            occurrence_count = int(attributes_payload.get("occurrence_count") or 0)
+            required_access_count = int(attributes_payload.get("required_access_count") or 0)
+            optional_access_count = int(attributes_payload.get("optional_access_count") or 0)
+
+            total_occurrence_count += max(0, occurrence_count)
+            total_required_access_count += max(0, required_access_count)
+            total_optional_access_count += max(0, optional_access_count)
+
+            raw_access_path_list = attributes_payload.get("access_paths")
+            if isinstance(raw_access_path_list, Sequence) and not isinstance(raw_access_path_list, (str, bytes)):
+                for access_path in raw_access_path_list:
+                    normalized_access_path = str(access_path or "").strip()
+                    if normalized_access_path:
+                        access_path_set.add(normalized_access_path)
+
+            environment_details.append(
+                {
+                    "env_name": env_name,
+                    "occurrence_count": max(0, occurrence_count),
+                    "required_access_count": max(0, required_access_count),
+                    "optional_access_count": max(0, optional_access_count),
+                }
+            )
+
+        subject_entity["attributes"] = {
+            "environment_override_count": len(environment_details),
+            "environment_override_names": sorted({name for name in environment_names if name}),
+            "environment_override_access_paths": sorted(access_path_set),
+            "environment_override_occurrence_count": total_occurrence_count,
+            "environment_override_required_access_count": total_required_access_count,
+            "environment_override_optional_access_count": total_optional_access_count,
+            "environment_overrides": sorted(environment_details, key=lambda item: str(item.get("env_name") or "")),
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -696,6 +1287,7 @@ class RepoIndexService:
         self._runtime_config = runtime_config or _build_default_runtime_config()
         self._module_parser = RepoModuleParser(self._splitter)
         self._mapping_service = ObjectMappingService(self._ks, self._runtime_config)
+        self._delta_state_store = _REPO_DELTA_STATE_STORE
 
     def scan_object(
         self,
@@ -715,6 +1307,110 @@ class RepoIndexService:
             if not bool(recursive):
                 break
         return sorted(result)
+
+    def _resolve_relative_object_path(self, source_path: str, *, scan_root: str) -> str:
+        source = Path(source_path).resolve()
+        root = Path(scan_root).resolve()
+        try:
+            return str(source.relative_to(root))
+        except Exception:
+            return str(Path(source_path).name)
+
+    def _compute_object_content_sha256(self, source_path: str) -> str:
+        path = Path(source_path)
+        try:
+            source_bytes = path.read_bytes()
+        except OSError:
+            return ""
+        return hashlib.sha256(source_bytes).hexdigest()
+
+    def _build_file_hash_map(self, *, scan_root: str, file_paths: Sequence[str]) -> dict[str, str]:
+        file_hash_map: dict[str, str] = {}
+        for source_path in file_paths:
+            rel_path = self._resolve_relative_object_path(source_path, scan_root=scan_root)
+            if not rel_path:
+                continue
+            file_hash_map[rel_path] = self._compute_object_content_sha256(source_path)
+        return file_hash_map
+
+    def _index_file_paths(self, *, scan_root: str, file_paths: Sequence[str]) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+        index_targets = [str(path) for path in file_paths if str(path).strip()]
+        t0 = time.perf_counter()
+
+        total_blocks = 0
+        total_entities = 0
+        total_relations = 0
+        total_embedded = 0
+        total_skipped = 0
+        total_indexed = 0
+        errors: list[str] = []
+        file_results: list[dict[str, Any]] = []
+
+        def _index_one(source_path: str) -> dict[str, Any]:
+            try:
+                return self.index_object(source_path, repo_root=scan_root)
+            except Exception as exc:
+                return {
+                    "path": source_path,
+                    "blocks": 0,
+                    "entities": 0,
+                    "relations": 0,
+                    "embedded": 0,
+                    "skipped": True,
+                    "error": str(exc),
+                }
+
+        def _collect_result(result_payload: Mapping[str, Any]) -> None:
+            nonlocal total_blocks, total_entities, total_relations, total_embedded, total_skipped, total_indexed
+            result_object = dict(result_payload)
+            file_results.append(result_object)
+            total_blocks += int(result_object.get("blocks", 0) or 0)
+            total_entities += int(result_object.get("entities", 0) or 0)
+            total_relations += int(result_object.get("relations", 0) or 0)
+            total_embedded += int(result_object.get("embedded", 0) or 0)
+            if bool(result_object.get("skipped")):
+                total_skipped += 1
+            else:
+                total_indexed += 1
+            error_text = str(result_object.get("error") or "").strip()
+            if error_text:
+                errors.append(f"{result_object.get('path')}: {error_text}")
+
+        repo_backend = getattr(self._ks, "_repository", self._repo)
+        flush_context = getattr(repo_backend, "deferred_flush", None)
+        if not callable(flush_context):
+            flush_context = getattr(repo_backend, "deferred_write_queue", None)
+
+        if callable(flush_context):
+            with flush_context():
+                with ThreadPoolExecutor(max_workers=self._workers) as executor:
+                    futures = {executor.submit(_index_one, source_path): source_path for source_path in index_targets}
+                    for future in as_completed(futures):
+                        _collect_result(future.result())
+        else:
+            with ThreadPoolExecutor(max_workers=self._workers) as executor:
+                futures = {executor.submit(_index_one, source_path): source_path for source_path in index_targets}
+                for future in as_completed(futures):
+                    _collect_result(future.result())
+
+        elapsed = time.perf_counter() - t0
+        if hasattr(repo_backend, "_flush_image"):
+            repo_backend._flush_image()
+
+        summary = {
+            "scan_root": scan_root,
+            "files_input": len(index_targets),
+            "files_indexed": total_indexed,
+            "files_skipped": total_skipped,
+            "total_blocks": total_blocks,
+            "total_entities": total_entities,
+            "total_relations": total_relations,
+            "total_embedded": total_embedded,
+            "elapsed_s": round(elapsed, 2),
+            "rate_files_per_s": round(total_indexed / elapsed, 2) if elapsed > 0 else 0,
+            "errors": errors[:10],
+        }
+        return summary, file_results
 
     def index_object(self, source_path: str, *, repo_root: str) -> dict[str, Any]:
         """Split, map, store, and embed a single source file. Returns per-file report."""
@@ -847,70 +1543,86 @@ class RepoIndexService:
         self._ks.store_namespace_object(ns)
 
         files = self.scan_object(scan_root, extensions=tuple(extensions), recursive=bool(recursive))
-        t0 = time.perf_counter()
+        summary, _file_results = self._index_file_paths(scan_root=scan_root, file_paths=files)
+        summary["recursive"] = bool(recursive)
+        summary["files_found"] = len(files)
+        return summary
 
-        total_blocks = 0
-        total_entities = 0
-        total_relations = 0
-        total_embedded = 0
-        total_skipped = 0
-        errors: list[str] = []
+    def index_repo_delta_object(
+        self,
+        scan_root: str,
+        *,
+        extensions: Sequence[str] = (".py",),
+        recursive: bool = True,
+    ) -> dict[str, Any]:
+        """Incremental repo index run that processes only changed files."""
+        # Ensure namespace exists
+        ns = self._builder.build_namespace_object()
+        self._ks.store_namespace_object(ns)
 
-        def _index_one(fpath: str) -> dict[str, Any]:
-            try:
-                return self.index_object(fpath, repo_root=scan_root)
-            except Exception as exc:
-                return {"path": fpath, "blocks": 0, "embedded": 0, "skipped": True, "error": str(exc)}
+        files = self.scan_object(scan_root, extensions=tuple(extensions), recursive=bool(recursive))
+        previous_hash_map = self._delta_state_store.load_object_file_hashes(scan_root)
+        current_hash_map = self._build_file_hash_map(scan_root=scan_root, file_paths=files)
 
-        repo_backend = getattr(self._ks, "_repository", self._repo)
-        flush_context = getattr(repo_backend, "deferred_flush", None)
-        if not callable(flush_context):
-            flush_context = getattr(repo_backend, "deferred_write_queue", None)
-        if callable(flush_context):
-            with flush_context():
-                with ThreadPoolExecutor(max_workers=self._workers) as executor:
-                    futures = {executor.submit(_index_one, fp): fp for fp in files}
-                    for fut in as_completed(futures):
-                        r = fut.result()
-                        total_blocks += r.get("blocks", 0)
-                        total_entities += r.get("entities", 0)
-                        total_relations += r.get("relations", 0)
-                        total_embedded += r.get("embedded", 0)
-                        if r.get("skipped"):
-                            total_skipped += 1
-                        if r.get("error"):
-                            errors.append(f"{r['path']}: {r['error']}")
-        else:
-            with ThreadPoolExecutor(max_workers=self._workers) as executor:
-                futures = {executor.submit(_index_one, fp): fp for fp in files}
-                for fut in as_completed(futures):
-                    r = fut.result()
-                    total_blocks += r.get("blocks", 0)
-                    total_entities += r.get("entities", 0)
-                    total_relations += r.get("relations", 0)
-                    total_embedded += r.get("embedded", 0)
-                    if r.get("skipped"):
-                        total_skipped += 1
-                    if r.get("error"):
-                        errors.append(f"{r['path']}: {r['error']}")
+        changed_files: list[str] = []
+        unchanged_files = 0
+        for source_path in files:
+            rel_path = self._resolve_relative_object_path(source_path, scan_root=scan_root)
+            current_hash = current_hash_map.get(rel_path, "")
+            previous_hash = previous_hash_map.get(rel_path, "")
+            if current_hash and current_hash == previous_hash:
+                unchanged_files += 1
+                continue
+            changed_files.append(source_path)
 
-        elapsed = time.perf_counter() - t0
-        if hasattr(repo_backend, "_flush_image"):
-            repo_backend._flush_image()
+        deleted_paths = sorted(set(previous_hash_map.keys()) - set(current_hash_map.keys()))
+        summary, file_results = self._index_file_paths(scan_root=scan_root, file_paths=changed_files)
 
-        return {
-            "scan_root": scan_root,
-            "recursive": bool(recursive),
-            "files_found": len(files),
-            "files_skipped": total_skipped,
-            "total_blocks": total_blocks,
-            "total_entities": total_entities,
-            "total_relations": total_relations,
-            "total_embedded": total_embedded,
-            "elapsed_s": round(elapsed, 2),
-            "rate_files_per_s": round((len(files) - total_skipped) / elapsed, 2) if elapsed > 0 else 0,
-            "errors": errors[:10],
+        failed_changed_paths = {
+            str(result_payload.get("path") or "")
+            for result_payload in file_results
+            if str(result_payload.get("error") or "").strip()
         }
+
+        persisted_hash_map: dict[str, str] = {}
+        changed_file_set = {str(path) for path in changed_files}
+        for source_path in files:
+            rel_path = self._resolve_relative_object_path(source_path, scan_root=scan_root)
+            if not rel_path:
+                continue
+            current_hash = current_hash_map.get(rel_path, "")
+            if not current_hash:
+                continue
+            normalized_path = str(source_path)
+            if normalized_path in changed_file_set and normalized_path in failed_changed_paths:
+                previous_hash = previous_hash_map.get(rel_path, "")
+                if previous_hash:
+                    persisted_hash_map[rel_path] = previous_hash
+                continue
+            persisted_hash_map[rel_path] = current_hash
+
+        state_result = self._delta_state_store.store_object_file_hashes(scan_root, persisted_hash_map)
+
+        summary.update(
+            {
+                "recursive": bool(recursive),
+                "files_found": len(files),
+                "files_changed": len(changed_files),
+                "files_unchanged": unchanged_files,
+                "files_deleted_since_last_state": len(deleted_paths),
+                "changed_paths_sample": [
+                    self._resolve_relative_object_path(path, scan_root=scan_root)
+                    for path in changed_files[:20]
+                ],
+                "deleted_paths_sample": deleted_paths[:20],
+                "delta_state": {
+                    "ok": bool(state_result.get("ok")),
+                    "state_path": self._delta_state_store.load_storage_path(),
+                    "tracked_files": int(state_result.get("files", 0) or 0),
+                },
+            }
+        )
+        return summary
 
     def delete_repo_knowledge_objects(
         self,
@@ -1103,6 +1815,8 @@ def run_repo_knowledge_operation(
 
     service = create_repo_index_service(image_path=image_path, workers=max(1, int(workers)))
     normalized_operation = str(operation or "build").strip().lower()
+    if normalized_operation == "delta":
+        normalized_operation = "delta_build"
     resolved_cleanup_namespaces = cleanup_namespace_ids
     if isinstance(resolved_cleanup_namespaces, str):
         resolved_cleanup_namespaces = [resolved_cleanup_namespaces]
@@ -1149,6 +1863,15 @@ def run_repo_knowledge_operation(
                 recursive=bool(recursive),
             ),
         }
+    if normalized_operation == "delta_build":
+        result = service.index_repo_delta_object(
+            str(resolved_root),
+            extensions=normalized_extensions,
+            recursive=bool(recursive),
+        )
+        result["ok"] = True
+        result["operation"] = "delta_build"
+        return result
     if normalized_operation == "build":
         cleanup_report = None
         if cleanup_before_build:
@@ -1197,7 +1920,7 @@ def run_repo_knowledge_operation(
     return {
         "ok": False,
         "error": f"Unsupported operation: {operation}",
-        "allowed_operations": ["scan", "build", "cleanup", "delete", "rebuild", "status", "repair_namespace"],
+        "allowed_operations": ["scan", "delta_build", "build", "cleanup", "delete", "rebuild", "status", "repair_namespace"],
     }
 
 
@@ -1235,9 +1958,11 @@ def adb_worker(
     run_async: bool = False,
     job_id: str | None = None,
 ) -> dict | str:
-    """Scan or build repository knowledge using the AgentsDB parser schema."""
+    """Scan or index repository knowledge using the AgentsDB parser schema."""
     try:
         normalized_operation = str(operation or "build").strip().lower()
+        if normalized_operation == "delta":
+            normalized_operation = "delta_build"
         if normalized_operation == "status":
             normalized_job_id = str(job_id or "").strip()
             if not normalized_job_id:
@@ -1261,7 +1986,7 @@ def adb_worker(
             "delete_async": delete_async,
         }
 
-        if bool(run_async) and normalized_operation in {"build", "cleanup", "delete", "rebuild", "repair_namespace"}:
+        if bool(run_async) and normalized_operation in {"delta_build", "build", "cleanup", "delete", "rebuild", "repair_namespace"}:
             normalized_job_id = str(job_id or f"repo-job-{uuid4().hex[:12]}").strip()
             job_state = {
                 "job_id": normalized_job_id,

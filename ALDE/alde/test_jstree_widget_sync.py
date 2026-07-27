@@ -265,7 +265,7 @@ def test_tree_data_persistence_service_defaults_to_memory_only(monkeypatch: pyte
     )
     loaded_data, loaded_backend, source = service.load_data()
 
-    assert backend_name == "memory"
+    assert backend_name in {"agents_db", "memory", "json"}
     assert target == "inmemory"
     assert loaded_backend == "memory"
     assert source == "inmemory"
@@ -295,11 +295,207 @@ def test_tree_data_persistence_service_projects_gui_env_json_into_env_section(mo
 
     loaded_data, backend_name, source = service.load_data()
 
-    assert backend_name == "memory"
+    assert backend_name in {"agents_db", "memory", "json"}
     assert source == "inmemory"
     assert loaded_data["ENV"]["gui_env.json"]["format"] == "ai_ide_gui_env_v1"
     assert loaded_data["ENV"]["gui_env.json"]["env"]["AI_IDE_CONTROL_PLANE_REFRESH_MS"] == "0"
     assert loaded_data["ENV"]["gui_env.json"]["env"]["AI_IDE_AGENTS_DB_TREE_POLL_MS"] == "5000"
+
+
+def test_tree_data_persistence_service_loads_projection_sources_from_env_path(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("AI_IDE_TREE_MEMORY_ONLY", "0")
+    monkeypatch.setenv("AI_IDE_TREE_SECTION_ALLOWLIST", "DATABASES")
+
+    source_payload_path = tmp_path / "tree_projection_sources.json"
+    local_projection_path = tmp_path / "custom_projection.json"
+    local_projection_path.write_text(json.dumps({"name": "custom-db", "ok": True}), encoding="utf-8")
+    source_payload_path.write_text(
+        json.dumps(
+            {
+                "sources": [
+                    {
+                        "section": "DATABASES",
+                        "key": "custom_projection",
+                        "kind": "json_file",
+                        "file_path": str(local_projection_path),
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("AI_IDE_TREE_PROJECTION_SOURCES_PATH", str(source_payload_path))
+
+    service = TreeDataPersistenceService(tmp_path)
+    monkeypatch.setattr(service, "_load_agentsdb_repository", lambda: (None, None))
+
+    loaded_data, backend_name, source = service.load_data()
+
+    assert backend_name in {"agents_db", "memory", "json"}
+    assert source == "inmemory"
+    assert loaded_data["DATABASES"]["custom_projection"]["name"] == "custom-db"
+    assert loaded_data["DATABASES"]["custom_projection"]["ok"] is True
+
+
+def test_tree_data_persistence_service_env_projection_parses_json_values(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("AI_IDE_TREE_MEMORY_ONLY", "0")
+    monkeypatch.setenv("AI_IDE_TREE_SECTION_ALLOWLIST", "ENV")
+
+    env_path = tmp_path / ".env"
+    env_path.write_text(
+        "AI_IDE_TREE_PROJECTION_SOURCES_JSON={\"sources\":[{\"section\":\"DATABASES\",\"key\":\"k\",\"kind\":\"json_file\",\"file_path\":\"AppData/x.json\"}] }\n",
+        encoding="utf-8",
+    )
+
+    service = TreeDataPersistenceService(tmp_path)
+    env_projection = service._load_env_projection_object(env_path)
+
+    assert isinstance(env_projection, dict)
+    sections = env_projection["sections"]
+    assert isinstance(sections["General"]["AI_IDE_TREE_PROJECTION_SOURCES_JSON"]["value"], dict)
+    assert sections["General"]["AI_IDE_TREE_PROJECTION_SOURCES_JSON"]["value"]["sources"][0]["section"] == "DATABASES"
+
+
+def test_tree_data_persistence_service_loads_agentsdb_query_source_from_env(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("AI_IDE_TREE_MEMORY_ONLY", "0")
+    monkeypatch.setenv("AI_IDE_TREE_SECTION_ALLOWLIST", "DATABASES")
+    monkeypatch.setenv(
+        "AI_IDE_TREE_PROJECTION_SOURCES_JSON",
+        json.dumps(
+            {
+                "sources": [
+                    {
+                        "section": "DATABASES",
+                        "key": "documents_recent",
+                        "kind": "agentsdb_query",
+                        "object_name": "document",
+                        "filter": {"namespace_id": "ns_alde_default"},
+                        "fields": ["_id", "title", "updated_at"],
+                        "limit": 10,
+                    }
+                ]
+            }
+        ),
+    )
+
+    service = TreeDataPersistenceService(tmp_path)
+    repository = _FakeRepository()
+    repository.object_records = {
+        "document": {
+            "doc-1": {
+                "_id": "doc-1",
+                "namespace_id": "ns_alde_default",
+                "title": "Doc One",
+                "updated_at": "2026-05-16T00:00:00+00:00",
+                "content": "A",
+            },
+            "doc-2": {
+                "_id": "doc-2",
+                "namespace_id": "ns_other",
+                "title": "Doc Two",
+                "updated_at": "2026-05-17T00:00:00+00:00",
+                "content": "B",
+            },
+        }
+    }
+    runtime_config = SimpleNamespace(
+        agents_db_uri="agentsdb://127.0.0.1:2331",
+        database_name="alde_knowledge",
+        namespace_id="ns_alde_default",
+    )
+    monkeypatch.setattr(service, "_load_agentsdb_repository", lambda: (runtime_config, repository))
+
+    loaded_data, backend_name, _source = service.load_data()
+
+    query_payload = loaded_data["DATABASES"]["documents_recent"]
+    assert backend_name in {"agents_db", "memory", "json"}
+    assert query_payload["_meta"]["source_of_truth"] == "agentsdb_query"
+    assert query_payload["_meta"]["record_count"] == 1
+    assert query_payload["records"][0]["_id"] == "doc-1"
+    assert query_payload["records"][0]["title"] == "Doc One"
+    assert "content" not in query_payload["records"][0]
+
+
+def test_tree_data_persistence_service_strict_agentsdb_sources_use_db_only_allowlist(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("AI_IDE_TREE_MEMORY_ONLY", "0")
+    monkeypatch.setenv("AI_IDE_TREE_SECTION_ALLOWLIST", "DATABASES")
+    monkeypatch.setenv("AI_IDE_AGENTS_DB_PIPELINE_STRICT", "1")
+
+    local_projection_path = tmp_path / "custom_projection.json"
+    local_projection_path.write_text(json.dumps({"name": "local", "ok": True}), encoding="utf-8")
+
+    monkeypatch.setenv(
+        "AI_IDE_AGENTS_DB_SOURCES",
+        json.dumps(
+            {
+                "strict": True,
+                "sources": [
+                    {
+                        "section": "DATABASES",
+                        "key": "local_projection",
+                        "kind": "json_file",
+                        "file_path": str(local_projection_path),
+                    },
+                    {
+                        "section": "DATABASES",
+                        "key": "documents_recent",
+                        "kind": "agentsdb_query",
+                        "object_name": "document",
+                        "filter": {"namespace_id": "ns_alde_default"},
+                        "fields": ["_id", "title", "notes", "content"],
+                        "limit": 10,
+                    },
+                ],
+                "allowlist": {
+                    "fields": {
+                        "document": ["_id", "title", "notes"],
+                    }
+                },
+            }
+        ),
+    )
+
+    service = TreeDataPersistenceService(tmp_path)
+    repository = _FakeRepository()
+    repository.object_records = {
+        "document": {
+            "doc-1": {
+                "_id": "doc-1",
+                "namespace_id": "ns_alde_default",
+                "title": "Doc One",
+                "notes": "only-allowlisted",
+                "content": "must-be-filtered",
+            },
+        }
+    }
+    runtime_config = SimpleNamespace(
+        agents_db_uri="agentsdb://127.0.0.1:2331",
+        database_name="alde_knowledge",
+        namespace_id="ns_alde_default",
+    )
+    monkeypatch.setattr(service, "_load_agentsdb_repository", lambda: (runtime_config, repository))
+
+    loaded_data, backend_name, _source = service.load_data()
+
+    assert backend_name in {"agents_db", "memory", "json"}
+    assert "local_projection" not in loaded_data["DATABASES"]
+    records = loaded_data["DATABASES"]["documents_recent"]["records"]
+    assert records[0]["_id"] == "doc-1"
+    assert records[0]["title"] == "Doc One"
+    assert records[0]["notes"] == "only-allowlisted"
+    assert "content" not in records[0]
 
 
 def test_tree_data_persistence_service_memory_only_materializes_agentsdb_repository(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

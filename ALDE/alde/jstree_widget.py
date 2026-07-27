@@ -132,21 +132,15 @@ class TreeDataPersistenceService:
     )
 
     _AI_IDE_SECTION_NAME_ORDER: tuple[str, ...] = (
-        "PROJECTS",
         "RUNTIME",
-        "ENV",
-        "MCP",
-        "TEMPLATES",
-        "DATABASES",
         "CHAT_HISTORY",
-        "DOCUMENTS",
-        "RUNTIME_VIEWS",
-        "DISPATCHER_DB",
-        "GENERATED_DATA",
-        "HISTORY",
+        "DATABASES",
+        "MCP",
+        "ENV",
     )
+    _AI_IDE_SECTION_NAME_ORDER_ENV_NAME = "AI_IDE_SECTION_NAME_ORDER"
     _PROJECTION_SOURCE_OBJECT_DEFINITION: tuple[dict[str, Any], ...] = (
-        {"section": "ENV", "key": ".env", "kind": "env_file", "file_name": ".env"},
+        {"section": "ENV", "key": ".env.json", "kind": "env_file", "file_name": ".env.json"},
         {"section": "ENV", "key": "gui_env.json", "kind": "json_file", "file_name": "gui_env.json"},
         {"section": "RUNTIME_VIEWS", "key": "runtime_tabs", "kind": "json_file", "file_name": "control_plane_runtime_tabs.json"},
         {"section": "DISPATCHER_DB", "key": "dispatcher_doc_db", "kind": "json_file", "file_name": "dispatcher_doc_db.json"},
@@ -158,13 +152,18 @@ class TreeDataPersistenceService:
         {"section": "GENERATED_DATA", "key": "generated_files", "kind": "directory_index", "dir_name": "generated", "pattern": "*"},
         {"section": "CHAT_HISTORY", "key": "chat_history", "kind": "chat_history"},
     )
+    _PROJECTION_SOURCES_ENV_NAME = "AI_IDE_TREE_PROJECTION_SOURCES_JSON"
+    _PROJECTION_SOURCES_PATH_ENV_NAME = "AI_IDE_TREE_PROJECTION_SOURCES_PATH"
+    _PROJECTION_APPEND_SOURCES_ENV_NAME = "AI_IDE_TREE_PROJECTION_APPEND_SOURCES_JSON"
+    _PROJECTION_APPEND_SOURCES_PATH_ENV_NAME = "AI_IDE_TREE_PROJECTION_APPEND_SOURCES_PATH"
+    _AGENTS_DB_SOURCES_ENV_NAME = "AI_IDE_AGENTS_DB_SOURCES"
+    _AGENTS_DB_SOURCES_JSON_ENV_NAME = "AI_IDE_AGENTS_DB_SOURCES_JSON"
     _DEFAULT_SECTION_ALLOWLIST: tuple[str, ...] = (
-        "PROJECTS",
         "RUNTIME",
-        "ENV",
-        "MCP",
-        "DATABASES",
         "CHAT_HISTORY",
+        "DATABASES",
+        "ENV",
+        "MCP"
     )
     _DEFAULT_HISTORY_RETENTION_DAYS = 28
     _DEFAULT_HISTORY_MAX_ITEMS = 2000
@@ -190,6 +189,132 @@ class TreeDataPersistenceService:
     def _agentsdb_strict_mode(self) -> bool:
         value = str(os.getenv("AI_IDE_AGENTS_DB_TREE_STRICT", "1")).strip().lower()
         return value not in {"0", "false", "no", "off"}
+
+    def _agentsdb_pipeline_strict_mode(self) -> bool:
+        value = str(os.getenv("AI_IDE_AGENTS_DB_PIPELINE_STRICT", "1")).strip().lower()
+        return value not in {"0", "false", "no", "off"}
+
+    def _parse_bool_value(self, value: Any, *, default: bool = False) -> bool:
+        if isinstance(value, bool):
+            return value
+        text = str(value or "").strip().lower()
+        if not text:
+            return default
+        return text in {"1", "true", "yes", "on", "strict"}
+
+    def _agentsdb_sources_config_payload(self) -> tuple[dict[str, Any] | list[Any] | None, bool]:
+        raw_payload = ""
+        for env_name in (self._AGENTS_DB_SOURCES_ENV_NAME, self._AGENTS_DB_SOURCES_JSON_ENV_NAME):
+            candidate = str(os.getenv(env_name, "") or "").strip()
+            if candidate:
+                raw_payload = candidate
+                break
+        if not raw_payload:
+            return None, False
+
+        try:
+            parsed_payload = json.loads(raw_payload)
+        except Exception:
+            return None, True
+
+        if isinstance(parsed_payload, (dict, list)):
+            return parsed_payload, True
+        return None, True
+
+    def _agentsdb_sources_field_allowlist(self) -> dict[str, set[str]]:
+        parsed_payload, _has_config = self._agentsdb_sources_config_payload()
+        if not isinstance(parsed_payload, dict):
+            return {}
+
+        allowlist_payload = parsed_payload.get("allowlist") if isinstance(parsed_payload.get("allowlist"), Mapping) else {}
+        field_map_payload: Any = (
+            allowlist_payload.get("fields")
+            if isinstance(allowlist_payload.get("fields"), Mapping)
+            else parsed_payload.get("allowlist_fields")
+        )
+        if not isinstance(field_map_payload, Mapping):
+            return {}
+
+        field_allowlist_map: dict[str, set[str]] = {}
+        for object_name, field_values in field_map_payload.items():
+            normalized_object_name = str(object_name or "").strip().lower()
+            if not normalized_object_name:
+                continue
+            if isinstance(field_values, (str, bytes)):
+                normalized_fields = {str(field_values).strip()} if str(field_values).strip() else set()
+            elif isinstance(field_values, Sequence):
+                normalized_fields = {
+                    str(field_name).strip()
+                    for field_name in field_values
+                    if str(field_name).strip()
+                }
+            else:
+                normalized_fields = set()
+            if normalized_fields:
+                field_allowlist_map[normalized_object_name] = normalized_fields
+        return field_allowlist_map
+
+    def _default_strict_projection_sources(self) -> list[dict[str, Any]]:
+        return [
+            {
+                "section": "DATABASES",
+                "key": "agents_documents_recent",
+                "kind": "agentsdb_query",
+                "object_name": "document",
+                "fields": ["_id", "title", "updated_at", "source_uri", "notes"],
+                "limit": 200,
+            },
+            {
+                "section": "DATABASES",
+                "key": "agents_entities_recent",
+                "kind": "agentsdb_query",
+                "object_name": "entity",
+                "fields": ["_id", "entity_id", "entity_type", "updated_at", "notes"],
+                "limit": 200,
+            },
+            {
+                "section": "DATABASES",
+                "key": "agents_relations_recent",
+                "kind": "agentsdb_query",
+                "object_name": "relation",
+                "fields": ["_id", "source_entity_id", "target_entity_id", "relation_type", "updated_at", "notes"],
+                "limit": 200,
+            },
+        ]
+
+    def _default_strict_field_allowlist(self) -> dict[str, set[str]]:
+        return {
+            "document": {"_id", "title", "updated_at", "source_uri", "notes"},
+            "entity": {"_id", "entity_id", "entity_type", "updated_at", "notes"},
+            "relation": {"_id", "source_entity_id", "target_entity_id", "relation_type", "updated_at", "notes"},
+        }
+
+    def _projection_db_only_strict_mode(self) -> bool:
+        parsed_payload, has_config = self._agentsdb_sources_config_payload()
+        if not self._agentsdb_pipeline_strict_mode():
+            return False
+        if isinstance(parsed_payload, dict) and "strict" in parsed_payload:
+            return self._parse_bool_value(parsed_payload.get("strict"), default=True)
+        return has_config
+
+    def _strict_projection_sources_override(self) -> list[dict[str, Any]] | None:
+        parsed_payload, has_config = self._agentsdb_sources_config_payload()
+        if not has_config:
+            return None
+        loaded_sources = self._load_projection_sources_payload(parsed_payload)
+        if isinstance(loaded_sources, list) and loaded_sources:
+            return loaded_sources
+        if self._projection_db_only_strict_mode():
+            return self._default_strict_projection_sources()
+        return None
+
+    def _strict_projection_field_allowlist(self) -> dict[str, set[str]]:
+        configured_allowlist = self._agentsdb_sources_field_allowlist()
+        if configured_allowlist:
+            return configured_allowlist
+        if self._projection_db_only_strict_mode():
+            return self._default_strict_field_allowlist()
+        return {}
 
     def _agentsdb_tree_sync_enabled(self) -> bool:
         value = str(os.getenv("AI_IDE_AGENTS_DB_TREE_SYNC", "")).strip().lower()
@@ -289,6 +414,8 @@ class TreeDataPersistenceService:
         return resolved_policy
 
     def _projection_conflict_policy(self) -> str:
+        if self._projection_db_only_strict_mode():
+            return "agentsdb_strict"
         default_policy = "newest_wins"
         configured_policy = str(os.getenv("AI_IDE_AGENTS_DB_PROJECTION_CONFLICT_POLICY", "")).strip().lower()
         if not configured_policy:
@@ -511,10 +638,45 @@ class TreeDataPersistenceService:
                     dict(section_payload) if isinstance(section_payload, dict) else {}
                 )
 
-        for section_name in self._AI_IDE_SECTION_NAME_ORDER:
+        for section_name in self._resolved_ai_ide_section_name_order():
             normalized_data.setdefault(section_name, {})
 
         return normalized_data
+
+    def _resolved_ai_ide_section_name_order(self) -> tuple[str, ...]:
+        default_order = tuple(str(name).strip().upper() for name in self._AI_IDE_SECTION_NAME_ORDER if str(name).strip())
+        raw_value = str(os.getenv(self._AI_IDE_SECTION_NAME_ORDER_ENV_NAME, "") or "").strip()
+        if not raw_value:
+            return default_order
+
+        tokens: list[str] = []
+        parsed_from_json = False
+        if raw_value.startswith("["):
+            try:
+                parsed_payload = json.loads(raw_value)
+            except Exception:
+                parsed_payload = None
+            if isinstance(parsed_payload, list):
+                parsed_from_json = True
+                tokens = [str(item or "").strip() for item in parsed_payload]
+
+        if not parsed_from_json:
+            tokens = [part.strip() for part in re.split(r"[,;|\s]+", raw_value) if part.strip()]
+
+        ordered_unique: list[str] = []
+        for token in tokens:
+            normalized_token = str(token or "").strip().upper()
+            if not normalized_token or normalized_token in ordered_unique:
+                continue
+            ordered_unique.append(normalized_token)
+
+        if not ordered_unique:
+            return default_order
+
+        for default_section in default_order:
+            if default_section not in ordered_unique:
+                ordered_unique.append(default_section)
+        return tuple(ordered_unique)
 
     def _tree_section_allowlist(self) -> set[str]:
         raw_value = str(os.getenv("AI_IDE_TREE_SECTION_ALLOWLIST", "")).strip()
@@ -614,10 +776,18 @@ class TreeDataPersistenceService:
         normalized_data = self._normalize_tree_data_structure(data)
         allowed_sections = self._tree_section_allowlist()
         filtered: dict[str, Any] = {}
+        ordered_section_names: list[str] = []
 
-        for section_name, section_payload in normalized_data.items():
-            if section_name not in allowed_sections:
-                continue
+        for section_name in self._resolved_ai_ide_section_name_order():
+            if section_name in normalized_data and section_name in allowed_sections and section_name not in ordered_section_names:
+                ordered_section_names.append(section_name)
+
+        for section_name in normalized_data.keys():
+            if section_name in allowed_sections and section_name not in ordered_section_names:
+                ordered_section_names.append(section_name)
+
+        for section_name in ordered_section_names:
+            section_payload = normalized_data.get(section_name)
             payload = section_payload if isinstance(section_payload, dict) else {}
             if section_name == "PROJECTS":
                 payload = self._prune_projects_section(payload)
@@ -625,7 +795,10 @@ class TreeDataPersistenceService:
                 payload = self._trim_history_section(payload)
             filtered[section_name] = dict(payload)
 
-        for section_name in allowed_sections:
+        for section_name in ordered_section_names:
+            filtered.setdefault(section_name, {})
+
+        for section_name in sorted(allowed_sections):
             filtered.setdefault(section_name, {})
 
         return filtered
@@ -649,6 +822,159 @@ class TreeDataPersistenceService:
     def _projection_source_object_id(self, source_key: str) -> str:
         normalized_source_key = str(source_key or "projection").strip().lower()
         return f"ai_ide_projection:{normalized_source_key}"
+
+    def _normalize_projection_source_object(self, source_object: Any) -> dict[str, Any] | None:
+        if not isinstance(source_object, Mapping):
+            return None
+
+        section_name = str(source_object.get("section") or "").strip().upper()
+        source_key = str(source_object.get("key") or "").strip()
+        source_kind = str(source_object.get("kind") or "").strip().lower()
+        if not section_name or not source_key or not source_kind:
+            return None
+
+        normalized_source: dict[str, Any] = {
+            "section": section_name,
+            "key": source_key,
+            "kind": source_kind,
+        }
+        for optional_field in (
+            "file_name",
+            "file_path",
+            "dir_name",
+            "dir_path",
+            "pattern",
+            "object_name",
+            "collection_name",
+            "source_uri",
+            "query",
+            "filter",
+            "fields",
+            "sort_by",
+            "limit",
+            "max_entries",
+        ):
+            if optional_field in source_object:
+                normalized_source[optional_field] = source_object.get(optional_field)
+        return normalized_source
+
+    def _load_projection_sources_payload(self, payload: Any) -> list[dict[str, Any]] | None:
+        raw_sources: Any = None
+        if isinstance(payload, list):
+            raw_sources = payload
+        elif isinstance(payload, Mapping):
+            raw_sources = payload.get("sources")
+        if not isinstance(raw_sources, list):
+            return None
+
+        normalized_sources: list[dict[str, Any]] = []
+        for item in raw_sources:
+            normalized_item = self._normalize_projection_source_object(item)
+            if normalized_item is not None:
+                normalized_sources.append(normalized_item)
+        return normalized_sources
+
+    def _projection_sources_path_candidates(self, configured_path: str) -> list[Path]:
+        if not configured_path:
+            return []
+        raw_path = Path(configured_path).expanduser()
+        if raw_path.is_absolute():
+            return [raw_path]
+
+        candidate_path_list = [
+            (self._app_data_dir.parent / raw_path),
+            (self._app_data_dir.parent.parent / raw_path),
+            raw_path,
+        ]
+        unique_candidate_list: list[Path] = []
+        seen_set: set[str] = set()
+        for candidate_path in candidate_path_list:
+            try:
+                normalized_path = str(candidate_path.resolve())
+            except Exception:
+                normalized_path = str(candidate_path)
+            if normalized_path in seen_set:
+                continue
+            seen_set.add(normalized_path)
+            unique_candidate_list.append(candidate_path)
+        return unique_candidate_list
+
+    def _load_projection_sources_from_env(
+        self,
+        *,
+        inline_env_name: str,
+        path_env_name: str,
+    ) -> list[dict[str, Any]] | None:
+        inline_payload = str(os.getenv(inline_env_name, "") or "").strip()
+        if inline_payload:
+            try:
+                parsed_payload = json.loads(inline_payload)
+            except Exception:
+                parsed_payload = None
+            loaded_sources = self._load_projection_sources_payload(parsed_payload)
+            if loaded_sources is not None:
+                return loaded_sources
+
+        configured_path = str(os.getenv(path_env_name, "") or "").strip()
+        if not configured_path:
+            return None
+        for candidate_path in self._projection_sources_path_candidates(configured_path):
+            if not candidate_path.exists() or not candidate_path.is_file():
+                continue
+            try:
+                parsed_payload = json.loads(candidate_path.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            loaded_sources = self._load_projection_sources_payload(parsed_payload)
+            if loaded_sources is not None:
+                return loaded_sources
+        return None
+
+    def _projection_source_object_definition(self) -> tuple[dict[str, Any], ...]:
+        default_sources = [
+            dict(source_object)
+            for source_object in self._PROJECTION_SOURCE_OBJECT_DEFINITION
+            if isinstance(source_object, Mapping)
+        ]
+
+        strict_override_sources = self._strict_projection_sources_override()
+        if isinstance(strict_override_sources, list):
+            effective_sources = strict_override_sources
+        else:
+            effective_sources = None
+
+        override_sources = self._load_projection_sources_from_env(
+            inline_env_name=self._PROJECTION_SOURCES_ENV_NAME,
+            path_env_name=self._PROJECTION_SOURCES_PATH_ENV_NAME,
+        )
+        append_sources = self._load_projection_sources_from_env(
+            inline_env_name=self._PROJECTION_APPEND_SOURCES_ENV_NAME,
+            path_env_name=self._PROJECTION_APPEND_SOURCES_PATH_ENV_NAME,
+        )
+
+        if effective_sources is None:
+            effective_sources = list(override_sources) if isinstance(override_sources, list) else default_sources
+            if isinstance(append_sources, list) and append_sources:
+                effective_sources.extend(append_sources)
+
+        # Keep deterministic order while allowing later entries to override section/key duplicates.
+        deduped_source_map: dict[tuple[str, str], dict[str, Any]] = {}
+        deduped_order: list[tuple[str, str]] = []
+        for source_object in effective_sources:
+            normalized_source = self._normalize_projection_source_object(source_object)
+            if normalized_source is None:
+                continue
+            section_key = (
+                str(normalized_source.get("section") or "").strip().upper(),
+                str(normalized_source.get("key") or "").strip(),
+            )
+            if not section_key[0] or not section_key[1]:
+                continue
+            if section_key not in deduped_source_map:
+                deduped_order.append(section_key)
+            deduped_source_map[section_key] = normalized_source
+
+        return tuple(deduped_source_map[key] for key in deduped_order if key in deduped_source_map)
 
     def _json_safe_projection_data(self, data: Any) -> Any:
         try:
@@ -1075,15 +1401,148 @@ class TreeDataPersistenceService:
             "entries": entry_list,
         }
 
+    def _expand_projection_path_candidates(self, configured_path: str, app_data_dir_list: list[Path]) -> list[Path]:
+        normalized_path = str(configured_path or "").strip()
+        if not normalized_path:
+            return []
+        raw_path = Path(normalized_path).expanduser()
+        candidate_path_list: list[Path] = []
+        if raw_path.is_absolute():
+            candidate_path_list.append(raw_path)
+        else:
+            for app_data_dir in app_data_dir_list:
+                candidate_path_list.append(app_data_dir / raw_path)
+                candidate_path_list.append(app_data_dir.parent / raw_path)
+                candidate_path_list.append(app_data_dir.parent.parent / raw_path)
+            candidate_path_list.append(raw_path)
+
+        unique_candidate_list: list[Path] = []
+        seen_set: set[str] = set()
+        for candidate_path in candidate_path_list:
+            try:
+                normalized_candidate = str(candidate_path.resolve())
+            except Exception:
+                normalized_candidate = str(candidate_path)
+            if normalized_candidate in seen_set:
+                continue
+            seen_set.add(normalized_candidate)
+            unique_candidate_list.append(candidate_path)
+        return unique_candidate_list
+
+    def _agentsdb_query_projection_payload(
+        self,
+        source_object: Mapping[str, Any],
+        *,
+        runtime_config: Any | None,
+        repository: Any | None,
+    ) -> tuple[Any | None, str, str | None]:
+        if repository is None:
+            return None, "", None
+
+        query_payload = source_object.get("query") if isinstance(source_object.get("query"), Mapping) else {}
+        object_name = str(
+            source_object.get("object_name")
+            or source_object.get("collection_name")
+            or query_payload.get("object_name")
+            or query_payload.get("collection_name")
+            or ""
+        ).strip().lower()
+        if not object_name:
+            return None, "", None
+
+        raw_limit = source_object.get("limit", query_payload.get("limit", 50))
+        try:
+            resolved_limit = max(1, min(int(raw_limit), 10000))
+        except Exception:
+            resolved_limit = 50
+
+        filter_payload = source_object.get("filter", query_payload.get("filter"))
+        if not isinstance(filter_payload, Mapping):
+            filter_payload = {}
+        normalized_filter = dict(filter_payload)
+
+        try:
+            load_objects = getattr(repository, "load_objects", None)
+            if not callable(load_objects):
+                return None, "", None
+            raw_record_list = load_objects(object_name, object_filter=normalized_filter, limit=resolved_limit)
+        except Exception:
+            return None, "", None
+        if not isinstance(raw_record_list, list):
+            raw_record_list = []
+
+        strict_mode = self._projection_db_only_strict_mode()
+        field_allowlist_map = self._strict_projection_field_allowlist()
+        allowed_field_set = field_allowlist_map.get(object_name, set())
+
+        fields_payload = source_object.get("fields", query_payload.get("fields"))
+        selected_field_list = [
+            str(field_name).strip()
+            for field_name in (fields_payload if isinstance(fields_payload, Sequence) and not isinstance(fields_payload, (str, bytes)) else [])
+            if str(field_name).strip()
+        ]
+
+        if strict_mode:
+            if selected_field_list:
+                selected_field_list = [field_name for field_name in selected_field_list if field_name in allowed_field_set]
+            else:
+                selected_field_list = sorted(allowed_field_set)
+            if not selected_field_list:
+                selected_field_list = ["_id"]
+
+        projected_record_list: list[dict[str, Any]] = []
+        latest_updated_at = ""
+        for record in raw_record_list:
+            if not isinstance(record, Mapping):
+                continue
+            record_payload = dict(record)
+            if selected_field_list:
+                selected_payload = {
+                    field_name: self._json_safe_projection_data(record_payload.get(field_name))
+                    for field_name in selected_field_list
+                }
+                if "_id" not in selected_payload and "_id" in record_payload:
+                    selected_payload["_id"] = self._json_safe_projection_data(record_payload.get("_id"))
+                record_payload = selected_payload
+            else:
+                record_payload = self._json_safe_projection_data(record_payload)
+            projected_record_list.append(record_payload)
+
+            updated_at = str(record.get("updated_at") or record.get("created_at") or "").strip()
+            if updated_at and updated_at > latest_updated_at:
+                latest_updated_at = updated_at
+
+        database_name = self._agentsdb_repository_source(runtime_config)
+        source_uri = str(source_object.get("source_uri") or "").strip() or f"alde://agentsdb/query/{database_name}/{object_name}"
+
+        return {
+            "_meta": {
+                "source_of_truth": "agentsdb_query",
+                "database_name": database_name,
+                "object_name": object_name,
+                "limit": resolved_limit,
+                "filter": normalized_filter,
+                "record_count": len(projected_record_list),
+                "fields": selected_field_list,
+                "latest_updated_at": latest_updated_at,
+            },
+            "records": projected_record_list,
+        }, source_uri, latest_updated_at or None
+
     def _env_projection_path_candidates(self, app_data_dir_list: list[Path]) -> list[Path]:
         source_file = Path(__file__).resolve()
         candidate_path_list: list[Path] = [
+            source_file.parents[1] / ".env.json",
+            source_file.parents[2] / ".env.json",
+            source_file.with_suffix(".env.json"),
             source_file.parents[1] / ".env",
             source_file.parents[2] / ".env",
             source_file.with_suffix(".env"),
         ]
 
         for app_data_dir in app_data_dir_list:
+            candidate_path_list.append(app_data_dir.parent / ".env.json")
+            candidate_path_list.append(app_data_dir.parent.parent / ".env.json")
             candidate_path_list.append(app_data_dir.parent / ".env")
             candidate_path_list.append(app_data_dir.parent.parent / ".env")
 
@@ -1107,11 +1566,101 @@ class TreeDataPersistenceService:
             return None
 
         try:
-            line_list = env_path.read_text(encoding="utf-8", errors="replace").splitlines()
+            env_file_text = env_path.read_text(encoding="utf-8", errors="replace")
         except Exception:
             return None
 
+        if str(env_path.suffix or "").strip().lower() == ".json":
+            try:
+                json_payload = json.loads(env_file_text)
+            except Exception:
+                return None
+
+            section_payload_map: dict[str, dict[str, dict[str, Any]]] = {}
+
+            sections_payload = json_payload.get("sections") if isinstance(json_payload, Mapping) else None
+            if isinstance(sections_payload, Mapping):
+                for raw_section_name, raw_section_payload in sections_payload.items():
+                    section_name = str(raw_section_name or "").strip() or "General"
+                    section_payload_map.setdefault(section_name, {})
+                    if not isinstance(raw_section_payload, Mapping):
+                        continue
+                    for raw_variable_name, raw_variable_payload in raw_section_payload.items():
+                        variable_name = str(raw_variable_name or "").strip()
+                        if not self._ENV_OBJECT_NAME_PATTERN.match(variable_name):
+                            continue
+                        if isinstance(raw_variable_payload, Mapping):
+                            section_payload_map[section_name][variable_name] = {
+                                "value": raw_variable_payload.get("value", ""),
+                                "enabled": bool(raw_variable_payload.get("enabled", True)),
+                            }
+                        else:
+                            section_payload_map[section_name][variable_name] = {
+                                "value": raw_variable_payload,
+                                "enabled": True,
+                            }
+            else:
+                env_payload = json_payload.get("env") if isinstance(json_payload, Mapping) and isinstance(json_payload.get("env"), Mapping) else json_payload
+                if not isinstance(env_payload, Mapping):
+                    return None
+                section_payload_map["General"] = {}
+                for raw_variable_name, raw_value in env_payload.items():
+                    variable_name = str(raw_variable_name or "").strip()
+                    if not self._ENV_OBJECT_NAME_PATTERN.match(variable_name):
+                        continue
+                    section_payload_map["General"][variable_name] = {
+                        "value": raw_value,
+                        "enabled": True,
+                    }
+
+            variable_count = 0
+            enabled_count = 0
+            for section_payload in section_payload_map.values():
+                for field_payload in section_payload.values():
+                    variable_count += 1
+                    if bool(field_payload.get("enabled")):
+                        enabled_count += 1
+
+            return {
+                "_meta": {
+                    "source_path": str(env_path),
+                    "section_count": len(section_payload_map),
+                    "variable_count": variable_count,
+                    "enabled_count": enabled_count,
+                    "disabled_count": max(0, variable_count - enabled_count),
+                },
+                "sections": section_payload_map,
+            }
+
+        line_list = env_file_text.splitlines()
+
         section_payload_map: dict[str, dict[str, dict[str, Any]]] = {}
+
+        def parse_env_value(raw_value: Any) -> Any:
+            value_text = str(raw_value or "")
+            stripped_value = value_text.strip()
+            if not stripped_value:
+                return ""
+
+            candidate_payload_list = [stripped_value]
+            if len(stripped_value) >= 2 and stripped_value[0] == stripped_value[-1] and stripped_value[0] in {"'", '"'}:
+                candidate_payload_list.append(stripped_value[1:-1].strip())
+
+            for candidate_payload in candidate_payload_list:
+                if not candidate_payload:
+                    continue
+                if not (
+                    (candidate_payload.startswith("{") and candidate_payload.endswith("}"))
+                    or (candidate_payload.startswith("[") and candidate_payload.endswith("]"))
+                ):
+                    continue
+                try:
+                    parsed_payload = json.loads(candidate_payload)
+                except Exception:
+                    continue
+                if isinstance(parsed_payload, (dict, list)):
+                    return parsed_payload
+            return value_text
 
         def ensure_section_payload(section_name: str) -> str:
             normalized_section_name = str(section_name or "").strip() or "General"
@@ -1137,7 +1686,7 @@ class TreeDataPersistenceService:
                     if not variable_name:
                         continue
                     section_payload_map[current_section_name][variable_name] = {
-                        "value": str(disabled_assignment_match.group(2) or ""),
+                        "value": parse_env_value(disabled_assignment_match.group(2)),
                         "enabled": False,
                     }
                     continue
@@ -1156,7 +1705,7 @@ class TreeDataPersistenceService:
                 continue
 
             section_payload_map[current_section_name][variable_name] = {
-                "value": str(assignment_match.group(2) or ""),
+                "value": parse_env_value(assignment_match.group(2)),
                 "enabled": True,
             }
 
@@ -1185,7 +1734,9 @@ class TreeDataPersistenceService:
         if not isinstance(env_section_payload, dict):
             return None
 
-        preferred_payload = env_section_payload.get(".env")
+        preferred_payload = env_section_payload.get(".env.json")
+        if not isinstance(preferred_payload, dict) or not isinstance(preferred_payload.get("sections"), dict):
+            preferred_payload = env_section_payload.get(".env")
         if isinstance(preferred_payload, dict) and isinstance(preferred_payload.get("sections"), dict):
             return preferred_payload
 
@@ -1290,7 +1841,55 @@ class TreeDataPersistenceService:
         if env_path is None:
             return None
 
-        serialized_payload, section_count, variable_count, enabled_count = self._serialize_env_projection_sections(sections_payload)
+        if str(env_path.suffix or "").strip().lower() == ".json":
+            normalized_sections: dict[str, dict[str, dict[str, Any]]] = {}
+            env_payload: dict[str, Any] = {}
+            section_count = 0
+            variable_count = 0
+            enabled_count = 0
+
+            for raw_section_name, section_payload in sections_payload.items():
+                section_name = str(raw_section_name or "").strip() or "General"
+                if not isinstance(section_payload, Mapping):
+                    continue
+                normalized_sections.setdefault(section_name, {})
+                section_variable_count = 0
+
+                for raw_variable_name, raw_variable_payload in section_payload.items():
+                    variable_name = str(raw_variable_name or "").strip()
+                    if not self._ENV_OBJECT_NAME_PATTERN.match(variable_name):
+                        continue
+                    if isinstance(raw_variable_payload, Mapping):
+                        value_payload = raw_variable_payload.get("value", "")
+                        enabled_payload = bool(raw_variable_payload.get("enabled", True))
+                    else:
+                        value_payload = raw_variable_payload
+                        enabled_payload = True
+
+                    normalized_sections[section_name][variable_name] = {
+                        "value": value_payload,
+                        "enabled": enabled_payload,
+                    }
+                    section_variable_count += 1
+                    variable_count += 1
+                    if enabled_payload:
+                        enabled_count += 1
+                        env_payload[variable_name] = value_payload
+
+                if section_variable_count > 0:
+                    section_count += 1
+
+            serialized_payload = json.dumps(
+                {
+                    "format": "alde_env_json_v1",
+                    "env": env_payload,
+                    "sections": normalized_sections,
+                },
+                indent=2,
+                ensure_ascii=False,
+            ).rstrip() + "\n"
+        else:
+            serialized_payload, section_count, variable_count, enabled_count = self._serialize_env_projection_sections(sections_payload)
 
         existing_payload: str | None = None
         if env_path.exists() and env_path.is_file():
@@ -1319,8 +1918,13 @@ class TreeDataPersistenceService:
         self,
         source_object: dict[str, Any],
         app_data_dir_list: list[Path],
+        *,
+        runtime_config: Any | None = None,
+        repository: Any | None = None,
     ) -> tuple[Any | None, str, str | None]:
         source_kind = str(source_object.get("kind") or "").strip().lower()
+        if self._projection_db_only_strict_mode() and source_kind != "agentsdb_query":
+            return None, "", None
         if source_kind == "chat_history":
             if ChatHistory is None:
                 return None, "", None
@@ -1343,7 +1947,8 @@ class TreeDataPersistenceService:
 
         if source_kind == "env_file":
             configured_file_name = str(source_object.get("file_name") or ".env").strip() or ".env"
-            configured_path = Path(configured_file_name).expanduser()
+            configured_file_path = str(source_object.get("file_path") or "").strip()
+            configured_path = Path(configured_file_path or configured_file_name).expanduser()
 
             candidate_path_list: list[Path] = []
             if configured_path.is_absolute():
@@ -1371,27 +1976,41 @@ class TreeDataPersistenceService:
             return None, "", None
 
         if source_kind == "json_file":
+            configured_file_path = str(source_object.get("file_path") or "").strip()
             file_name = str(source_object.get("file_name") or "").strip()
-            if not file_name:
+            path_hint = configured_file_path or file_name
+            if not path_hint:
                 return None, "", None
-            for app_data_dir in app_data_dir_list:
-                file_path = app_data_dir / file_name
+            for file_path in self._expand_projection_path_candidates(path_hint, app_data_dir_list):
                 payload = self._load_json_projection_object(file_path)
                 if payload is not None:
                     return payload, str(file_path), self._mtime_iso(file_path)
             return None, "", None
 
         if source_kind == "directory_index":
+            configured_dir_path = str(source_object.get("dir_path") or "").strip()
             dir_name = str(source_object.get("dir_name") or "").strip()
-            if not dir_name:
+            path_hint = configured_dir_path or dir_name
+            if not path_hint:
                 return None, "", None
             pattern = str(source_object.get("pattern") or "*").strip() or "*"
-            for app_data_dir in app_data_dir_list:
-                directory_path = app_data_dir / dir_name
-                payload = self._load_directory_file_index(directory_path, pattern=pattern)
+            max_entries_value = source_object.get("max_entries")
+            try:
+                max_entries = max(1, min(int(max_entries_value), 5000)) if max_entries_value is not None else 250
+            except Exception:
+                max_entries = 250
+            for directory_path in self._expand_projection_path_candidates(path_hint, app_data_dir_list):
+                payload = self._load_directory_file_index(directory_path, pattern=pattern, max_entries=max_entries)
                 if payload is not None:
                     return payload, str(directory_path), self._mtime_iso(directory_path)
             return None, "", None
+
+        if source_kind == "agentsdb_query":
+            return self._agentsdb_query_projection_payload(
+                source_object,
+                runtime_config=runtime_config,
+                repository=repository,
+            )
 
         return None, "", None
 
@@ -1406,6 +2025,7 @@ class TreeDataPersistenceService:
         runtime_config: Any | None,
     ) -> tuple[Any | None, str, bool]:
         conflict_policy = self._projection_conflict_policy()
+        source_kind = str(source_object.get("kind") or "").strip().lower()
         agentsdb_record = self._load_projection_record_from_agentsdb(repository, source_key)
         agentsdb_payload = agentsdb_record.get("data") if isinstance(agentsdb_record, dict) else None
         agentsdb_uri = str((agentsdb_record or {}).get("source_uri") or f"alde://ai_ide/projection/{source_key}")
@@ -1420,7 +2040,12 @@ class TreeDataPersistenceService:
             nonlocal local_loaded, local_payload, local_uri, local_updated_at
             if local_loaded:
                 return local_payload, local_uri, local_updated_at
-            payload, uri, updated_at = self._load_projection_payload_from_local_source(source_object, app_data_dir_list)
+            payload, uri, updated_at = self._load_projection_payload_from_local_source(
+                source_object,
+                app_data_dir_list,
+                runtime_config=runtime_config,
+                repository=repository,
+            )
             local_loaded = True
             local_payload = payload
             local_uri = str(uri or "")
@@ -1428,9 +2053,22 @@ class TreeDataPersistenceService:
             return local_payload, local_uri, local_updated_at
 
         if conflict_policy == "agentsdb_strict":
-            if agentsdb_payload is None:
-                return None, "", False
-            return agentsdb_payload, agentsdb_uri, True
+            if agentsdb_payload is not None:
+                return agentsdb_payload, agentsdb_uri, True
+            if source_kind == "agentsdb_query":
+                local_payload, local_uri, _ = load_local_once()
+                if local_payload is None:
+                    return None, "", False
+                self._upsert_projection_payload_to_agentsdb(
+                    repository=repository,
+                    runtime_config=runtime_config,
+                    section_name=section_name,
+                    source_key=source_key,
+                    source_uri=local_uri,
+                    data=local_payload,
+                )
+                return local_payload, local_uri or agentsdb_uri, True
+            return None, "", False
 
         if conflict_policy == "agentsdb_first":
             if agentsdb_payload is not None:
@@ -1507,11 +2145,11 @@ class TreeDataPersistenceService:
     ) -> dict[str, dict[str, Any]]:
         projection_sections: dict[str, dict[str, Any]] = {
             section_name: {}
-            for section_name in self._AI_IDE_SECTION_NAME_ORDER
+            for section_name in self._resolved_ai_ide_section_name_order()
         }
 
         app_data_dir_list = self._projection_app_data_dir_list()
-        for source_object in self._PROJECTION_SOURCE_OBJECT_DEFINITION:
+        for source_object in self._projection_source_object_definition():
             section_name = str(source_object.get("section") or "").strip().upper()
             source_key = str(source_object.get("key") or "").strip()
             if not section_name or not source_key:
@@ -1999,7 +2637,7 @@ class TreeDataPersistenceService:
             "projection_contract": {
                 "source_of_truth": "agents_db",
                 "consumer": "ai_ide",
-                "section_order": list(self._AI_IDE_SECTION_NAME_ORDER),
+                "section_order": list(self._resolved_ai_ide_section_name_order()),
                 "projection_conflict_policy": self._projection_conflict_policy(),
             },
             "updated_at": timestamp,
@@ -2500,9 +3138,9 @@ class TreeDataPersistenceService:
                     },
                     upsert=True,
                 )
-                return "mongodb", self._target_label()
+                return "agentsdb", self._target_label()
             except Exception as exc:
-                print(f"[WARNING] MongoDB tree save failed, falling back to JSON: {exc}")
+                print(f"[WARNING] agentsdb tree save failed, falling back to JSON: {exc}")
 
         if tree_sync_enabled and self._agentsdb_strict_mode():
             raise RuntimeError("agents_db tree persistence required but unavailable")
@@ -2642,18 +3280,18 @@ QScrollBar:horizontal, QScrollBar:vertical {
 }
 
 /* size while idle (almost invisible but still receives hover)   */
-QScrollBar:vertical   { width: 4px;  }
+QScrollBar:vertical   { width: 6px;  }
 QScrollBar:horizontal { height:50px;  }
 
 /* grow a bit + colour when mouse enters the bar itself          */
-QScrollBar:vertical:hover   { width: 4px; }
+QScrollBar:vertical:hover   { width: 6px; }
 QScrollBar:horizontal:hover { height:50px; }
 
 /* ----- handle (the draggable knob) --------------------------- */
 QScrollBar::handle {
     background: rgba(120,120,120,0.0);   /* transparent while idle  */
     border-radius: 4px;
-    min-width: 4px;
+    min-width: 6px;
     min-height: 600px;
 }
 QScrollBar::handle:hover {
@@ -3012,17 +3650,16 @@ class JsonTreeWidgetWithToolbar(QWidget):
 # ------------------------- JsonTreeWidget -------------------------------
 class JsonTreeWidget(QTreeWidget):
     _DEFAULT_ROOT_SECTION_LAYOUT: tuple[tuple[str, bool], ...] = (
-        ("RUNTIME", False),
+        ("RUNTIME", True),
         ("CHAT_HISTORY", True),
         ("DATABASES", True),
-        ("ENV", True),
         ("MCP", True),
-        ("PROJECTS", True),
+        ("ENV", True),
     )
     _SMALL_FONT_SECTION_NAMES: set[str] = {"PROJECTS", "CHAT_HISTORY"}
     _HISTORY_SECTION_NAMES: set[str] = {"CHAT_HISTORY", "HISTORY"}
     _HIDDEN_ROOT_SECTION_NAMES: set[str] = {"PROJECTS"}
-    _TREE_ICON_SIZE = QSize(18, 18)
+    _TREE_ICON_SIZE = QSize(20, 20)
     # Block-based layout: hierarchy is conveyed by grouped chips, not indentation.
     _TREE_INDENTATION = 0
     _initial_load_async_result_ready = Signal(object)
@@ -3371,7 +4008,7 @@ class JsonTreeWidget(QTreeWidget):
         self._data = {}
 
         allowed_sections = self._persistence_service._tree_section_allowlist()
-        for section_name, collapsed in self._DEFAULT_ROOT_SECTION_LAYOUT:
+        for section_name, collapsed in self._resolved_root_section_layout():
             if section_name not in allowed_sections:
                 continue
             self._data[section_name] = {}
@@ -3830,13 +4467,28 @@ class JsonTreeWidget(QTreeWidget):
 
         value, section_name = lazy_payload
         item.takeChildren()
+        parent_item_key = self._extract_item_key_from_text(item.text(0))
 
         if isinstance(value, dict):
             for key, child_value in value.items():
-                item.addChild(self._build_item(key, child_value, section_name=section_name))
+                item.addChild(
+                    self._build_item(
+                        key,
+                        child_value,
+                        section_name=section_name,
+                        parent_key=parent_item_key,
+                    )
+                )
         elif isinstance(value, (list, tuple)):
             for index, child_value in enumerate(value):
-                item.addChild(self._build_item(index, child_value, section_name=section_name))
+                item.addChild(
+                    self._build_item(
+                        index,
+                        child_value,
+                        section_name=section_name,
+                        parent_key=parent_item_key,
+                    )
+                )
 
         self._remember_item_texts_recursive(item)
         self._apply_board_card_item_widgets()
@@ -4191,14 +4843,21 @@ class JsonTreeWidget(QTreeWidget):
         """Rebuild tree from `data` and collapse to top level."""
         self._data = data  # Store for save logic
         self.clear()
-        root_item = self._build_item("root", data, section_name=None)
+        root_item = self._build_item("root", data, section_name=None, parent_key=None)
         # move children of artificial root to top level
         while root_item.childCount():
             self.addTopLevelItem(root_item.takeChild(0))
         self.expandToDepth(0)
         self._apply_board_card_item_widgets()
 
-    def _build_item(self, key: str | int, value: Any, *, section_name: str | None = None) -> QTreeWidgetItem:
+    def _build_item(
+        self,
+        key: str | int,
+        value: Any,
+        *,
+        section_name: str | None = None,
+        parent_key: str | None = None,
+    ) -> QTreeWidgetItem:
         section_upper = (section_name or "").upper()
 
         idx: int | None = None
@@ -4217,6 +4876,23 @@ class JsonTreeWidget(QTreeWidget):
                     if inner.isdigit():
                         key_label = inner
 
+        is_env_records_row = (
+            section_upper == "ENV"
+            and isinstance(key, int)
+            and str(parent_key or "").strip().lower() == "records"
+            and isinstance(value, Mapping)
+        )
+        if is_env_records_row:
+            record_id = ""
+            for id_field in ("_id", "id", "entity_id", "canonical_name", "title"):
+                candidate_id = str(value.get(id_field) or "").strip()
+                if candidate_id:
+                    record_id = candidate_id
+                    break
+            key_label = f"[{int(key) + 1:02d}]"
+            if record_id:
+                key_label = f"{key_label}: {json.dumps(record_id, ensure_ascii=False)}"
+
         if isinstance(value, dict):
             if section_upper in self._HISTORY_SECTION_NAMES:
                 # Requested: remove brackets/dots/braces. Keep it compact.
@@ -4231,7 +4907,7 @@ class JsonTreeWidget(QTreeWidget):
                     parts.append(role_str)
                 label = " ".join(p for p in parts if p)
             else:
-                label = f"{key_label} {{...}}"
+                label = key_label if is_env_records_row else f"{key_label} {{...}}"
 
             item = QTreeWidgetItem([label])
             item.setFlags(item.flags() | Qt.ItemIsEditable)
@@ -4240,7 +4916,14 @@ class JsonTreeWidget(QTreeWidget):
                 self._add_lazy_placeholder(item, value, section_name)
             else:
                 for k, v in value.items():
-                    item.addChild(self._build_item(k, v, section_name=section_name))
+                    item.addChild(
+                        self._build_item(
+                            k,
+                            v,
+                            section_name=section_name,
+                            parent_key=str(key),
+                        )
+                    )
         elif isinstance(value, (list, tuple)):
             item = QTreeWidgetItem([f"{key_label} [{len(value)}]"])
             item.setFlags(item.flags() | Qt.ItemIsEditable)
@@ -4249,7 +4932,14 @@ class JsonTreeWidget(QTreeWidget):
                 self._add_lazy_placeholder(item, value, section_name)
             else:
                 for i, v in enumerate(value):
-                    item.addChild(self._build_item(i, v, section_name=section_name))
+                    item.addChild(
+                        self._build_item(
+                            i,
+                            v,
+                            section_name=section_name,
+                            parent_key=str(key),
+                        )
+                    )
         else:
             text = json.dumps(value, ensure_ascii=False)
             item = QTreeWidgetItem([f"{key_label}: {text}"])
@@ -4473,7 +5163,10 @@ class JsonTreeWidget(QTreeWidget):
     
     def _initialize_root_sections(self) -> None:
         """Initialize default root sections like VS Code Explorer."""
-        for section_name, collapsed in self._DEFAULT_ROOT_SECTION_LAYOUT:
+        allowed_sections = self._persistence_service._tree_section_allowlist()
+        for section_name, collapsed in self._resolved_root_section_layout():
+            if section_name not in allowed_sections:
+                continue
             self._add_root_section(section_name, collapsed=collapsed)
             self._data[section_name] = {}
         
@@ -4487,6 +5180,15 @@ class JsonTreeWidget(QTreeWidget):
         self._update_root_section_header_styles()
         self._update_section_item_font_sizes()
         self._apply_board_card_item_widgets()
+
+    def _resolved_root_section_layout(self) -> tuple[tuple[str, bool], ...]:
+        collapse_defaults = {
+            str(section_name).strip().upper(): bool(collapsed)
+            for section_name, collapsed in self._DEFAULT_ROOT_SECTION_LAYOUT
+            if str(section_name).strip()
+        }
+        section_order = self._persistence_service._resolved_ai_ide_section_name_order()
+        return tuple((section_name, collapse_defaults.get(section_name, True)) for section_name in section_order)
 
     def _update_section_item_font_sizes(self) -> None:
         """Apply per-section font sizing to already-built items."""
@@ -4901,6 +5603,10 @@ class JsonTreeWidget(QTreeWidget):
         """
         normalized_section_name = str(section_name or "").strip().upper()
         if not normalized_section_name:
+            return
+
+        allowed_sections = self._persistence_service._tree_section_allowlist()
+        if normalized_section_name not in allowed_sections:
             return
 
         section = self._root_sections.get(normalized_section_name)
@@ -5336,12 +6042,34 @@ class JsonTreeWidget(QTreeWidget):
         if not ok or not key_name:
             return
 
-        self.add_to_section(section_name, key_name, imported_data)
+        normalized_imported_data = imported_data
+        if isinstance(imported_data, str):
+            stripped_payload = imported_data.strip()
+            candidate_payload_list = [stripped_payload]
+            if len(stripped_payload) >= 2 and stripped_payload[0] == stripped_payload[-1] and stripped_payload[0] in {"'", '"'}:
+                candidate_payload_list.append(stripped_payload[1:-1].strip())
+            for candidate_payload in candidate_payload_list:
+                if not candidate_payload:
+                    continue
+                if not (
+                    (candidate_payload.startswith("{") and candidate_payload.endswith("}"))
+                    or (candidate_payload.startswith("[") and candidate_payload.endswith("]"))
+                ):
+                    continue
+                try:
+                    parsed_payload = json.loads(candidate_payload)
+                except Exception:
+                    continue
+                if isinstance(parsed_payload, (dict, list)):
+                    normalized_imported_data = parsed_payload
+                    break
+
+        self.add_to_section(section_name, key_name, normalized_imported_data)
         if callable(sync_parser_result_to_agentsdb_knowledge):
             try:
-                serialized_payload = json.dumps(imported_data, ensure_ascii=False, default=str)
+                serialized_payload = json.dumps(normalized_imported_data, ensure_ascii=False, default=str)
             except Exception:
-                serialized_payload = str(imported_data)
+                serialized_payload = str(normalized_imported_data)
             sync_parser_result_to_agentsdb_knowledge(
                 object_name="documents",
                 correlation_id=f"tree-import:{hashlib.sha256(f'{file_path}:{key_name}:{section_name}'.encode('utf-8')).hexdigest()[:24]}",
@@ -5372,7 +6100,7 @@ class JsonTreeWidget(QTreeWidget):
                         "summary": f"Data tree import from {Path(file_path).name}",
                         "section": str(section_name),
                         "import_format": str(import_format),
-                        "payload": imported_data,
+                        "payload": normalized_imported_data,
                     },
                     "db_updates": {
                         "processing_state": "processed",
@@ -6134,6 +6862,21 @@ class JsonTreeWidget(QTreeWidget):
         if ChatHistory is None:
             QMessageBox.information(self, "History", "ChatHistory not available")
             return
+
+        allowed_sections = self._persistence_service._tree_section_allowlist()
+        target_section = None
+        for candidate_section in ("CHAT_HISTORY", "HISTORY"):
+            if candidate_section in allowed_sections:
+                target_section = candidate_section
+                break
+        if target_section is None:
+            QMessageBox.information(
+                self,
+                "History",
+                "Chat history section is not enabled in AI_IDE_TREE_SECTION_ALLOWLIST",
+            )
+            return
+
         try:
             history = ChatHistory._load()
         except Exception as e:
@@ -6149,7 +6892,7 @@ class JsonTreeWidget(QTreeWidget):
             self.remove_from_section("HISTORY", "Chat History")
         except Exception:
             pass
-        self.add_to_section("CHAT_HISTORY", "Chat History", history, persist=True)
+        self.add_to_section(target_section, "Chat History", history, persist=True)
 
 
 # ------------------------- JsonHighlighter ------------------------------
@@ -6218,18 +6961,18 @@ QScrollBar:horizontal, QScrollBar:vertical {
 }
 
 /* size while idle (almost invisible but still receives hover)   */
-QScrollBar:vertical   { width: 4px;  }
+QScrollBar:vertical   { width: 6px;  }
 QScrollBar:horizontal { height:50px;  }
 
 /* grow a bit + colour when mouse enters the bar itself          */
-QScrollBar:vertical:hover   { width: 4px; }
+QScrollBar:vertical:hover   { width: 6px; }
 QScrollBar:horizontal:hover { height:50px; }
 
 /* ----- handle (the draggable knob) --------------------------- */
 QScrollBar::handle {
     background: rgba(120,120,120,0.0);   /* transparent while idle  */
     border-radius: 4px;
-    min-width: 4px;
+    min-width: 6px;
     min-height: 600px;
 }
 QScrollBar::handle:hover {

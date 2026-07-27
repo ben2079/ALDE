@@ -41,6 +41,61 @@ def _print_section(title: str) -> None:
     print(f"\n{'='*62}\n  {title}\n{'='*62}")
 
 
+def _count_environment_override_artifacts(repo: AgentDbInMemoryRepository) -> dict[str, int]:
+    entity_payload_list = repo.load_objects(
+        "entity",
+        {"namespace_id": "ns_repo_knowledge", "entity_type": "environment_override"},
+        limit=500000,
+    )
+    env_entity_id_set = {
+        str(payload.get("_id") or payload.get("id") or "").strip()
+        for payload in entity_payload_list
+        if isinstance(payload, dict)
+    }
+    env_entity_id_set.discard("")
+
+    relation_payload_list = repo.load_objects(
+        "relation",
+        {"namespace_id": "ns_repo_knowledge", "relation_type": "uses_environment_override"},
+        limit=500000,
+    )
+    env_relation_payload_list = [
+        payload
+        for payload in relation_payload_list
+        if isinstance(payload, dict)
+        and str(payload.get("target_entity_id") or "").strip() in env_entity_id_set
+    ]
+    env_relation_id_set = {
+        str(payload.get("_id") or payload.get("id") or "").strip()
+        for payload in env_relation_payload_list
+    }
+    env_relation_id_set.discard("")
+
+    embedding_payload_list = repo.load_objects(
+        "embedding",
+        {"namespace_id": "ns_repo_knowledge"},
+        limit=500000,
+    )
+    env_entity_embedding_count = 0
+    env_relation_embedding_count = 0
+    for payload in embedding_payload_list:
+        if not isinstance(payload, dict):
+            continue
+        owner_type = str(payload.get("owner_type") or "").strip()
+        owner_id = str(payload.get("owner_id") or "").strip()
+        if owner_type == "entity" and owner_id in env_entity_id_set:
+            env_entity_embedding_count += 1
+        elif owner_type == "relation" and owner_id in env_relation_id_set:
+            env_relation_embedding_count += 1
+
+    return {
+        "env_override_entities": len(env_entity_id_set),
+        "env_override_relations": len(env_relation_id_set),
+        "env_override_entity_embeddings": env_entity_embedding_count,
+        "env_override_relation_embeddings": env_relation_embedding_count,
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Index ALDE repo Python sources into agentsdb")
     parser.add_argument("--scan-root", default=str(_ALDE_SRC), help="Root directory to scan")
@@ -103,6 +158,13 @@ def main() -> None:
     doc_count = len(repo._load_collection_object("document"))
     print(f"\n  agentsdb embeddings total : {emb_count}")
     print(f"  agentsdb documents  total : {doc_count}")
+
+    env_report = _count_environment_override_artifacts(repo)
+    print("\n  Environment Overrides (entity -> relation -> embedding):")
+    print(f"    entities            : {env_report['env_override_entities']}")
+    print(f"    relations           : {env_report['env_override_relations']}")
+    print(f"    entity embeddings   : {env_report['env_override_entity_embeddings']}")
+    print(f"    relation embeddings : {env_report['env_override_relation_embeddings']}")
 
     ns_repo = repo.load_object("namespace", "ns_repo_knowledge")
     print(f"  namespace ns_repo_knowledge : {'OK' if ns_repo else 'MISSING'}")
