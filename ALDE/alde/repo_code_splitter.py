@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 import ast
 import copy
+import errno
 import hashlib
 import json
 import os
@@ -153,6 +154,75 @@ def _update_repo_worker_job(job_id: str, **updates: Any) -> dict[str, Any]:
     job_state = _load_repo_worker_job(job_id) or {"job_id": str(job_id or "").strip()}
     job_state.update(updates)
     return _store_repo_worker_job(str(job_id or "").strip(), job_state)
+
+
+def _is_process_alive(process_id: int) -> bool:
+    if process_id <= 0:
+        return False
+    try:
+        os.kill(process_id, 0)
+    except OSError as exc:
+        if exc.errno == errno.ESRCH:
+            return False
+        if exc.errno == errno.EPERM:
+            return True
+        return False
+    except Exception:
+        return False
+    return True
+
+
+def _maybe_finalize_stale_repo_worker_job(job_state: Mapping[str, Any]) -> dict[str, Any]:
+    normalized_job_state = dict(job_state)
+    normalized_job_id = str(normalized_job_state.get("job_id") or "").strip()
+    normalized_status = str(normalized_job_state.get("status") or "").strip().lower()
+    if normalized_status not in {"queued", "running"}:
+        return normalized_job_state
+
+    stale_timeout_seconds = 900.0
+    try:
+        stale_timeout_seconds = max(60.0, float(os.getenv("ALDE_REPO_WORKER_STALE_TIMEOUT_SECONDS", "900") or "900"))
+    except Exception:
+        stale_timeout_seconds = 900.0
+
+    now_ts = time.time()
+    reference_timestamp = 0.0
+    for timestamp_key in ("heartbeat_at", "started_at", "created_at"):
+        try:
+            candidate_value = float(normalized_job_state.get(timestamp_key) or 0.0)
+        except Exception:
+            candidate_value = 0.0
+        if candidate_value > reference_timestamp:
+            reference_timestamp = candidate_value
+
+    worker_pid_raw = normalized_job_state.get("worker_pid")
+    try:
+        worker_pid = int(worker_pid_raw)
+    except Exception:
+        worker_pid = 0
+    if worker_pid <= 0:
+        if reference_timestamp > 0.0 and (now_ts - reference_timestamp) >= stale_timeout_seconds:
+            finalized_state = _update_repo_worker_job(
+                normalized_job_id,
+                status="failed",
+                finished_at=now_ts,
+                error=f"stale_running_job_without_worker_pid_timeout:{int(stale_timeout_seconds)}s",
+            )
+            return dict(finalized_state)
+        return normalized_job_state
+    if _is_process_alive(worker_pid):
+        return normalized_job_state
+
+    stale_error = str(normalized_job_state.get("error") or "").strip()
+    if not stale_error:
+        stale_error = "worker_process_terminated_before_job_completion"
+    finalized_state = _update_repo_worker_job(
+        normalized_job_id,
+        status="failed",
+        finished_at=time.time(),
+        error=stale_error,
+    )
+    return dict(finalized_state)
 
 
 class RepoDeltaStateService:
@@ -764,6 +834,17 @@ class RepoEnvironmentOverrideParser:
         occurrence_payload_list: Sequence[Mapping[str, Any]],
         rel_path: str,
     ) -> list[dict[str, Any]]:
+        def _atomic_label_tokens(raw_value: Any) -> list[str]:
+            text_value = str(raw_value or "").strip().lower()
+            if not text_value:
+                return []
+            token_values = [
+                token
+                for token in re.findall(r"[a-z0-9_]{2,}", text_value)
+                if token
+            ]
+            return sorted(set(token_values))
+
         grouped_occurrence_payloads: dict[str, list[dict[str, Any]]] = {}
         for occurrence_payload in occurrence_payload_list:
             env_name = str(occurrence_payload.get("env_name") or "").strip()
@@ -826,12 +907,29 @@ class RepoEnvironmentOverrideParser:
             optional_access_count = max(0, total_occurrence_count - required_access_count)
             section_key = str(normalized_occurrence_payload_list[0].get("section_key") or "block_1") if normalized_occurrence_payload_list else "block_1"
             default_value_list = sorted(default_value_labels)
+            default_value_atomic_labels = sorted(
+                {
+                    token
+                    for label_value in default_value_list
+                    for token in _atomic_label_tokens(label_value)
+                }
+            )
             summary = f"Environment override {env_name} referenced in {rel_path}."
             if default_value_list:
                 summary = f"{summary} Defaults: {', '.join(default_value_list[:3])}."
 
             source_field = access_paths[0] if access_paths else "os.getenv"
-            relation_description = f"{module_name} uses environment override {env_name}."
+            relation_type_label = "uses_environment_override"
+            relation_description = f"module={module_name}; relation={relation_type_label}; env={env_name}"
+            feature_labels = sorted(
+                {
+                    "environment_override",
+                    relation_type_label,
+                    *[f"access:{path_value}" for path_value in access_paths if path_value],
+                    *[f"default:{token}" for token in default_value_atomic_labels if token],
+                    *[f"env:{token}" for token in _atomic_label_tokens(env_name)],
+                }
+            )
             entity_payload_list.append(
                 {
                     "entity_key": f"environment_override:{env_name}",
@@ -842,13 +940,15 @@ class RepoEnvironmentOverrideParser:
                     "summary": summary,
                     "is_target": True,
                     "source_entity": "subject",
-                    "is_relational": "uses_environment_override",
+                    "is_relational": relation_type_label,
                     "explicit_description": relation_description,
                     "metadata": {
                         "mapped_from": "repo_env_override_parser",
                         "source_field": source_field,
                         "source_path": rel_path,
                         "relation_description": relation_description,
+                        "relation_labels": [relation_type_label],
+                        "feature_labels": feature_labels,
                         "occurrence_count": total_occurrence_count,
                     },
                     "attributes": {
@@ -859,6 +959,8 @@ class RepoEnvironmentOverrideParser:
                         "optional_access_count": optional_access_count,
                         "access_paths": access_paths,
                         "default_values": default_value_list,
+                        "default_value_labels": default_value_atomic_labels,
+                        "feature_labels": feature_labels,
                         "occurrences": normalized_occurrence_payload_list,
                     },
                 }
@@ -1412,6 +1514,131 @@ class RepoIndexService:
         }
         return summary, file_results
 
+    def _index_file_paths_with_progress(
+        self,
+        *,
+        scan_root: str,
+        file_paths: Sequence[str],
+        progress_callback: Any | None = None,
+        progress_phase: str = "build_indexing",
+    ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+        index_targets = [str(path) for path in file_paths if str(path).strip()]
+        t0 = time.perf_counter()
+
+        total_blocks = 0
+        total_entities = 0
+        total_relations = 0
+        total_embedded = 0
+        total_skipped = 0
+        total_indexed = 0
+        errors: list[str] = []
+        file_results: list[dict[str, Any]] = []
+
+        def _emit_progress(update_payload: Mapping[str, Any], *, force: bool = False) -> None:
+            if not callable(progress_callback):
+                return
+            payload = dict(update_payload)
+            payload.setdefault("phase", progress_phase)
+            payload.setdefault("files_total", len(index_targets))
+            payload.setdefault("timestamp", time.time())
+            if force:
+                payload["force"] = True
+            try:
+                progress_callback(payload)
+            except Exception:
+                pass
+
+        def _index_one(source_path: str) -> dict[str, Any]:
+            try:
+                return self.index_object(source_path, repo_root=scan_root)
+            except Exception as exc:
+                return {
+                    "path": source_path,
+                    "blocks": 0,
+                    "entities": 0,
+                    "relations": 0,
+                    "embedded": 0,
+                    "skipped": True,
+                    "error": str(exc),
+                }
+
+        def _collect_result(result_payload: Mapping[str, Any]) -> None:
+            nonlocal total_blocks, total_entities, total_relations, total_embedded, total_skipped, total_indexed
+            result_object = dict(result_payload)
+            file_results.append(result_object)
+            total_blocks += int(result_object.get("blocks", 0) or 0)
+            total_entities += int(result_object.get("entities", 0) or 0)
+            total_relations += int(result_object.get("relations", 0) or 0)
+            total_embedded += int(result_object.get("embedded", 0) or 0)
+            if bool(result_object.get("skipped")):
+                total_skipped += 1
+            else:
+                total_indexed += 1
+            error_text = str(result_object.get("error") or "").strip()
+            if error_text:
+                errors.append(f"{result_object.get('path')}: {error_text}")
+
+            _emit_progress(
+                {
+                    "files_completed": len(file_results),
+                    "files_indexed": total_indexed,
+                    "files_skipped": total_skipped,
+                    "total_blocks": total_blocks,
+                    "total_entities": total_entities,
+                    "total_relations": total_relations,
+                    "total_embedded": total_embedded,
+                }
+            )
+
+        _emit_progress({"phase": progress_phase, "state": "started", "files_total": len(index_targets)}, force=True)
+
+        repo_backend = getattr(self._ks, "_repository", self._repo)
+        flush_context = getattr(repo_backend, "deferred_flush", None)
+        if not callable(flush_context):
+            flush_context = getattr(repo_backend, "deferred_write_queue", None)
+
+        if callable(flush_context):
+            with flush_context():
+                with ThreadPoolExecutor(max_workers=self._workers) as executor:
+                    futures = {executor.submit(_index_one, source_path): source_path for source_path in index_targets}
+                    for future in as_completed(futures):
+                        _collect_result(future.result())
+        else:
+            with ThreadPoolExecutor(max_workers=self._workers) as executor:
+                futures = {executor.submit(_index_one, source_path): source_path for source_path in index_targets}
+                for future in as_completed(futures):
+                    _collect_result(future.result())
+
+        elapsed = time.perf_counter() - t0
+        if hasattr(repo_backend, "_flush_image"):
+            repo_backend._flush_image()
+
+        summary = {
+            "scan_root": scan_root,
+            "files_input": len(index_targets),
+            "files_indexed": total_indexed,
+            "files_skipped": total_skipped,
+            "total_blocks": total_blocks,
+            "total_entities": total_entities,
+            "total_relations": total_relations,
+            "total_embedded": total_embedded,
+            "elapsed_s": round(elapsed, 2),
+            "rate_files_per_s": round(total_indexed / elapsed, 2) if elapsed > 0 else 0,
+            "errors": errors[:10],
+        }
+        _emit_progress(
+            {
+                "phase": progress_phase,
+                "state": "completed",
+                "files_completed": len(file_results),
+                "files_indexed": total_indexed,
+                "files_skipped": total_skipped,
+                "elapsed_s": summary["elapsed_s"],
+            },
+            force=True,
+        )
+        return summary, file_results
+
     def index_object(self, source_path: str, *, repo_root: str) -> dict[str, Any]:
         """Split, map, store, and embed a single source file. Returns per-file report."""
         payload = self._module_parser.parse_object(source_path, repo_root=repo_root)
@@ -1536,6 +1763,7 @@ class RepoIndexService:
         *,
         extensions: Sequence[str] = (".py",),
         recursive: bool = True,
+        progress_callback: Any | None = None,
     ) -> dict[str, Any]:
         """Full repo index run: scan → split → store → embed. Returns summary report."""
         # Ensure namespace exists
@@ -1543,7 +1771,26 @@ class RepoIndexService:
         self._ks.store_namespace_object(ns)
 
         files = self.scan_object(scan_root, extensions=tuple(extensions), recursive=bool(recursive))
-        summary, _file_results = self._index_file_paths(scan_root=scan_root, file_paths=files)
+        if callable(progress_callback):
+            try:
+                progress_callback(
+                    {
+                        "phase": "build_scan",
+                        "state": "completed",
+                        "files_found": len(files),
+                        "recursive": bool(recursive),
+                        "timestamp": time.time(),
+                        "force": True,
+                    }
+                )
+            except Exception:
+                pass
+        summary, _file_results = self._index_file_paths_with_progress(
+            scan_root=scan_root,
+            file_paths=files,
+            progress_callback=progress_callback,
+            progress_phase="build_indexing",
+        )
         summary["recursive"] = bool(recursive)
         summary["files_found"] = len(files)
         return summary
@@ -1554,6 +1801,7 @@ class RepoIndexService:
         *,
         extensions: Sequence[str] = (".py",),
         recursive: bool = True,
+        progress_callback: Any | None = None,
     ) -> dict[str, Any]:
         """Incremental repo index run that processes only changed files."""
         # Ensure namespace exists
@@ -1576,7 +1824,12 @@ class RepoIndexService:
             changed_files.append(source_path)
 
         deleted_paths = sorted(set(previous_hash_map.keys()) - set(current_hash_map.keys()))
-        summary, file_results = self._index_file_paths(scan_root=scan_root, file_paths=changed_files)
+        summary, file_results = self._index_file_paths_with_progress(
+            scan_root=scan_root,
+            file_paths=changed_files,
+            progress_callback=progress_callback,
+            progress_phase="delta_indexing",
+        )
 
         failed_changed_paths = {
             str(result_payload.get("path") or "")
@@ -1632,6 +1885,8 @@ class RepoIndexService:
         owner_prefixes: Sequence[str],
         async_delete: bool = True,
         limit: int = 50_000,
+        progress_callback: Any | None = None,
+        progress_phase: str = "cleanup",
     ) -> dict[str, Any]:
         """Delete repo-knowledge artifacts via repository.delete_object().
 
@@ -1717,6 +1972,21 @@ class RepoIndexService:
                 return False
 
         unique_targets = list(dict.fromkeys(delete_targets))
+
+        if callable(progress_callback):
+            try:
+                progress_callback(
+                    {
+                        "phase": progress_phase,
+                        "state": "started",
+                        "candidates": len(unique_targets),
+                        "timestamp": time.time(),
+                        "force": True,
+                    }
+                )
+            except Exception:
+                pass
+
         repo_backend = getattr(self._ks, "_repository", self._repo)
         flush_context = getattr(repo_backend, "deferred_flush", None)
         if not callable(flush_context):
@@ -1730,10 +2000,36 @@ class RepoIndexService:
                         for future in as_completed(futures):
                             if future.result():
                                 deleted_count += 1
+                            if callable(progress_callback):
+                                try:
+                                    progress_callback(
+                                        {
+                                            "phase": progress_phase,
+                                            "state": "running",
+                                            "deleted": deleted_count,
+                                            "candidates": len(unique_targets),
+                                            "timestamp": time.time(),
+                                        }
+                                    )
+                                except Exception:
+                                    pass
                 else:
                     for target in unique_targets:
                         if _delete_one(target):
                             deleted_count += 1
+                        if callable(progress_callback):
+                            try:
+                                progress_callback(
+                                    {
+                                        "phase": progress_phase,
+                                        "state": "running",
+                                        "deleted": deleted_count,
+                                        "candidates": len(unique_targets),
+                                        "timestamp": time.time(),
+                                    }
+                                )
+                            except Exception:
+                                pass
         else:
             if async_delete and unique_targets:
                 worker_count = max(1, min(self._workers, 8))
@@ -1742,15 +2038,41 @@ class RepoIndexService:
                     for future in as_completed(futures):
                         if future.result():
                             deleted_count += 1
+                        if callable(progress_callback):
+                            try:
+                                progress_callback(
+                                    {
+                                        "phase": progress_phase,
+                                        "state": "running",
+                                        "deleted": deleted_count,
+                                        "candidates": len(unique_targets),
+                                        "timestamp": time.time(),
+                                    }
+                                )
+                            except Exception:
+                                pass
             else:
                 for target in unique_targets:
                     if _delete_one(target):
                         deleted_count += 1
+                    if callable(progress_callback):
+                        try:
+                            progress_callback(
+                                {
+                                    "phase": progress_phase,
+                                    "state": "running",
+                                    "deleted": deleted_count,
+                                    "candidates": len(unique_targets),
+                                    "timestamp": time.time(),
+                                }
+                            )
+                        except Exception:
+                            pass
 
         if hasattr(repo_backend, "_flush_image"):
             repo_backend._flush_image()
 
-        return {
+        cleanup_summary = {
             "ok": True,
             "deleted": deleted_count,
             "candidates": len(unique_targets),
@@ -1762,6 +2084,21 @@ class RepoIndexService:
             "errors": errors[:20],
             "async_delete": bool(async_delete),
         }
+        if callable(progress_callback):
+            try:
+                progress_callback(
+                    {
+                        "phase": progress_phase,
+                        "state": "completed",
+                        "deleted": deleted_count,
+                        "candidates": len(unique_targets),
+                        "timestamp": time.time(),
+                        "force": True,
+                    }
+                )
+            except Exception:
+                pass
+        return cleanup_summary
 
 
 def create_repo_index_service(
@@ -1802,6 +2139,7 @@ def run_repo_knowledge_operation(
     cleanup_object_names: list[str] | str | None,
     cleanup_owner_prefixes: list[str] | str | None,
     delete_async: bool,
+    progress_callback: Any | None = None,
 ) -> dict[str, Any]:
     resolved_root = Path(os.path.abspath(os.path.expanduser(root_dir or Path(__file__).resolve().parents[1])))
     resolved_extensions = extensions
@@ -1868,6 +2206,7 @@ def run_repo_knowledge_operation(
             str(resolved_root),
             extensions=normalized_extensions,
             recursive=bool(recursive),
+            progress_callback=progress_callback,
         )
         result["ok"] = True
         result["operation"] = "delta_build"
@@ -1880,11 +2219,14 @@ def run_repo_knowledge_operation(
                 namespace_ids=normalized_cleanup_namespaces,
                 owner_prefixes=normalized_cleanup_prefixes,
                 async_delete=bool(delete_async),
+                progress_callback=progress_callback,
+                progress_phase="build_cleanup",
             )
         result = service.index_repo_object(
             str(resolved_root),
             extensions=normalized_extensions,
             recursive=bool(recursive),
+            progress_callback=progress_callback,
         )
         result["ok"] = True
         result["operation"] = "build"
@@ -1897,6 +2239,8 @@ def run_repo_knowledge_operation(
             namespace_ids=normalized_cleanup_namespaces,
             owner_prefixes=normalized_cleanup_prefixes,
             async_delete=bool(delete_async),
+            progress_callback=progress_callback,
+            progress_phase="cleanup",
         )
         cleanup_report["operation"] = "cleanup"
         return cleanup_report
@@ -1906,11 +2250,14 @@ def run_repo_knowledge_operation(
             namespace_ids=normalized_cleanup_namespaces,
             owner_prefixes=normalized_cleanup_prefixes,
             async_delete=bool(delete_async),
+            progress_callback=progress_callback,
+            progress_phase="rebuild_cleanup",
         )
         result = service.index_repo_object(
             str(resolved_root),
             extensions=normalized_extensions,
             recursive=bool(recursive),
+            progress_callback=progress_callback,
         )
         result["ok"] = True
         result["operation"] = "rebuild"
@@ -1925,13 +2272,63 @@ def run_repo_knowledge_operation(
 
 
 def run_repo_worker_job(job_id: str, job_payload: Mapping[str, Any]) -> None:
-    _update_repo_worker_job(job_id, status="running", started_at=time.time(), error=None)
+    progress_state = {"last_emit": 0.0}
+    heartbeat_stop_event = threading.Event()
+    heartbeat_state = {"seq": 0}
+
+    def _heartbeat_loop() -> None:
+        while not heartbeat_stop_event.wait(1.0):
+            heartbeat_state["seq"] = int(heartbeat_state.get("seq", 0) or 0) + 1
+            _update_repo_worker_job(
+                job_id,
+                heartbeat_at=time.time(),
+                heartbeat_seq=heartbeat_state["seq"],
+                worker_pid=os.getpid(),
+            )
+
+    def _progress_callback(update_payload: Mapping[str, Any]) -> None:
+        payload = dict(update_payload or {})
+        force_emit = bool(payload.pop("force", False))
+        now_ts = time.time()
+        if not force_emit and (now_ts - float(progress_state.get("last_emit", 0.0) or 0.0)) < 0.5:
+            return
+        progress_state["last_emit"] = now_ts
+        _update_repo_worker_job(
+            job_id,
+            heartbeat_at=now_ts,
+            progress=payload,
+            progress_phase=str(payload.get("phase") or ""),
+        )
+
+    _update_repo_worker_job(
+        job_id,
+        status="running",
+        started_at=time.time(),
+        heartbeat_at=time.time(),
+        heartbeat_seq=0,
+        worker_pid=os.getpid(),
+        progress={"phase": "worker_start", "state": "running"},
+        progress_phase="worker_start",
+        error=None,
+    )
+    heartbeat_thread = threading.Thread(
+        target=_heartbeat_loop,
+        name=f"repo-worker-heartbeat:{job_id}",
+        daemon=True,
+    )
+    heartbeat_thread.start()
     try:
-        result = run_repo_knowledge_operation(**dict(job_payload))
+        result = run_repo_knowledge_operation(
+            **dict(job_payload),
+            progress_callback=_progress_callback,
+        )
         _update_repo_worker_job(
             job_id,
             status="completed",
             finished_at=time.time(),
+            heartbeat_at=time.time(),
+            progress={"phase": "completed", "state": "completed"},
+            progress_phase="completed",
             result=dict(result),
             error=None,
         )
@@ -1940,8 +2337,14 @@ def run_repo_worker_job(job_id: str, job_payload: Mapping[str, Any]) -> None:
             job_id,
             status="failed",
             finished_at=time.time(),
+            heartbeat_at=time.time(),
+            progress={"phase": "failed", "state": "failed"},
+            progress_phase="failed",
             error=f"{type(exc).__name__}: {exc}",
         )
+    finally:
+        heartbeat_stop_event.set()
+        heartbeat_thread.join(timeout=1.0)
 
 def adb_worker(
     operation: str,
@@ -1970,7 +2373,8 @@ def adb_worker(
             job_state = _load_repo_worker_job(normalized_job_id)
             if not isinstance(job_state, dict):
                 return {"ok": False, "error": f"unknown job_id: {normalized_job_id}"}
-            return {"ok": True, "operation": "status", "job": dict(job_state)}
+            normalized_job_state = _maybe_finalize_stale_repo_worker_job(job_state)
+            return {"ok": True, "operation": "status", "job": dict(normalized_job_state)}
 
         operation_payload = {
             "operation": normalized_operation,
@@ -1993,6 +2397,7 @@ def adb_worker(
                 "operation": normalized_operation,
                 "status": "queued",
                 "created_at": time.time(),
+                "worker_pid": os.getpid(),
                 "params": {
                     "root_dir": root_dir,
                     "image_path": image_path,
@@ -2545,6 +2950,17 @@ class LoadContextPromptParser:
             return ""
         return normalized_value
 
+    def _atomic_relation_labels_object(self, relation_value: str) -> list[str]:
+        raw_value = str(relation_value or "").strip().lower()
+        if not raw_value:
+            return []
+        normalized_value = re.sub(r"[^a-z0-9]+", "_", raw_value).strip("_")
+        if not normalized_value:
+            return []
+        # Split merged labels like "imports_module_and_uses_env" into atomic parts.
+        candidate_values = [value for value in normalized_value.split("_and_") if value]
+        return self._deduplicate_object(candidate_values)
+
     def _extract_hint_flags(self, query_text: str) -> tuple[bool, bool]:
         tokens = {match.group(1).lower() for match in self._HINT_TOKEN_PATTERN.finditer(str(query_text or ""))}
         wants_entities = bool(tokens & self._ENTITY_HINTS)
@@ -2585,12 +3001,12 @@ class LoadContextPromptParser:
             if target_name:
                 object_names.append(target_name)
             if relation_text:
-                relation_labels.append(relation_text)
+                relation_labels.extend(self._atomic_relation_labels_object(relation_text))
 
         for match in self._RELATION_LABEL_PATTERN.finditer(query_text):
             relation_text = str(match.group("relation") or "").strip(" ,")
             if relation_text:
-                relation_labels.append(relation_text)
+                relation_labels.extend(self._atomic_relation_labels_object(relation_text))
 
         for match in self._TYPE_PATTERN.finditer(query_text):
             raw_types = str(match.group("types") or "")

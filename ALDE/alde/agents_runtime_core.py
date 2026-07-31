@@ -97,7 +97,9 @@ class AgentRuntimeCoreService:
         if normalized_target == "_xplaner_xrouter":
             env_model = str(os.getenv("AI_IDE_CHAT_MODEL") or "").strip().lstrip("/")
             configured_model = str((get_agent_config(normalized_target) or {}).get("model") or "").strip().lstrip("/")
-            model = str(model_name or env_model or configured_model or "qwen2.5-coder:7b")
+            model = str(model_name or env_model or configured_model).strip().lstrip("/")
+            if not model:
+                raise RuntimeError("Chat model is not configured. Set AI_IDE_CHAT_MODEL or pass model_name.")
             chat_kwargs: dict[str, Any] = {
                 "_model": model,
                 "_input_text": prompt,

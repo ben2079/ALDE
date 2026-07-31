@@ -1411,6 +1411,19 @@ AGENT_RUNTIME: dict[str, dict[str, Any]] = {
         },
         "workflow": {"definition": "xworker_leaf"},
     },
+    "_mcp_webplayer_operator": {
+        "canonical_name": "mcp_webplayer_operator",
+        "model": "gpt-4o-mini",
+        "tools": [
+            "call_api",
+            "@doc_ro",
+        ],
+        "defaults": {
+            "job_name": "webplayer_operator",
+            "skill_profile": "mcp_webplayer_operator",
+        },
+        "workflow": {"definition": "xworker_leaf"},
+    },
 }
 
 
@@ -1854,6 +1867,37 @@ PROMPT_FRAGMENTS: dict[str, dict[str, Any]] = {
     "deterministic_workflow": {
         "text": "Follow declared workflow/state transitions deterministically instead of improvising orchestration.",
     },
+    "mcp_webplayer_call_templates": {
+        "description": "Canonical MCP JSON payload templates for WebPlayer control via call_api.",
+        "instructions": [
+            "Target MCP endpoint: http://127.0.0.1:8766/mcp",
+            "Always send POST with Content-Type: application/json.",
+            "Use initialize once per session to confirm protocol and capabilities.",
+            "Use prompts/get with name='webplayer_operator' before first playback action.",
+            "Use prompts/list to confirm the active prompt set: webplayer_operator, webplayer_strategy_overview, webplayer_strategy_ifaai_generalized.",
+            "Then use tools/call with one of: webplayer_play, webplayer_search_play, webplayer_playlist_play, webplayer_library_play, webplayer_open_playback_target, webplayer_stop, webplayer_forward, webplayer_backward, webplayer_now_playing, webplayer_search, tidal_api_request, tidal_api_track, tidal_api_track_manifest, tidal_api_widevine.",
+            "Prefer webplayer_search_play, webplayer_playlist_play, webplayer_library_play, or webplayer_open_playback_target for playback start; keep webplayer_play as a retry fallback.",
+            "After each control action call webplayer_now_playing and summarize status/title/artist/album.",
+            "If tool result has ok=false, return stderr/stdout and propose a corrective next step.",
+            "Canonical call_api payload templates:",
+            "INIT: {'endpoint':'http://127.0.0.1:8766/mcp','method':'POST','payload':'{\"method\":\"initialize\",\"params\":{}}'}",
+            "PROMPT_GET: {'endpoint':'http://127.0.0.1:8766/mcp','method':'POST','payload':'{\"method\":\"prompts/get\",\"params\":{\"name\":\"webplayer_operator\",\"arguments\":{\"player_selector\":\"chromium\"}}}'}",
+            "PROMPT_LIST: {'endpoint':'http://127.0.0.1:8766/mcp','method':'POST','payload':'{\"method\":\"prompts/list\",\"params\":{}}'}",
+            "PLAY: {'endpoint':'http://127.0.0.1:8766/mcp','method':'POST','payload':'{\"method\":\"tools/call\",\"params\":{\"name\":\"webplayer_play\",\"arguments\":{\"player_selector\":\"chromium\"}}}'}",
+            "SEARCH_PLAY: {'endpoint':'http://127.0.0.1:8766/mcp','method':'POST','payload':'{\"method\":\"tools/call\",\"params\":{\"name\":\"webplayer_search_play\",\"arguments\":{\"player_selector\":\"chromium\",\"query\":\"<USER_QUERY>\"}}}'}",
+            "PLAYLIST_PLAY: {'endpoint':'http://127.0.0.1:8766/mcp','method':'POST','payload':'{\"method\":\"tools/call\",\"params\":{\"name\":\"webplayer_playlist_play\",\"arguments\":{\"player_selector\":\"chromium\",\"playlist_url\":\"<TIDAL_PLAYLIST_URL>\"}}}'}",
+            "LIBRARY_PLAY: {'endpoint':'http://127.0.0.1:8766/mcp','method':'POST','payload':'{\"method\":\"tools/call\",\"params\":{\"name\":\"webplayer_library_play\",\"arguments\":{\"player_selector\":\"chromium\",\"section\":\"favorites_tracks\"}}}'}",
+            "OPEN_TARGET: {'endpoint':'http://127.0.0.1:8766/mcp','method':'POST','payload':'{\"method\":\"tools/call\",\"params\":{\"name\":\"webplayer_open_playback_target\",\"arguments\":{\"player_selector\":\"chromium\",\"target_url\":\"<TIDAL_URL>\"}}}'}",
+            "STOP: {'endpoint':'http://127.0.0.1:8766/mcp','method':'POST','payload':'{\"method\":\"tools/call\",\"params\":{\"name\":\"webplayer_stop\",\"arguments\":{\"player_selector\":\"chromium\"}}}'}",
+            "FORWARD: {'endpoint':'http://127.0.0.1:8766/mcp','method':'POST','payload':'{\"method\":\"tools/call\",\"params\":{\"name\":\"webplayer_forward\",\"arguments\":{\"player_selector\":\"chromium\"}}}'}",
+            "BACKWARD: {'endpoint':'http://127.0.0.1:8766/mcp','method':'POST','payload':'{\"method\":\"tools/call\",\"params\":{\"name\":\"webplayer_backward\",\"arguments\":{\"player_selector\":\"chromium\"}}}'}",
+            "NOW_PLAYING: {'endpoint':'http://127.0.0.1:8766/mcp','method':'POST','payload':'{\"method\":\"tools/call\",\"params\":{\"name\":\"webplayer_now_playing\",\"arguments\":{\"player_selector\":\"chromium\"}}}'}",
+            "SEARCH: {'endpoint':'http://127.0.0.1:8766/mcp','method':'POST','payload':'{\"method\":\"tools/call\",\"params\":{\"name\":\"webplayer_search\",\"arguments\":{\"player_selector\":\"chromium\",\"query\":\"<USER_QUERY>\"}}}'}",
+            "TIDAL_TRACK: {'endpoint':'http://127.0.0.1:8766/mcp','method':'POST','payload':'{\"method\":\"tools/call\",\"params\":{\"name\":\"tidal_api_track\",\"arguments\":{\"track_id\":\"<TRACK_ID>\",\"country_code\":\"DE\"}}}'}",
+            "TIDAL_MANIFEST: {'endpoint':'http://127.0.0.1:8766/mcp','method':'POST','payload':'{\"method\":\"tools/call\",\"params\":{\"name\":\"tidal_api_track_manifest\",\"arguments\":{\"track_id\":\"<TRACK_ID>\"}}}'}",
+            "TIDAL_WIDEVINE: {'endpoint':'http://127.0.0.1:8766/mcp','method':'POST','payload':'{\"method\":\"tools/call\",\"params\":{\"name\":\"tidal_api_widevine\",\"arguments\":{\"body_base64\":\"<BASE64_PAYLOAD>\"}}}'}",
+        ],
+    },
 }
 
 
@@ -1946,6 +1990,12 @@ AGENT_SKILLS: dict[str, dict[str, Any]] = {
         "description": "Worker profile for running the standalone mail-agent runtime bridge.",
         "job_name": "mail_agent_runtime",
     },
+    "xworker_mcp_webplayer_operator": {
+        "role": "xworker",
+        "prompt_fragments": ["source_grounding", "json_output", "mcp_webplayer_call_templates"],
+        "description": "Operate remote WebPlayer MCP with deterministic call_api payloads.",
+        "job_name": "webplayer_operator",
+    },
   
 }
 
@@ -2021,6 +2071,21 @@ AGENT_MANIFEST: dict[str, dict[str, Any]] = {
                     "handoff_schema": "xworker_to_xworker",
                 },
             },
+        },
+    },
+    "_mcp_webplayer_operator": {
+        "role": "xworker",
+        "skill_profile": "xworker_mcp_webplayer_operator",
+        "instance_policy": "session_scoped",
+        "routing_policy": {"mode": "xworker", "can_route": False},
+        "handoff_policy": {
+            "default_protocol": "message_text",
+            "accepted_protocols": ["message_text", "agent_handoff_v1"],
+            "emitted_protocols": ["message_text", "agent_handoff_v1"],
+            "allowed_targets": [],
+            "allowed_sources": ["_xrouter_xplanner", "_xplaner_xrouter"],
+            "target_policies": {},
+            "source_policies": {},
         },
     },
 }
@@ -2526,6 +2591,18 @@ FORCED_ROUTES: dict[str, list[dict[str, Any]]] = {
         {
             "name": "agent_prefix",
             "trigger": {"type": "at_prefix"},
+        },
+        {
+            "name": "webplayer_prefix",
+            "trigger": {
+                "type": "text_prefix",
+                "prefix": "//wp",
+                "ignore_case": True,
+            },
+            "route": {
+                "target_agent": "_mcp_webplayer_operator",
+                "user_question": "__trigger_remainder__",
+            },
         },
         {
             "name": "cover_letter_writer_direct_payload",

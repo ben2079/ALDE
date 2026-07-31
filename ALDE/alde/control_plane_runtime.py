@@ -46,6 +46,17 @@ def _load_env_float(name: str, default: float, *, minimum: float, maximum: float
     return max(float(minimum), min(float(maximum), parsed_value))
 
 
+def _load_env_int(name: str, default: int, *, minimum: int, maximum: int) -> int:
+    raw_value = _safe_str(os.getenv(name, ""))
+    if not raw_value:
+        return int(default)
+    try:
+        parsed_value = int(raw_value)
+    except Exception:
+        return int(default)
+    return max(int(minimum), min(int(maximum), parsed_value))
+
+
 def _json_safe_copy(value: Any) -> Any:
     try:
         return json.loads(json.dumps(value, ensure_ascii=False, default=str))
@@ -192,6 +203,152 @@ def _load_symbol(module_name: str, symbol_name: str) -> Any:
     if last_error is not None:
         raise last_error
     raise ImportError(f"Unable to load {symbol_name} from {module_name}")
+
+
+class RepoWorkerMonitoringService:
+    _JOBS_PATH_ENV = "ALDE_REPO_WORKER_JOBS_PATH"
+
+    def _resolve_jobs_path(self) -> Path:
+        configured_path = _safe_str(os.getenv(self._JOBS_PATH_ENV, ""))
+        if configured_path:
+            return Path(os.path.abspath(os.path.expanduser(configured_path)))
+        return _PACKAGE_ROOT / "AppData" / "repo_worker_jobs.json"
+
+    def _load_jobs_payload(self) -> dict[str, Any]:
+        target_path = self._resolve_jobs_path()
+        if not target_path.is_file():
+            return {"ok": False, "error": "jobs_file_missing", "path": str(target_path), "jobs": []}
+        try:
+            raw_payload = json.loads(target_path.read_text(encoding="utf-8") or "{}")
+        except Exception as exc:
+            return {
+                "ok": False,
+                "error": f"jobs_file_invalid:{type(exc).__name__}",
+                "path": str(target_path),
+                "jobs": [],
+            }
+
+        jobs_payload = raw_payload.get("jobs") if isinstance(raw_payload, dict) else {}
+        if not isinstance(jobs_payload, dict):
+            jobs_payload = {}
+
+        jobs: list[dict[str, Any]] = []
+        for job_id, job_payload in jobs_payload.items():
+            if not isinstance(job_payload, dict):
+                continue
+            job_object = dict(job_payload)
+            job_object.setdefault("job_id", str(job_id))
+            jobs.append(job_object)
+
+        jobs.sort(
+            key=lambda item: (
+                float(item.get("started_at") or 0.0),
+                float(item.get("created_at") or 0.0),
+                _safe_str(item.get("job_id")),
+            ),
+            reverse=True,
+        )
+        return {
+            "ok": True,
+            "error": "",
+            "path": str(target_path),
+            "jobs": jobs,
+            "updated_at": raw_payload.get("updated_at") if isinstance(raw_payload, dict) else None,
+        }
+
+    def _age_seconds(self, timestamp_value: Any, now_dt: datetime) -> float | None:
+        try:
+            timestamp = float(timestamp_value)
+        except Exception:
+            return None
+        if timestamp <= 0:
+            return None
+        return max(0.0, now_dt.timestamp() - timestamp)
+
+    def load_snapshot(self) -> dict[str, Any]:
+        loaded_payload = self._load_jobs_payload()
+        jobs = [dict(item) for item in (loaded_payload.get("jobs") or []) if isinstance(item, dict)]
+        now_dt = datetime.now(timezone.utc)
+        stale_timeout_seconds = _load_env_int(
+            "ALDE_REPO_WORKER_STALE_TIMEOUT_SECONDS",
+            900,
+            minimum=60,
+            maximum=86_400,
+        )
+
+        status_counts: dict[str, int] = {}
+        active_jobs: list[dict[str, Any]] = []
+        stale_active_jobs: list[dict[str, Any]] = []
+        failed_jobs: list[dict[str, Any]] = []
+        max_active_heartbeat_age_seconds = 0.0
+
+        for job_payload in jobs:
+            status_value = _safe_str(job_payload.get("status")).lower() or "unknown"
+            status_counts[status_value] = status_counts.get(status_value, 0) + 1
+
+            heartbeat_age_seconds = self._age_seconds(job_payload.get("heartbeat_at"), now_dt)
+            started_age_seconds = self._age_seconds(job_payload.get("started_at"), now_dt)
+            created_age_seconds = self._age_seconds(job_payload.get("created_at"), now_dt)
+
+            heartbeat_or_age = heartbeat_age_seconds
+            if heartbeat_or_age is None:
+                if started_age_seconds is not None:
+                    heartbeat_or_age = started_age_seconds
+                else:
+                    heartbeat_or_age = created_age_seconds
+
+            if status_value in {"queued", "running"}:
+                active_entry = {
+                    "job_id": _safe_str(job_payload.get("job_id")),
+                    "operation": _safe_str(job_payload.get("operation")) or "unknown",
+                    "status": status_value,
+                    "progress_phase": _safe_str(job_payload.get("progress_phase")) or "n/a",
+                    "heartbeat_age_seconds": heartbeat_or_age,
+                    "heartbeat_seq": int(job_payload.get("heartbeat_seq") or 0),
+                    "created_at": job_payload.get("created_at"),
+                    "started_at": job_payload.get("started_at"),
+                }
+                active_jobs.append(active_entry)
+                if isinstance(heartbeat_or_age, (int, float)):
+                    max_active_heartbeat_age_seconds = max(max_active_heartbeat_age_seconds, float(heartbeat_or_age))
+                    if float(heartbeat_or_age) >= float(stale_timeout_seconds):
+                        stale_active_jobs.append(active_entry)
+
+            if status_value == "failed":
+                failed_jobs.append(
+                    {
+                        "job_id": _safe_str(job_payload.get("job_id")),
+                        "operation": _safe_str(job_payload.get("operation")) or "unknown",
+                        "error": _safe_str(job_payload.get("error")) or "unknown",
+                        "finished_at": job_payload.get("finished_at"),
+                    }
+                )
+
+        failed_jobs.sort(
+            key=lambda item: (
+                float(item.get("finished_at") or 0.0),
+                _safe_str(item.get("job_id")),
+            ),
+            reverse=True,
+        )
+
+        return {
+            "generated_at": _utc_now_iso(),
+            "ok": bool(loaded_payload.get("ok")),
+            "error": _safe_str(loaded_payload.get("error")),
+            "jobs_path": _safe_str(loaded_payload.get("path")),
+            "updated_at": loaded_payload.get("updated_at"),
+            "jobs_total": len(jobs),
+            "active_jobs": active_jobs[:12],
+            "active_job_count": len(active_jobs),
+            "stale_active_jobs": stale_active_jobs[:12],
+            "stale_active_job_count": len(stale_active_jobs),
+            "failed_jobs": failed_jobs[:12],
+            "failed_job_count": len(failed_jobs),
+            "status_counts": dict(sorted(status_counts.items())),
+            "stale_timeout_seconds": stale_timeout_seconds,
+            "max_active_heartbeat_age_seconds": round(float(max_active_heartbeat_age_seconds), 3),
+        }
 
 
 class RuntimeProjectionService:
@@ -1422,9 +1579,11 @@ class OperatorStatusService:
         self,
         validation_service: WorkflowValidationService,
         queue_health_service: QueueHealthService,
+        repo_worker_monitoring_service: RepoWorkerMonitoringService,
     ) -> None:
         self._validation_service = validation_service
         self._queue_health_service = queue_health_service
+        self._repo_worker_monitoring_service = repo_worker_monitoring_service
 
     def load_dispatcher_status(self) -> dict[str, Any]:
         try:
@@ -1820,9 +1979,32 @@ class OperatorStatusService:
         mcp_probe_metrics = self._load_mcp_probe_metrics(normalized_probe)
         mcp_overall_metrics = dict(mcp_probe_metrics.get("overall_metrics") or {})
         mcp_transport_metrics = dict(mcp_probe_metrics.get("transport_metrics") or {})
+        repo_worker_monitoring = self._repo_worker_monitoring_service.load_snapshot()
         mcp_active_server = _safe_str(normalized_probe.get("active_server") or normalized_probe.get("selected_server"))
         mcp_active_transport = _safe_str(normalized_probe.get("active_transport") or normalized_probe.get("selected_transport"))
         mcp_fallback_used = bool(normalized_probe.get("fallback_used"))
+
+        repo_worker_jobs_total = int(repo_worker_monitoring.get("jobs_total") or 0)
+        repo_worker_active_job_count = int(repo_worker_monitoring.get("active_job_count") or 0)
+        repo_worker_failed_job_count = int(repo_worker_monitoring.get("failed_job_count") or 0)
+        repo_worker_stale_active_job_count = int(repo_worker_monitoring.get("stale_active_job_count") or 0)
+        repo_worker_max_heartbeat_age_seconds = float(repo_worker_monitoring.get("max_active_heartbeat_age_seconds") or 0.0)
+        repo_worker_jobs_path = _safe_str(repo_worker_monitoring.get("jobs_path"))
+        repo_worker_error = _safe_str(repo_worker_monitoring.get("error"))
+        repo_worker_ok = bool(repo_worker_monitoring.get("ok"))
+
+        if not repo_worker_ok and repo_worker_jobs_total <= 0:
+            repo_worker_state = "not-run"
+            repo_worker_note = repo_worker_error or "Repo worker telemetry not yet available"
+        elif repo_worker_stale_active_job_count > 0:
+            repo_worker_state = "fail"
+            repo_worker_note = f"{repo_worker_stale_active_job_count} stale active jobs"
+        elif repo_worker_active_job_count > 0 and repo_worker_max_heartbeat_age_seconds >= 30.0:
+            repo_worker_state = "fail"
+            repo_worker_note = f"active heartbeat age={repo_worker_max_heartbeat_age_seconds:.0f}s"
+        else:
+            repo_worker_state = "pass"
+            repo_worker_note = "Repo worker telemetry healthy"
 
         validation_errors = [
             str(item)
@@ -1901,6 +2083,18 @@ class OperatorStatusService:
                 detail=validation_summary,
                 note=f"{len(validation_errors)} issues projected" if validation_errors else "No active validation errors",
             ),
+            self._build_service_row(
+                title="Repo Worker",
+                state=repo_worker_state,
+                detail=(
+                    f"active={repo_worker_active_job_count} failed={repo_worker_failed_job_count} "
+                    f"stale={repo_worker_stale_active_job_count}"
+                ),
+                note=(
+                    f"{repo_worker_note}"
+                    + (f" | path={Path(repo_worker_jobs_path).name}" if repo_worker_jobs_path else "")
+                ),
+            ),
         ]
 
         alerts: list[str] = []
@@ -1916,6 +2110,12 @@ class OperatorStatusService:
             alerts.append(mcp_probe_message)
         if validation_errors:
             alerts.extend(validation_errors[:3])
+        if repo_worker_stale_active_job_count > 0:
+            alerts.append(f"Repo worker reports {repo_worker_stale_active_job_count} stale active jobs.")
+        if repo_worker_state == "fail" and repo_worker_active_job_count > 0 and repo_worker_max_heartbeat_age_seconds >= 30.0:
+            alerts.append(
+                f"Repo worker heartbeat age is elevated at {repo_worker_max_heartbeat_age_seconds:.0f}s."
+            )
 
         healthy_service_count = sum(1 for row in service_rows if bool(row.get("healthy")))
         recent_actions = self.load_recent_action_items(recent_action_entries=recent_action_entries, limit=12)
@@ -1937,6 +2137,12 @@ class OperatorStatusService:
             "mcp_latency_p50_ms": round(self._load_numeric_value(mcp_overall_metrics.get("p50_latency_ms")), 3),
             "mcp_latency_p95_ms": round(self._load_numeric_value(mcp_overall_metrics.get("p95_latency_ms")), 3),
             "mcp_active_transport": mcp_active_transport or "",
+            "repo_worker_jobs_total": repo_worker_jobs_total,
+            "repo_worker_active_job_count": repo_worker_active_job_count,
+            "repo_worker_failed_job_count": repo_worker_failed_job_count,
+            "repo_worker_stale_active_job_count": repo_worker_stale_active_job_count,
+            "repo_worker_max_heartbeat_age_seconds": repo_worker_max_heartbeat_age_seconds,
+            "repo_worker_ok": 1 if repo_worker_ok else 0,
         }
 
         return _build_projection_snapshot(
@@ -1975,6 +2181,16 @@ class OperatorStatusService:
             mcp_probe_metrics=mcp_probe_metrics,
             mcp_overall_metrics=mcp_overall_metrics,
             mcp_transport_metrics=mcp_transport_metrics,
+            repo_worker_monitoring=repo_worker_monitoring,
+            repo_worker_state=repo_worker_state,
+            repo_worker_note=repo_worker_note,
+            repo_worker_jobs_path=repo_worker_jobs_path,
+            repo_worker_jobs_total=repo_worker_jobs_total,
+            repo_worker_active_job_count=repo_worker_active_job_count,
+            repo_worker_failed_job_count=repo_worker_failed_job_count,
+            repo_worker_stale_active_job_count=repo_worker_stale_active_job_count,
+            repo_worker_max_heartbeat_age_seconds=repo_worker_max_heartbeat_age_seconds,
+            repo_worker_ok=repo_worker_ok,
             service_count=len(service_rows),
             healthy_service_count=healthy_service_count,
             service_rows=service_rows,
@@ -1989,9 +2205,11 @@ class DesktopMonitoringSnapshotService:
         self,
         view_service: RuntimeViewService,
         observability_service: RuntimeObservabilityService,
+        repo_worker_monitoring_service: RepoWorkerMonitoringService,
     ) -> None:
         self._view_service = view_service
         self._observability_service = observability_service
+        self._repo_worker_monitoring_service = repo_worker_monitoring_service
 
     def load_snapshot(
         self,
@@ -2093,6 +2311,16 @@ class DesktopMonitoringSnapshotService:
             if isinstance(observability.get("router_parallel_status"), dict)
             else {}
         )
+        repo_worker_monitoring = self._repo_worker_monitoring_service.load_snapshot()
+        repo_worker_status_counts = (
+            repo_worker_monitoring.get("status_counts")
+            if isinstance(repo_worker_monitoring.get("status_counts"), dict)
+            else {}
+        )
+        repo_worker_active_job_count = int(repo_worker_monitoring.get("active_job_count") or 0)
+        repo_worker_failed_job_count = int(repo_worker_monitoring.get("failed_job_count") or 0)
+        repo_worker_stale_active_job_count = int(repo_worker_monitoring.get("stale_active_job_count") or 0)
+        repo_worker_max_heartbeat_age_seconds = float(repo_worker_monitoring.get("max_active_heartbeat_age_seconds") or 0.0)
         router_parallel_timeout_branches = int(router_parallel_status.get("total_timeout_branches") or 0)
         router_parallel_partial_fail_runs = int(router_parallel_status.get("total_partial_fail_runs") or 0)
         router_parallel_total_runs = int(router_parallel_status.get("total_parallel_runs") or 0)
@@ -2116,6 +2344,18 @@ class DesktopMonitoringSnapshotService:
             alerts.append(
                 f"Router parallel hard-timeout mode used in {router_parallel_hard_timeout_runs} runs."
             )
+        if repo_worker_stale_active_job_count > 0:
+            alerts.append(
+                f"Repo worker telemetry reports {repo_worker_stale_active_job_count} stale active jobs."
+            )
+        if repo_worker_active_job_count > 0 and repo_worker_max_heartbeat_age_seconds >= 30.0:
+            alerts.append(
+                f"Repo worker active heartbeat age is {repo_worker_max_heartbeat_age_seconds:.0f}s."
+            )
+        if not bool(repo_worker_monitoring.get("ok")) and _safe_str(repo_worker_monitoring.get("error")):
+            alerts.append(
+                f"Repo worker telemetry unavailable: {_safe_str(repo_worker_monitoring.get('error'))}."
+            )
         recent_items = [
             _build_recent_projection_item(
                 timestamp=_safe_str(event_object.get("timestamp")),
@@ -2130,6 +2370,52 @@ class DesktopMonitoringSnapshotService:
             for event_object in list(events[-12:])
             if isinstance(event_object, dict)
         ]
+        for active_job in (repo_worker_monitoring.get("active_jobs") or [])[:4]:
+            if not isinstance(active_job, dict):
+                continue
+            job_id = _safe_str(active_job.get("job_id"))
+            operation_name = _safe_str(active_job.get("operation")) or "unknown"
+            status_name = _safe_str(active_job.get("status")) or "running"
+            heartbeat_age = active_job.get("heartbeat_age_seconds")
+            heartbeat_note = "n/a"
+            if isinstance(heartbeat_age, (int, float)):
+                heartbeat_note = f"{float(heartbeat_age):.0f}s"
+            recent_items.append(
+                _build_recent_projection_item(
+                    timestamp=None,
+                    title=f"Repo worker {status_name}",
+                    summary=f"{operation_name} {job_id} heartbeat_age={heartbeat_note}",
+                    source="repo_worker",
+                    status="warn" if status_name == "queued" else "info",
+                    audit_type="repo_worker",
+                    action_group="runtime_monitoring",
+                    metadata=active_job,
+                )
+            )
+        latest_failed_job = next(
+            (
+                failed_job
+                for failed_job in (repo_worker_monitoring.get("failed_jobs") or [])
+                if isinstance(failed_job, dict)
+            ),
+            None,
+        )
+        if isinstance(latest_failed_job, dict):
+            recent_items.append(
+                _build_recent_projection_item(
+                    timestamp=None,
+                    title="Repo worker failure",
+                    summary=(
+                        f"{_safe_str(latest_failed_job.get('operation')) or 'unknown'} "
+                        f"{_safe_str(latest_failed_job.get('job_id')) or 'job'}"
+                    ),
+                    source="repo_worker",
+                    status="fail",
+                    audit_type="repo_worker_failure",
+                    action_group="runtime_monitoring",
+                    metadata=latest_failed_job,
+                )
+            )
         summary_metrics = {
             "session_count": int(runtime_view.get("session_count") or 0),
             "event_count": int(runtime_view.get("event_count") or 0),
@@ -2139,6 +2425,14 @@ class DesktopMonitoringSnapshotService:
             "average_latency_ms": average_latency_ms,
             "active_session_count": int(observability.get("active_session_count") or 0),
             "validation_issue_count": len(validation_errors),
+            "repo_worker_jobs_total": int(repo_worker_monitoring.get("jobs_total") or 0),
+            "repo_worker_active_job_count": repo_worker_active_job_count,
+            "repo_worker_failed_job_count": repo_worker_failed_job_count,
+            "repo_worker_stale_active_job_count": repo_worker_stale_active_job_count,
+            "repo_worker_running_count": int(repo_worker_status_counts.get("running") or 0),
+            "repo_worker_queued_count": int(repo_worker_status_counts.get("queued") or 0),
+            "repo_worker_completed_count": int(repo_worker_status_counts.get("completed") or 0),
+            "repo_worker_max_heartbeat_age_seconds": repo_worker_max_heartbeat_age_seconds,
             "router_parallel_runs": router_parallel_total_runs,
             "router_parallel_timeout_branches": router_parallel_timeout_branches,
             "router_parallel_partial_fail_runs": router_parallel_partial_fail_runs,
@@ -2162,6 +2456,7 @@ class DesktopMonitoringSnapshotService:
             router_parallel_status=router_parallel_status,
             router_parallel_enabled=bool(router_parallel_config.get("parallel_enabled")),
             latest_sessions=latest_session_summaries,
+            repo_worker_monitoring=repo_worker_monitoring,
             observability=observability,
             session_count=int(runtime_view.get("session_count") or 0),
             event_count=int(runtime_view.get("event_count") or 0),
@@ -2337,9 +2632,11 @@ RUNTIME_VIEW_SERVICE = RuntimeViewService(RUNTIME_PROJECTION_SERVICE, RUNTIME_ME
 WORKFLOW_VALIDATION_SERVICE = WorkflowValidationService()
 WORKFLOW_STATUS_SERVICE = WorkflowStatusService(WORKFLOW_VALIDATION_SERVICE)
 QUEUE_HEALTH_SERVICE = QueueHealthService()
+REPO_WORKER_MONITORING_SERVICE = RepoWorkerMonitoringService()
 OPERATOR_STATUS_SERVICE = OperatorStatusService(
     WORKFLOW_VALIDATION_SERVICE,
     QUEUE_HEALTH_SERVICE,
+    REPO_WORKER_MONITORING_SERVICE,
 )
 RUNTIME_OBSERVABILITY_SERVICE = RuntimeObservabilityService(
     RUNTIME_VIEW_SERVICE,
@@ -2349,6 +2646,7 @@ RUNTIME_OBSERVABILITY_SERVICE = RuntimeObservabilityService(
 DESKTOP_MONITORING_SNAPSHOT_SERVICE = DesktopMonitoringSnapshotService(
     RUNTIME_VIEW_SERVICE,
     RUNTIME_OBSERVABILITY_SERVICE,
+    REPO_WORKER_MONITORING_SERVICE,
 )
 CONTROL_PLANE_SNAPSHOT_EXPORT_SERVICE = ControlPlaneSnapshotExportService(
     RUNTIME_PROJECTION_SERVICE,

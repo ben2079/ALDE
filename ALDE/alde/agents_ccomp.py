@@ -223,16 +223,6 @@ Citizen
     _HISTORY = ChatHistory()  # eager instantiation
     """
 
-def _normalize_github_models_base_url(base_url: Any) -> str:
-    text = str(base_url or "").strip()
-    if not text:
-        return "https://models.github.ai/inference"
-    lowered = text.rstrip("/").lower()
-    if lowered.startswith("https://github.com/models"):
-        return "https://models.github.ai/inference"
-    if lowered.startswith("https://models.github.ai/inference"):
-        return "https://models.github.ai/inference"
-    return text.rstrip("/")
 
 
 def _normalize_chat_model_name(model_name: Any, provider: str | None = None) -> str:
@@ -248,88 +238,6 @@ def _normalize_chat_model_name(model_name: Any, provider: str | None = None) -> 
 
    # This is the main class that is used to generate a chat response
 class ChatCompletion():
-
-    @staticmethod
-    def _provider_fallback_name(provider: str | None = None) -> str:
-            current_provider = str(provider or os.getenv("AI_IDE_MODEL_PROVIDER") or "").strip().lower()
-            configured_fallback = str(os.getenv("AI_IDE_MODEL_PROVIDER_FALLBACK") or "").strip().lower()
-            if configured_fallback:
-                return configured_fallback
-            if current_provider in {"github", "github_models", "github-models"}:
-                return "ollama"
-            return ""
-
-    @staticmethod
-    def _switch_chat_provider_profile(provider: str | None = None) -> bool:
-            fallback = ChatCompletion._provider_fallback_name(provider)
-            if not fallback:
-                return False
-
-            current_provider = str(provider or os.getenv("AI_IDE_MODEL_PROVIDER") or "").strip().lower()
-            if fallback == current_provider:
-                return False
-
-            os.environ["AI_IDE_MODEL_PROVIDER"] = fallback
-            try:
-                for cls_obj in (ChatCompletion, globals().get("ChatCom"), globals().get("ChatComE")):
-                    if cls_obj is None:
-                        continue
-                    try:
-                        cls_obj._close_clients()
-                    except Exception:
-                        try:
-                            if hasattr(cls_obj, "_client"):
-                                cls_obj._client = None  # type: ignore[attr-defined]
-                            if hasattr(cls_obj, "_http_client"):
-                                cls_obj._http_client = None  # type: ignore[attr-defined]
-                        except Exception:
-                            pass
-            except Exception:
-                pass
-            ChatCompletion._apply_chat_provider_profile()
-            return True
-
-    @staticmethod
-    def _apply_chat_provider_profile() -> None:
-            provider = str(os.getenv("AI_IDE_MODEL_PROVIDER") or "").strip().lower()
-            if not provider:
-                return
-
-            def _set_if_value(env_name: str, value: Any) -> None:
-                text = str(value or "").strip().lstrip("/")
-                if text:
-                    os.environ[env_name] = text
-
-            if provider in {"ollama", "ollama_local", "local_ollama"}:
-                _set_if_value("OPENAI_BASE_URL", os.getenv("AI_IDE_OLLAMA_BASE_URL") or "http://127.0.0.1:11434/v1")
-                _set_if_value("OPENAI_API_KEY", os.getenv("AI_IDE_OLLAMA_API_KEY") or "ollama-local")
-                _set_if_value("AI_IDE_CHAT_MODEL", _normalize_chat_model_name(os.getenv("AI_IDE_OLLAMA_CHAT_MODEL") or "qwen2.5-coder:7b", provider=provider))
-                return
-
-            if provider in {"github", "github_models", "github-models"}:
-                _set_if_value(
-                    "OPENAI_BASE_URL",
-                    _normalize_github_models_base_url(
-                        os.getenv("AI_IDE_GITHUB_MODELS_BASE_URL")
-                        or os.getenv("AI_IDE_GITHUB_MODELS_URL")
-                        or "https://models.github.ai/inference"
-                    ),
-                )
-                _set_if_value(
-                    "OPENAI_API_KEY",
-                    os.getenv("AI_IDE_GITHUB_MODELS_API_KEY")
-                    or os.getenv("GITHUB_MODELS_API_KEY")
-                    or os.getenv("GITHUB_TOKEN")
-                    or os.getenv("GH_TOKEN"),
-                )
-                _set_if_value("AI_IDE_CHAT_MODEL", _normalize_chat_model_name(os.getenv("AI_IDE_GITHUB_CHAT_MODEL") or "openai/gpt-4.1-mini", provider=provider))
-                return
-
-            if provider in {"openai", "openai_cloud", "openai-api"}:
-                _set_if_value("OPENAI_BASE_URL", os.getenv("AI_IDE_OPENAI_BASE_URL") or os.getenv("OPENAI_BASE_URL"))
-                _set_if_value("OPENAI_API_KEY", os.getenv("AI_IDE_OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY"))
-                _set_if_value("AI_IDE_CHAT_MODEL", _normalize_chat_model_name(os.getenv("AI_IDE_OPENAI_CHAT_MODEL") or os.getenv("AI_IDE_CHAT_MODEL") or "gpt-4.1-mini", provider=provider))
-                return
 
     @staticmethod
     def _read_api_key() -> str:
@@ -355,7 +263,7 @@ class ChatCompletion():
                         __text = str(__value)
                     if __text.strip() == "":
                         continue
-                    if __name in {"AI_IDE_CHAT_MODEL", "AI_IDE_OLLAMA_CHAT_MODEL", "AI_IDE_GITHUB_CHAT_MODEL", "AI_IDE_OPENAI_CHAT_MODEL"}:
+                    if __name in {"AI_IDE_CHAT_MODEL"}:
                         __text = __text.strip().lstrip("/")
                     os.environ.setdefault(__name, __text)
 
@@ -368,19 +276,13 @@ class ChatCompletion():
                     break
 
             load_dotenv()                     # fallback
-            ChatCompletion._apply_chat_provider_profile()
             __key = os.getenv("OPENAI_API_KEY")
             if not __key:
-                __provider = str(os.getenv("AI_IDE_MODEL_PROVIDER") or "").strip().lower()
-                if __provider in {"github", "github_models", "github-models"}:
-                    raise RuntimeError(
-                        "GitHub Models key missing – set AI_IDE_GITHUB_MODELS_API_KEY or GITHUB_TOKEN (scope: models:read)."
-                    )
                 raise RuntimeError(
                     "OPENAI_API_KEY not found – supply it via .env.json/.env or environment."
                 )
             return __key
-    
+
     # Single shared OpenAI client instance for this module.
     # Lazily initialized so imports work without OPENAI_API_KEY set.
     _client: OpenAI | None = None
@@ -1939,10 +1841,15 @@ class ChatCom(ChatCompletion,ChatHistory):
                 env_model = str(os.getenv("AI_IDE_CHAT_MODEL") or "").strip()
                 explicit_model = str(getattr(self, "_model", "") or "").strip().lstrip("/")
                 config_model = str((_agent_cfg.get("model") if isinstance(_agent_cfg, dict) else "") or "").strip().lstrip("/")
-                model = explicit_model or env_model or config_model or "qwen2.5-coder:7b"
+                model = explicit_model or env_model or config_model
                 print(f"Using model: {model}")
             except Exception:
-                model = str(os.getenv("AI_IDE_CHAT_MODEL") or "").strip().lstrip("/") or "qwen2.5-coder:7b"
+                model = str(os.getenv("AI_IDE_CHAT_MODEL") or "").strip().lstrip("/")
+
+            if not str(model or "").strip():
+                raise RuntimeError(
+                    "Chat model is not configured. Set AI_IDE_CHAT_MODEL or provide an explicit model."
+                )
 
 
             try:
@@ -2003,10 +1910,7 @@ class ChatCom(ChatCompletion,ChatHistory):
                     )
                     return response
                 if not attempted_provider_fallback and any(token in err_text.lower() for token in ("no_access", "unknown_model")):
-                    if ChatCompletion._switch_chat_provider_profile(str(os.getenv("AI_IDE_MODEL_PROVIDER") or "")):
-                        attempted_provider_fallback = True
-                        tools = None
-                        return _response(_input)
+                    attempted_provider_fallback = True
                 try:
                     _chat.log(
                         _role="tool",
@@ -2087,7 +1991,9 @@ class ChatCom(ChatCompletion,ChatHistory):
                         self.assistant_msg_content = ""
                     else:
                         try:
-                            retry_model = _normalize_chat_model_name(getattr(self, "_model", "") or os.getenv("AI_IDE_CHAT_MODEL") or "qwen2.5-coder:7b", provider=os.getenv("AI_IDE_MODEL_PROVIDER"))
+                            retry_model = _normalize_chat_model_name(getattr(self, "_model", "") or os.getenv("AI_IDE_CHAT_MODEL") or "", provider=os.getenv("AI_IDE_MODEL_PROVIDER"))
+                            if not retry_model:
+                                raise RuntimeError("Retry model is not configured.")
                             plain_text_retry = self._get_client().chat.completions.create(
                                 model=retry_model,
                                 messages=[
@@ -2359,7 +2265,11 @@ class ChatComE(ChatCompletion,ChatHistory):
             tools:list[dict],
             tool_choice:str
             ):
-            self.model:str = _normalize_chat_model_name(_model or os.getenv("AI_IDE_CHAT_MODEL") or "qwen2.5-coder:7b", provider=os.getenv("AI_IDE_MODEL_PROVIDER"))
+            self.model:str = _normalize_chat_model_name(_model or os.getenv("AI_IDE_CHAT_MODEL") or "", provider=os.getenv("AI_IDE_MODEL_PROVIDER"))
+            if not self.model:
+                raise RuntimeError(
+                    "Chat model is not configured. Set AI_IDE_CHAT_MODEL or pass _model explicitly."
+                )
             self._messages:list = _messages
             self.tools:list[dict] = tools
             self.tool_choice:str = tool_choice
@@ -2439,12 +2349,7 @@ class ChatComE(ChatCompletion,ChatHistory):
                         )
                         return self.response
                     if any(token in err_text.lower() for token in ("no_access", "unknown_model")):
-                        if ChatCompletion._switch_chat_provider_profile(str(os.getenv("AI_IDE_MODEL_PROVIDER") or "")):
-                            self.client = self._get_client()
-                            self.model = _normalize_chat_model_name(os.getenv("AI_IDE_CHAT_MODEL") or self.model, provider=os.getenv("AI_IDE_MODEL_PROVIDER")) or self.model
-                            self.tools = []
-                            self.tool_choice = "none"
-                            return self._response()
+                        pass
                     try:
                         self.log(
                             _role="tool",

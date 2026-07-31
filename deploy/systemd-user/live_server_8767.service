@@ -1,0 +1,13 @@
+[Unit]
+Description=Live Server (moved from 8766 to 8767)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/eq-ai-tuner.worktrees/copilot-worktree-2026-02-25T18-56-01
+ExecStart=/usr/bin/python3 live_server.py --host 0.0.0.0 --port 8767 --web-root web --snapshot data/latest_snapshot.json
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=default.target

@@ -7,6 +7,7 @@ all method dispatch to MCP_REQUEST_SERVICE.
 from __future__ import annotations
 
 import argparse
+import errno
 import json
 import socketserver
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -101,12 +102,23 @@ class McpHttpRequestHandler(BaseHTTPRequestHandler):
 
 
 class McpNetworkServerService:
+    def _create_server(self, server_factory: Any, *, host: str, port: int) -> Any:
+        try:
+            return server_factory((host, port), McpTcpRequestHandler if server_factory is McpTcpServer else McpHttpRequestHandler)
+        except OSError as exc:
+            if host not in {"0.0.0.0", "::", ""} and exc.errno in {errno.EADDRNOTAVAIL, errno.EADDRINUSE}:
+                try:
+                    return server_factory(("0.0.0.0", port), McpTcpRequestHandler if server_factory is McpTcpServer else McpHttpRequestHandler)
+                except OSError:
+                    raise
+            raise
+
     def run_tcp_server(self, *, host: str, port: int) -> None:
-        with McpTcpServer((host, port), McpTcpRequestHandler) as server:
+        with self._create_server(McpTcpServer, host=host, port=port) as server:
             server.serve_forever()
 
     def run_http_server(self, *, host: str, port: int) -> None:
-        with ThreadingHTTPServer((host, port), McpHttpRequestHandler) as server:
+        with self._create_server(ThreadingHTTPServer, host=host, port=port) as server:
             server.serve_forever()
 
 
@@ -121,7 +133,7 @@ def _parse_args() -> argparse.Namespace:
         default="tcp",
         help="Network transport mode",
     )
-    parser.add_argument("--host", default="127.0.0.1", help="Bind host")
+    parser.add_argument("--host", default="0.0.0.0", help="Bind host")
     parser.add_argument(
         "--port",
         type=int,

@@ -8,17 +8,22 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import sys
 import time
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parent.parent
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
+ALDE_ROOT = ROOT / "ALDE"
+for candidate in (ROOT, ALDE_ROOT):
+    candidate_text = str(candidate)
+    if candidate_text not in sys.path:
+        sys.path.insert(0, candidate_text)
 
-from ALDE.alde.repo_code_splitter import repo_knowledge_worker
+try:
+    from ALDE.alde.agents_tools import repo_knowledge_worker
+except ImportError:
+    from alde.agents_tools import repo_knowledge_worker  # type: ignore
 
 
 def main() -> int:
@@ -26,6 +31,12 @@ def main() -> int:
     parser.add_argument("--root-dir", default=str(ROOT / "ALDE" / "alde"), help="Repo root to index")
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--poll-seconds", type=float, default=1.0)
+    parser.add_argument(
+        "--timeout-seconds",
+        type=float,
+        default=900.0,
+        help="Fail fast when status polling exceeds this timeout.",
+    )
     args = parser.parse_args()
 
     kickoff = repo_knowledge_worker(
@@ -42,7 +53,25 @@ def main() -> int:
         return 1
 
     job_id = str(kickoff.get("job_id"))
+    started_at = time.monotonic()
     while True:
+        if time.monotonic() - started_at > max(1.0, float(args.timeout_seconds)):
+            print(
+                json.dumps(
+                    {
+                        "status": {
+                            "ok": False,
+                            "operation": "status",
+                            "job_id": job_id,
+                            "error": "timeout",
+                            "timeout_seconds": float(args.timeout_seconds),
+                        }
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
+            return 2
         status_payload = repo_knowledge_worker(operation="status", job_id=job_id)
         print(json.dumps({"status": status_payload}, ensure_ascii=False, indent=2))
         if not isinstance(status_payload, dict) or not status_payload.get("ok"):

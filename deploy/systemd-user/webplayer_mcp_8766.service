@@ -1,0 +1,14 @@
+[Unit]
+Description=Standalone WebPlayer MCP Server (HTTP)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/Vs_Code_Projects/Projects/ALDE_Projekt
+Environment=PYTHONPATH=%h/Vs_Code_Projects/Projects/ALDE_Projekt/ALDE
+ExecStart=/usr/bin/python3 -m alde.webplayer_mcp_server --transport http --host 0.0.0.0 --port 8766
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=default.target

@@ -717,7 +717,7 @@ class AgentsDbDocumentBackend:
                         )
                     ).load_repository()
                 else:
-                    socket_repository_class = UiAgentDbSocketRepository or AgentDbSocketRepository
+                    socket_repository_class =  AgentDbSocketRepository
                     socket_repository = socket_repository_class.create_from_uri(agents_db_uri, database_name)
                 # Validate socket reachability before selecting this backend.
                 socket_repository.ensure_index_objects()

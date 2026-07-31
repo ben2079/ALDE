@@ -291,6 +291,18 @@ class TestRuntimeView(unittest.TestCase):
             ), patch(
                 "alde.control_plane_runtime.OPERATOR_STATUS_SERVICE.load_mcp_config_path",
                 return_value=mcp_config_path,
+            ), patch(
+                "alde.control_plane_runtime.REPO_WORKER_MONITORING_SERVICE.load_snapshot",
+                return_value={
+                    "ok": False,
+                    "error": "jobs_file_missing",
+                    "jobs_path": "/tmp/repo_worker_jobs.json",
+                    "jobs_total": 0,
+                    "active_job_count": 0,
+                    "failed_job_count": 0,
+                    "stale_active_job_count": 0,
+                    "max_active_heartbeat_age_seconds": 0.0,
+                },
             ):
                 snapshot = load_operator_status_snapshot(
                     mcp_probe={
@@ -317,12 +329,12 @@ class TestRuntimeView(unittest.TestCase):
             self.assertTrue(snapshot["mcp_config_present"])
             self.assertTrue(snapshot["mcp_probe"]["ok"])
             self.assertEqual(snapshot["snapshot_kind"], "operator")
-            self.assertEqual(snapshot["service_count"], 5)
+            self.assertEqual(snapshot["service_count"], 6)
             self.assertEqual(snapshot["healthy_service_count"], 4)
             self.assertEqual(snapshot["attention_count"], 0)
             self.assertEqual(
                 [row["title"] for row in snapshot["service_rows"]],
-                ["Queue", "AgentsDB", "Dispatcher", "MCP", "Workflow Validation"],
+                ["Queue", "AgentsDB", "Dispatcher", "MCP", "Workflow Validation", "Repo Worker"],
             )
             self.assertEqual(snapshot["recent_item_count"], 1)
             self.assertEqual(snapshot["recent_actions"][0]["title"], "Queue probe")
@@ -369,6 +381,18 @@ class TestRuntimeView(unittest.TestCase):
             ), patch(
                 "alde.control_plane_runtime.OPERATOR_STATUS_SERVICE.load_mcp_config_path",
                 return_value=mcp_config_path,
+            ), patch(
+                "alde.control_plane_runtime.REPO_WORKER_MONITORING_SERVICE.load_snapshot",
+                return_value={
+                    "ok": False,
+                    "error": "jobs_file_missing",
+                    "jobs_path": "/tmp/repo_worker_jobs.json",
+                    "jobs_total": 0,
+                    "active_job_count": 0,
+                    "failed_job_count": 0,
+                    "stale_active_job_count": 0,
+                    "max_active_heartbeat_age_seconds": 0.0,
+                },
             ):
                 snapshot = load_operator_status_snapshot(
                     mcp_probe={

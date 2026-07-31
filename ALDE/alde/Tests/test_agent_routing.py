@@ -621,6 +621,46 @@ result, route = agents_factory.execute_route_to_agent(
         execute_forced_route_mock.assert_called_once()
         get_client.assert_not_called()
 
+    def test_forced_webplayer_prefix_routes_to_webplayer_operator_config(self) -> None:
+        route = agents_configurator.resolve_forced_route(
+            "_xplaner_xrouter",
+            "//wp play",
+            set(agents_factory.AGENTS_REGISTRY.keys()),
+        )
+
+        self.assertIsInstance(route, dict)
+        self.assertEqual(route.get("target_agent"), "_mcp_webplayer_operator")
+        self.assertEqual(route.get("user_question"), "play")
+
+        target_config = agents_configurator.get_agent_config("_mcp_webplayer_operator")
+        self.assertEqual(target_config.get("canonical_name"), "mcp_webplayer_operator")
+        self.assertEqual(target_config.get("skill_profile"), "mcp_webplayer_operator")
+        self.assertEqual(target_config.get("model"), "gpt-4o-mini")
+        self.assertEqual(target_config.get("tools"), ["call_api", "@doc_ro"])
+        self.assertFalse(bool((target_config.get("routing_policy") or {}).get("can_route")))
+
+    def test_chatcom_forced_webplayer_prefix_uses_expected_target_config(self) -> None:
+        with patch.object(chat_mod.ChatCompletion, "_get_client") as get_client, patch(
+            "alde.agents_factory.execute_forced_route",
+            return_value="Routing to _mcp_webplayer_operator",
+        ) as execute_forced_route_mock:
+            chat = chat_mod.ChatCom(
+                _model="gpt-4o-mini",
+                _input_text="//wp play",
+                _name="test_webplayer_route",
+            )
+            result = chat.get_response()
+
+        self.assertIsInstance(chat._forced_route, dict)
+        self.assertEqual(chat._forced_route.get("target_agent"), "_mcp_webplayer_operator")
+        self.assertEqual(chat._forced_route.get("user_question"), "play")
+        self.assertEqual(result, "Routing to _mcp_webplayer_operator")
+        execute_forced_route_mock.assert_called_once()
+        route_args = dict(execute_forced_route_mock.call_args.args[0])
+        self.assertEqual(route_args.get("target_agent"), "_mcp_webplayer_operator")
+        self.assertEqual(route_args.get("user_question"), "play")
+        get_client.assert_not_called()
+
     def test_available_job_names_include_runtime_default_jobs(self) -> None:
         job_names = agents_configurator.get_available_job_names()
 

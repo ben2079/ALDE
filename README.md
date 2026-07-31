@@ -124,6 +124,7 @@ For orientation:
 - Request and handoff flow reference: `ALDE/REQUEST_RESPONSE_HANDOFF_FLOW.md`
 - Future learning/runtime evolution: `ALDE/AUTONOMOUS_MULTI_AGENT_ROADMAP.md`
 - Historical cleanup note: `ALDE/WORKFLOW_FIXES.md`
+- Monitoring/OpenTelemetry migration project doc: `ALDE/alde/OTEL_UMBAU_PROJEKTDOKUMENTATION.md`
 
 ## Retrieval Glossary
 

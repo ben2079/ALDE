@@ -22,6 +22,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from threading import Thread
 from urllib.parse import parse_qsl, quote, unquote, urlencode, urlparse, urlunparse
+from urllib.request import Request, urlopen
 
 # Keep both repository roots on sys.path so local imports work in direct-script
 # mode and when the module is imported through the lowercase package alias.
@@ -184,6 +185,177 @@ def _load_startup_dotenv_into_process() -> None:
 
 
 _load_startup_dotenv_into_process()
+
+
+def _default_agentsdb_connection_config_path() -> Path:
+    explicit_path = str(os.getenv("AI_IDE_KNOWLEDGE_AGENTS_DB_CONFIG_PATH", "") or "").strip()
+    if explicit_path:
+        raw_path = Path(explicit_path)
+        if raw_path.is_absolute():
+            return raw_path.expanduser()
+        return (Path(_workspace_root) / raw_path).expanduser()
+    return (Path(_workspace_root) / "AppData" / "agentsdb_connection.json").expanduser()
+
+
+def persist_connection_selection_to_config(
+    source_uri: str,
+    *,
+    config_path: str | Path | None = None,
+    connection_name: str | None = None,
+    tree_store: object | None = None,
+) -> dict[str, object]:
+    normalized_uri = str(source_uri or "").strip()
+    if not normalized_uri:
+        return {}
+
+    resolved_config_path = Path(config_path).expanduser() if config_path is not None else _default_agentsdb_connection_config_path()
+    resolved_connection_name = str(connection_name or "").strip() or "connection"
+
+    existing_payload: dict[str, object] = {}
+    if resolved_config_path.exists() and resolved_config_path.is_file():
+        try:
+            loaded_payload = json.loads(resolved_config_path.read_text(encoding="utf-8"))
+        except Exception:
+            loaded_payload = {}
+        if isinstance(loaded_payload, dict):
+            existing_payload = dict(loaded_payload)
+
+    normalized_payload = dict(existing_payload)
+    normalized_payload["agents_db_uri"] = normalized_uri
+    normalized_payload.setdefault("backend_uri", "agentsmem://local")
+    normalized_payload.setdefault("database_name", "alde_knowledge")
+    normalized_payload.setdefault("memory_image_path", "AppData/agentsdb.json")
+    normalized_payload.setdefault("auto_start", True)
+
+    resolved_config_path.parent.mkdir(parents=True, exist_ok=True)
+    resolved_config_path.write_text(
+        json.dumps(normalized_payload, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+
+    if tree_store is not None:
+        add_to_section = getattr(tree_store, "add_to_section", None)
+        remove_from_section = getattr(tree_store, "remove_from_section", None)
+        if callable(remove_from_section):
+            while bool(remove_from_section("DATABASES", resolved_connection_name)):
+                pass
+        if callable(add_to_section):
+            add_to_section(
+                "DATABASES",
+                resolved_connection_name,
+                {
+                    "name": resolved_connection_name,
+                    "type": "AgentsDB",
+                    "uri": normalized_uri,
+                    "kind": "connection",
+                    "backend_uri": str(normalized_payload.get("backend_uri") or "agentsmem://local"),
+                    "database_name": str(normalized_payload.get("database_name") or "alde_knowledge"),
+                    "auto_start": bool(normalized_payload.get("auto_start", True)),
+                },
+            )
+
+    return normalized_payload
+
+
+def _normalize_mcp_endpoint_url(source_uri: str) -> str:
+    normalized_uri = str(source_uri or "").strip()
+    if not normalized_uri:
+        return ""
+
+    try:
+        parsed_uri = urlparse(normalized_uri)
+    except Exception:
+        return ""
+
+    if str(parsed_uri.scheme or "").lower() not in {"http", "https"}:
+        return ""
+
+    host_value = str(parsed_uri.netloc or "").strip()
+    if not host_value:
+        return ""
+
+    path_value = str(parsed_uri.path or "").strip()
+    if not path_value or path_value == "/":
+        path_value = "/mcp"
+    elif path_value.rstrip("/") == "/mcp":
+        path_value = "/mcp"
+
+    return urlunparse(
+        (
+            str(parsed_uri.scheme or "http").lower(),
+            host_value,
+            path_value,
+            str(parsed_uri.params or ""),
+            str(parsed_uri.query or ""),
+            str(parsed_uri.fragment or ""),
+        )
+    )
+
+
+def probe_mcp_endpoint_for_uri(
+    source_uri: str,
+    *,
+    request_func: Callable[[str, dict[str, object]], dict[str, object]] | None = None,
+) -> dict[str, object]:
+    normalized_uri = str(source_uri or "").strip()
+    endpoint_url = _normalize_mcp_endpoint_url(normalized_uri)
+    if not endpoint_url:
+        return {
+            "ok": False,
+            "status_text": "Connection saved; no MCP endpoint to probe",
+            "endpoint_url": "",
+            "probe_error": "unsupported_uri",
+        }
+
+    request_payload = {"method": "initialize", "params": {}}
+    try:
+        if request_func is None:
+            request_func = lambda request_url, payload: dict(
+                json.loads(
+                    urlopen(
+                        Request(
+                            request_url,
+                            data=json.dumps(payload).encode("utf-8"),
+                            headers={"Content-Type": "application/json"},
+                            method="POST",
+                        ),
+                        timeout=5.0,
+                    ).read().decode("utf-8", errors="replace")
+                )
+            )
+        response_payload = request_func(endpoint_url, request_payload)
+    except Exception as exc:  # noqa: BLE001
+        return {
+            "ok": False,
+            "status_text": "Connection failed / Health check failed",
+            "endpoint_url": endpoint_url,
+            "probe_error": str(exc),
+        }
+
+    if not isinstance(response_payload, dict):
+        return {
+            "ok": False,
+            "status_text": "Connection failed / Health check failed",
+            "endpoint_url": endpoint_url,
+            "probe_error": "invalid_response",
+        }
+
+    result_payload = response_payload.get("result") if isinstance(response_payload.get("result"), dict) else None
+    if result_payload is None and "error" in response_payload:
+        return {
+            "ok": False,
+            "status_text": "Connection failed / Health check failed",
+            "endpoint_url": endpoint_url,
+            "probe_error": str(response_payload.get("error") or "unknown_error"),
+        }
+
+    return {
+        "ok": True,
+        "status_text": "Connection established / Health check ok",
+        "endpoint_url": endpoint_url,
+        "response": response_payload,
+    }
+
 
 _GUI_ENV_CONFIG_ENV_NAME = "AI_IDE_GUI_ENV_CONFIG_PATH"
 _GUI_ENV_CONFIG_FILENAME = "gui_env.json"
@@ -2514,7 +2686,7 @@ class EditorTabs(QTabWidget):
 # ═══════════════════════  drag-and-drop QTextEdit  ════════════════════════
 
 class FileDropTextEdit(QTextEdit):
-    filesDropped = Signal(list)
+    filesDropped = Signal(list)     
     submitRequested = Signal()
 
     def __init__(self, *a, **kw):
@@ -2625,6 +2797,7 @@ def _normalize_chat_model_name(model_name: Any, provider: str | None = None) -> 
         return f"openai/{text}"
     return text
 
+
 # ═══════════════════════  AI chat dock  ═══════════════════════════════════
 
 class AIWidget(QWidget):
@@ -2650,18 +2823,9 @@ class AIWidget(QWidget):
         self.api_key: str = self._read_api_key()
         self._api_key_missing: bool = not bool(self.api_key)
         provider = str(os.getenv("AI_IDE_MODEL_PROVIDER") or "").strip().lower()
-        provider_model = ""
-        if provider in {"github", "github_models", "github-models"}:
-            provider_model = _normalize_chat_model_name(os.getenv("AI_IDE_GITHUB_CHAT_MODEL") or "", provider=provider)
-        elif provider in {"ollama", "ollama_local", "local_ollama"}:
-            provider_model = _normalize_chat_model_name(os.getenv("AI_IDE_OLLAMA_CHAT_MODEL") or "", provider=provider)
-        elif provider in {"openai", "openai_cloud", "openai-api"}:
-            provider_model = _normalize_chat_model_name(os.getenv("AI_IDE_OPENAI_CHAT_MODEL") or "", provider=provider)
-        self._model: str = (
-            _normalize_chat_model_name(os.getenv("AI_IDE_CHAT_MODEL") or "", provider=provider)
-            or provider_model
-            or "qwen2.5-coder:7b"
-        )
+        self._model: str = _normalize_chat_model_name(os.getenv("AI_IDE_CHAT_MODEL") or "", provider=provider)
+        self._model_missing: bool = not bool(self._model)
+   
         self._dropped_files: List[str] = []
         self._runtime_context_entries: list[dict[str, str]] = []
         self.scheme = _build_scheme(accent, base)                # Farbschema mergen
@@ -2670,7 +2834,7 @@ class AIWidget(QWidget):
         self._wire()
         self._async_result_ready.connect(self._handle_async_result)
 
-        if self._api_key_missing:
+        if self._api_key_missing or self._model_missing:
             try:
                 for btn in (getattr(self, "btn_send", None),):
                     if btn is not None:
@@ -2678,7 +2842,10 @@ class AIWidget(QWidget):
             except Exception:
                 pass
             try:
-                self._append("System", "OPENAI_API_KEY not found. Set it in your environment or a .env file to enable chat.")
+                if self._api_key_missing:
+                    self._append("System", "OPENAI_API_KEY not found. Set it in your environment or a .env file to enable chat.")
+                if self._model_missing:
+                    self._append("System", "AI_IDE_CHAT_MODEL not found. Set it in your environment or .env/.env.json to enable chat.")
             except Exception:
                 pass
         
@@ -2736,40 +2903,8 @@ class AIWidget(QWidget):
     @staticmethod
     def _read_api_key() -> str:
         _load_startup_dotenv_into_process()
-        load_dotenv()
-        provider = str(os.getenv("AI_IDE_MODEL_PROVIDER") or "").strip().lower()
         key = (os.getenv("OPENAI_API_KEY") or "").strip()
 
-        if provider in {"github", "github_models", "github-models"}:
-            key = key or str(os.getenv("AI_IDE_GITHUB_MODELS_API_KEY") or "").strip() or str(os.getenv("GITHUB_MODELS_API_KEY") or "").strip() or str(os.getenv("GITHUB_TOKEN") or "").strip() or str(os.getenv("GH_TOKEN") or "").strip()
-            base_url = _normalize_github_models_base_url(
-                os.getenv("AI_IDE_GITHUB_MODELS_BASE_URL")
-                or os.getenv("AI_IDE_GITHUB_MODELS_URL")
-                or "https://models.github.ai/inference"
-            )
-            os.environ["OPENAI_BASE_URL"] = base_url
-            if key:
-                os.environ["OPENAI_API_KEY"] = key
-            model_name = _normalize_chat_model_name(os.getenv("AI_IDE_GITHUB_CHAT_MODEL") or "openai/gpt-4.1-mini", provider=provider)
-            os.environ["AI_IDE_CHAT_MODEL"] = model_name
-            return key
-
-        if provider in {"ollama", "ollama_local", "local_ollama"}:
-            key = key or str(os.getenv("AI_IDE_OLLAMA_API_KEY") or "").strip() or "ollama-local"
-            os.environ["OPENAI_API_KEY"] = key
-            if not str(os.getenv("OPENAI_BASE_URL") or "").strip():
-                os.environ["OPENAI_BASE_URL"] = str(os.getenv("AI_IDE_OLLAMA_BASE_URL") or "").strip() or "http://127.0.0.1:11434/v1"
-            os.environ["AI_IDE_CHAT_MODEL"] = _normalize_chat_model_name(os.getenv("AI_IDE_OLLAMA_CHAT_MODEL") or "qwen2.5-coder:7b", provider=provider)
-            return key
-
-        if provider in {"openai", "openai_cloud", "openai-api"}:
-            if key:
-                os.environ["OPENAI_API_KEY"] = key
-            base_url = str(os.getenv("AI_IDE_OPENAI_BASE_URL") or "").strip() or str(os.getenv("OPENAI_BASE_URL") or "").strip()
-            if base_url:
-                os.environ["OPENAI_BASE_URL"] = base_url
-            os.environ["AI_IDE_CHAT_MODEL"] = _normalize_chat_model_name(os.getenv("AI_IDE_OPENAI_CHAT_MODEL") or os.getenv("AI_IDE_CHAT_MODEL") or "gpt-4.1-mini", provider=provider)
-            return key
 
         return key
     
@@ -3325,6 +3460,12 @@ class AIWidget(QWidget):
         if getattr(self, "_api_key_missing", False):
             try:
                 self._append("System", "Chat is disabled because OPENAI_API_KEY is not set.")
+            except Exception:
+                pass
+            return
+        if getattr(self, "_model_missing", False):
+            try:
+                self._append("System", "Chat is disabled because AI_IDE_CHAT_MODEL is not set.")
             except Exception:
                 pass
             return
@@ -6442,7 +6583,7 @@ class ControlPlaneWidget(QWidget):
                 (
                     f"color: {marker_color};"
                     "font-weight: 700;"
-                    "font-size: 11px;"
+                    "font-size: 12px;"
                     "background: transparent;"
                     "border: none;"
                     "padding: 0px;"
@@ -6455,7 +6596,7 @@ class ControlPlaneWidget(QWidget):
                 (
                     f"color: {palette['label_fg']};"
                     "font-weight: 700;"
-                    "font-size: 10px;"
+                    "font-size: 11px;"
                     f"background: {palette['label_bg']};"
                     f"border: 1px solid {palette['label_border']};"
                     "border-radius: 6px;"
@@ -9676,6 +9817,8 @@ class ControlPlaneWidget(QWidget):
             extensions_widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
             external_uri_input = extensions_widget.create_external_uri_proxy(panel)
             external_uri_input.setProperty("runtime_widget_header_proxy", True)
+            external_uri_input.setPlaceholderText("open/add connection")
+            external_uri_input.setToolTip("Add connection to env / open in board")
             header.insertWidget(1, external_uri_input, 1)
             extensions_signal = getattr(extensions_widget, "widgetStateChanged", None)
             if extensions_signal is not None and hasattr(extensions_signal, "connect"):
@@ -12474,6 +12617,29 @@ class ControlPlaneWidget(QWidget):
         latest_state = (latest_session.get("latest_workflow_state") or {}) if isinstance(latest_session, dict) else {}
         latest_handoff = (latest_session.get("latest_handoff") or {}) if isinstance(latest_session, dict) else {}
         tree_stream_diagnostic = dict(snapshot.get("tree_stream_diagnostic") or {})
+        summary_metrics = dict(snapshot.get("summary_metrics") or {})
+        repo_worker_jobs_total = int(summary_metrics.get("repo_worker_jobs_total") or 0)
+        repo_worker_active_job_count = int(summary_metrics.get("repo_worker_active_job_count") or 0)
+        repo_worker_failed_job_count = int(summary_metrics.get("repo_worker_failed_job_count") or 0)
+        repo_worker_stale_active_job_count = int(summary_metrics.get("repo_worker_stale_active_job_count") or 0)
+        repo_worker_running_count = int(summary_metrics.get("repo_worker_running_count") or 0)
+        repo_worker_queued_count = int(summary_metrics.get("repo_worker_queued_count") or 0)
+        repo_worker_completed_count = int(summary_metrics.get("repo_worker_completed_count") or 0)
+        repo_worker_max_heartbeat_age_seconds = float(summary_metrics.get("repo_worker_max_heartbeat_age_seconds") or 0.0)
+        repo_worker_monitoring = dict(snapshot.get("repo_worker_monitoring") or {})
+        repo_worker_jobs_path = str(repo_worker_monitoring.get("jobs_path") or "n/a")
+        repo_worker_latest_failures = [
+            failed_job
+            for failed_job in (repo_worker_monitoring.get("failed_jobs") or [])
+            if isinstance(failed_job, dict)
+        ]
+        repo_worker_failure_note = "none"
+        if repo_worker_latest_failures:
+            latest_failed_job = repo_worker_latest_failures[0]
+            repo_worker_failure_note = (
+                f"{str(latest_failed_job.get('operation') or 'unknown')} "
+                f"{str(latest_failed_job.get('job_id') or 'job')}"
+            ).strip()
         filtered_trace_entries = self._filtered_trace_entries(snapshot)
         active_trace_filters = [
             selector.currentText().strip()
@@ -12498,6 +12664,8 @@ class ControlPlaneWidget(QWidget):
                     f"<p><b>Projected sessions:</b> {snapshot.get('session_count', 0)} | <b>events:</b> {snapshot.get('event_count', 0)}</p>",
                     f"<p><b>Detailed trace entries:</b> {snapshot.get('trace_count', 0)} total | <b>visible:</b> {len(filtered_trace_entries)} | <b>filters:</b> {html.escape(active_filter_text)}</p>",
                     f"<p><b>Control-plane health:</b> {html.escape('ready' if bool(snapshot.get('healthy')) else 'attention required')} | <b>Queue:</b> {html.escape(str(snapshot.get('queue_backend') or 'n/a'))} ({'ok' if bool(snapshot.get('queue_healthy')) else 'degraded'}) | <b>Active sessions:</b> {int(snapshot.get('active_session_count') or 0)} | <b>Validation issues:</b> {int(snapshot.get('validation_issue_count') or 0)}</p>",
+                    f"<p><b>Repo telemetry:</b> jobs={repo_worker_jobs_total} | active={repo_worker_active_job_count} | running={repo_worker_running_count} | queued={repo_worker_queued_count} | completed={repo_worker_completed_count} | failed={repo_worker_failed_job_count} | stale={repo_worker_stale_active_job_count} | max heartbeat age={repo_worker_max_heartbeat_age_seconds:.0f}s</p>",
+                    f"<p><b>Repo telemetry source:</b> {html.escape(repo_worker_jobs_path)} | <b>Latest failure:</b> {html.escape(repo_worker_failure_note)}</p>",
                     f"<p><b>Explorer tree stream:</b> {html.escape(str(tree_stream_diagnostic.get('transport') or 'n/a'))} | <b>state:</b> {html.escape(str(tree_stream_diagnostic.get('connection_state') or 'unavailable'))} | <b>cursor:</b> {html.escape(str(tree_stream_diagnostic.get('last_event_id') or 'n/a'))}</p>",
                     f"<p><b>Success:</b> {snapshot.get('success_count', 0)} | <b>Failures:</b> {snapshot.get('failure_count', 0)} | <b>Avg latency:</b> {snapshot.get('average_latency_ms', 0.0):.0f} ms</p>",
                     f"<p><b>Latest workflow state:</b> {html.escape(str(latest_state.get('summary') or 'n/a'))}</p>",
@@ -12669,6 +12837,57 @@ class ControlPlaneWidget(QWidget):
             f"<li>{html.escape(str(item))}</li>"
             for item in validation_error_items
         )
+        summary_metrics = dict(snapshot.get("summary_metrics") or {})
+        repo_worker_jobs_total = int(
+            snapshot.get("repo_worker_jobs_total")
+            or summary_metrics.get("repo_worker_jobs_total")
+            or 0
+        )
+        repo_worker_active_job_count = int(
+            snapshot.get("repo_worker_active_job_count")
+            or summary_metrics.get("repo_worker_active_job_count")
+            or 0
+        )
+        repo_worker_failed_job_count = int(
+            snapshot.get("repo_worker_failed_job_count")
+            or summary_metrics.get("repo_worker_failed_job_count")
+            or 0
+        )
+        repo_worker_stale_active_job_count = int(
+            snapshot.get("repo_worker_stale_active_job_count")
+            or summary_metrics.get("repo_worker_stale_active_job_count")
+            or 0
+        )
+        repo_worker_max_heartbeat_age_seconds = float(
+            snapshot.get("repo_worker_max_heartbeat_age_seconds")
+            or summary_metrics.get("repo_worker_max_heartbeat_age_seconds")
+            or 0.0
+        )
+        repo_worker_jobs_path = str(
+            snapshot.get("repo_worker_jobs_path")
+            or ((snapshot.get("repo_worker_monitoring") or {}).get("jobs_path"))
+            or "n/a"
+        )
+        repo_worker_row = next(
+            (
+                row
+                for row in service_rows
+                if str(row.get("title") or "").strip().lower() == "repo worker"
+            ),
+            None,
+        )
+        repo_worker_state = str((repo_worker_row or {}).get("state") or "not-run").strip().lower()
+        if repo_worker_state == "pass":
+            repo_worker_chip = self._render_status_chip("repo worker ok", SIGNAL_GREEN)
+        elif repo_worker_state == "fail":
+            repo_worker_chip = self._render_status_chip("repo worker fail", SIGNAL_RED)
+        elif repo_worker_state == "not-run":
+            repo_worker_chip = self._render_status_chip("repo worker not-run", SIGNAL_YELLOW)
+        else:
+            repo_worker_chip = self._render_status_chip(
+                f"repo worker {repo_worker_state or 'unknown'}",
+                self.scheme["col8"],
+            )
         status_rows_html: list[str] = []
         for row in service_rows:
             state = str(row.get("state") or "unknown").strip().lower()
@@ -12702,7 +12921,8 @@ class ControlPlaneWidget(QWidget):
                 [
                     "<h3>Operator Status</h3>",
                     "<p>Focused view of queue health, AgentsDB readiness, dispatcher readiness, MCP availability, and workflow validation.</p>",
-                    f"<p><b>Control-plane health:</b> {html.escape('ready' if bool(snapshot.get('healthy')) else 'attention required')} | <b>Healthy checks:</b> {int(snapshot.get('healthy_service_count') or 0)}/{int(snapshot.get('service_count') or 0)} | <b>Queue:</b> {html.escape(str(snapshot.get('queue_backend') or 'n/a'))} ({'ok' if bool(snapshot.get('queue_healthy')) else 'degraded'}) | <b>AgentsDB:</b> {html.escape(agentsdb_detail)} ({html.escape(agentsdb_state)}) | <b>Validation issues:</b> {int(snapshot.get('validation_issue_count') or 0)} | <b>Alerts:</b> {int(snapshot.get('attention_count') or 0)}</p>",
+                    f"<p><b>Control-plane health:</b> {html.escape('ready' if bool(snapshot.get('healthy')) else 'attention required')} | <b>Repo Worker:</b> {repo_worker_chip} | <b>Healthy checks:</b> {int(snapshot.get('healthy_service_count') or 0)}/{int(snapshot.get('service_count') or 0)} | <b>Queue:</b> {html.escape(str(snapshot.get('queue_backend') or 'n/a'))} ({'ok' if bool(snapshot.get('queue_healthy')) else 'degraded'}) | <b>AgentsDB:</b> {html.escape(agentsdb_detail)} ({html.escape(agentsdb_state)}) | <b>Validation issues:</b> {int(snapshot.get('validation_issue_count') or 0)} | <b>Alerts:</b> {int(snapshot.get('attention_count') or 0)}</p>",
+                    f"<p><b>Repo telemetry:</b> jobs={repo_worker_jobs_total} | active={repo_worker_active_job_count} | failed={repo_worker_failed_job_count} | stale={repo_worker_stale_active_job_count} | max heartbeat age={repo_worker_max_heartbeat_age_seconds:.0f}s | <b>source:</b> {html.escape(repo_worker_jobs_path)}</p>",
                     f"<p><b>Recent actions:</b> {int(snapshot.get('recent_item_count') or 0)} | <b>Pass:</b> {int(status_counts.get('pass') or 0)} | <b>Fail:</b> {int(status_counts.get('fail') or 0)} | <b>Latest:</b> {html.escape(str(latest_action.get('summary') or 'n/a'))}</p>",
                     f"<p><b>Audit types:</b> {html.escape(audit_types_text or 'n/a')} | <b>Groups:</b> {html.escape(action_groups_text or 'n/a')} | <b>Sources:</b> {html.escape(sources_text or 'n/a')}</p>",
                     "<h4>Service Status</h4>",
@@ -14728,8 +14948,8 @@ class ExtensionsWorkspaceWidget(QWidget):
         add_button.setIcon(_icon("plus_custombar_24.svg"))
         add_button.setIconSize(QSize(14, 14))
         add_button.setAutoRaise(True)
-        add_button.setToolTip("Neue Extension-Verbindung")
-        add_button.clicked.connect(lambda _checked=False: self.open_new_connection_tab(activate=True))
+        add_button.setToolTip("Add connection to env / open in board")
+        add_button.clicked.connect(lambda _checked=False: self._add_connection_from_input(activate=True))
 
         proxy_layout.addWidget(proxy_bar, 1)
         proxy_layout.addWidget(add_button, 0)
@@ -14876,7 +15096,7 @@ class ExtensionsWorkspaceWidget(QWidget):
         proxy_input.setAttribute(Qt.WA_StyledBackground, True)
         proxy_input.setAutoFillBackground(True)
         proxy_input.setMinimumHeight(30)
-        proxy_input.setPlaceholderText("agentsdb://127.0.0.1:2331/tools:graph_view")
+        proxy_input.setPlaceholderText("open/add connection")
         proxy_font = proxy_input.font()
         if proxy_font.pointSize() > 0:
             proxy_font.setPointSize(proxy_font.pointSize() + 1)
@@ -14886,12 +15106,12 @@ class ExtensionsWorkspaceWidget(QWidget):
         load_action = proxy_input.addAction(load_icon_idle, QLineEdit.TrailingPosition)
         load_action.setToolTip("Widget laden")
         add_tab_action = proxy_input.addAction(add_tab_icon_idle, QLineEdit.TrailingPosition)
-        add_tab_action.setToolTip("Neue Extension-Verbindung")
+        add_tab_action.setToolTip("Add connection to env / open in board")
         proxy_input.menuRequested.connect(lambda: self._popup_active_session_selection_menu(proxy_input))
         proxy_input.textEdited.connect(self._set_active_session_uri)
         proxy_input.returnPressed.connect(self._load_active_session_widget)
         load_action.triggered.connect(self._load_active_session_widget)
-        add_tab_action.triggered.connect(lambda: self.open_new_connection_tab(activate=True))
+        add_tab_action.triggered.connect(lambda: self._add_connection_from_input(proxy_input, activate=True))
         self._style_line_edit_action_button(proxy_input, load_action, "extensionsGraphControlButton")
         self._style_line_edit_action_button(proxy_input, add_tab_action, "extensionsGraphControlButton")
         self._external_uri_proxies.append(proxy_input)
@@ -15142,6 +15362,60 @@ class ExtensionsWorkspaceWidget(QWidget):
         self._sync_embedded_tab_bar_proxies()
         self._sync_external_uri_proxies()
         self._sync_main_toolbar_visibility_for_active_tab()
+
+    def _add_connection_from_input(self, uri_input: QLineEdit | None = None, *, activate: bool = True) -> None:
+        resolved_input = uri_input
+        if not isinstance(resolved_input, QLineEdit):
+            active_state = self._active_session_state()
+            if isinstance(active_state, dict):
+                resolved_input = active_state.get("uri_input")
+            if not isinstance(resolved_input, QLineEdit):
+                resolved_input = None
+
+        source_uri = ""
+        if isinstance(resolved_input, QLineEdit):
+            source_uri = str(resolved_input.text() or "").strip()
+
+        probe_result: dict[str, object] | None = None
+        if source_uri:
+            tree_store = None
+            explorer_widget = getattr(self, "explorer", None)
+            if explorer_widget is not None:
+                tree_store = getattr(explorer_widget, "tree", None)
+            persist_connection_selection_to_config(
+                source_uri,
+                connection_name=self._connection_name_from_uri(source_uri),
+                tree_store=tree_store,
+            )
+            probe_result = probe_mcp_endpoint_for_uri(source_uri)
+
+        session_state = self._add_extension_tab(activate=activate, source_uri=source_uri)
+        if isinstance(session_state, dict):
+            session_state["connection_probe"] = probe_result or {}
+            status_label = session_state.get("control_status_label")
+            if isinstance(status_label, (QLabel, QLineEdit)):
+                status_text = str((probe_result or {}).get("status_text") or "")
+                if status_text:
+                    status_label.setText(status_text)
+
+        self._sync_external_uri_proxies()
+
+    @staticmethod
+    def _connection_name_from_uri(source_uri: str) -> str:
+        normalized_uri = str(source_uri or "").strip()
+        if not normalized_uri:
+            return "connection"
+        try:
+            parsed_uri = urlparse(normalized_uri)
+        except Exception:
+            parsed_uri = None
+        host_name = ""
+        if parsed_uri is not None:
+            host_name = str(parsed_uri.hostname or "").strip()
+        if host_name:
+            port_value = str(parsed_uri.port or "").strip() if parsed_uri is not None else ""
+            return f"{host_name}:{port_value}" if port_value else host_name
+        return normalized_uri
 
     def open_new_connection_tab(self, *, activate: bool = True) -> None:
         self._add_extension_tab(activate=activate)
@@ -15524,7 +15798,7 @@ class ExtensionsWorkspaceWidget(QWidget):
         uri_input = QLineEdit(control_page)
         uri_input.setObjectName("extensionsGraphUriInput")
         uri_input.setMinimumHeight(30)
-        uri_input.setPlaceholderText("agentsdb://127.0.0.1:2331/tools:graph_view")
+        uri_input.setPlaceholderText("open/add connection")
         uri_input.setText(str(source_uri or "agentsdb://127.0.0.1:2331/tools:graph_view"))
         uri_input.hide()
         load_icon_idle = _icon_with_opacity("load_content.svg", opacity=0.72)
@@ -15535,7 +15809,7 @@ class ExtensionsWorkspaceWidget(QWidget):
         add_tab_icon_idle = _icon_with_opacity("plus_custombar_24.svg", opacity=0.72)
         add_tab_action = uri_input.addAction(add_tab_icon_idle, QLineEdit.TrailingPosition)
         add_tab_action.setObjectName("extensionsGraphAddTabAction")
-        add_tab_action.setToolTip("Neue Extension-Verbindung")
+        add_tab_action.setToolTip("Add connection to env / open in board")
 
         selection_menu = QMenu(control_page)
         selection_menu.setObjectName("extensionsGraphSelectionMenu")
@@ -15555,9 +15829,14 @@ class ExtensionsWorkspaceWidget(QWidget):
         uri_filter = _UriMenuEventFilter(selection_menu, uri_input)
         uri_input.installEventFilter(uri_filter)
         session_state["requested_tool_id"] = str(tool_id or "").strip()
+        status_label = QLabel("Connection status pending", control_page)
+        status_label.setObjectName("extensionsGraphControlStatus")
+        status_label.setWordWrap(True)
+        control_layout.addWidget(status_label)
         control_layout.addStretch(1)
 
         session_state["uri_input"] = uri_input
+        session_state["control_status_label"] = status_label
         session_state["load_action"] = load_action
         session_state["add_tab_action"] = add_tab_action
         session_state["selection_menu"] = selection_menu
@@ -15587,7 +15866,7 @@ class ExtensionsWorkspaceWidget(QWidget):
         )
         selection_menu.triggered.connect(_apply_selector_choice)
         load_action.triggered.connect(lambda: self._load_extension_into_session(session_state, fit_view=True))
-        add_tab_action.triggered.connect(lambda: self.open_new_connection_tab(activate=True))
+        add_tab_action.triggered.connect(lambda: self._add_connection_from_input(uri_input, activate=True))
 
         return control_page
 
@@ -15767,7 +16046,14 @@ class ExtensionsWorkspaceWidget(QWidget):
             blocker = QtCore.QSignalBlocker(selection_menu)
             selection_menu.clear()
             selection_menu.setEnabled(True)
-            display_rows: list[dict[str, Any]] = []
+            display_rows: list[dict[str, Any]] = [
+                {
+                    "kind": "connection",
+                    "label": 'add_connection(upsert_tree(env: mcp: url: ""), sync_tree)',
+                    "uri": 'add_connection(upsert_tree(env: mcp: url: ""), sync_tree)',
+                    "tool_id": "mcp_connection_template",
+                }
+            ]
             for connection_row in (preview_payload.get("connections") or []):
                 if not isinstance(connection_row, dict):
                     continue

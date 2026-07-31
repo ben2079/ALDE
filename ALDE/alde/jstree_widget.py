@@ -5420,7 +5420,7 @@ class JsonTreeWidget(QTreeWidget):
             (
                 f"color: {marker_color};"
                 "font-weight: 700;"
-                "font-size: 13px;"
+                "font-size: 14px;"
                 "background: transparent;"
                 "border: none;"
                 "padding: 0px;"
@@ -5531,7 +5531,7 @@ class JsonTreeWidget(QTreeWidget):
         self._apply_board_card_label_style(
             label_widget,
             item_category,
-            font_size_px=10,
+            font_size_px=11,
         )
         desired_height = max(23, int(label_widget.sizeHint().height()) + row_margin_top)
         item.setSizeHint(0, QSize(0, desired_height))
