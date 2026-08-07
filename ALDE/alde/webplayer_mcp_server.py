@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import base64
 import json
+import os
 import shlex
 import socketserver
 import subprocess
@@ -1219,6 +1220,10 @@ PY
 
 
 class WebPlayerMcpRequestService:
+    _SUPPORTED_PROTOCOL_VERSIONS = ("2026-07-28", "2025-03-26")
+    _UI_EXTENSION_NAME = "io.modelcontextprotocol/ui"
+    _UI_RESOURCE_URI = "ui://webplayer/operator-console.html"
+    _UI_RESOURCE_MIME_TYPE = "text/html"
     _STRATEGY_RISK_TIER_ALLOWED_VALUES = {"low", "standard", "high", "critical"}
     _STRATEGY_RISK_TIER_DEFAULT = "standard"
     _STRATEGY_COMPLIANCE_MODE_ALLOWED_VALUES = {"strict", "balanced", "adaptive"}
@@ -1251,6 +1256,7 @@ class WebPlayerMcpRequestService:
     ) -> None:
         self.player_service = player_service or WebPlayerService()
         self.tidal_api_service = tidal_api_service or TidalApiService()
+        self._ui_enabled = False
 
     def _normalize_prompt_argument(
         self,
@@ -1340,7 +1346,169 @@ class WebPlayerMcpRequestService:
             ]
         ).strip()
 
+    @staticmethod
+    def _load_csv_values(raw_value: Any) -> list[str]:
+        if isinstance(raw_value, list):
+            return [str(item).strip() for item in raw_value if str(item).strip()]
+        return [item.strip() for item in str(raw_value or "").split(",") if item.strip()]
+
+    def _load_ui_extension_requested(self, params: dict[str, Any]) -> bool:
+        capabilities = params.get("capabilities")
+        if isinstance(capabilities, dict):
+            extensions = capabilities.get("extensions")
+            if isinstance(extensions, dict) and self._UI_EXTENSION_NAME in extensions:
+                return True
+            experimental = capabilities.get("experimental")
+            if isinstance(experimental, dict) and self._UI_EXTENSION_NAME in experimental:
+                return True
+        meta = params.get("_meta")
+        if isinstance(meta, dict) and self._UI_EXTENSION_NAME in self._load_csv_values(
+            meta.get("io.modelcontextprotocol/extensions")
+        ):
+            return True
+        return str(os.getenv("WEBPLAYER_MCP_UI_EXTENSION_DEFAULT") or "").strip().casefold() in {
+            "1", "true", "yes", "on"
+        }
+
+    def _load_ui_resource(self, params: dict[str, Any]) -> dict[str, Any]:
+        if not self._load_ui_extension_requested(params):
+            return {"error": "ui_extension_not_enabled"}
+        return {
+            "uri": self._UI_RESOURCE_URI,
+            "name": "webplayer-operator-console",
+            "title": "WebPlayer MCP Operator Console",
+            "description": "Compact MCP App UI for WebPlayer operations.",
+            "mimeType": self._UI_RESOURCE_MIME_TYPE,
+        }
+
+    def _load_ui_resource_markup(self) -> str:
+        return """<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>WebPlayer MCP Operator Console</title>
+<style>body{font:14px system-ui,sans-serif;margin:12px;background:#f8fafc;color:#0f172a}
+.panel{border:1px solid #cbd5e1;border-radius:12px;padding:12px;background:#fff}
+button{margin-right:8px;border:1px solid #94a3b8;border-radius:8px;padding:6px 10px;cursor:pointer}
+#log{margin-top:10px;white-space:pre-wrap;max-height:220px;overflow:auto}</style></head>
+<body><div class="panel"><button id="now-playing">webplayer_now_playing</button>
+<pre id="log">Ready.</pre></div><script>
+const log=document.getElementById("log");
+async function request(){if(!window.mcp||typeof window.mcp.request!=="function"){log.textContent="Host bridge unavailable (window.mcp.request missing).";return}
+try{log.textContent=JSON.stringify(await window.mcp.request({method:"tools/call",params:{name:"webplayer_now_playing",arguments:{}}}),null,2)}catch(error){log.textContent=String(error)}}
+document.getElementById("now-playing").onclick=request;
+</script></body></html>"""
+
+    def _load_requested_protocol_version(self, params: dict[str, Any]) -> str:
+        requested = str(params.get("protocolVersion") or "").strip()
+        if not requested:
+            return "2025-03-26"
+        if requested not in self._SUPPORTED_PROTOCOL_VERSIONS:
+            raise ValueError(f"Unsupported protocol version: {requested}")
+        return requested
+
+    @staticmethod
+    def _load_jsonrpc_error(*, request_id: Any, code: int, message: str) -> dict[str, Any]:
+        return {"jsonrpc": "2.0", "id": request_id, "error": {"code": code, "message": message}}
+
+    def _load_mcp_tool_definitions(self, *, ui_enabled: bool) -> list[dict[str, Any]]:
+        definitions: list[dict[str, Any]] = []
+        for spec in self.load_tool_definitions():
+            function = dict((spec or {}).get("function") or {})
+            name = str(function.get("name") or "").strip()
+            if not name:
+                continue
+            definition: dict[str, Any] = {
+                "name": name,
+                "title": name,
+                "description": str(function.get("description") or ""),
+                "inputSchema": function.get("parameters")
+                if isinstance(function.get("parameters"), dict)
+                else {"type": "object", "additionalProperties": False},
+            }
+            if ui_enabled:
+                definition["_meta"] = {"ui": {"resourceUri": self._UI_RESOURCE_URI}}
+            definitions.append(definition)
+        return definitions
+
+    def _dispatch_jsonrpc_object(self, payload: dict[str, Any]) -> dict[str, Any]:
+        request_id = payload.get("id")
+        method = str(payload.get("method") or "").strip()
+        params = payload.get("params")
+        if not isinstance(params, dict):
+            params = {}
+        requested_ui = self._load_ui_extension_requested(params)
+        if method == "initialize":
+            try:
+                protocol_version = self._load_requested_protocol_version(params)
+            except ValueError as exc:
+                return self._load_jsonrpc_error(request_id=request_id, code=-32602, message=str(exc))
+            self._ui_enabled = requested_ui
+            capabilities: dict[str, Any] = {"tools": {}, "prompts": {}}
+            if self._ui_enabled:
+                capabilities["resources"] = {"listChanged": False}
+                capabilities["extensions"] = {
+                    self._UI_EXTENSION_NAME: {"resourceUri": self._UI_RESOURCE_URI}
+                }
+            result = {
+                "protocolVersion": protocol_version,
+                "serverInfo": {"name": "webplayer-mcp"},
+                "capabilities": capabilities,
+                "supportedVersions": list(self._SUPPORTED_PROTOCOL_VERSIONS),
+            }
+        elif method == "tools/list":
+            result = {
+                "resultType": "complete",
+                "tools": self._load_mcp_tool_definitions(ui_enabled=self._ui_enabled or requested_ui),
+            }
+        elif method == "resources/list":
+            resource = self._load_ui_resource(
+                {"_meta": {"io.modelcontextprotocol/extensions": self._UI_EXTENSION_NAME}}
+                if self._ui_enabled or requested_ui
+                else params
+            )
+            if "error" in resource:
+                result = {"resources": [], "resultType": "complete"}
+            else:
+                result = {"resources": [resource], "resultType": "complete"}
+        elif method == "resources/read":
+            resource = self._load_ui_resource(
+                {**params, "_meta": {"io.modelcontextprotocol/extensions": self._UI_EXTENSION_NAME}}
+                if self._ui_enabled or requested_ui
+                else params
+            )
+            if "error" in resource:
+                return self._load_jsonrpc_error(request_id=request_id, code=-32001, message=str(resource["error"]))
+            if str(params.get("uri") or "").strip() != self._UI_RESOURCE_URI:
+                return self._load_jsonrpc_error(request_id=request_id, code=-32001, message="resource_not_found")
+            result = {
+                "contents": [{
+                    "uri": self._UI_RESOURCE_URI,
+                    "mimeType": self._UI_RESOURCE_MIME_TYPE,
+                    "text": self._load_ui_resource_markup(),
+                }],
+                "resultType": "complete",
+            }
+        elif method == "tools/call":
+            result_payload = self.load_tools_call_result(params)
+            if "error" in result_payload:
+                return self._load_jsonrpc_error(request_id=request_id, code=-32602, message=str(result_payload["error"]))
+            result = result_payload.get("result") or {}
+        elif method == "prompts/list":
+            result = dict(self.load_prompts_list_result(params).get("result") or {})
+            result["resultType"] = "complete"
+        elif method == "prompts/get":
+            result_payload = self.load_prompts_get_result(params)
+            if "error" in result_payload:
+                return self._load_jsonrpc_error(request_id=request_id, code=-32602, message=str(result_payload["error"]))
+            result = result_payload.get("result") or {}
+        else:
+            return self._load_jsonrpc_error(
+                request_id=request_id, code=-32601, message=f"Method not found: {method}"
+            )
+        return {"jsonrpc": "2.0", "id": request_id, "result": result}
+
     def dispatch_object(self, payload: Any) -> dict[str, Any]:
+        if isinstance(payload, dict) and payload.get("jsonrpc") == "2.0":
+            return self._dispatch_jsonrpc_object(payload)
         if not isinstance(payload, dict):
             return {"error": "invalid_json"}
 
@@ -1968,17 +2136,58 @@ class McpTcpServer(socketserver.ThreadingTCPServer):
 class McpHttpRequestHandler(BaseHTTPRequestHandler):
     server_version = "webplayer-mcp-http/1.0"
 
+    @staticmethod
+    def _allowed_origins() -> set[str]:
+        configured = {
+            origin.strip()
+            for origin in str(os.getenv("WEBPLAYER_MCP_ALLOWED_ORIGINS") or "").split(",")
+            if origin.strip()
+        }
+        return configured or {
+            "http://localhost",
+            "http://127.0.0.1",
+            "https://localhost",
+            "https://127.0.0.1",
+        }
+
+    def _cors_origin(self) -> str:
+        origin = str(self.headers.get("Origin") or "").strip()
+        if origin and origin in self._allowed_origins():
+            return origin
+        return "*" if not origin else ""
+
     def _write_json_response(self, payload: dict[str, Any], status: int = 200) -> None:
         body = json.dumps(payload, ensure_ascii=True).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
+        cors_origin = self._cors_origin()
+        if cors_origin:
+            self.send_header("Access-Control-Allow-Origin", cors_origin)
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, Accept, MCP-Protocol-Version, MCP-Extensions")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
 
+    def do_OPTIONS(self) -> None:  # noqa: N802
+        self.send_response(204)
+        cors_origin = self._cors_origin()
+        if cors_origin:
+            self.send_header("Access-Control-Allow-Origin", cors_origin)
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, Accept, MCP-Protocol-Version, MCP-Extensions")
+        self.send_header("Access-Control-Max-Age", "600")
+        self.end_headers()
+
     def do_GET(self) -> None:  # noqa: N802
         if self.path.rstrip("/") == "/health":
             self._write_json_response({"ok": True, "server": "webplayer-mcp-http"}, status=200)
+            return
+        if self.path.rstrip("/") == "":
+            self._write_json_response(
+                {"ok": True, "server": "webplayer-mcp-http", "mcpEndpoint": "/mcp", "healthEndpoint": "/health"},
+                status=200,
+            )
             return
         self._write_json_response({"error": "not_found"}, status=404)
 
