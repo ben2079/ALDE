@@ -57,7 +57,7 @@ curl -s http://127.0.0.1:8767/ | head
 
 The browser-facing WebPlayer MCP endpoint is `http://192.168.0.48:8766/mcp`. Its UI
 extension is negotiated with `io.modelcontextprotocol/ui`; it exposes the widget
-resource at `ui://webplayer/operator-console.html`. The same contract is also
+resource at `ui://webplayer/mini-controls.html`. The same contract is also
 available on the ALDE MCP server at `ui://alde/operator-console.html`. A webapp
 can verify the WebPlayer path without loading a local file:
 
@@ -67,7 +67,8 @@ curl -s -X POST http://192.168.0.48:8766/mcp \
   -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"capabilities":{"extensions":{"io.modelcontextprotocol/ui":{}}}}}'
 ```
 
-The host must provide `window.mcp.request({method, params})` to the widget.
+The host bridge provides `window.mcp.callTool({name, arguments})` to the widget.
+The widget falls back to the `/mcp` HTTP endpoint when it is opened standalone.
 The network server supports browser `OPTIONS` preflight and advertises the
 `/mcp` and `/health` paths at its root endpoint.
 

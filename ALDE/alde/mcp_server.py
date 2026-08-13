@@ -318,7 +318,7 @@ class McpRequestService:
     def _load_requested_protocol_version(self, params: Dict[str, Any]) -> str:
         requested_version = str(params.get("protocolVersion") or "").strip()
         if not requested_version:
-            return "2025-03-26"
+            return "2026-07-28"
         if requested_version not in self._SUPPORTED_PROTOCOL_VERSIONS:
             raise ValueError(f"Unsupported protocol version: {requested_version}")
         return requested_version

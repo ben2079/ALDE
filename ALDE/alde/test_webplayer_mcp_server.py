@@ -121,6 +121,24 @@ def test_tidal_api_track_manifest_builds_expected_query() -> None:
     assert "usage=STREAM" in request_object.url
 
 
+def test_tidal_api_request_merges_credentials_from_environment(monkeypatch) -> None:
+    monkeypatch.setenv("WEBPLAYER_MCP_TIDAL_AUTHORIZATION", "Bearer env-token")
+    monkeypatch.setenv("WEBPLAYER_MCP_TIDAL_X_TIDAL_TOKEN", "env-x-token")
+
+    service = TidalApiService()
+    request_object = service.load_object_request(
+        object_name="tidal_api_request",
+        arguments={
+            "url": "https://tidal.com/v1/ping",
+            "headers": {"Authorization": "Bearer explicit-token", "X-Test": "1"},
+        },
+    )
+
+    assert request_object.headers["Authorization"] == "Bearer explicit-token"
+    assert request_object.headers["x-tidal-token"] == "env-x-token"
+    assert request_object.headers["X-Test"] == "1"
+
+
 def test_tools_call_rejects_missing_search_query() -> None:
     service = WebPlayerMcpRequestService()
     payload = service.dispatch_object(
@@ -196,7 +214,7 @@ def test_tools_call_rejects_invalid_library_section() -> None:
 def test_initialize_protocol_version() -> None:
     service = WebPlayerMcpRequestService()
     payload = service.dispatch_object({"method": "initialize", "params": {}})
-    assert payload.get("result", {}).get("protocolVersion") == "2025-03-26"
+    assert payload.get("result", {}).get("protocolVersion") == "2026-07-28"
     capabilities = payload.get("result", {}).get("capabilities", {})
     assert "tools" in capabilities
     assert "prompts" in capabilities
@@ -237,6 +255,55 @@ def test_jsonrpc_webplayer_resources_use_negotiated_ui_state() -> None:
     payload = service.dispatch_object({"jsonrpc": "2.0", "id": 2, "method": "resources/list", "params": {}})
     resources = payload["result"]["resources"]
     assert resources[0]["uri"] == service._UI_RESOURCE_URI
+
+
+def test_jsonrpc_webplayer_resource_is_mcp_app_mini_controls() -> None:
+    service = WebPlayerMcpRequestService()
+    service.dispatch_object(
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {"capabilities": {"extensions": {"io.modelcontextprotocol/ui": {}}}},
+        }
+    )
+
+    payload = service.dispatch_object(
+        {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "resources/read",
+            "params": {"uri": service._UI_RESOURCE_URI},
+        }
+    )
+    content = payload["result"]["contents"][0]
+    assert content["mimeType"] == "text/html;profile=mcp-app"
+    assert "window.mcp.callTool" in content["text"]
+    assert "webplayer_backward" in content["text"]
+
+
+def test_jsonrpc_tools_call_returns_spec_content_blocks() -> None:
+    service = WebPlayerMcpRequestService()
+    payload = service.dispatch_object(
+        {
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tools/call",
+            "params": {
+                "name": "webplayer_search",
+                "arguments": {},
+            },
+        }
+    )
+
+    result = payload["result"]
+    content = result["content"]
+    assert isinstance(content, list)
+    assert content
+    assert content[0]["type"] == "text"
+    assert isinstance(content[0]["text"], str)
+    assert isinstance(result["structuredContent"], dict)
+    assert result["isError"] is True
 
 
 def test_jsonrpc_webplayer_rejects_unsupported_protocol_version() -> None:

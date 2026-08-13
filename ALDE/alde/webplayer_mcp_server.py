@@ -359,14 +359,32 @@ class TidalApiService:
 
     def _load_headers_object(self, raw_headers: Any) -> dict[str, str]:
         if not isinstance(raw_headers, dict):
-            return {}
-        headers: dict[str, str] = {}
+            return self._load_environment_default_headers()
+        headers: dict[str, str] = self._load_environment_default_headers()
         for key, value in raw_headers.items():
             normalized_key = str(key).strip()
             if not normalized_key:
                 continue
             headers[normalized_key] = str(value)
         return headers
+
+    def _load_environment_default_headers(self) -> dict[str, str]:
+        headers: dict[str, str] = {}
+        authorization_value = self._load_environment_header_value("WEBPLAYER_MCP_TIDAL_AUTHORIZATION")
+        if authorization_value:
+            headers["Authorization"] = authorization_value
+
+        x_tidal_token_value = self._load_environment_header_value("WEBPLAYER_MCP_TIDAL_X_TIDAL_TOKEN")
+        if x_tidal_token_value:
+            headers["x-tidal-token"] = x_tidal_token_value
+
+        return headers
+
+    def _load_environment_header_value(self, environment_name: str) -> str:
+        raw_value = os.getenv(environment_name)
+        if raw_value is None:
+            return ""
+        return str(raw_value).strip()
 
     def _load_timeout_seconds(self, raw_timeout: Any, *, default_timeout_s: int) -> int:
         try:
@@ -1222,8 +1240,8 @@ PY
 class WebPlayerMcpRequestService:
     _SUPPORTED_PROTOCOL_VERSIONS = ("2026-07-28", "2025-03-26")
     _UI_EXTENSION_NAME = "io.modelcontextprotocol/ui"
-    _UI_RESOURCE_URI = "ui://webplayer/operator-console.html"
-    _UI_RESOURCE_MIME_TYPE = "text/html"
+    _UI_RESOURCE_URI = "ui://webplayer/mini-controls.html"
+    _UI_RESOURCE_MIME_TYPE = "text/html;profile=mcp-app"
     _STRATEGY_RISK_TIER_ALLOWED_VALUES = {"low", "standard", "high", "critical"}
     _STRATEGY_RISK_TIER_DEFAULT = "standard"
     _STRATEGY_COMPLIANCE_MODE_ALLOWED_VALUES = {"strict", "balanced", "adaptive"}
@@ -1375,32 +1393,55 @@ class WebPlayerMcpRequestService:
             return {"error": "ui_extension_not_enabled"}
         return {
             "uri": self._UI_RESOURCE_URI,
-            "name": "webplayer-operator-console",
-            "title": "WebPlayer MCP Operator Console",
-            "description": "Compact MCP App UI for WebPlayer operations.",
+            "name": "webplayer-mini-controls",
+            "title": "WebPlayer Mini Controls",
+            "description": "Compact MCP App controls for WebPlayer playback.",
             "mimeType": self._UI_RESOURCE_MIME_TYPE,
         }
 
     def _load_ui_resource_markup(self) -> str:
         return """<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>WebPlayer MCP Operator Console</title>
-<style>body{font:14px system-ui,sans-serif;margin:12px;background:#f8fafc;color:#0f172a}
-.panel{border:1px solid #cbd5e1;border-radius:12px;padding:12px;background:#fff}
-button{margin-right:8px;border:1px solid #94a3b8;border-radius:8px;padding:6px 10px;cursor:pointer}
-#log{margin-top:10px;white-space:pre-wrap;max-height:220px;overflow:auto}</style></head>
-<body><div class="panel"><button id="now-playing">webplayer_now_playing</button>
-<pre id="log">Ready.</pre></div><script>
-const log=document.getElementById("log");
-async function request(){if(!window.mcp||typeof window.mcp.request!=="function"){log.textContent="Host bridge unavailable (window.mcp.request missing).";return}
-try{log.textContent=JSON.stringify(await window.mcp.request({method:"tools/call",params:{name:"webplayer_now_playing",arguments:{}}}),null,2)}catch(error){log.textContent=String(error)}}
-document.getElementById("now-playing").onclick=request;
+<title>WebPlayer Mini Controls</title>
+<style>
+:root{color-scheme:dark}body{font:12px system-ui,sans-serif;margin:6px;background:transparent;color:#d1d5db}
+.panel{display:inline-block;min-width:220px;padding:8px;border:1px solid #6b7280;border-radius:10px;background:rgba(0,0,0,.82)}
+.controls{display:flex;gap:4px;align-items:center}.controls button{border:0;border-radius:6px;padding:6px 9px;color:#e5e7eb;background:#374151;cursor:pointer}
+.controls button:hover{background:#4b5563}.status{margin-top:8px;min-height:2.5em;white-space:pre-wrap}
+</style></head>
+<body><div class="panel"><div class="controls">
+<button data-tool="webplayer_backward" aria-label="previous">|&lt;</button>
+<button data-tool="webplayer_play" data-args='{"playback_backend":"browser","player_selector":"chromium","cdp_port":9222,"cdp_autoclick":true}' aria-label="play">Play</button>
+<button data-tool="webplayer_stop" aria-label="stop">Stop</button>
+<button data-tool="webplayer_forward" aria-label="next">&gt;|</button>
+<button data-tool="webplayer_volume_adjust" data-args='{"delta_percent":-5}' aria-label="volume down">-</button>
+<button data-tool="webplayer_volume_adjust" data-args='{"delta_percent":5}' aria-label="volume up">+</button>
+</div><div id="status" class="status">Ready.</div></div>
+<script>
+const statusEl=document.getElementById("status");
+const defaultArgs={player_selector:"chromium",cdp_port:9222};
+async function callTool(name,args){
+  const argumentsValue={...defaultArgs,...(args||{})};
+  if(window.mcp&&typeof window.mcp.callTool==="function"){
+    return window.mcp.callTool({name,arguments:argumentsValue});
+  }
+  const response=await fetch("/mcp",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({jsonrpc:"2.0",id:Date.now(),method:"tools/call",params:{name,arguments:argumentsValue}})});
+  if(!response.ok)throw new Error("MCP HTTP "+response.status);
+  return response.json();
+}
+function render(result){statusEl.textContent=typeof result==="string"?result:JSON.stringify(result,null,2)}
+async function refresh(){try{render(await callTool("webplayer_now_playing",{}))}catch(error){render(String(error))}}
+for(const button of document.querySelectorAll("[data-tool]"))button.addEventListener("click",async()=>{
+  button.disabled=true;try{render(await callTool(button.dataset.tool,JSON.parse(button.dataset.args||"{}")));await refresh()}catch(error){render(String(error))}finally{button.disabled=false}
+});
+refresh();
 </script></body></html>"""
 
     def _load_requested_protocol_version(self, params: dict[str, Any]) -> str:
         requested = str(params.get("protocolVersion") or "").strip()
         if not requested:
-            return "2025-03-26"
+            return "2026-07-28"
         if requested not in self._SUPPORTED_PROTOCOL_VERSIONS:
             raise ValueError(f"Unsupported protocol version: {requested}")
         return requested
@@ -1488,7 +1529,7 @@ document.getElementById("now-playing").onclick=request;
                 "resultType": "complete",
             }
         elif method == "tools/call":
-            result_payload = self.load_tools_call_result(params)
+            result_payload = self._load_jsonrpc_tools_call_result(params)
             if "error" in result_payload:
                 return self._load_jsonrpc_error(request_id=request_id, code=-32602, message=str(result_payload["error"]))
             result = result_payload.get("result") or {}
@@ -1529,10 +1570,12 @@ document.getElementById("now-playing").onclick=request;
             return {"error": "method_not_implemented"}
         return handler(params)
 
-    def load_initialize_result(self, _params: dict[str, Any]) -> dict[str, Any]:
+    def load_initialize_result(self, params: dict[str, Any] | None = None) -> dict[str, Any]:
+        normalized_params = dict(params or {})
+        protocol_version = self._load_requested_protocol_version(normalized_params)
         return {
             "result": {
-                "protocolVersion": "2025-03-26",
+                "protocolVersion": protocol_version,
                 "serverInfo": {"name": "webplayer-mcp"},
                 "capabilities": {
                     "tools": {},
@@ -1654,12 +1697,9 @@ document.getElementById("now-playing").onclick=request;
             }
         }
 
-    def load_tools_call_result(self, params: dict[str, Any]) -> dict[str, Any]:
-        tool_name = str(params.get("name") or "").strip()
-        if not tool_name:
-            return {"error": "missing_tool_name"}
-
-        arguments_payload = params.get("arguments") or {}
+    @staticmethod
+    def _load_tools_call_arguments_payload(raw_arguments: Any) -> dict[str, Any]:
+        arguments_payload = raw_arguments or {}
         if isinstance(arguments_payload, str):
             try:
                 arguments_payload = json.loads(arguments_payload)
@@ -1667,22 +1707,57 @@ document.getElementById("now-playing").onclick=request;
                 arguments_payload = {}
         if not isinstance(arguments_payload, dict):
             arguments_payload = {}
+        return arguments_payload
 
+    def _load_tools_call_execution_payload(
+        self,
+        *,
+        tool_name: str,
+        arguments_payload: dict[str, Any],
+    ) -> dict[str, Any]:
         if tool_name.startswith("tidal_api_"):
-            tidal_api_result = self.tidal_api_service.dispatch_object(
+            return self.tidal_api_service.dispatch_object(
                 object_name=tool_name,
                 arguments=arguments_payload,
             )
-            return {"result": {"content": json.dumps(tidal_api_result, ensure_ascii=True)}}
 
         player_selector = str(arguments_payload.get("player_selector") or "chromium").strip() or "chromium"
         query = str(arguments_payload.get("query") or "").strip() if "query" in arguments_payload else None
 
-        result_payload = self.player_service.dispatch_object(
+        return self.player_service.dispatch_object(
             object_name=tool_name,
             player_selector=player_selector,
             query=query,
             arguments=arguments_payload,
+        )
+
+    def _load_jsonrpc_tools_call_result(self, params: dict[str, Any]) -> dict[str, Any]:
+        tool_name = str(params.get("name") or "").strip()
+        if not tool_name:
+            return {"error": "missing_tool_name"}
+
+        arguments_payload = self._load_tools_call_arguments_payload(params.get("arguments"))
+        execution_payload = self._load_tools_call_execution_payload(
+            tool_name=tool_name,
+            arguments_payload=arguments_payload,
+        )
+        text_payload = json.dumps(execution_payload, ensure_ascii=True)
+        return {
+            "result": {
+                "content": [{"type": "text", "text": text_payload}],
+                "structuredContent": execution_payload,
+                "isError": bool(execution_payload.get("ok") is False),
+            }
+        }
+
+    def load_tools_call_result(self, params: dict[str, Any]) -> dict[str, Any]:
+        tool_name = str(params.get("name") or "").strip()
+        if not tool_name:
+            return {"error": "missing_tool_name"}
+        arguments_payload = self._load_tools_call_arguments_payload(params.get("arguments"))
+        result_payload = self._load_tools_call_execution_payload(
+            tool_name=tool_name,
+            arguments_payload=arguments_payload,
         )
         return {"result": {"content": json.dumps(result_payload, ensure_ascii=True)}}
 
@@ -2211,6 +2286,15 @@ class McpHttpRequestHandler(BaseHTTPRequestHandler):
         except Exception:
             self._write_json_response({"error": "invalid_json"}, status=400)
             return
+
+        extensions = str(self.headers.get("MCP-Extensions") or "").strip()
+        if extensions and isinstance(request_payload, dict) and request_payload.get("jsonrpc") == "2.0":
+            params = request_payload.get("params")
+            normalized_params = dict(params) if isinstance(params, dict) else {}
+            metadata = dict(normalized_params.get("_meta") or {})
+            metadata.setdefault("io.modelcontextprotocol/extensions", extensions)
+            normalized_params["_meta"] = metadata
+            request_payload["params"] = normalized_params
 
         response_payload = MCP_REQUEST_SERVICE.dispatch_object(request_payload)
         status_code = 200 if "result" in response_payload else 400

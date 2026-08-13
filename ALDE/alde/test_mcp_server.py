@@ -25,6 +25,13 @@ def test_jsonrpc_initialize_selects_requested_supported_protocol_version() -> No
     assert payload.get("result", {}).get("protocolVersion") == "2026-07-28"
 
 
+def test_jsonrpc_initialize_defaults_to_latest_supported_protocol_version() -> None:
+    service = McpRequestService()
+    payload = service.dispatch_object({"jsonrpc": "2.0", "id": 3, "method": "initialize", "params": {}})
+
+    assert payload.get("result", {}).get("protocolVersion") == "2026-07-28"
+
+
 def test_jsonrpc_initialize_rejects_unsupported_protocol_version() -> None:
     service = McpRequestService()
     payload = service.dispatch_object(
