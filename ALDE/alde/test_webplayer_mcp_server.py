@@ -1,10 +1,17 @@
 from __future__ import annotations
 
 import ast
+import asyncio
+import base64
+import binascii
 import json
+import os
+import tempfile
 import threading
+import time
 import urllib.request
 from http.server import ThreadingHTTPServer
+from pathlib import Path
 
 from ALDE.alde.webplayer_mcp_server import McpHttpRequestHandler, TidalApiService, WebPlayerMcpRequestService
 
@@ -405,6 +412,10 @@ def test_jsonrpc_webplayer_resource_is_mcp_app_mini_controls() -> None:
     assert "window.mcp.callTool" in content["text"]
     assert "webplayer_favorite_current_track" in content["text"]
     assert "id=\"favoriteButton\"" in content["text"]
+    assert 'id="actionFeedback"' in content["text"]
+    assert 'role="status"' in content["text"]
+    assert 'aria-live="polite"' in content["text"]
+    assert 'aria-atomic="true"' in content["text"]
     assert "danger.is-active" in content["text"]
     assert 'class="favorite-icon"' in content["text"]
     assert ".favorite-icon path" in content["text"]
@@ -448,6 +459,14 @@ def test_webplayer_http_fallback_serves_mini_controls_html() -> None:
             assert "marquee-track" in body
             assert "webplayer_favorite_current_track" in body
             assert "id=\"favoriteButton\"" in body
+            assert 'id="actionFeedback"' in body
+            assert 'role="status"' in body
+            assert 'aria-live="polite"' in body
+            assert 'aria-atomic="true"' in body
+            assert 'id="status"' not in body
+            feedback_style = body.split(".action-feedback {", 1)[1].split("}", 1)[0]
+            assert "position: absolute;" in feedback_style
+            assert "pointer-events: none;" in feedback_style
             assert "danger.is-active" in body
             assert 'class="favorite-icon"' in body
             assert 'data-ansi-background=":[\\|/]:"' in body
@@ -485,6 +504,12 @@ def test_webplayer_http_fallback_serves_mini_controls_html() -> None:
             assert "lyrics_subtitles_base64" in body
             assert "window.setInterval(updateLyricsMarquee, 500)" in body
             assert "updateFavoriteButtonTarget" in body
+            assert 'setStatus("Adding to favorites…", "loading", 0)' in body
+            assert 'actionError ? "error" : "success"' in body
+            assert "actionFeedbackEl.hidden = false" in body
+            assert "actionFeedbackEl.hidden = true" in body
+            assert "`Favorite failed: ${actionError}`" in body
+            assert "`Favorite failed: ${errorMessage}`" in body
             assert 'playback_backend: "api_only"' in body
             assert "track_id: normalizedTrackId" in body
             assert "hasBitDepthSampleRate" in body
@@ -713,7 +738,172 @@ def test_webplayer_api_only_commands_are_built() -> None:
     assert "openapi_tracks_mediaTags_via_relationship_items" in favorite_command
     assert "WEBPLAYER_TRACK_ID=" in favorite_command
     assert "WEBPLAYER_COUNTRY_CODE=" in favorite_command
+    assert "WEBPLAYER_CDP_PORT=9222" in favorite_command
+    assert "WEBPLAYER_CDP_TOKEN_TIMEOUT_S=45" in favorite_command
+    assert "class TidalBrowserAccessTokenService" in favorite_command
+    assert "except ImportError:" in favorite_command
+    assert 'self.last_error = "cdp_websockets_missing"' in favorite_command
+    assert "Network.requestWillBeSentExtraInfo" in favorite_command
+    assert "/json/new?" in favorite_command
+    assert "/json/close/" in favorite_command
+    assert '"source": "browser_cdp_network"' in favorite_command
+    assert "tempfile.mkstemp" in favorite_command
+    assert "os.fchmod(file_descriptor, 0o600)" in favorite_command
     assert "error=playerctl_missing" not in favorite_command
+
+    script = favorite_command.split("python3 - <<'PY'\n", 1)[1].rsplit("\nPY", 1)[0]
+    compile(script, "<webplayer_favorite_api_only>", "exec")
+
+
+def test_browser_access_token_service_parses_and_stores_validated_token(tmp_path: Path) -> None:
+    service = WebPlayerMcpRequestService()
+    namespace = {
+        "base64": base64,
+        "binascii": binascii,
+        "json": json,
+        "os": os,
+        "Path": Path,
+        "tempfile": tempfile,
+        "time": time,
+    }
+    exec(  # noqa: S102
+        service.player_service._load_browser_access_token_service_script(),  # noqa: SLF001
+        namespace,
+    )
+    token_service_class = namespace["TidalBrowserAccessTokenService"]
+    expires_at = int(time.time()) + 3600
+    payload_segment = base64.urlsafe_b64encode(
+        json.dumps({"exp": expires_at}).encode("utf-8")
+    ).decode("ascii").rstrip("=")
+    access_token = f"header.{payload_segment}.signature"
+
+    request_event = {
+        "method": "Network.requestWillBeSentExtraInfo",
+        "params": {"headers": {"authorization": f"Bearer {access_token}"}},
+    }
+    assert token_service_class._load_bearer_token(request_event) == access_token
+    assert token_service_class._load_bearer_token(
+        {"method": "Network.requestWillBeSentExtraInfo", "params": {"headers": {}}}
+    ) == ""
+
+    token_path = tmp_path / "tidal-token.json"
+    token_service = token_service_class(
+        debug_port=9222,
+        timeout_s=45,
+        token_path=token_path,
+        public_web_token="public-token",
+        user_agent="test-agent",
+    )
+    token_service._store_access_token(
+        access_token,
+        {"sessionId": "session-1", "userId": "user-1"},
+    )
+
+    stored_payload = json.loads(token_path.read_text(encoding="utf-8"))
+    assert stored_payload["access_token"] == access_token
+    assert stored_payload["expires_at"] == expires_at
+    assert stored_payload["session_id"] == "session-1"
+    assert stored_payload["source"] == "browser_cdp_network"
+    assert stored_payload["user_id"] == "user-1"
+    assert token_path.stat().st_mode & 0o777 == 0o600
+
+
+def test_browser_access_token_service_processes_queued_cdp_header(tmp_path: Path) -> None:
+    service = WebPlayerMcpRequestService()
+
+    class FakeWebSocket:
+        def __init__(self, access_token: str) -> None:
+            self.access_token = access_token
+            self.messages: list[str] = []
+            self.sent_methods: list[str] = []
+
+        async def send(self, raw_payload: str) -> None:
+            payload = json.loads(raw_payload)
+            method = str(payload["method"])
+            self.sent_methods.append(method)
+            if method == "Page.close":
+                return
+            if method == "Page.navigate":
+                self.messages.append(
+                    json.dumps(
+                        {
+                            "method": "Network.requestWillBeSentExtraInfo",
+                            "params": {
+                                "headers": {
+                                    "Authorization": f"Bearer {self.access_token}",
+                                }
+                            },
+                        }
+                    )
+                )
+            self.messages.append(json.dumps({"id": payload["id"], "result": {}}))
+
+        async def recv(self) -> str:
+            return self.messages.pop(0)
+
+    class FakeConnection:
+        def __init__(self, websocket: FakeWebSocket) -> None:
+            self.websocket = websocket
+
+        async def __aenter__(self) -> FakeWebSocket:
+            return self.websocket
+
+        async def __aexit__(self, *_args: object) -> None:
+            return None
+
+    class FakeWebsockets:
+        def __init__(self, websocket: FakeWebSocket) -> None:
+            self.websocket = websocket
+
+        def connect(self, *_args: object, **_kwargs: object) -> FakeConnection:
+            return FakeConnection(self.websocket)
+
+    namespace = {
+        "asyncio": asyncio,
+        "base64": base64,
+        "binascii": binascii,
+        "json": json,
+        "os": os,
+        "Path": Path,
+        "tempfile": tempfile,
+        "time": time,
+        "WebSocketException": RuntimeError,
+    }
+    exec(  # noqa: S102
+        service.player_service._load_browser_access_token_service_script(),  # noqa: SLF001
+        namespace,
+    )
+    token_service_class = namespace["TidalBrowserAccessTokenService"]
+    access_token = "captured-browser-access-token-with-sufficient-length"
+    fake_websocket = FakeWebSocket(access_token)
+    namespace["websockets"] = FakeWebsockets(fake_websocket)
+    token_service = token_service_class(
+        debug_port=9222,
+        timeout_s=5,
+        token_path=tmp_path / "tidal-token.json",
+        public_web_token="public-token",
+        user_agent="test-agent",
+    )
+    token_service._create_page_target = lambda: {
+        "id": "target-1",
+        "webSocketDebuggerUrl": "ws://test-target",
+    }
+    token_service._load_session_payload = lambda token: (
+        {"sessionId": "session-1", "userId": "user-1"}
+        if token == access_token
+        else {}
+    )
+
+    captured_token, session_payload = asyncio.run(token_service._capture_access_token())
+
+    assert captured_token == access_token
+    assert session_payload["userId"] == "user-1"
+    assert fake_websocket.sent_methods == [
+        "Network.enable",
+        "Page.enable",
+        "Page.navigate",
+        "Page.close",
+    ]
 
 
 def test_webplayer_favorite_command_embedded_python_script_compiles() -> None:

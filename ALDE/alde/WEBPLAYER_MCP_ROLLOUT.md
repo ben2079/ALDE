@@ -80,9 +80,14 @@ as plain HTTP at `/ui/webplayer/mini-controls` (alias:
 directly when inline MCP App rendering is unavailable. The fallback view uses
 icon buttons plus a scrolling now-playing strip instead of dumping raw tool
 output into the page.
-The favorite button saves the current track through the TIDAL favorites API by
-refreshing the access token from the browser's localStorage auth blob, so it no
-longer depends on a remote debug port.
+The favorite button saves the current track through the TIDAL collection API
+using the configured account credentials and verifies the resulting collection
+state. A transient `role="status"` overlay reports loading, success, and
+concrete API or transport errors without restoring the removed permanent status
+bar. When a cached access token expires, the server uses the configured CDP port
+to open a temporary background TIDAL tab, captures a browser-authenticated API
+request, validates its Bearer token through `/v1/sessions`, stores it atomically
+with mode `0600`, and closes the temporary tab.
 The volume buttons operate on the active Chromium sink-input via `pactl` so they
 actually change the audible browser stream; `playerctl` remains a fallback path.
 When inline rendering is unavailable, the same app can be delivered on localhost via

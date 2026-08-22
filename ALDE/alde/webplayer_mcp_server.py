@@ -828,6 +828,295 @@ class WebPlayerService:
             + "\nPY"
         )
 
+    def _load_browser_access_token_service_script(self) -> str:
+        return dedent(
+            r"""
+            class TidalBrowserAccessTokenService:
+                def __init__(
+                    self,
+                    *,
+                    debug_port: int,
+                    timeout_s: int,
+                    token_path: Path | None,
+                    public_web_token: str,
+                    user_agent: str,
+                ) -> None:
+                    self.debug_port = int(debug_port)
+                    self.timeout_s = max(5, int(timeout_s))
+                    self.token_path = token_path
+                    self.public_web_token = str(public_web_token)
+                    self.user_agent = str(user_agent)
+                    self.last_error = ""
+                    self.last_warning = ""
+                    self.target_id = ""
+
+                def load_access_token(self) -> str:
+                    if self.debug_port <= 0:
+                        self.last_error = "invalid_cdp_port"
+                        return ""
+                    if websockets is None:
+                        self.last_error = "cdp_websockets_missing"
+                        return ""
+                    try:
+                        access_token, session_payload = asyncio.run(self._capture_access_token())
+                    except HTTPError as exc:
+                        self.last_error = f"cdp_http_{int(exc.code or 500)}"
+                        return ""
+                    except (URLError, OSError, TimeoutError, asyncio.TimeoutError) as exc:
+                        self.last_error = f"cdp_unavailable:{type(exc).__name__}"
+                        return ""
+                    except (json.JSONDecodeError, WebSocketException) as exc:
+                        self.last_error = f"cdp_protocol_error:{type(exc).__name__}"
+                        return ""
+                    finally:
+                        self._close_page_target()
+                    if not access_token:
+                        if not self.last_error:
+                            self.last_error = "authorization_not_observed"
+                        return ""
+                    self._store_access_token(access_token, session_payload)
+                    return access_token
+
+                async def _capture_access_token(self) -> tuple[str, dict[str, object]]:
+                    target = self._create_page_target()
+                    websocket_url = str(target.get("webSocketDebuggerUrl") or "").strip()
+                    if not websocket_url:
+                        self.last_error = "cdp_target_websocket_missing"
+                        return "", {}
+
+                    async with websockets.connect(websocket_url, max_size=8_000_000) as websocket:
+                        message_id = 0
+                        event_queue: list[dict[str, object]] = []
+
+                        async def send_method(
+                            method_name: str,
+                            params: dict[str, object] | None = None,
+                        ) -> dict[str, object]:
+                            nonlocal message_id
+                            message_id += 1
+                            payload: dict[str, object] = {"id": message_id, "method": method_name}
+                            if params:
+                                payload["params"] = params
+                            await websocket.send(json.dumps(payload))
+                            while True:
+                                raw_message = await asyncio.wait_for(
+                                    websocket.recv(),
+                                    timeout=min(10, self.timeout_s),
+                                )
+                                message = json.loads(raw_message)
+                                if message.get("id") == message_id:
+                                    return message
+                                if isinstance(message, dict):
+                                    event_queue.append(message)
+
+                        try:
+                            await send_method("Network.enable")
+                            await send_method("Page.enable")
+                            await send_method("Page.navigate", {"url": "https://listen.tidal.com/"})
+                            deadline = time.monotonic() + self.timeout_s
+                            tested_tokens: set[str] = set()
+                            while event_queue or time.monotonic() < deadline:
+                                if event_queue:
+                                    message = event_queue.pop(0)
+                                else:
+                                    remaining = max(0.1, deadline - time.monotonic())
+                                    try:
+                                        raw_message = await asyncio.wait_for(
+                                            websocket.recv(),
+                                            timeout=remaining,
+                                        )
+                                    except asyncio.TimeoutError:
+                                        break
+                                    message = json.loads(raw_message)
+                                access_token = self._load_bearer_token(message)
+                                if not access_token or access_token in tested_tokens:
+                                    continue
+                                tested_tokens.add(access_token)
+                                session_payload = self._load_session_payload(access_token)
+                                if session_payload:
+                                    return access_token, session_payload
+                            self.last_error = (
+                                "browser_tokens_rejected"
+                                if tested_tokens
+                                else "authorization_not_observed"
+                            )
+                            return "", {}
+                        finally:
+                            message_id += 1
+                            try:
+                                await websocket.send(
+                                    json.dumps({"id": message_id, "method": "Page.close"})
+                                )
+                            except WebSocketException:
+                                self.last_warning = "cdp_target_close_failed"
+
+                def _create_page_target(self) -> dict[str, object]:
+                    target_url = (
+                        f"http://127.0.0.1:{self.debug_port}/json/new?"
+                        + quote("about:blank", safe="")
+                    )
+                    request = Request(target_url, method="PUT")
+                    with urlopen(request, timeout=min(10, self.timeout_s)) as response:
+                        payload = json.loads(response.read().decode("utf-8", "replace"))
+                    if not isinstance(payload, dict):
+                        self.last_error = "cdp_target_invalid"
+                        return {}
+                    self.target_id = str(payload.get("id") or "").strip()
+                    return payload
+
+                def _close_page_target(self) -> None:
+                    if not self.target_id:
+                        return
+                    close_url = (
+                        f"http://127.0.0.1:{self.debug_port}/json/close/"
+                        + quote(self.target_id, safe="")
+                    )
+                    try:
+                        with urlopen(close_url, timeout=min(5, self.timeout_s)) as response:
+                            response.read()
+                    except HTTPError as exc:
+                        if int(exc.code or 500) != 404:
+                            self.last_warning = f"cdp_target_close_http_{int(exc.code or 500)}"
+                    except (URLError, OSError):
+                        self.last_warning = "cdp_target_close_failed"
+                    finally:
+                        self.target_id = ""
+
+                @staticmethod
+                def _load_bearer_token(message: dict[str, object]) -> str:
+                    method_name = str(message.get("method") or "")
+                    params = message.get("params")
+                    if not isinstance(params, dict):
+                        return ""
+                    headers: object = {}
+                    if method_name == "Network.requestWillBeSent":
+                        request_payload = params.get("request")
+                        if isinstance(request_payload, dict):
+                            headers = request_payload.get("headers")
+                    elif method_name == "Network.requestWillBeSentExtraInfo":
+                        headers = params.get("headers")
+                    if not isinstance(headers, dict):
+                        return ""
+                    authorization = next(
+                        (
+                            str(value or "").strip()
+                            for key, value in headers.items()
+                            if str(key).casefold() == "authorization"
+                        ),
+                        "",
+                    )
+                    scheme, separator, token = authorization.partition(" ")
+                    if separator and scheme.casefold() == "bearer" and len(token.strip()) > 32:
+                        return token.strip()
+                    return ""
+
+                def _load_session_payload(self, access_token: str) -> dict[str, object]:
+                    request = Request(
+                        "https://api.tidal.com/v1/sessions",
+                        headers={
+                            "Accept": "application/json",
+                            "Authorization": "Bearer " + access_token,
+                            "Origin": "https://listen.tidal.com",
+                            "Referer": "https://listen.tidal.com/",
+                            "User-Agent": self.user_agent,
+                            "x-tidal-token": self.public_web_token,
+                        },
+                    )
+                    try:
+                        with urlopen(request, timeout=min(20, self.timeout_s)) as response:
+                            if int(getattr(response, "status", 200)) // 100 != 2:
+                                return {}
+                            payload = json.loads(response.read().decode("utf-8", "replace"))
+                    except (HTTPError, URLError, OSError, json.JSONDecodeError):
+                        return {}
+                    if not isinstance(payload, dict):
+                        return {}
+                    if not str(payload.get("userId") or "").strip():
+                        return {}
+                    return payload
+
+                @staticmethod
+                def _load_token_expiry(access_token: str) -> int | None:
+                    try:
+                        payload_segment = access_token.split(".")[1]
+                        padding = "=" * (-len(payload_segment) % 4)
+                        payload = json.loads(
+                            base64.urlsafe_b64decode(payload_segment + padding).decode(
+                                "utf-8",
+                                "replace",
+                            )
+                        )
+                    except (IndexError, ValueError, binascii.Error, json.JSONDecodeError):
+                        return None
+                    if not isinstance(payload, dict):
+                        return None
+                    try:
+                        return int(payload.get("exp") or 0)
+                    except (TypeError, ValueError):
+                        return None
+
+                def _store_access_token(
+                    self,
+                    access_token: str,
+                    session_payload: dict[str, object],
+                ) -> None:
+                    if self.token_path is None:
+                        self.last_warning = "token_file_not_configured"
+                        return
+                    token_payload: dict[str, object] = {}
+                    if self.token_path.is_file():
+                        try:
+                            existing_payload = json.loads(
+                                self.token_path.read_text(encoding="utf-8")
+                            )
+                        except (OSError, json.JSONDecodeError):
+                            existing_payload = {}
+                        if isinstance(existing_payload, dict):
+                            token_payload.update(existing_payload)
+
+                    current_time = int(time.time())
+                    expires_at = self._load_token_expiry(access_token)
+                    if expires_at is None:
+                        expires_at = current_time + 300
+                    token_payload.update(
+                        {
+                            "access_token": access_token,
+                            "expires_at": expires_at,
+                            "expires_in": max(0, expires_at - current_time),
+                            "session_id": str(session_payload.get("sessionId") or "").strip(),
+                            "source": "browser_cdp_network",
+                            "token_type": "Bearer",
+                            "updated_at": current_time,
+                            "user_id": str(session_payload.get("userId") or "").strip(),
+                        }
+                    )
+
+                    temporary_path = ""
+                    try:
+                        self.token_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+                        file_descriptor, temporary_path = tempfile.mkstemp(
+                            prefix=f".{self.token_path.name}.",
+                            suffix=".tmp",
+                            dir=str(self.token_path.parent),
+                        )
+                        os.fchmod(file_descriptor, 0o600)
+                        with os.fdopen(file_descriptor, "w", encoding="utf-8") as handle:
+                            json.dump(token_payload, handle, ensure_ascii=True, indent=2)
+                            handle.write("\n")
+                        os.replace(temporary_path, self.token_path)
+                        temporary_path = ""
+                        os.chmod(self.token_path, 0o600)
+                    except OSError as exc:
+                        self.last_warning = f"token_store_failed:{type(exc).__name__}"
+                    finally:
+                        if temporary_path:
+                            try:
+                                Path(temporary_path).unlink(missing_ok=True)
+                            except OSError:
+                                self.last_warning = "token_temp_cleanup_failed"
+            """
+        ).strip()
+
     def _load_favorite_track_api_only_command(self, *, arguments: dict[str, Any]) -> str:
         track_id = str(arguments.get("track_id") or "").strip()
         if not track_id:
@@ -841,22 +1130,49 @@ class WebPlayerService:
             return "echo 'error=invalid_track_id'; exit 1;"
 
         country_code = self._load_country_code(arguments.get("country_code"), default_value="DE")
+        cdp_port = self._load_bounded_int(
+            arguments.get("cdp_port"),
+            default_value=9222,
+            minimum=0,
+            maximum=65535,
+        )
+        token_refresh_timeout_s = self._load_bounded_int(
+            arguments.get("token_refresh_timeout_s"),
+            default_value=45,
+            minimum=5,
+            maximum=120,
+        )
         track_id_payload = shlex.quote(track_id)
         country_code_payload = shlex.quote(country_code)
         python_script = dedent(
             r"""
+            import asyncio
+            import base64
+            import binascii
             import json
             import os
+            import tempfile
             import time
             from pathlib import Path
             from urllib.error import HTTPError, URLError
-            from urllib.parse import urlencode
+            from urllib.parse import quote, urlencode
             from urllib.request import Request, urlopen
+
+            try:
+                import websockets
+                from websockets.exceptions import WebSocketException
+            except ImportError:
+                websockets = None
+
+                class WebSocketException(Exception):
+                    pass
 
             __TRACK_METADATA_HELPERS__
 
             PUBLIC_WEB_TOKEN = "__PUBLIC_WEB_TOKEN__"
             USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36"
+
+            __BROWSER_ACCESS_TOKEN_SERVICE__
 
             def emit(message: str) -> None:
                 print(message, flush=True)
@@ -866,6 +1182,15 @@ class WebPlayerService:
             if not track_id:
                 emit("error=missing_track_id_api_only")
                 raise SystemExit(1)
+
+            def load_token_path() -> Path | None:
+                token_file = str(
+                    os.environ.get("TIDAL_API_TOKEN_FILE")
+                    or os.path.expanduser("~/.config/webplayer-mcp/tidal-token.json")
+                ).strip()
+                if token_file.startswith("%h/"):
+                    token_file = str(Path.home() / token_file.removeprefix("%h/"))
+                return Path(token_file) if token_file else None
 
             def load_access_token() -> str:
                 try:
@@ -881,30 +1206,40 @@ class WebPlayerService:
                     except Exception:
                         pass
 
-                token_file = str(
-                    os.environ.get("TIDAL_API_TOKEN_FILE")
-                    or os.path.expanduser("~/.config/webplayer-mcp/tidal-token.json")
-                ).strip()
-                if token_file.startswith("%h/"):
-                    token_file = str(Path.home() / token_file.removeprefix("%h/"))
-                if not token_file:
-                    return ""
-                token_path = Path(token_file)
-                if not token_path.is_file():
-                    return ""
-                try:
-                    token_payload = json.loads(token_path.read_text(encoding="utf-8"))
-                except (OSError, json.JSONDecodeError):
-                    return ""
-                if not isinstance(token_payload, dict):
-                    return ""
-                access_token_value = str(token_payload.get("access_token") or "").strip()
-                if not access_token_value:
-                    return ""
-                expires_at = token_payload.get("expires_at")
-                if isinstance(expires_at, (int, float)) and float(expires_at) <= time.time() + 60:
-                    return ""
-                return access_token_value
+                token_path = load_token_path()
+                if token_path is not None and token_path.is_file():
+                    try:
+                        token_payload = json.loads(token_path.read_text(encoding="utf-8"))
+                    except (OSError, json.JSONDecodeError):
+                        token_payload = {}
+                    if isinstance(token_payload, dict):
+                        access_token_value = str(token_payload.get("access_token") or "").strip()
+                        expires_at = token_payload.get("expires_at")
+                        token_is_current = not isinstance(expires_at, (int, float)) or (
+                            float(expires_at) > time.time() + 60
+                        )
+                        if access_token_value and token_is_current:
+                            return access_token_value
+
+                browser_token_service = TidalBrowserAccessTokenService(
+                    debug_port=int(os.environ.get("WEBPLAYER_CDP_PORT") or 9222),
+                    timeout_s=int(os.environ.get("WEBPLAYER_CDP_TOKEN_TIMEOUT_S") or 45),
+                    token_path=token_path,
+                    public_web_token=str(
+                        os.environ.get("WEBPLAYER_MCP_TIDAL_X_TIDAL_TOKEN")
+                        or PUBLIC_WEB_TOKEN
+                    ),
+                    user_agent=USER_AGENT,
+                )
+                browser_access_token = browser_token_service.load_access_token()
+                if browser_access_token:
+                    emit("access_token_source=browser_cdp_network")
+                    if browser_token_service.last_warning:
+                        emit(f"token_refresh_warning={browser_token_service.last_warning}")
+                    return browser_access_token
+                if browser_token_service.last_error:
+                    emit(f"token_refresh_error={browser_token_service.last_error}")
+                return ""
 
             access_token = load_access_token()
             if not access_token:
@@ -1079,11 +1414,16 @@ class WebPlayerService:
         ).replace(
             "__TRACK_METADATA_HELPERS__",
             self._load_track_metadata_helpers_script(),
+        ).replace(
+            "__BROWSER_ACCESS_TOKEN_SERVICE__",
+            self._load_browser_access_token_service_script(),
         ).replace("__PUBLIC_WEB_TOKEN__", TidalApiService._DEFAULT_WEB_TOKEN).strip()
         return (
             "if ! command -v python3 >/dev/null 2>&1; then echo 'error=python3_missing'; exit 1; fi; "
             + f"WEBPLAYER_TRACK_ID={track_id_payload} "
             + f"WEBPLAYER_COUNTRY_CODE={country_code_payload} "
+            + f"WEBPLAYER_CDP_PORT={cdp_port} "
+            + f"WEBPLAYER_CDP_TOKEN_TIMEOUT_S={token_refresh_timeout_s} "
             + "python3 - <<'PY'\n"
             + python_script
             + "\nPY"
@@ -4533,6 +4873,7 @@ class WebPlayerMcpRequestService:
     }
 
     .panel {
+      position: relative;
       border: 1px solid rgba(255, 255, 255, 0.06);
       border-radius: 16px;
       background-color: rgba(0, 0, 0, 0.9);
@@ -4737,16 +5078,35 @@ class WebPlayerMcpRequestService:
       white-space: nowrap;
     }
 
-    .status {
-      min-height: 1.25em;
-      color: var(--muted);
+    .action-feedback {
+      position: absolute;
+      z-index: 10;
+      left: 50%;
+      bottom: 12px;
+      max-width: calc(100% - 24px);
+      padding: 7px 11px;
+      border: 1px solid rgba(255, 255, 255, 0.14);
+      border-radius: 999px;
+      background: rgba(8, 12, 18, 0.94);
+      color: var(--text);
+      box-shadow: 0 8px 24px rgba(0, 0, 0, 0.55);
       font-size: 12px;
       white-space: nowrap;
       overflow: hidden;
       text-overflow: ellipsis;
+      transform: translateX(-50%);
+      pointer-events: none;
     }
 
-    .status.error {
+    .action-feedback.loading {
+      color: var(--warn);
+    }
+
+    .action-feedback.success {
+      color: var(--good);
+    }
+
+    .action-feedback.error {
       color: var(--bad);
     }
 
@@ -4825,12 +5185,13 @@ class WebPlayerMcpRequestService:
         </div>
       </div>
 
+      <div id="actionFeedback" class="action-feedback" role="status" aria-live="polite" aria-atomic="true" hidden></div>
     </div>
   </div>
 
   <script>
     const defaultArgs = { player_selector: "chromium", cdp_port: 9222 };
-    const statusEl = document.getElementById("status");
+    const actionFeedbackEl = document.getElementById("actionFeedback");
     const metaStatusEl = document.getElementById("metaStatus");
     const metaPlayerEl = document.getElementById("metaPlayer");
     const metaAlbumEl = document.getElementById("metaAlbum");
@@ -4857,6 +5218,7 @@ class WebPlayerMcpRequestService:
     let synchronizedLyrics = [];
     let plainLyrics = [];
     let nowPlayingRefreshPending = false;
+    let actionFeedbackHideTimer = null;
 
     function parseJsonMaybe(value) {
       if (typeof value !== "string") return value;
@@ -5031,10 +5393,35 @@ class WebPlayerMcpRequestService:
       albumArtworkEl.hidden = false;
     }
 
-    function setStatus(message, kind = "normal") {
-      if (!statusEl) return;
-      statusEl.textContent = String(message || "");
-      statusEl.className = kind === "error" ? "status error" : "status";
+    function setStatus(message, kind = "normal", timeoutMs = null) {
+      if (!actionFeedbackEl) return;
+      if (actionFeedbackHideTimer !== null) {
+        window.clearTimeout(actionFeedbackHideTimer);
+        actionFeedbackHideTimer = null;
+      }
+
+      const normalizedMessage = String(message || "").trim();
+      if (!normalizedMessage) {
+        actionFeedbackEl.hidden = true;
+        actionFeedbackEl.textContent = "";
+        return;
+      }
+
+      const supportedKinds = new Set(["normal", "loading", "success", "error"]);
+      const normalizedKind = supportedKinds.has(kind) ? kind : "normal";
+      actionFeedbackEl.textContent = normalizedMessage;
+      actionFeedbackEl.className = `action-feedback ${normalizedKind}`;
+      actionFeedbackEl.hidden = false;
+
+      const defaultTimeoutMs = normalizedKind === "loading" ? 0 : (normalizedKind === "error" ? 6000 : 3200);
+      const hideAfterMs = timeoutMs === null ? defaultTimeoutMs : Math.max(0, Number(timeoutMs) || 0);
+      if (hideAfterMs > 0) {
+        actionFeedbackHideTimer = window.setTimeout(() => {
+          actionFeedbackEl.hidden = true;
+          actionFeedbackEl.textContent = "";
+          actionFeedbackHideTimer = null;
+        }, hideAfterMs);
+      }
     }
 
     function setFavoriteButtonState(state) {
@@ -5172,9 +5559,12 @@ class WebPlayerMcpRequestService:
       const targetVolume = String(stdout.target_volume || root.target_volume || "").trim();
       const volumeTarget = String(stdout.volume_target || root.volume_target || "").trim().toLowerCase();
       const favoriteResult = String(stdout.favorite_result || root.favorite_result || "").trim().toLowerCase();
+      const actionError = loadActionError(payload);
 
-      if (root && root.ok === false) {
-        return `Error: ${stdout.error || root.error || root.stderr || root.stdout || "request failed"}`;
+      if (actionError) {
+        return toolName === "webplayer_favorite_current_track"
+          ? `Favorite failed: ${actionError}`
+          : `Error: ${actionError}`;
       }
       if (toolName === "webplayer_favorite_current_track") {
         if (favoriteResult.startsWith("token_user_")) {
@@ -5204,6 +5594,17 @@ class WebPlayerMcpRequestService:
         return [status || "Done", title && artist ? `${title} — ${artist}` : (title || artist)].filter(Boolean).join(" • ");
       }
       return status || "Done";
+    }
+
+    function loadActionError(payload) {
+      const root = payload && typeof payload === "object" ? payload : {};
+      const stdout = parseKeyValueLines(String(root.stdout || ""));
+      const explicitError = String(stdout.error || root.error || "").trim();
+      if (explicitError) return explicitError;
+      if (root.ok === false) {
+        return String(root.stderr || root.stdout || "request failed").trim();
+      }
+      return "";
     }
 
     async function callTool(name, args) {
@@ -5251,11 +5652,15 @@ class WebPlayerMcpRequestService:
 
     for (const button of document.querySelectorAll("[data-tool]")) {
       button.addEventListener("click", async () => {
+        const toolName = button.dataset.tool;
         button.disabled = true;
+        if (toolName === "webplayer_favorite_current_track") {
+          setStatus("Adding to favorites…", "loading", 0);
+        }
         try {
-          const toolName = button.dataset.tool;
           const args = JSON.parse(button.dataset.args || "{}");
           const payload = await callTool(toolName, args);
+          const actionError = loadActionError(payload);
           if (toolName === "webplayer_favorite_current_track") {
             const root = payload && typeof payload === "object" ? payload : {};
             const stdout = parseKeyValueLines(String(root.stdout || ""));
@@ -5267,14 +5672,20 @@ class WebPlayerMcpRequestService:
               setFavoriteButtonState("liked");
             }
           }
-          setStatus(summarizeAction(toolName, payload));
+          setStatus(summarizeAction(toolName, payload), actionError ? "error" : "success");
           if (toolName === "webplayer_now_playing") {
             updateNowPlaying(payload);
           } else {
             await refreshNowPlaying();
           }
         } catch (error) {
-          setStatus(String(error), "error");
+          const errorMessage = error instanceof Error ? error.message : String(error);
+          setStatus(
+            toolName === "webplayer_favorite_current_track"
+              ? `Favorite failed: ${errorMessage}`
+              : errorMessage,
+            "error",
+          );
         } finally {
           button.disabled = false;
         }
