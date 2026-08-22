@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import ast
 import json
+import threading
+import urllib.request
+from http.server import ThreadingHTTPServer
 
-from ALDE.alde.webplayer_mcp_server import TidalApiService, WebPlayerMcpRequestService
+from ALDE.alde.webplayer_mcp_server import McpHttpRequestHandler, TidalApiService, WebPlayerMcpRequestService
 
 
 def test_tools_list_contains_required_webplayer_tools() -> None:
@@ -16,6 +20,8 @@ def test_tools_list_contains_required_webplayer_tools() -> None:
     assert "webplayer_forward" in names
     assert "webplayer_backward" in names
     assert "webplayer_now_playing" in names
+    assert "webplayer_favorite_current_track" in names
+    assert "webplayer_volume_adjust" in names
     assert "webplayer_search" in names
     assert "webplayer_search_play" in names
     assert "webplayer_playlist_play" in names
@@ -44,6 +50,71 @@ def test_search_play_tool_exposes_cdp_autoclick_parameters() -> None:
     assert "cdp_autoclick" in properties
     assert "cdp_port" in properties
     assert "cdp_click_timeout_s" in properties
+
+
+def test_favorite_tool_exposes_wait_for_player_parameter() -> None:
+    service = WebPlayerMcpRequestService()
+    payload = service.dispatch_object({"method": "tools/list", "params": {}})
+    tools = payload.get("result", {}).get("tools", [])
+
+    favorite_definition = None
+    for tool_definition in tools:
+        function_definition = tool_definition.get("function") or {}
+        if function_definition.get("name") == "webplayer_favorite_current_track":
+            favorite_definition = function_definition
+            break
+
+    assert favorite_definition is not None
+    properties = (favorite_definition.get("parameters") or {}).get("properties") or {}
+    assert "playback_backend" in properties
+    assert "wait_for_player_s" in properties
+    assert "track_id" in properties
+    assert "country_code" in properties
+    assert "cdp_port" not in properties
+    assert "cdp_click_timeout_s" not in properties
+
+
+def test_volume_tool_exposes_volume_target_parameter() -> None:
+    service = WebPlayerMcpRequestService()
+    payload = service.dispatch_object({"method": "tools/list", "params": {}})
+    tools = payload.get("result", {}).get("tools", [])
+
+    volume_definition = None
+    for tool_definition in tools:
+        function_definition = tool_definition.get("function") or {}
+        if function_definition.get("name") == "webplayer_volume_adjust":
+            volume_definition = function_definition
+            break
+
+    assert volume_definition is not None
+    properties = (volume_definition.get("parameters") or {}).get("properties") or {}
+    playback_backend = properties.get("playback_backend") or {}
+    assert playback_backend.get("default") == "browser"
+    assert playback_backend.get("enum") == ["browser", "api_only", "api"]
+    volume_target = properties.get("volume_target") or {}
+    assert volume_target.get("default") == "browser"
+    assert volume_target.get("enum") == ["browser", "system"]
+
+
+def test_search_tool_exposes_api_only_country_code_parameter() -> None:
+    service = WebPlayerMcpRequestService()
+    payload = service.dispatch_object({"method": "tools/list", "params": {}})
+    tools = payload.get("result", {}).get("tools", [])
+
+    search_definition = None
+    for tool_definition in tools:
+        function_definition = tool_definition.get("function") or {}
+        if function_definition.get("name") == "webplayer_search":
+            search_definition = function_definition
+            break
+
+    assert search_definition is not None
+    properties = (search_definition.get("parameters") or {}).get("properties") or {}
+    playback_backend = properties.get("playback_backend") or {}
+    assert playback_backend.get("default") == "browser"
+    assert playback_backend.get("enum") == ["browser", "api_only", "api"]
+    country_code = properties.get("country_code") or {}
+    assert country_code.get("default") == "DE"
 
 
 def test_tools_call_routes_tidal_api_tool_to_tidal_service() -> None:
@@ -139,6 +210,21 @@ def test_tidal_api_request_merges_credentials_from_environment(monkeypatch) -> N
     assert request_object.headers["X-Test"] == "1"
 
 
+def test_tidal_api_request_uses_default_public_token_when_env_missing(monkeypatch) -> None:
+    monkeypatch.delenv("WEBPLAYER_MCP_TIDAL_AUTHORIZATION", raising=False)
+    monkeypatch.delenv("WEBPLAYER_MCP_TIDAL_X_TIDAL_TOKEN", raising=False)
+
+    service = TidalApiService()
+    request_object = service.load_object_request(
+        object_name="tidal_api_request",
+        arguments={
+            "url": "https://tidal.com/v1/ping",
+        },
+    )
+
+    assert request_object.headers["x-tidal-token"] == "CzET4vdadNUFQ5JU"
+
+
 def test_tools_call_rejects_missing_search_query() -> None:
     service = WebPlayerMcpRequestService()
     payload = service.dispatch_object(
@@ -155,6 +241,44 @@ def test_tools_call_rejects_missing_search_query() -> None:
     result_payload = json.loads(content)
     assert result_payload["ok"] is False
     assert "missing_query" in result_payload.get("stdout", "")
+
+
+def test_tools_call_rejects_browser_control_in_api_only_mode() -> None:
+    service = WebPlayerMcpRequestService()
+    payload = service.dispatch_object(
+        {
+            "method": "tools/call",
+            "params": {
+                "name": "webplayer_play",
+                "arguments": {"playback_backend": "api_only"},
+            },
+        }
+    )
+
+    content = payload.get("result", {}).get("content")
+    result_payload = json.loads(content)
+    assert result_payload["ok"] is False
+    assert "unsupported_api_only" in result_payload.get("stdout", "")
+    assert "playback_backend=api_only" in result_payload.get("stdout", "")
+    assert "object_name=webplayer_play" in result_payload.get("stdout", "")
+
+
+def test_tools_call_rejects_api_only_favorite_without_track_id() -> None:
+    service = WebPlayerMcpRequestService()
+    payload = service.dispatch_object(
+        {
+            "method": "tools/call",
+            "params": {
+                "name": "webplayer_favorite_current_track",
+                "arguments": {"playback_backend": "api_only"},
+            },
+        }
+    )
+
+    content = payload.get("result", {}).get("content")
+    result_payload = json.loads(content)
+    assert result_payload["ok"] is False
+    assert "missing_track_id_api_only" in result_payload.get("stdout", "")
 
 
 def test_tools_call_rejects_missing_search_play_query() -> None:
@@ -279,7 +403,95 @@ def test_jsonrpc_webplayer_resource_is_mcp_app_mini_controls() -> None:
     content = payload["result"]["contents"][0]
     assert content["mimeType"] == "text/html;profile=mcp-app"
     assert "window.mcp.callTool" in content["text"]
+    assert "webplayer_favorite_current_track" in content["text"]
+    assert "id=\"favoriteButton\"" in content["text"]
+    assert "danger.is-active" in content["text"]
+    assert 'class="favorite-icon"' in content["text"]
+    assert ".favorite-icon path" in content["text"]
+    assert ".icon-button.danger.is-active .favorite-icon path" in content["text"]
+    assert "id=\"playToggleButton\"" in content["text"]
+    assert '"wait_for_player_s":2' in content["text"]
+    assert "webplayer_volume_adjust" in content["text"]
+    assert "volumeModeBrowser" in content["text"]
+    assert "volumeModeSystem" in content["text"]
+    assert "id=\"metaQuality\"" in content["text"]
+    assert "id=\"metaBitrate\"" in content["text"]
     assert "webplayer_backward" in content["text"]
+    assert "<svg" in content["text"]
+    assert "marquee-track" in content["text"]
+    assert content["text"].index('data-tool="webplayer_favorite_current_track"') < content["text"].index('id="playToggleButton"')
+    assert 'data-tool="webplayer_stop"' not in content["text"]
+    assert "JSON.stringify(result)" not in content["text"]
+
+
+def test_webplayer_http_fallback_serves_mini_controls_html() -> None:
+    server = ThreadingHTTPServer(("127.0.0.1", 0), McpHttpRequestHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+
+    try:
+        port = int(server.server_address[1])
+        for path in ("/ui/webplayer/mini-controls", "/ui/webplayer/mini-controls.html"):
+            with urllib.request.urlopen(f"http://127.0.0.1:{port}{path}") as response:
+                body = response.read().decode("utf-8")
+                content_type = response.headers.get_content_type()
+                cache_control = str(response.headers.get("Cache-Control") or "")
+                pragma = str(response.headers.get("Pragma") or "")
+
+            assert response.status == 200
+            assert content_type == "text/html"
+            assert "no-store" in cache_control
+            assert "no-cache" in cache_control
+            assert pragma == "no-cache"
+            assert "WebPlayer Mini Controls" in body
+            assert "<svg" in body
+            assert "marquee-track" in body
+            assert "webplayer_favorite_current_track" in body
+            assert "id=\"favoriteButton\"" in body
+            assert "danger.is-active" in body
+            assert 'class="favorite-icon"' in body
+            icon_button_style = body.split(".icon-button {", 1)[1].split("}", 1)[0]
+            assert "border: 0;" in icon_button_style
+            assert "background: transparent;" in icon_button_style
+            assert "box-shadow: none;" in icon_button_style
+            inactive_heart_style = body.split(".favorite-icon path {", 1)[1].split("}", 1)[0]
+            active_heart_style = body.split(
+                ".icon-button.danger.is-active .favorite-icon path {",
+                1,
+            )[1].split("}", 1)[0]
+            assert "fill: transparent;" in inactive_heart_style
+            assert "fill: currentColor;" in active_heart_style
+            assert "id=\"playToggleButton\"" in body
+            assert body.index('data-tool="webplayer_favorite_current_track"') < body.index('id="playToggleButton"')
+            assert 'data-tool="webplayer_stop"' not in body
+            assert '"wait_for_player_s":2' in body
+            assert "webplayer_volume_adjust" in body
+            assert "volumeModeBrowser" in body
+            assert "volumeModeSystem" in body
+            assert "id=\"metaQuality\"" in body
+            assert "id=\"metaBitrate\"" in body
+            assert "id=\"albumArtwork\"" in body
+            assert "id=\"metaBpm\"" in body
+            assert "id=\"metaKey\"" in body
+            assert "Bit/Hz: none" in body
+            assert "parseSynchronizedLyrics" in body
+            assert "lyrics_subtitles_base64" in body
+            assert "window.setInterval(updateLyricsMarquee, 500)" in body
+            assert "updateFavoriteButtonTarget" in body
+            assert 'playback_backend: "api_only"' in body
+            assert "track_id: normalizedTrackId" in body
+            assert "hasBitDepthSampleRate" in body
+            update_now_playing_script = body.split("function updateNowPlaying", 1)[1].split(
+                "function summarizeAction",
+                1,
+            )[0]
+            assert "const trackId =" in update_now_playing_script
+            assert "const countryCode =" in update_now_playing_script
+            assert "JSON.stringify(result)" not in body
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
 
 
 def test_jsonrpc_tools_call_returns_spec_content_blocks() -> None:
@@ -304,6 +516,254 @@ def test_jsonrpc_tools_call_returns_spec_content_blocks() -> None:
     assert isinstance(content[0]["text"], str)
     assert isinstance(result["structuredContent"], dict)
     assert result["isError"] is True
+
+
+def test_webplayer_favorite_and_volume_commands_are_built() -> None:
+    service = WebPlayerMcpRequestService()
+    supported_actions = service.player_service.load_supported_actions()
+    assert "webplayer_favorite_current_track" in supported_actions
+    assert "webplayer_volume_adjust" in supported_actions
+
+    favorite_command = service.player_service._load_favorite_current_track_command(  # noqa: SLF001
+        player_selector="chromium",
+        arguments={"wait_for_player_s": 2},
+    )
+    assert "api.tidal.com/v1/sessions" in favorite_command
+    assert "api.tidal.com/v1/search?" in favorite_command
+    assert "listen.tidal.com/v1/search?" in favorite_command
+    assert "countryCode" in favorite_command
+    assert "userCollectionTracks/me/relationships/items" in favorite_command
+    assert "Object.keys(localStorage)" in favorite_command
+    assert "refreshToken" in favorite_command
+    assert "clientSecret" in favorite_command
+    assert "oauth2/token" in favorite_command
+    assert "tidal_headers_final" in favorite_command
+    assert "tidal_public_headers" in favorite_command
+    assert "headers = tidal_headers_final(access_token)" in favorite_command
+    assert '"Be" "arer " + access_token' in favorite_command
+    assert '"metadata", "xesam:url"' in favorite_command
+    assert "mpris:trackid" in favorite_command
+    assert 're.search(r"/track/([0-9]+)", url_value)' in favorite_command
+    assert "def load_track_id_from_cache" in favorite_command
+    assert '"Cache" / "Cache_Data"' in favorite_command
+    assert 'emit(f"track_id_source={track_id_source or \'unknown\'}")' in favorite_command
+    assert "token_browser_user_mismatch" in favorite_command
+    assert "favorite_state=liked" in favorite_command
+    assert "favorite_backend=api" in favorite_command
+    assert "favorite_backend=cdp" in favorite_command
+    assert "_run_cdp_favorite_click" in favorite_command
+    assert "load_stream_quality_via_relationship_items" in favorite_command
+    assert "stream_quality_source=" in favorite_command
+    assert 'emit(f"quality={quality_value}")' in favorite_command
+    assert 'emit(f"bitrate={bitrate_value}")' in favorite_command
+    assert "openapi_tracks_mediaTags_via_relationship_items" in favorite_command
+    assert '"page[size]": 100' in favorite_command
+    assert '"filter[id]": track_id' not in favorite_command
+    assert 'button[data-test="footer-favorite-button"]' in favorite_command
+    assert 'button[data-test="add-to-favorites-button"]' in favorite_command
+    assert "state.textContent" in favorite_command
+    assert "aus meiner musik entfernen" in favorite_command
+    assert "remove from my collection" in favorite_command
+    assert 'button[aria-label*="Add to playlist" i]' not in favorite_command
+    assert "load_access_token_for_browser_user" in favorite_command
+    assert "token_user_alignment=browser_user_match" in favorite_command
+    assert "load_browser_favorites_snapshot" in favorite_command
+    assert "update_session_environment" in favorite_command
+    assert "favorite_verify_source=" in favorite_command
+    assert "favorite_verified=" in favorite_command
+    assert "favorite_verify_openapi_status=" in favorite_command
+    assert "favorite_verify_ids_status=" in favorite_command
+    assert "account_alignment_required=" in favorite_command
+    assert "favorite_target_collection_user_id=" in favorite_command
+    assert "if not token_browser_user_mismatch and track_id in browser_favorite_track_ids" in favorite_command
+    assert 'emit("favorite_state=unknown")' not in favorite_command
+    assert 'emit(f"favorite_result=token_user_{favorite_result}")' not in favorite_command
+    assert "openapi_userCollectionTracks_me" in favorite_command
+    assert "openapi_write_conflict" in favorite_command
+    assert "v1_favorites_ids" in favorite_command
+    assert "WEBPLAYER_TOKEN_USER_ID" in favorite_command
+    assert "token_user_env_file=" in favorite_command
+    assert "session-env" in favorite_command
+    assert "TidalOAuthTokenService" in favorite_command
+    assert "TIDAL_API_TOKEN_FILE" in favorite_command
+    assert 'source_profile.parent / "Local State"' in favorite_command
+    assert 'b"AuthDB/" in child.read_bytes()' not in favorite_command
+    assert 'subprocess.run(["playerctl", "-l"]' in favorite_command
+    assert "CzET4vdadNUFQ5JU" in favorite_command
+    assert "WEBPLAYER_CDP_PORT=" in favorite_command
+    assert "WEBPLAYER_CDP_CLICK_TIMEOUT_S=" in favorite_command
+
+    volume_command = service.player_service._load_volume_adjust_command(  # noqa: SLF001
+        player_selector="chromium",
+        arguments={"delta_percent": 5},
+    )
+    assert "pactl set-sink-input-volume" in volume_command
+    assert "pactl set-sink-volume @DEFAULT_SINK@" in volume_command
+    assert "volume_target=browser" in volume_command
+    assert "LC_ALL=C pactl list sink-inputs" in volume_command
+    assert 'application\\.name = "Chromium"' in volume_command
+    assert "volume_adjustment" in volume_command
+    assert "sink_input_id" in volume_command
+    assert "pactl_missing" in volume_command
+    assert "delta_percent=5" in volume_command
+
+
+def test_webplayer_track_metadata_helpers_normalize_quality_and_audio_format() -> None:
+    service = WebPlayerMcpRequestService()
+    helper_namespace: dict[str, object] = {}
+    exec(service.player_service._load_track_metadata_helpers_script(), helper_namespace)  # noqa: S102, SLF001
+
+    normalize_quality = helper_namespace["normalize_stream_quality"]
+    load_audio_format = helper_namespace["load_audio_format_reference"]
+    load_artwork_url = helper_namespace["load_artwork_url"]
+
+    assert callable(normalize_quality)
+    assert normalize_quality(["LOSSLESS", "HIRES_LOSSLESS"]) == "HI_RES_LOSSLESS"
+    assert normalize_quality("HI_RES") == "HI_RES_LOSSLESS"
+    assert normalize_quality("MASTER") == "HI_RES_LOSSLESS"
+    assert normalize_quality("unknown") == "none"
+    assert callable(load_audio_format)
+    assert load_audio_format("LOSSLESS") == ("16", "44.1", "16/44.1 kHz")
+    assert load_audio_format("HIRES_LOSSLESS") == ("24", "192", "24/192 kHz")
+    assert callable(load_artwork_url)
+    assert load_artwork_url("903a2cb9-f702-43cf-a643-eb659fc381e8") == (
+        "https://resources.tidal.com/images/903a2cb9/f702/43cf/a643/eb659fc381e8/320x320.jpg"
+    )
+
+
+def test_webplayer_now_playing_command_exposes_rich_track_metadata() -> None:
+    service = WebPlayerMcpRequestService()
+    now_playing_command = service.player_service._load_now_playing_command(  # noqa: SLF001
+        player_selector="chromium"
+    )
+
+    assert "load_stream_quality_via_relationship_items" in now_playing_command
+    assert "stream_quality_source=" in now_playing_command
+    assert 'emit(f"quality={quality_value}")' in now_playing_command
+    assert 'emit(f"bitrate={bitrate_value}")' in now_playing_command
+    assert "load_quality_bitrate_reference" in now_playing_command
+    assert "openapi_tracks_mediaTags_via_relationship_items" in now_playing_command
+    assert "normalize_stream_quality" in now_playing_command
+    assert "HI_RES_LOSSLESS" in now_playing_command
+    assert "load_tidal_track_metadata" in now_playing_command
+    assert "load_playback_context_metadata" in now_playing_command
+    assert "load_track_id_from_public_search" in now_playing_command
+    assert 'track_id_source = "public_search"' in now_playing_command
+    assert 'emit(f"track_id_source={track_id_source or \'unknown\'}")' in now_playing_command
+    assert "albums.coverArt,lyrics" in now_playing_command
+    assert "/playbackinfopostpaywall?" in now_playing_command
+    assert "audioSamplingRate" in now_playing_command
+    assert "lyrics_text_base64" in now_playing_command
+    assert "lyrics_subtitles_base64" in now_playing_command
+    assert 'emit(f"bit_depth={bit_depth}")' in now_playing_command
+    assert 'emit(f"sample_rate_khz={sample_rate_khz}")' in now_playing_command
+    assert 'emit(f"artwork_url={artwork_url}")' in now_playing_command
+    assert 'emit(f"country_code={country_code}")' in now_playing_command
+    assert '"bpm",' in now_playing_command
+    assert '"musical_key",' in now_playing_command
+    assert '"api_relationship_items"' in now_playing_command
+
+    script = now_playing_command.split("python3 - <<'PY'\n", 1)[1].rsplit("\nPY", 1)[0]
+    compile(script, "<webplayer_now_playing>", "exec")
+
+
+def test_webplayer_api_only_commands_are_built() -> None:
+    service = WebPlayerMcpRequestService()
+
+    unsupported_play_command = service.player_service.load_object_command(  # noqa: SLF001
+        object_name="webplayer_play",
+        query=None,
+        player_selector="chromium",
+        arguments={"playback_backend": "api_only"},
+    )
+    assert "unsupported_api_only" in unsupported_play_command
+    assert "object_name=webplayer_play" in unsupported_play_command
+
+    search_command = service.player_service.load_object_command(  # noqa: SLF001
+        object_name="webplayer_search",
+        query="Muse",
+        player_selector="chromium",
+        arguments={"playback_backend": "api_only", "query": "Muse"},
+    )
+    assert "listen.tidal.com/v1/search" in search_command
+    assert "search_backend=api_only" in search_command
+    assert "WEBPLAYER_SEARCH_QUERY=" in search_command
+    assert "WEBPLAYER_COUNTRY_CODE=" in search_command
+    assert "xdg-open" not in search_command
+
+    favorite_command = service.player_service.load_object_command(  # noqa: SLF001
+        object_name="webplayer_favorite_current_track",
+        query=None,
+        player_selector="chromium",
+        arguments={"playback_backend": "api_only", "track_id": "12345", "country_code": "DE"},
+    )
+    assert "userCollectionTracks/me/relationships/items" in favorite_command
+    assert "favorite_backend=api_only" in favorite_command
+    assert "load_stream_quality_via_relationship_items" in favorite_command
+    assert "stream_quality_source=" in favorite_command
+    assert 'emit(f"quality={quality_value}")' in favorite_command
+    assert 'emit(f"bitrate={bitrate_value}")' in favorite_command
+    assert "openapi_tracks_mediaTags_via_relationship_items" in favorite_command
+    assert "WEBPLAYER_TRACK_ID=" in favorite_command
+    assert "WEBPLAYER_COUNTRY_CODE=" in favorite_command
+    assert "error=playerctl_missing" not in favorite_command
+
+
+def test_webplayer_favorite_command_embedded_python_script_compiles() -> None:
+    service = WebPlayerMcpRequestService()
+    favorite_command = service.player_service._load_favorite_current_track_command(  # noqa: SLF001
+        player_selector="chromium",
+        arguments={"wait_for_player_s": 2},
+    )
+    script = favorite_command.split("python3 - <<'PY'\n", 1)[1].rsplit("\nPY", 1)[0]
+    compile(script, "<webplayer_favorite_current_track>", "exec")
+
+
+def test_webplayer_favorite_command_does_not_pass_check_to_popen() -> None:
+    service = WebPlayerMcpRequestService()
+    favorite_command = service.player_service._load_favorite_current_track_command(  # noqa: SLF001
+        player_selector="chromium",
+        arguments={"wait_for_player_s": 2},
+    )
+    script = favorite_command.split("python3 - <<'PY'\n", 1)[1].rsplit("\nPY", 1)[0]
+    module = ast.parse(script)
+    popen_calls = [
+        node
+        for node in ast.walk(module)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "subprocess"
+        and node.func.attr == "Popen"
+    ]
+    assert popen_calls
+    for call in popen_calls:
+        assert all(keyword.arg != "check" for keyword in call.keywords if keyword.arg is not None)
+
+
+def test_webplayer_favorite_uses_long_running_timeout_override() -> None:
+    class CommandServiceStub:
+        def __init__(self) -> None:
+            self.command_timeout_s: int | None = None
+
+        def run_object(self, *, object_name: str, command: str, command_timeout_s: int | None = None):  # noqa: ANN001
+            self.command_timeout_s = command_timeout_s
+
+            class Result:
+                def to_payload(self) -> dict[str, object]:
+                    return {"object_name": object_name, "ok": True, "stdout": "", "stderr": ""}
+
+            return Result()
+
+    command_service = CommandServiceStub()
+    service = WebPlayerMcpRequestService()
+    service.player_service.command_service = command_service
+    service.player_service.dispatch_object(
+        object_name="webplayer_favorite_current_track",
+        player_selector="chromium",
+        arguments={"wait_for_player_s": 2, "command_timeout_s": 90},
+    )
+    assert command_service.command_timeout_s == 90
 
 
 def test_jsonrpc_webplayer_rejects_unsupported_protocol_version() -> None:
