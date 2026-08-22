@@ -90,6 +90,10 @@ request, validates its Bearer token through `/v1/sessions`, stores it atomically
 with mode `0600`, and closes the temporary tab.
 The volume buttons operate on the active Chromium sink-input via `pactl` so they
 actually change the audible browser stream; `playerctl` remains a fallback path.
+Library playback navigates the existing authenticated Chromium CDP tab before
+clicking playback controls. The current TIDAL tracks-collection route is
+`https://tidal.com/my-collection/tracks`; `favorites_tracks` and
+`my_collection_tracks` both resolve to this route.
 When inline rendering is unavailable, the same app can be delivered on localhost via
 TCP transport using `127.0.0.1:8765` and the `webplayer_mcp_8765.service` unit.
 The network server supports browser `OPTIONS` preflight and advertises the

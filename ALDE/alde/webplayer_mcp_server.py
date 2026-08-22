@@ -436,12 +436,12 @@ class TidalApiService:
 
 class WebPlayerService:
     _LIBRARY_SECTION_URLS = {
-        "favorites_tracks": "https://listen.tidal.com/browse/favorites/tracks",
-        "favorites_albums": "https://listen.tidal.com/browse/favorites/albums",
-        "favorites_playlists": "https://listen.tidal.com/browse/favorites/playlists",
-        "my_collection_tracks": "https://listen.tidal.com/browse/my-collection/tracks",
-        "history": "https://listen.tidal.com/browse/history",
-        "home": "https://listen.tidal.com/",
+        "favorites_tracks": "https://tidal.com/my-collection/tracks",
+        "favorites_albums": "https://tidal.com/my-collection/albums",
+        "favorites_playlists": "https://tidal.com/my-collection/playlists",
+        "my_collection_tracks": "https://tidal.com/my-collection/tracks",
+        "history": "https://tidal.com/browse/history",
+        "home": "https://tidal.com/",
     }
     _PLAYBACK_METADATA_ACTIONS = {
         "webplayer_play",
@@ -4114,8 +4114,7 @@ class WebPlayerService:
             + shlex.quote(str(query or ""))
             + f" CDP_PORT={int(cdp_port)} CDP_CLICK_TIMEOUT_S={int(cdp_click_timeout_s)} "
         )
-        cdp_script = '''
-python3 - <<'PY'
+        cdp_script = '''python3 - <<'PY'
 import asyncio
 import json
 import os
@@ -4294,6 +4293,84 @@ PY
 '''
         return env_prefix + cdp_script + " "
 
+    def _load_cdp_navigate_command(self, *, target_url: str, cdp_port: int) -> str:
+        env_prefix = (
+            "CDP_NAVIGATE_URL="
+            + shlex.quote(str(target_url or ""))
+            + f" CDP_PORT={int(cdp_port)} "
+        )
+        cdp_script = '''python3 - <<'PY'
+import asyncio
+import json
+import os
+import urllib.request
+
+try:
+    import websockets
+except Exception:
+    print('error=cdp_websockets_missing')
+    raise SystemExit(10)
+
+target_url = str(os.environ.get('CDP_NAVIGATE_URL') or '').strip()
+cdp_port = int(str(os.environ.get('CDP_PORT') or '9222'))
+
+async def run() -> int:
+    if not target_url:
+        print('error=cdp_navigate_url_missing')
+        return 11
+    with urllib.request.urlopen(f'http://127.0.0.1:{cdp_port}/json/list', timeout=5) as response:
+        targets = json.loads(response.read().decode('utf-8', errors='replace'))
+    page_targets = [
+        target
+        for target in targets
+        if str(target.get('type') or '') == 'page'
+        and str(target.get('webSocketDebuggerUrl') or '').strip()
+    ]
+    tidal_targets = [
+        target
+        for target in page_targets
+        if 'tidal.com' in str(target.get('url') or '').casefold()
+    ]
+    selected_target = tidal_targets[0] if tidal_targets else (page_targets[0] if page_targets else None)
+    if selected_target is None:
+        print('error=cdp_no_page_target')
+        return 12
+
+    async with websockets.connect(
+        str(selected_target.get('webSocketDebuggerUrl') or ''),
+        max_size=8_000_000,
+    ) as websocket:
+        await websocket.send(
+            json.dumps(
+                {
+                    'id': 1,
+                    'method': 'Page.navigate',
+                    'params': {'url': target_url},
+                }
+            )
+        )
+        while True:
+            message = json.loads(await websocket.recv())
+            if message.get('id') != 1:
+                continue
+            result = message.get('result') or {}
+            error_text = str(result.get('errorText') or '').strip()
+            if error_text:
+                print('error=cdp_navigate_failed:' + error_text)
+                return 13
+            print('cdp_navigated=true')
+            print('opened_url=' + target_url)
+            return 0
+
+try:
+    raise SystemExit(asyncio.run(run()))
+except Exception as exc:
+    print('error=cdp_navigate_exception:' + str(exc))
+    raise SystemExit(14)
+PY
+'''
+        return env_prefix + cdp_script + " "
+
     def _load_open_url_and_play_command(
         self,
         *,
@@ -4312,6 +4389,17 @@ PY
             target_url=target_url,
             log_file_path="/tmp/webplayer_mcp_target.log",
             allow_xdg_open_fallback=False,
+        )
+        cdp_navigate_command = self._load_cdp_navigate_command(
+            target_url=target_url,
+            cdp_port=cdp_port,
+        )
+        open_or_navigate_command = (
+            cdp_navigate_command
+            + " cdp_navigate_exit_code=$?; "
+            + "if [ \"$cdp_navigate_exit_code\" -ne 0 ]; then "
+            + open_command
+            + " fi; "
         )
         initial_play_command = self._load_play_retry_command(
             player_selector=player_selector,
@@ -4339,7 +4427,7 @@ PY
 
         if not cdp_autoclick:
             return (
-                open_command
+                open_or_navigate_command
                 + f" sleep {wait_for_page_s}; "
                 + initial_play_command
                 + " "
@@ -4362,7 +4450,7 @@ PY
         )
 
         return (
-            open_command
+            open_or_navigate_command
             + f" sleep {wait_for_page_s}; "
             + "if ! command -v playerctl >/dev/null 2>&1; then "
             + cdp_click_command

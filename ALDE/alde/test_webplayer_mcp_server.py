@@ -808,6 +808,25 @@ def test_browser_access_token_service_parses_and_stores_validated_token(tmp_path
     assert token_path.stat().st_mode & 0o777 == 0o600
 
 
+def test_webplayer_library_tracks_use_current_route_and_existing_cdp_tab() -> None:
+    service = WebPlayerMcpRequestService()
+    library_command = service.player_service.load_object_command(  # noqa: SLF001
+        object_name="webplayer_library_play",
+        query=None,
+        player_selector="chromium",
+        arguments={"section": "my_collection_tracks", "cdp_port": 9222},
+    )
+
+    assert "https://tidal.com/my-collection/tracks" in library_command
+    assert "my-collections/tracks" not in library_command
+    assert "CDP_NAVIGATE_URL=" in library_command
+    assert "CDP_PORT=9222 python3 - <<'PY'" in library_command
+    assert "'method': 'Page.navigate'" in library_command
+    assert "cdp_navigated=true" in library_command
+    assert "cdp_navigate_exit_code=$?" in library_command
+    assert 'button[data-test*="play" i]' in library_command
+
+
 def test_browser_access_token_service_processes_queued_cdp_header(tmp_path: Path) -> None:
     service = WebPlayerMcpRequestService()
 
