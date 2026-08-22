@@ -1,5 +1,5 @@
 [Unit]
-Description=Standalone WebPlayer MCP Server (HTTP)
+Description=Standalone WebPlayer MCP Server (TCP localhost)
 After=network.target
 
 [Service]
@@ -7,7 +7,7 @@ Type=simple
 WorkingDirectory=%h/Vs_Code_Projects/Projects/ALDE_Projekt
 Environment=PYTHONPATH=%h/Vs_Code_Projects/Projects/ALDE_Projekt/ALDE
 EnvironmentFile=-%h/.config/systemd/user/webplayer_mcp.env
-ExecStart=/usr/bin/python3 -m alde.webplayer_mcp_server --transport http --host 0.0.0.0 --port 8766
+ExecStart=/usr/bin/python3 -m alde.webplayer_mcp_server --transport tcp --host 127.0.0.1 --port 8765
 Restart=always
 RestartSec=2
 

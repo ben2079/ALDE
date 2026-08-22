@@ -11,6 +11,41 @@ def test_initialize_exposes_prompt_capability() -> None:
     assert "prompts" in capabilities
 
 
+def test_jsonrpc_initialize_selects_requested_supported_protocol_version() -> None:
+    service = McpRequestService()
+    payload = service.dispatch_object(
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {"protocolVersion": "2026-07-28"},
+        }
+    )
+
+    assert payload.get("result", {}).get("protocolVersion") == "2026-07-28"
+
+
+def test_jsonrpc_initialize_defaults_to_latest_supported_protocol_version() -> None:
+    service = McpRequestService()
+    payload = service.dispatch_object({"jsonrpc": "2.0", "id": 3, "method": "initialize", "params": {}})
+
+    assert payload.get("result", {}).get("protocolVersion") == "2026-07-28"
+
+
+def test_jsonrpc_initialize_rejects_unsupported_protocol_version() -> None:
+    service = McpRequestService()
+    payload = service.dispatch_object(
+        {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "initialize",
+            "params": {"protocolVersion": "9999-01-01"},
+        }
+    )
+
+    assert payload.get("error", {}).get("code") == -32602
+
+
 def test_prompts_list_contains_strategy_prompts() -> None:
     service = McpRequestService()
     payload = service.dispatch_object({"method": "prompts/list", "params": {}})

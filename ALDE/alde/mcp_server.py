@@ -42,6 +42,13 @@ class McpRequestService:
         ("prompts.md", "PROMPTS.md"),
         ("ifaai_guideline.md", "IFAAI_GUIDELINE.md"),
     )
+    _SUPPORTED_PROTOCOL_VERSIONS = ("2026-07-28", "2025-03-26")
+    _UI_EXTENSION_NAME = "io.modelcontextprotocol/ui"
+    _UI_RESOURCE_URI = "ui://alde/operator-console.html"
+    _UI_RESOURCE_MIME_TYPE = "text/html"
+
+    def __init__(self) -> None:
+        self._ui_enabled = False
 
     def _workspace_root_path(self) -> Path:
         # mcp_server.py lives in ALDE/alde; the workspace root is two levels above ALDE.
@@ -274,15 +281,56 @@ class McpRequestService:
             except Exception:
                 return "<unserializable>"
 
-    def load_initialize_result(self, _params: Dict[str, Any]) -> dict[str, Any]:
+    @staticmethod
+    def _load_csv_values(raw_value: Any) -> list[str]:
+        if isinstance(raw_value, list):
+            return [str(item).strip() for item in raw_value if str(item).strip()]
+        return [item.strip() for item in str(raw_value or "").split(",") if item.strip()]
+
+    def _load_ui_extension_requested(self, params: Dict[str, Any]) -> bool:
+        capabilities = params.get("capabilities")
+        if isinstance(capabilities, dict):
+            extensions = capabilities.get("extensions")
+            if isinstance(extensions, dict) and self._UI_EXTENSION_NAME in extensions:
+                return True
+            experimental = capabilities.get("experimental")
+            if isinstance(experimental, dict) and self._UI_EXTENSION_NAME in experimental:
+                return True
+        meta = params.get("_meta")
+        if isinstance(meta, dict):
+            extensions = self._load_csv_values(meta.get("io.modelcontextprotocol/extensions"))
+            if self._UI_EXTENSION_NAME in extensions:
+                return True
+        return str(os.getenv("ALDE_MCP_UI_EXTENSION_DEFAULT") or "").strip().casefold() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+
+    def _load_server_capabilities_payload(self, *, ui_enabled: bool = False) -> dict[str, Any]:
+        capabilities: dict[str, Any] = {"tools": {}, "prompts": {}}
+        if ui_enabled:
+            capabilities["resources"] = {"listChanged": False}
+            capabilities["extensions"] = {self._UI_EXTENSION_NAME: {"resourceUri": self._UI_RESOURCE_URI}}
+        return capabilities
+
+    def _load_requested_protocol_version(self, params: Dict[str, Any]) -> str:
+        requested_version = str(params.get("protocolVersion") or "").strip()
+        if not requested_version:
+            return "2026-07-28"
+        if requested_version not in self._SUPPORTED_PROTOCOL_VERSIONS:
+            raise ValueError(f"Unsupported protocol version: {requested_version}")
+        return requested_version
+
+    def load_initialize_result(self, params: Dict[str, Any]) -> dict[str, Any]:
         return {
             "result": {
-                "protocolVersion": "2025-03-26",
+                "protocolVersion": self._load_requested_protocol_version(params),
                 "serverInfo": {"name": "alde-local-mcp"},
-                "capabilities": {
-                    "tools": {},
-                    "prompts": {},
-                },
+                "capabilities": self._load_server_capabilities_payload(
+                    ui_enabled=self._load_ui_extension_requested(params)
+                ),
             }
         }
 
@@ -290,6 +338,65 @@ class McpRequestService:
         tool_registry = get_tool_registry()
         tools = [self.safe_serialize_object(spec) for _name, spec in tool_registry.items()]
         return {"result": {"tools": tools}}
+
+    def _load_mcp_tool_definitions(self, *, ui_enabled: bool) -> list[dict[str, Any]]:
+        definitions: list[dict[str, Any]] = []
+        for spec in get_tool_registry().values():
+            function = dict((spec or {}).get("function") or {})
+            name = str(function.get("name") or "").strip()
+            if not name:
+                continue
+            definition: dict[str, Any] = {
+                "name": name,
+                "title": name,
+                "description": str(function.get("description") or ""),
+                "inputSchema": function.get("parameters")
+                if isinstance(function.get("parameters"), dict)
+                else {"type": "object", "additionalProperties": False},
+            }
+            if ui_enabled:
+                definition["_meta"] = {"ui": {"resourceUri": self._UI_RESOURCE_URI}}
+            definitions.append(definition)
+        return definitions
+
+    def _load_ui_resource_markup(self) -> str:
+        return """<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ALDE MCP Operator Console</title>
+<style>body{font:14px system-ui,sans-serif;margin:12px;background:#f8fafc;color:#0f172a}
+.panel{border:1px solid #cbd5e1;border-radius:12px;padding:12px;background:#fff}
+button{margin-right:8px;border:1px solid #94a3b8;border-radius:8px;padding:6px 10px;cursor:pointer}
+#log{margin-top:10px;white-space:pre-wrap;max-height:220px;overflow:auto}</style></head>
+<body><div class="panel"><button id="prompts">prompts/list</button><button id="tools">tools/list</button>
+<pre id="log">Ready.</pre></div><script>
+const log=document.getElementById("log");
+async function request(method){if(!window.mcp||typeof window.mcp.request!=="function"){log.textContent="Host bridge unavailable (window.mcp.request missing).";return}
+try{log.textContent=JSON.stringify(await window.mcp.request({method,params:{}}),null,2)}catch(error){log.textContent=String(error)}}
+document.getElementById("prompts").onclick=()=>request("prompts/list");
+document.getElementById("tools").onclick=()=>request("tools/list");
+</script></body></html>"""
+
+    def load_resources_list_result(self, params: Dict[str, Any]) -> dict[str, Any]:
+        if not self._load_ui_extension_requested(params):
+            return {"result": {"resources": []}}
+        return {"result": {"resources": [{
+            "uri": self._UI_RESOURCE_URI,
+            "name": "alde-operator-console",
+            "title": "ALDE MCP Operator Console",
+            "description": "Compact MCP app UI for prompt and tool introspection.",
+            "mimeType": self._UI_RESOURCE_MIME_TYPE,
+        }]}}
+
+    def load_resources_read_result(self, params: Dict[str, Any]) -> dict[str, Any]:
+        if not self._load_ui_extension_requested(params):
+            return {"error": "ui_extension_not_enabled"}
+        if str(params.get("uri") or "").strip() != self._UI_RESOURCE_URI:
+            return {"error": "resource_not_found"}
+        return {"result": {"contents": [{
+            "uri": self._UI_RESOURCE_URI,
+            "mimeType": self._UI_RESOURCE_MIME_TYPE,
+            "text": self._load_ui_resource_markup(),
+        }]}}
 
     def load_tools_call_result(self, params: Dict[str, Any]) -> dict[str, Any]:
         name = params.get("name")
@@ -403,9 +510,96 @@ class McpRequestService:
             }
         }
 
+    @staticmethod
+    def _load_jsonrpc_error(*, request_id: Any, code: int, message: str) -> dict[str, Any]:
+        return {"jsonrpc": "2.0", "id": request_id, "error": {"code": code, "message": message}}
+
+    def _dispatch_jsonrpc_object(self, payload: dict[str, Any]) -> dict[str, Any]:
+        request_id = payload.get("id")
+        method = str(payload.get("method") or "").strip()
+        params = payload.get("params")
+        if not isinstance(params, dict):
+            params = {}
+        requested_ui_enabled = self._load_ui_extension_requested(params)
+        if method == "initialize":
+            try:
+                result = self.load_initialize_result(params).get("result") or {}
+            except ValueError as exc:
+                return self._load_jsonrpc_error(
+                    request_id=request_id,
+                    code=-32602,
+                    message=str(exc),
+                )
+            self._ui_enabled = requested_ui_enabled
+            result["supportedVersions"] = list(self._SUPPORTED_PROTOCOL_VERSIONS)
+        elif method == "server/discover":
+            result = {
+                "resultType": "complete",
+                "supportedVersions": list(self._SUPPORTED_PROTOCOL_VERSIONS),
+                "capabilities": self._load_server_capabilities_payload(ui_enabled=self._ui_enabled or requested_ui_enabled),
+            }
+        elif method == "tools/list":
+            result = {
+                "resultType": "complete",
+                "tools": self._load_mcp_tool_definitions(ui_enabled=self._ui_enabled or requested_ui_enabled),
+            }
+        elif method == "resources/list":
+            result = self.load_resources_list_result(
+                {"_meta": {"io.modelcontextprotocol/extensions": self._UI_EXTENSION_NAME}}
+                if self._ui_enabled or requested_ui_enabled
+                else params
+            ).get("result") or {}
+            result["resultType"] = "complete"
+        elif method == "resources/read":
+            legacy = self.load_resources_read_result(
+                {**params, "_meta": {"io.modelcontextprotocol/extensions": self._UI_EXTENSION_NAME}}
+                if self._ui_enabled or requested_ui_enabled
+                else params
+            )
+            if "error" in legacy:
+                return self._load_jsonrpc_error(
+                    request_id=request_id,
+                    code=-32001,
+                    message=str(legacy["error"]),
+                )
+            else:
+                result = legacy.get("result") or {}
+                result["resultType"] = "complete"
+        elif method == "tools/call":
+            legacy = self.load_tools_call_result(params)
+            if "error" in legacy:
+                return self._load_jsonrpc_error(
+                    request_id=request_id,
+                    code=-32602,
+                    message=str(legacy["error"]),
+                )
+            result = legacy.get("result") or {}
+        elif method == "prompts/list":
+            result = self.load_prompts_list_result(params).get("result") or {}
+            result["resultType"] = "complete"
+        elif method == "prompts/get":
+            legacy = self.load_prompts_get_result(params)
+            if "error" in legacy:
+                return self._load_jsonrpc_error(
+                    request_id=request_id,
+                    code=-32602,
+                    message=str(legacy["error"]),
+                )
+            result = legacy.get("result") or {}
+        else:
+            return self._load_jsonrpc_error(
+                request_id=request_id,
+                code=-32601,
+                message=f"Method not found: {method}",
+            )
+        return {"jsonrpc": "2.0", "id": request_id, "result": result}
+
     def dispatch_object(self, payload: Any) -> dict[str, Any]:
         if not isinstance(payload, dict):
             return {"error": "invalid_json"}
+
+        if payload.get("jsonrpc") == "2.0":
+            return self._dispatch_jsonrpc_object(payload)
 
         method = payload.get("method")
         params = payload.get("params", {})
@@ -415,6 +609,8 @@ class McpRequestService:
 
         handlers = {
             "initialize": self.load_initialize_result,
+            "resources/list": self.load_resources_list_result,
+            "resources/read": self.load_resources_read_result,
             "tools/list": self.load_tools_list_result,
             "tools/call": self.load_tools_call_result,
             "prompts/list": self.load_prompts_list_result,

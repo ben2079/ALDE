@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import errno
 import json
+import os
 import socketserver
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
@@ -57,17 +58,58 @@ class McpHttpRequestHandler(BaseHTTPRequestHandler):
 
     server_version = "alde-mcp-http/1.0"
 
+    @staticmethod
+    def _allowed_origins() -> set[str]:
+        configured = {
+            origin.strip()
+            for origin in str(os.getenv("ALDE_MCP_ALLOWED_ORIGINS") or "").split(",")
+            if origin.strip()
+        }
+        return configured or {
+            "http://localhost",
+            "http://127.0.0.1",
+            "https://localhost",
+            "https://127.0.0.1",
+        }
+
+    def _cors_origin(self) -> str:
+        origin = str(self.headers.get("Origin") or "").strip()
+        if origin and origin in self._allowed_origins():
+            return origin
+        return "*" if not origin else ""
+
     def _write_json_response(self, payload: dict[str, Any], status: int = 200) -> None:
         body = json.dumps(payload, ensure_ascii=True).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
+        cors_origin = self._cors_origin()
+        if cors_origin:
+            self.send_header("Access-Control-Allow-Origin", cors_origin)
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, Accept, MCP-Protocol-Version, MCP-Extensions")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
 
+    def do_OPTIONS(self) -> None:  # noqa: N802
+        self.send_response(204)
+        cors_origin = self._cors_origin()
+        if cors_origin:
+            self.send_header("Access-Control-Allow-Origin", cors_origin)
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, Accept, MCP-Protocol-Version, MCP-Extensions")
+        self.send_header("Access-Control-Max-Age", "600")
+        self.end_headers()
+
     def do_GET(self) -> None:  # noqa: N802
         if self.path.rstrip("/") == "/health":
             self._write_json_response({"ok": True, "server": "alde-mcp-http"}, status=200)
+            return
+        if self.path.rstrip("/") == "":
+            self._write_json_response(
+                {"ok": True, "server": "alde-mcp-http", "mcpEndpoint": "/mcp", "healthEndpoint": "/health"},
+                status=200,
+            )
             return
         self._write_json_response({"error": "not_found"}, status=404)
 
@@ -133,7 +175,7 @@ def _parse_args() -> argparse.Namespace:
         default="tcp",
         help="Network transport mode",
     )
-    parser.add_argument("--host", default="0.0.0.0", help="Bind host")
+    parser.add_argument("--host", default=None, help="Bind host")
     parser.add_argument(
         "--port",
         type=int,
@@ -146,7 +188,7 @@ def _parse_args() -> argparse.Namespace:
 def main() -> None:
     args = _parse_args()
     transport = str(args.transport or "tcp").strip().lower()
-    host = str(args.host or "127.0.0.1").strip() or "127.0.0.1"
+    host = str(args.host or ("127.0.0.1" if transport == "http" else "0.0.0.0")).strip()
     port = int(args.port) if args.port is not None else (8765 if transport == "tcp" else 8766)
 
     if transport == "http":

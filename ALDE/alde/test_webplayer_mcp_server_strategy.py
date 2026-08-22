@@ -84,4 +84,6 @@ def test_webplayer_operator_prompt_prefers_current_playback_flow() -> None:
     assert "webplayer_playlist_play" in text
     assert "webplayer_library_play" in text
     assert "webplayer_open_playback_target" in text
+    assert "webplayer_favorite_current_track" in text
+    assert "webplayer_volume_adjust" in text
     assert "tidal_api_track_manifest" in text
