@@ -4535,7 +4535,13 @@ class WebPlayerMcpRequestService:
     .panel {
       border: 1px solid rgba(255, 255, 255, 0.06);
       border-radius: 16px;
-      background: linear-gradient(180deg, rgba(0, 0, 0, 0.9), rgba(5, 6, 10, 0.88));
+      background-color: rgba(0, 0, 0, 0.9);
+      background-image:
+        url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='63' height='26' viewBox='0 0 63 26'%3E%3Ctext x='0' y='19' fill='%237dd3fc' fill-opacity='.10' font-family='monospace' font-size='15' letter-spacing='0'%3E%3A%5B%5C%7C%2F%5D%3A%3C/text%3E%3C/svg%3E"),
+        linear-gradient(180deg, rgba(0, 0, 0, 0.82), rgba(5, 6, 10, 0.8));
+      background-position: 0 0, 0 0;
+      background-repeat: repeat, no-repeat;
+      background-size: 63px 26px, 100% 100%;
       box-shadow: 0 22px 60px rgba(0, 0, 0, 0.78);
       padding: 10px;
       display: grid;
@@ -4752,7 +4758,7 @@ class WebPlayerMcpRequestService:
 </head>
 <body>
   <div class="app">
-    <div class="panel">
+    <div class="panel" data-ansi-background=":[\\|/]:">
       <div class="controls" role="toolbar" aria-label="WebPlayer controls">
       <button id="favoriteButton" class="icon-button danger" data-tool="webplayer_favorite_current_track" data-args='{"wait_for_player_s":2}' aria-label="Favorite" aria-pressed="false" title="Favorite">
         <svg class="favorite-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">

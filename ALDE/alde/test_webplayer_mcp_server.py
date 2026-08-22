@@ -450,6 +450,13 @@ def test_webplayer_http_fallback_serves_mini_controls_html() -> None:
             assert "id=\"favoriteButton\"" in body
             assert "danger.is-active" in body
             assert 'class="favorite-icon"' in body
+            assert 'data-ansi-background=":[\\|/]:"' in body
+            assert "%3A%5B%5C%7C%2F%5D%3A" in body
+            panel_style = body.split(".panel {", 1)[1].split("}", 1)[0]
+            assert "background-repeat: repeat, no-repeat;" in panel_style
+            assert "width='63' height='26'" in panel_style
+            assert "letter-spacing='0'" in panel_style
+            assert "background-size: 63px 26px, 100% 100%;" in panel_style
             icon_button_style = body.split(".icon-button {", 1)[1].split("}", 1)[0]
             assert "border: 0;" in icon_button_style
             assert "background: transparent;" in icon_button_style
