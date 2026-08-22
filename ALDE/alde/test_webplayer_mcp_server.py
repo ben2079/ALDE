@@ -494,9 +494,15 @@ def test_webplayer_http_fallback_serves_mini_controls_html() -> None:
             assert "webplayer_volume_adjust" in body
             assert "volumeModeBrowser" in body
             assert "volumeModeSystem" in body
+            assert "id=\"metaTitle\"" in body
+            assert "id=\"metaArtist\"" in body
             assert "id=\"metaQuality\"" in body
             assert "id=\"metaBitrate\"" in body
             assert "id=\"albumArtwork\"" in body
+            artwork_style = body.split(".album-artwork {", 1)[1].split("}", 1)[0]
+            assert "width: 80px;" in artwork_style
+            assert "height: 80px;" in artwork_style
+            assert "flex: 0 0 80px;" in artwork_style
             assert "id=\"metaBpm\"" in body
             assert "id=\"metaKey\"" in body
             assert "Bit/Hz: none" in body
@@ -513,6 +519,8 @@ def test_webplayer_http_fallback_serves_mini_controls_html() -> None:
             assert 'playback_backend: "api_only"' in body
             assert "track_id: normalizedTrackId" in body
             assert "hasBitDepthSampleRate" in body
+            assert 'metaTitleEl.textContent = `Title: ${title || "—"}`' in body
+            assert 'metaArtistEl.textContent = `Artist: ${artist || "—"}`' in body
             update_now_playing_script = body.split("function updateNowPlaying", 1)[1].split(
                 "function summarizeAction",
                 1,

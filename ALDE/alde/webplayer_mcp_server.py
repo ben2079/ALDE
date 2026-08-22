@@ -5104,9 +5104,9 @@ class WebPlayerMcpRequestService:
     }
 
     .album-artwork {
-      width: 64px;
-      height: 64px;
-      flex: 0 0 64px;
+      width: 80px;
+      height: 80px;
+      flex: 0 0 80px;
       border: 1px solid rgba(255, 255, 255, 0.08);
       border-radius: 10px;
       object-fit: cover;
@@ -5263,6 +5263,8 @@ class WebPlayerMcpRequestService:
             <div class="meta">
               <span id="metaStatus" class="pill">Status: …</span>
               <span id="metaPlayer" class="pill">Player: …</span>
+              <span id="metaTitle" class="pill">Title: …</span>
+              <span id="metaArtist" class="pill">Artist: …</span>
               <span id="metaAlbum" class="pill">Album: …</span>
               <span id="metaQuality" class="pill">Quality: none</span>
               <span id="metaBitrate" class="pill">Bit/Hz: none</span>
@@ -5282,6 +5284,8 @@ class WebPlayerMcpRequestService:
     const actionFeedbackEl = document.getElementById("actionFeedback");
     const metaStatusEl = document.getElementById("metaStatus");
     const metaPlayerEl = document.getElementById("metaPlayer");
+    const metaTitleEl = document.getElementById("metaTitle");
+    const metaArtistEl = document.getElementById("metaArtist");
     const metaAlbumEl = document.getElementById("metaAlbum");
     const metaQualityEl = document.getElementById("metaQuality");
     const metaBitrateEl = document.getElementById("metaBitrate");
@@ -5624,6 +5628,8 @@ class WebPlayerMcpRequestService:
       updateAlbumArtwork(artworkUrl, title, album);
       metaStatusEl.textContent = `Status: ${status || "Unknown"}`;
       metaPlayerEl.textContent = `Player: ${player || "—"}`;
+      metaTitleEl.textContent = `Title: ${title || "—"}`;
+      metaArtistEl.textContent = `Artist: ${artist || "—"}`;
       metaAlbumEl.textContent = `Album: ${album || "—"}`;
       if (metaQualityEl) metaQualityEl.textContent = `Quality: ${quality}`;
       if (metaBitrateEl) metaBitrateEl.textContent = `Bit/Hz: ${bitrate}`;
