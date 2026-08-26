@@ -22,6 +22,8 @@ This rollout is meant to be executed **directly on host `192.168.0.48`**.
 ## Files added in this repo
 
 - `ALDE/alde/webplayer_mcp_server.py`
+- `ALDE/alde/mcp_server.py` (ALDE MCP App UI host bridge and `ui://` resource)
+- `ALDE/alde/mcp_net_server.py` (ALDE browser CORS preflight and endpoint discovery)
 - `deploy/systemd-user/live_server_8767.service`
 - `deploy/systemd-user/webplayer_mcp_8766.service`
 
@@ -50,6 +52,24 @@ If your previous live service has a different unit name, stop/disable that unit 
 curl -s http://127.0.0.1:8766/health
 curl -s http://127.0.0.1:8767/ | head
 ```
+
+## MCP App UI / WebApp extension path
+
+The browser-facing WebPlayer MCP endpoint is `http://192.168.0.48:8766/mcp`. Its UI
+extension is negotiated with `io.modelcontextprotocol/ui`; it exposes the widget
+resource at `ui://webplayer/operator-console.html`. The same contract is also
+available on the ALDE MCP server at `ui://alde/operator-console.html`. A webapp
+can verify the WebPlayer path without loading a local file:
+
+```bash
+curl -s -X POST http://192.168.0.48:8766/mcp \
+  -H 'Content-Type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"capabilities":{"extensions":{"io.modelcontextprotocol/ui":{}}}}}'
+```
+
+The host must provide `window.mcp.request({method, params})` to the widget.
+The network server supports browser `OPTIONS` preflight and advertises the
+`/mcp` and `/health` paths at its root endpoint.
 
 ## 4) MCP checks
 

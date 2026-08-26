@@ -202,6 +202,57 @@ def test_initialize_protocol_version() -> None:
     assert "prompts" in capabilities
 
 
+def test_jsonrpc_initialize_negotiates_webplayer_ui_extension() -> None:
+    service = WebPlayerMcpRequestService()
+    payload = service.dispatch_object(
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2026-07-28",
+                "capabilities": {"extensions": {"io.modelcontextprotocol/ui": {}}},
+            },
+        }
+    )
+
+    result = payload["result"]
+    assert result["protocolVersion"] == "2026-07-28"
+    assert result["capabilities"]["extensions"]["io.modelcontextprotocol/ui"]["resourceUri"] == (
+        service._UI_RESOURCE_URI
+    )
+
+
+def test_jsonrpc_webplayer_resources_use_negotiated_ui_state() -> None:
+    service = WebPlayerMcpRequestService()
+    service.dispatch_object(
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {"capabilities": {"extensions": {"io.modelcontextprotocol/ui": {}}}},
+        }
+    )
+
+    payload = service.dispatch_object({"jsonrpc": "2.0", "id": 2, "method": "resources/list", "params": {}})
+    resources = payload["result"]["resources"]
+    assert resources[0]["uri"] == service._UI_RESOURCE_URI
+
+
+def test_jsonrpc_webplayer_rejects_unsupported_protocol_version() -> None:
+    service = WebPlayerMcpRequestService()
+    payload = service.dispatch_object(
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {"protocolVersion": "9999-01-01"},
+        }
+    )
+
+    assert payload["error"]["code"] == -32602
+
+
 def test_prompts_list_contains_webplayer_operator() -> None:
     service = WebPlayerMcpRequestService()
     payload = service.dispatch_object({"method": "prompts/list", "params": {}})
