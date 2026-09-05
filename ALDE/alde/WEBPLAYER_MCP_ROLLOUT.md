@@ -215,3 +215,63 @@ journalctl --user -u live_server.service -n 120 --no-pager
 ```
 
 If playback tools return `error=no_player`, start media playback in Chromium first.
+
+### Browser/CDP availability
+
+The `/health` response only proves that the MCP HTTP process is running; it
+does not prove that a browser is reachable. Browser playback is selected by
+`playback_backend=browser`. If that argument is omitted, the
+`WEBPLAYER_PLAYBACK_BACKEND` service environment value is used, so
+`api_only` deliberately disables browser/MPRIS control.
+
+The browser path has two layers:
+
+- `playerctl` controls the Chromium MPRIS player for play, stop, next,
+  previous, metadata, and volume operations.
+- Search/playlist/library/target workflows use CDP on `127.0.0.1:9222` (or
+  the request's `cdp_port`) to navigate and click controls. If no CDP page is
+  available, the workflow can start a supported local Chromium/Chrome binary
+  with that debugging port.
+
+Useful checks on the host are:
+
+```bash
+systemctl --user show webplayer_mcp.service -p Environment
+command -v playerctl
+curl -s http://127.0.0.1:9222/json/version
+```
+
+To restore browser control, set `WEBPLAYER_PLAYBACK_BACKEND=browser` (or pass
+`playback_backend=browser` per call), ensure `playerctl` is installed and the
+user service has access to the graphical session, then restart the service.
+Alternatively, use `playback_backend=api_only` with a valid TIDAL token when
+browser control is intentionally unavailable.
+
+#### Recovery options when the active browser has no CDP port
+
+On the remote host, the currently playing Chromium instance may have been
+started by the desktop session without `--remote-debugging-port`. MCP cannot
+attach CDP to that already-running process; adding the flag requires the
+browser to be restarted with the same authenticated profile.
+
+Use these options in order of preference:
+
+1. **Persistent CDP launch (recommended):** start the active Chromium profile
+   with `--remote-debugging-port=9222`, then enable
+   `WEBPLAYER_BROWSER_BACKEND_ENABLED=1` in the MCP service. Pass
+   `playback_backend=browser` and `cdp_port=9222` explicitly until the
+   service defaults are confirmed.
+2. **Live-browser bridge:** install a browser MCP extension/bridge that uses
+   the existing logged-in session. This avoids restarting Chromium, but it is
+   an additional component and is not part of this repository's deployed
+   contract.
+3. **Separate Playwright/Puppeteer profile:** useful for testing selectors,
+   but not a production fix for TIDAL playback because a clean profile may
+   lose the authenticated session or hit TIDAL's anti-bot challenge.
+4. **API/SDK playback:** keep this as a fallback only. Catalog metadata can
+   advertise `HIRES_LOSSLESS`, while the current API entitlement may still
+   return a preview manifest instead of full playback.
+
+Do not use a copied or empty Chromium profile as the production playback
+profile. It can render the TIDAL catalog while still failing playback with
+`S6001`; preserve the profile that is already playing successfully.

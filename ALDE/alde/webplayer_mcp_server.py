@@ -2941,7 +2941,12 @@ class WebPlayerService:
                 return ""
 
             def _load_chromium_command() -> str:
-                for candidate in ("chromium", "chromium-browser"):
+                for candidate in (
+                    "chromium",
+                    "chromium-browser",
+                    "google-chrome",
+                    "google-chrome-stable",
+                ):
                     command_path = shutil.which(candidate)
                     if command_path:
                         return command_path
@@ -4055,6 +4060,7 @@ class WebPlayerService:
         target_url: str,
         log_file_path: str,
         allow_xdg_open_fallback: bool,
+        cdp_port: int = 9222,
     ) -> str:
         quoted_url = shlex.quote(target_url)
         quoted_log_path = shlex.quote(log_file_path)
@@ -4086,7 +4092,9 @@ class WebPlayerService:
             "if [ -S \"$XDG_RUNTIME_DIR/wayland-0\" ]; then export WAYLAND_DISPLAY=wayland-0; "
             "elif [ -S \"$XDG_RUNTIME_DIR/wayland-1\" ]; then export WAYLAND_DISPLAY=wayland-1; fi; "
             "nohup \"$BROWSER_CMD\" --ozone-platform=wayland --enable-features=UseOzonePlatform "
-            "--no-first-run --no-default-browser-check --remote-debugging-port=9222 --remote-allow-origins=* "
+            "--no-first-run --no-default-browser-check --remote-debugging-port="
+            + str(int(cdp_port))
+            + " --remote-allow-origins=* "
             "--user-data-dir=/tmp/webplayer-mcp-browser --new-window "
             + quoted_url
             + " >"
@@ -4389,6 +4397,7 @@ PY
             target_url=target_url,
             log_file_path="/tmp/webplayer_mcp_target.log",
             allow_xdg_open_fallback=False,
+            cdp_port=cdp_port,
         )
         cdp_navigate_command = self._load_cdp_navigate_command(
             target_url=target_url,

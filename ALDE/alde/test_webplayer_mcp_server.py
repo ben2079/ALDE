@@ -762,6 +762,15 @@ def test_webplayer_api_only_commands_are_built() -> None:
     script = favorite_command.split("python3 - <<'PY'\n", 1)[1].rsplit("\nPY", 1)[0]
     compile(script, "<webplayer_favorite_api_only>", "exec")
 
+    browser_favorite_command = service.player_service.load_object_command(  # noqa: SLF001
+        object_name="webplayer_favorite_current_track",
+        query=None,
+        player_selector="chromium",
+        arguments={"playback_backend": "browser"},
+    )
+    assert '"google-chrome"' in browser_favorite_command
+    assert '"google-chrome-stable"' in browser_favorite_command
+
 
 def test_browser_access_token_service_parses_and_stores_validated_token(tmp_path: Path) -> None:
     service = WebPlayerMcpRequestService()
@@ -833,6 +842,19 @@ def test_webplayer_library_tracks_use_current_route_and_existing_cdp_tab() -> No
     assert "cdp_navigated=true" in library_command
     assert "cdp_navigate_exit_code=$?" in library_command
     assert 'button[data-test*="play" i]' in library_command
+
+
+def test_webplayer_browser_fallback_uses_requested_cdp_port() -> None:
+    service = WebPlayerMcpRequestService()
+    search_play_command = service.player_service.load_object_command(  # noqa: SLF001
+        object_name="webplayer_search_play",
+        query="Muse",
+        player_selector="chromium",
+        arguments={"cdp_port": 9333},
+    )
+
+    assert "CDP_PORT=9333 python3 - <<'PY'" in search_play_command
+    assert "--remote-debugging-port=9333" in search_play_command
 
 
 def test_browser_access_token_service_processes_queued_cdp_header(tmp_path: Path) -> None:
