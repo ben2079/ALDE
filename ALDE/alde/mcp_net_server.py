@@ -13,6 +13,7 @@ import os
 import socketserver
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
+from urllib.parse import urlsplit
 
 try:
     from .mcp_server import MCP_REQUEST_SERVICE  # type: ignore
@@ -72,9 +73,44 @@ class McpHttpRequestHandler(BaseHTTPRequestHandler):
             "https://127.0.0.1",
         }
 
+    @staticmethod
+    def _origin_matches_allowlist(origin: str, allowed_origins: set[str]) -> bool:
+        if origin in allowed_origins:
+            return True
+        try:
+            parsed_origin = urlsplit(origin)
+            _ = parsed_origin.port
+        except ValueError:
+            return False
+        if (
+            parsed_origin.scheme not in {"http", "https"}
+            or not parsed_origin.hostname
+            or parsed_origin.username
+            or parsed_origin.password
+            or parsed_origin.path
+            or parsed_origin.query
+            or parsed_origin.fragment
+        ):
+            return False
+        for allowed_origin in allowed_origins:
+            try:
+                parsed_allowed = urlsplit(allowed_origin)
+                allowed_port = parsed_allowed.port
+            except ValueError:
+                continue
+            if (
+                parsed_allowed.scheme != parsed_origin.scheme
+                or parsed_allowed.hostname != parsed_origin.hostname
+                or allowed_port is not None
+            ):
+                continue
+            if not parsed_allowed.username and not parsed_allowed.password and not parsed_allowed.path:
+                return True
+        return False
+
     def _cors_origin(self) -> str:
         origin = str(self.headers.get("Origin") or "").strip()
-        if origin and origin in self._allowed_origins():
+        if origin and self._origin_matches_allowlist(origin, self._allowed_origins()):
             return origin
         return "*" if not origin else ""
 

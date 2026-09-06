@@ -2474,11 +2474,23 @@ class WebPlayerService:
             from urllib.parse import urlencode
             from urllib.request import Request, urlopen
 
-            import websockets
-            from cryptography.hazmat.primitives import hashes
-            from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-            from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
-            from cryptography.hazmat.primitives.keywrap import aes_key_unwrap
+            try:
+                import websockets
+            except ImportError:
+                websockets = None
+
+            try:
+                from cryptography.hazmat.primitives import hashes
+                from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+                from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+                from cryptography.hazmat.primitives.keywrap import aes_key_unwrap
+            except ImportError:
+                hashes = None
+                Cipher = None
+                algorithms = None
+                modes = None
+                PBKDF2HMAC = None
+                aes_key_unwrap = None
 
             __TRACK_METADATA_HELPERS__
 
@@ -2786,6 +2798,9 @@ class WebPlayerService:
             async def _run_cdp_favorite_click(cdp_port: int, timeout_s: int) -> str:
                 if cdp_port <= 0:
                     return ""
+                if websockets is None:
+                    emit("error=missing_python_dependency:websockets")
+                    return ""
                 try:
                     with urlopen(f"http://127.0.0.1:{cdp_port}/json/list", timeout=4) as response:
                         targets = json.loads(response.read().decode("utf-8", "replace"))
@@ -2958,6 +2973,11 @@ class WebPlayerService:
                     return int(sock.getsockname()[1])
 
             async def _load_browser_auth_payload(debug_port: int, *, strict_errors: bool) -> dict[str, str]:
+                if websockets is None:
+                    if strict_errors:
+                        emit("error=missing_python_dependency:websockets")
+                        raise SystemExit(1)
+                    return {}
                 page_target = None
                 deadline = time.time() + 20
                 while time.time() < deadline:
@@ -3181,6 +3201,11 @@ class WebPlayerService:
                         emit("error=missing_tidal_auth_blob")
                         raise SystemExit(1)
                     return []
+                if PBKDF2HMAC is None:
+                    if strict_errors:
+                        emit("error=missing_python_dependency:cryptography")
+                        raise SystemExit(1)
+                    return []
 
                 decoded_credentials: dict[str, dict[str, object]] = {}
                 client_credentials: dict[str, object] | None = None
@@ -3358,50 +3383,6 @@ class WebPlayerService:
                 if matched_token:
                     return matched_token
                 return ""
-
-            def tidal_headers(access_token: str) -> dict[str, str]:
-                x_tidal_token = os.environ.get("WEBPLAYER_MCP_TIDAL_X_TIDAL_TOKEN", "").strip() or PUBLIC_WEB_TOKEN
-                return {
-                    "Authorization": f"Bearer {access_token}",
-                    "x-tidal-token": x_tidal_token,
-                    "Accept": "application/json",
-                    "Accept-Language": "en-US,en;q=0.9",
-                    "Origin": "https://listen.tidal.com",
-                    "Referer": "https://listen.tidal.com/",
-                    "User-Agent": USER_AGENT,
-                }
-
-            def tidal_headers(access_token: str) -> dict[str, str]:
-                authorization = ""
-                x_tidal_token = os.environ.get("WEBPLAYER_MCP_TIDAL_X_TIDAL_TOKEN", "").strip() or PUBLIC_WEB_TOKEN
-                headers = {
-                    "x-tidal-token": x_tidal_token,
-                    "Accept": "application/json",
-                    "Accept-Language": "en-US,en;q=0.9",
-                    "Origin": "https://listen.tidal.com",
-                    "Referer": "https://listen.tidal.com/",
-                    "User-Agent": USER_AGENT,
-                }
-                if authorization:
-                    headers["Authorization"] = authorization
-                else:
-                    if not access_token:
-                        emit("error=missing_tidal_access_token")
-                        raise SystemExit(1)
-                    headers["Authorization"] = f"Bearer {access_token}"
-                return headers
-
-            def tidal_headers(access_token: str) -> dict[str, str]:
-                x_tidal_token = os.environ.get("WEBPLAYER_MCP_TIDAL_X_TIDAL_TOKEN", "").strip() or PUBLIC_WEB_TOKEN
-                return {
-                    "Authorization": f"Bearer {access_token}",
-                    "x-tidal-token": x_tidal_token,
-                    "Accept": "application/json",
-                    "Accept-Language": "en-US,en;q=0.9",
-                    "Origin": "https://listen.tidal.com",
-                    "Referer": "https://listen.tidal.com/",
-                    "User-Agent": USER_AGENT,
-                }
 
             def tidal_headers_final(access_token: str) -> dict[str, str]:
                 x_tidal_token = os.environ.get("WEBPLAYER_MCP_TIDAL_X_TIDAL_TOKEN", "").strip() or PUBLIC_WEB_TOKEN
@@ -6667,9 +6648,45 @@ class McpHttpRequestHandler(BaseHTTPRequestHandler):
             "https://127.0.0.1",
         }
 
+    @staticmethod
+    def _origin_matches_allowlist(origin: str, allowed_origins: set[str]) -> bool:
+        if origin in allowed_origins:
+            return True
+        try:
+            parsed_origin = urlparse(origin)
+            _ = parsed_origin.port
+        except ValueError:
+            return False
+        if (
+            parsed_origin.scheme not in {"http", "https"}
+            or not parsed_origin.hostname
+            or parsed_origin.username
+            or parsed_origin.password
+            or parsed_origin.path
+            or parsed_origin.params
+            or parsed_origin.query
+            or parsed_origin.fragment
+        ):
+            return False
+        for allowed_origin in allowed_origins:
+            try:
+                parsed_allowed = urlparse(allowed_origin)
+                allowed_port = parsed_allowed.port
+            except ValueError:
+                continue
+            if (
+                parsed_allowed.scheme != parsed_origin.scheme
+                or parsed_allowed.hostname != parsed_origin.hostname
+                or allowed_port is not None
+            ):
+                continue
+            if not parsed_allowed.username and not parsed_allowed.password and not parsed_allowed.path:
+                return True
+        return False
+
     def _cors_origin(self) -> str:
         origin = str(self.headers.get("Origin") or "").strip()
-        if origin and origin in self._allowed_origins():
+        if origin and self._origin_matches_allowlist(origin, self._allowed_origins()):
             return origin
         return "*" if not origin else ""
 

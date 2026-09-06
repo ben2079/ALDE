@@ -26,12 +26,12 @@
     },
     "webplayer-mcp": {
       "type": "http",
-      "url": "http://192.168.0.48:8766"
+      "url": "http://127.0.0.1:8766/mcp"
     },
     "webplayer-ui-stdio": {
       "type": "stdio",
       "command": "python3",
-      "cwd": "/home/ben/Vs_Code_Projects/Projects/ALDE.worktrees/mini-controls-webplayer-load",
+      "cwd": "${workspaceFolder}",
       "args": [
         "-u",
         "-m",
