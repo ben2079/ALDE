@@ -2,8 +2,9 @@
   "servers": {
     "webplayer-mcp": {
       "type": "http",
-      "url": "http://127.0.0.1:8766/mcp"
+      "url": "http://127.0.0.1:8766"
     }
-  },
-  "inputs": []
+  }
+  
+  
 }

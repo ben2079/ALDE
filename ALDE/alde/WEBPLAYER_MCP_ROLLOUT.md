@@ -60,13 +60,11 @@ curl -s http://127.0.0.1:8767/ | head
 
 ## MCP App UI / WebApp extension path
 
-The browser-facing WebPlayer MCP endpoint is
-`http://127.0.0.1:8766/mcp` on the service host. Clients on another machine can
-use `http://192.168.0.48:8766/mcp` when the host is reachable. Its UI extension
-is negotiated with `io.modelcontextprotocol/ui`; it exposes the widget resource
-at `ui://webplayer/mini-controls.html`. The same contract is also available on
-the ALDE MCP server at `ui://alde/operator-console.html`. A webapp can verify
-the WebPlayer path without loading a local file:
+The browser-facing WebPlayer MCP endpoint is `http://192.168.0.48:8766/mcp`. Its UI
+extension is negotiated with `io.modelcontextprotocol/ui`; it exposes the widget
+resource at `ui://webplayer/mini-controls.html`. The same contract is also
+available on the ALDE MCP server at `ui://alde/operator-console.html`. A webapp
+can verify the WebPlayer path without loading a local file:
 
 ```bash
 curl -s -X POST http://192.168.0.48:8766/mcp \
@@ -100,13 +98,6 @@ When inline rendering is unavailable, the same app can be delivered on localhost
 TCP transport using `127.0.0.1:8765` and the `webplayer_mcp_8765.service` unit.
 The network server supports browser `OPTIONS` preflight and advertises the
 `/mcp` and `/health` paths at its root endpoint.
-For a packaged install, install the optional WebPlayer dependencies with
-`python3 -m pip install -e '.[webplayer]'`; without them, favorite-track
-operations return a structured `missing_python_dependency` error instead of
-failing during script startup. The default CORS allowlist accepts localhost
-and 127.0.0.1 origins with development ports; set
-`ALDE_MCP_ALLOWED_ORIGINS` or `WEBPLAYER_MCP_ALLOWED_ORIGINS` for a custom
-allowlist.
 
 ### Rich now-playing metadata
 
@@ -210,8 +201,7 @@ curl -s -X POST http://127.0.0.1:8766/mcp \
 
 Use:
 
-- Local service host: `http://127.0.0.1:8766/mcp`
-- Remote client: `http://192.168.0.48:8766/mcp`
+- URL: `http://192.168.0.48:8766/mcp`
 - Methods: `initialize`, `tools/list`, `prompts/list`, `prompts/get`, `tools/call`
 
 ## 6) Troubleshooting

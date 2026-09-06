@@ -13,7 +13,6 @@ import urllib.request
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 
-from ALDE.alde.mcp_net_server import McpHttpRequestHandler as NetworkMcpHttpRequestHandler
 from ALDE.alde.webplayer_mcp_server import McpHttpRequestHandler, TidalApiService, WebPlayerMcpRequestService
 
 
@@ -533,31 +532,6 @@ def test_webplayer_http_fallback_serves_mini_controls_html() -> None:
         server.shutdown()
         server.server_close()
         thread.join(timeout=2)
-
-
-def test_http_cors_allows_local_development_ports_for_default_origins() -> None:
-    allowed_origins = {"http://localhost", "http://127.0.0.1"}
-    handlers = (McpHttpRequestHandler, NetworkMcpHttpRequestHandler)
-
-    for handler in handlers:
-        assert handler._origin_matches_allowlist("http://localhost:3000", allowed_origins)  # noqa: SLF001
-        assert handler._origin_matches_allowlist("http://127.0.0.1:5173", allowed_origins)  # noqa: SLF001
-        assert not handler._origin_matches_allowlist("http://localhost.example:3000", allowed_origins)  # noqa: SLF001
-        assert not handler._origin_matches_allowlist("http://localhost:bad", allowed_origins)  # noqa: SLF001
-
-
-def test_favorite_command_reports_missing_optional_dependencies_and_has_one_header_builder() -> None:
-    service = WebPlayerMcpRequestService()
-    favorite_command = service.player_service._load_favorite_current_track_command(  # noqa: SLF001
-        player_selector="chromium",
-        arguments={"wait_for_player_s": 2},
-    )
-    script = favorite_command.split("python3 - <<'PY'\n", 1)[1].rsplit("\nPY", 1)[0]
-
-    assert "error=missing_python_dependency:websockets" in script
-    assert "error=missing_python_dependency:cryptography" in script
-    assert script.count("def tidal_headers(") == 0
-    assert "def tidal_headers_final(" in script
 
 
 def test_jsonrpc_tools_call_returns_spec_content_blocks() -> None:

@@ -1,9 +1,8 @@
 {
-  "servers": {
-    "webplayer-mcp": {
-      "type": "http",
-      "url": "http://192.168.0.48:8766/mcp"
-    }
-  },
-  "inputs": []
+	"servers": {
+		"webplayer-mcp": {
+			"url": "http://192.168.0.48:8766",
+			"type": "http"
+		}
+	}
 }

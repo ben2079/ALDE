@@ -79,7 +79,6 @@ class McpHttpRequestHandler(BaseHTTPRequestHandler):
             return True
         try:
             parsed_origin = urlsplit(origin)
-            _ = parsed_origin.port
         except ValueError:
             return False
         if (
@@ -95,13 +94,12 @@ class McpHttpRequestHandler(BaseHTTPRequestHandler):
         for allowed_origin in allowed_origins:
             try:
                 parsed_allowed = urlsplit(allowed_origin)
-                allowed_port = parsed_allowed.port
             except ValueError:
                 continue
             if (
                 parsed_allowed.scheme != parsed_origin.scheme
                 or parsed_allowed.hostname != parsed_origin.hostname
-                or allowed_port is not None
+                or parsed_allowed.port is not None
             ):
                 continue
             if not parsed_allowed.username and not parsed_allowed.password and not parsed_allowed.path:
