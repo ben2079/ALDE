@@ -428,6 +428,7 @@ class WebPlayerService:
         "webplayer_play",
         "webplayer_forward",
         "webplayer_backward",
+        "webplayer_volume",
         "webplayer_now_playing",
         "webplayer_search_play",
         "webplayer_playlist_play",
@@ -446,6 +447,7 @@ class WebPlayerService:
         "webplayer_stop",
         "webplayer_forward",
         "webplayer_backward",
+        "webplayer_volume",
         "webplayer_now_playing",
         "webplayer_search",
         "webplayer_search_play",
@@ -537,6 +539,11 @@ class WebPlayerService:
             return self._load_forward_command(player_selector=player_selector)
         if object_name == "webplayer_backward":
             return self._load_backward_command(player_selector=player_selector)
+        if object_name == "webplayer_volume":
+            return self._load_volume_command(
+                player_selector=player_selector,
+                arguments=arguments,
+            )
         if object_name == "webplayer_now_playing":
             return self._load_now_playing_command(player_selector=player_selector)
         if object_name == "webplayer_search":
@@ -648,6 +655,27 @@ class WebPlayerService:
             "echo player=$selected_player; "
             "echo title=$(playerctl -p \"$selected_player\" metadata xesam:title 2>/dev/null || true); "
             "echo status=$(playerctl -p \"$selected_player\" status 2>/dev/null || echo unknown);"
+        )
+
+    def _load_volume_command(self, *, player_selector: str, arguments: dict[str, Any]) -> str:
+        delta_percent = self._load_bounded_int(
+            arguments.get("delta_percent"),
+            default_value=10,
+            minimum=-100,
+            maximum=100,
+        )
+        delta_fraction = delta_percent / 100
+        return (
+            "if ! command -v playerctl >/dev/null 2>&1; then echo 'error=playerctl_missing'; exit 1; fi; "
+            + self._load_player_pick_script(player_selector=player_selector, wait_seconds=0)
+            + "current_volume=$(playerctl -p \"$selected_player\" volume 2>/dev/null || echo ''); "
+            "if ! printf '%s' \"$current_volume\" | awk 'BEGIN{ok=0} /^[0-9]+([.][0-9]+)?$/{ok=1} END{exit !ok}'; then "
+            "echo 'error=volume_unavailable'; exit 1; fi; "
+            f"new_volume=$(awk -v current=\"$current_volume\" -v delta=\"{delta_fraction}\" "
+            "'BEGIN { value=current + delta; if (value < 0) value=0; if (value > 1) value=1; printf \"%.6f\", value }'); "
+            "playerctl -p \"$selected_player\" volume \"$new_volume\"; "
+            "echo player=$selected_player; "
+            "echo volume=$new_volume;"
         )
 
     def _load_now_playing_command(self, *, player_selector: str) -> str:
@@ -1240,6 +1268,7 @@ class WebPlayerMcpRequestService:
         "webplayer_stop",
         "webplayer_forward",
         "webplayer_backward",
+        "webplayer_volume",
         "webplayer_search",
     )
     _TIDAL_API_TOOL_NAMES = (
@@ -1631,8 +1660,9 @@ document.getElementById("now-playing").onclick=request;
                 "4) Stop playback with webplayer_stop when requested.\n"
                 "5) Skip next with webplayer_forward when requested.\n"
                 "6) Skip previous with webplayer_backward when requested.\n"
+                "7) Adjust volume with webplayer_volume using delta_percent (for example, +10 or -10).\n"
                 f"{search_line}\n"
-                "8) Use tidal_api_request, tidal_api_track, tidal_api_track_manifest, or tidal_api_widevine when the user asks for direct API inspection or manifest data.\n"
+                "9) Use tidal_api_request, tidal_api_track, tidal_api_track_manifest, or tidal_api_widevine when the user asks for direct API inspection or manifest data.\n"
                 "After each control action, call webplayer_now_playing and summarize status/title/artist/album.\n"
                 "If any tool returns ok=false, surface stderr/stdout and propose the next corrective action."
             )
@@ -1759,6 +1789,27 @@ document.getElementById("now-playing").onclick=request;
                     "name": "webplayer_backward",
                     "description": "Go back to previous track.",
                     "parameters": {"type": "object", "properties": dict(base_properties), "required": []},
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "webplayer_volume",
+                    "description": "Increase or decrease web player volume by a percentage-point delta, clamped to 0-100%.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            **dict(base_properties),
+                            "delta_percent": {
+                                "type": "integer",
+                                "description": "Percentage points to add to volume; positive increases and negative decreases.",
+                                "default": 10,
+                                "minimum": -100,
+                                "maximum": 100,
+                            },
+                        },
+                        "required": [],
+                    },
                 },
             },
             {

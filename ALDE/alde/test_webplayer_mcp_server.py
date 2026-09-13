@@ -15,6 +15,7 @@ def test_tools_list_contains_required_webplayer_tools() -> None:
     assert "webplayer_stop" in names
     assert "webplayer_forward" in names
     assert "webplayer_backward" in names
+    assert "webplayer_volume" in names
     assert "webplayer_now_playing" in names
     assert "webplayer_search" in names
     assert "webplayer_search_play" in names
@@ -137,6 +138,31 @@ def test_tools_call_rejects_missing_search_query() -> None:
     result_payload = json.loads(content)
     assert result_payload["ok"] is False
     assert "missing_query" in result_payload.get("stdout", "")
+
+
+def test_volume_command_defaults_to_ten_percent_delta() -> None:
+    service = WebPlayerMcpRequestService()
+    command = service.player_service.load_object_command(
+        object_name="webplayer_volume",
+        query=None,
+        player_selector="chromium",
+        arguments={},
+    )
+
+    assert 'delta="0.1"' in command
+    assert "current_volume" in command
+
+
+def test_volume_command_clamps_requested_delta() -> None:
+    service = WebPlayerMcpRequestService()
+    command = service.player_service.load_object_command(
+        object_name="webplayer_volume",
+        query=None,
+        player_selector="chromium",
+        arguments={"delta_percent": 250},
+    )
+
+    assert 'delta="1.0"' in command
 
 
 def test_tools_call_rejects_missing_search_play_query() -> None:
