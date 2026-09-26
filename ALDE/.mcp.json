@@ -3,7 +3,21 @@
     "webplayer-mcp-remote": {
       "type": "http",
       "url": "http://192.168.0.48:8766/mcp"
+    },
+    "remote-sse": {
+      "type": "sse",
+      "url": "http://192.168.0.225:3001/sse",
+      "headers": {
+        "Authorization": "${input:mcp-auth-token}"
+      }
     }
   },
-  "inputs": []
+  "inputs": [
+    {
+      "type": "promptString",
+      "id": "mcp-auth-token",
+      "description": "Token for the remote SSE MCP server",
+      "password": true
+    }
+  ]
 }
