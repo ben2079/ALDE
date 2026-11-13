@@ -240,6 +240,12 @@ Rules:
 - sanitize and normalize inbound data before it reaches the internal bus
 - require explicit policy for every outbound side effect
 
+## Physical Network Media
+
+For copper Ethernet links, use twisted-pair cabling and select its category for the required link speed and channel length. Cat 6A is suitable for 10GBASE-T links up to 100 m; follow the applicable cabling standard and installation requirements. Use unshielded cable where the environment permits, and use shielded cable only when needed and correctly bonded. Physical cabling does not replace the logical isolation and access controls between LAN zones.
+
+For background on twisted-pair construction and shielding, see [Twisted-Pair-Kabel](https://de-academic.com/dic.nsf/dewiki/1420650).
+
 ## Authentication And Authorization Model
 
 ### User Authentication
